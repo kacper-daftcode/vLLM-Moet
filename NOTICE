@@ -1,0 +1,26 @@
+vLLM-Moet
+Copyright 2026 the vLLM-Moet authors
+
+This product includes software developed for serving DeepSeek-V4-Flash on a single
+SM120 GPU: 2-bit MoE expert quantization, an FP4 "delta" tier, and hand-written SASS
+kernels (the `cubit` toolchain).
+
+Built on and incorporating:
+
+- vLLM (https://github.com/vllm-project/vllm), Apache License 2.0,
+  Copyright contributors to the vLLM project. The base is the official tag v0.19.2rc0;
+  `patch/vllm-moet.patch` is applied on top of it. That patch also carries the DeepSeek-V4
+  model support + sparse-MLA / MTP / indexer + SM120 enablement, which were authored by
+  vLLM contributors and the base-fork (kacper-daftcode) authors — not by this project.
+  This project's own contribution is the 2-bit MoE + FP4 delta + the cubit kernels.
+
+- DeepGEMM (https://github.com/deepseek-ai/DeepGEMM) is referenced by the base for
+  Hopper/Blackwell-DC FP8 paths; it is not used or redistributed here (it has no SM120
+  backend — this project uses CUTLASS/Triton/cubit paths on SM120 instead).
+
+- The DeepSeek-V4-Flash model weights are NOT included or redistributed. Obtain the
+  official checkpoint separately; the 2-bit planes are built from it at load time.
+
+cubit (the SASS assembler and the hand-written kernels under `kernels/`) and the 2-bit
+MoE + FP4-delta quantization (`patch/vllm-new-files/`) are the original contribution of
+this project.

@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+*~
+
+# Internal session logs / research harnesses (not for publication)
+internal/

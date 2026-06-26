@@ -1,0 +1,316 @@
+// mla_prefill_state2 — fp8-staged variant of mla_prefill_state: 2 CTAs/SM occupancy (vs v1's 1).
+// Same online-state prefill contract + same params as v1 (Q bf16 A-frags). The win: stage the
+// NoPE KV in smem as raw fp8 (448 B/cand) + UE8M0 f32 scale-mults, RoPE as bf16 -> ~44 KB
+// total (vs 72 KB bf16) so 2 CTAs co-reside (static smem, Block-Limit-SharedMem 1->2).
+// Dequant fp8->bf16 INLINE at QK time (HMMA bf16) and PV time (compute is ~free, ncu 0.2%).
+//
+// ====================== STATUS (v2, occupancy pass) ======================
+// VALIDATED (GPU7): 16/32/64 heads, grid-over-T, partial-mask, 2-chunk accumulate; deterministic.
+//   acc rel vs f32/Triton ~1.1-1.5e-3 (req <2.5e-2); denom ~1e-6; max ~2e-6.
+// OCCUPANCY: ncu Block-Limit-SharedMem 1->2, Theoretical Occ 16.7%->33.3% (2 CTAs/SM). Achieved
+//   25% @ T=256 (256 CTAs / ~170 SMs = 1.5 avg). Still latency-bound (Compute 0.2%, DRAM 0.3%).
+// BENCH vs Triton (head_block as vLLM): T=256 C=512 -> 0.897 vs 1.99 ms = 2.21x ; C=2048 -> 2.22x.
+//   (v1 bf16/1-CTA was 1.46x; the fp8/2-CTA pass is +51%.)
+// NEXT (to reach 3-6x = 4 CTAs/SM): cubit sets regcount = roundup32(max_reg+32) (elf_builder.rs),
+//   so regcount is 64 only if max_reg<=63 (-> Block-Limit-Reg 4), else 96 (-> 2). There is NO
+//   value giving 3. So need max_reg<=63 AND smem<=25KB. Path: (a) C=32 fp8 tile (~22KB smem ->
+//   Block-Limit-SharedMem 4); (b) drive max_reg<=63 by recomputing the persistent values
+//   (token offsets R64-71, nhg R72, lane R73-76, CTAID R79) per-phase into low temps, leaving
+//   only gp persistent (R63). Then min(reg 4, smem 4) = 4 CTAs/SM -> ~2x more.
+// smem (static, ~44.3KB): KV_NOPE fp8[64][448]@0 (0x7000) ; KV_ROPE bf16[64][64]@0x7000 (0x2000) ;
+//   SCALE f32[64][8]@0x9000 (0x800, =2^(ue8m0-127)) ; SCORES f32[16][64]@0x9800 (0x1000) ;
+//   PROBS bf16[16][64]@0xA800 (0x800) ; CORR f32[16]@0xB000 ; SLOTS i32[64]@0xB040.  end 0xB140.
+// regs: R73=wid R74=lane R75=g R76=t R77=block_stride/gp ; R72=nhg R79=CTAID ; tok R64/66/68/70.
+//   max_reg=79 -> regcount 96 -> 2 CTAs/SM (reg-capped; see NEXT to get to 4).
+// BLOCK_SIZE: the cache paging block (tokens/page) is parameterized for bs in {2,4,8,64}. Per page the
+//   fp8_ds_mla cache is SoA: [bs x 576B entry (448 fp8 NoPE + 128 bf16 RoPE)][bs x 8B UE8M0 scale]. So
+//   slot decode is page=slot>>log2bs, off=slot&(bs-1), scbase=page_base+off*8+bs*576. block_stride
+//   (R77, =cache.stride(0)) already auto-adjusts the page step. The 3 bs-dependent constants are passed
+//   as params log2bs/bsmask/scale_base(=bs*576) and loaded into R57/R59/R63 (live only in stage_cand;
+//   reused by group_loop). Within-entry 0x240(576)/0x1c0(448) and scale stride 8B are bs-INDEPENDENT.
+.entry mla_prefill_state2
+    .reg R0-R79
+    .param u64 d_q
+    .param u64 d_cache
+    .param u64 d_slots
+    .param u64 d_max
+    .param u64 d_denom
+    .param u64 d_acc
+    .param u32 scale2
+    .param u32 block_stride
+    .param u32 nhg
+    .param u32 log2bs
+    .param u32 bsmask
+    .param u32 scale_base
+    .shared .align 16 smem[45376]
+
+    S2R R0, SR_TID.X ;
+    LDCU.64 UR4, c[0x0][0x358] ;
+    UMOV UR6, 0x0 ;
+    SHF.R.U32.HI R73, RZ, 0x5, R0 ;           // wid
+    LOP3.LUT R74, R0, 0x1f, RZ, 0xc0, !PT ;   // lane
+    SHF.R.U32.HI R75, RZ, 0x2, R74 ;          // g
+    LOP3.LUT R76, R74, 0x3, RZ, 0xc0, !PT ;   // t
+    LDC R77, c[0x0][0x3b4] ;                  // block_stride (reused as gp after staging)
+    ISETP.NE.AND P4, PT, R73, RZ, PT ;
+    S2R R79, SR_CTAID.X ;
+    LDC R72, c[0x0][0x3b8] ;                                                 // nhg (freed after group-loop init)
+    IMAD R64, R79, R72, RZ ; SHF.L.U32 R64, R64, 0xe, RZ ; MOV R65, RZ ;   // tok*nhg*0x4000 (d_q)
+    IMAD R66, R79, 0x100, RZ ; MOV R67, RZ ;                                // tok*0x100 (d_slots)
+    IMAD R68, R79, R72, RZ ; SHF.L.U32 R68, R68, 0x6, RZ ; MOV R69, RZ ;    // tok*nhg*0x40 (state)
+    IMAD R70, R79, R72, RZ ; SHF.L.U32 R70, R70, 0xf, RZ ; MOV R71, RZ ;    // tok*nhg*0x8000 (acc)
+
+    // ===== Phase 0: gather KV tile -> smem (NoPE fp8 raw, RoPE bf16, scale f32 mult) =====
+    ISETP.LT.U32.AND P2, PT, R74, 0x1c, PT ;   // lane<28 (NoPE 16B copy)
+    ISETP.LT.U32.AND P3, PT, R74, 0x7, PT ;    // lane<7 (scale)
+    LDC.64 R24, c[0x0][0x390] ; IADD.64 R24, R24, R66 ;
+    SHF.L.U32 R36, R73, 0x2, RZ ; MOV R37, RZ ; IADD.64 R24, R24, R36 ;      // &slots[wid]
+    IMAD R26, R73, 0x1c0, RZ ; IMAD R26, R74, 0x10, R26 ;                    // NoPE out = cand*448 + lane*16
+    IMAD R27, R73, 0x20, RZ ; IMAD R27, R74, 0x4, R27 ; IADD3 R27, PT, PT, R27, 0x9000, RZ ;  // scale out
+    IMAD R28, R73, 0x80, RZ ; IMAD R28, R74, 0x4, R28 ; IADD3 R28, PT, PT, R28, 0x7000, RZ ;  // rope out
+    IMAD R29, R73, 0x4, RZ ; IADD3 R29, PT, PT, R29, 0xb040, RZ ;            // slot stash
+    LDC R57, c[0x0][0x3bc] ;                                                  // log2bs   (bs-dep, staging only)
+    LDC R59, c[0x0][0x3c0] ;                                                  // bsmask = bs-1
+    LDC R63, c[0x0][0x3c4] ;                                                  // scale_base = bs*576
+    UMOV UR9, 0x8 ;
+stage_cand:
+    UIADD3 UR9, UPT, UPT, UR9, -0x1, URZ ;
+    UISETP.NE.AND UP3, UPT, UR9, URZ, UPT ;
+    LDG.E R30, desc[UR4][R24.64] ;
+    STS [R29], R30 ;
+    ISETP.GE.AND P0, PT, R30, RZ, PT ;
+    @!P0 MOV R30, RZ ;
+    SHF.R.U32.HI R31, RZ, R57, R30 ;                                         // page = slot >> log2bs
+    LOP3.LUT R32, R30, R59, RZ, 0xc0, !PT ;                                  // off  = slot & bsmask
+    LDC.64 R34, c[0x0][0x388] ;
+    IMAD.WIDE.U32 R34, R31, R77, R34 ;
+    IMAD.WIDE.U32 R38, R32, 0x240, R34 ;                                     // td
+    SHF.L.U32 R36, R32, 0x3, RZ ; IADD3 R36, PT, PT, R36, R63, RZ ; MOV R37, RZ ; IADD.64 R40, R34, R36 ;  // scbase = page_base + off*8 + scale_base(bs*576)
+    SHF.L.U32 R36, R74, 0x4, RZ ; MOV R37, RZ ; IADD.64 R48, R38, R36 ;      // NoPE src = td + 16*lane
+    @P2 LDG.E.128 R44, desc[UR4][R48.64] ;
+    @P2 STS.64 [R26], R44 ;
+    @P2 STS.64 [R26+0x8], R46 ;
+    MOV R36, R74 ; MOV R37, RZ ; IADD.64 R50, R40, R36 ;                     // scale src = scbase + lane
+    @P3 LDG.E.U8 R52, desc[UR4][R50.64] ;
+    @P3 SHF.L.U32 R52, R52, 0x17, RZ ;
+    @P3 STS [R27], R52 ;
+    SHF.L.U32 R36, R74, 0x2, RZ ; MOV R37, RZ ; IADD.64 R54, R38, R36 ; IADD.64 R54, R54, 0x1c0 ;   // rope src = td+448+4*lane
+    LDG.E R56, desc[UR4][R54.64] ;
+    STS [R28], R56 ;
+    IADD.64 R24, R24, 0x20 ;
+    IADD3 R26, PT, PT, R26, 0xe00, RZ ;
+    IADD3 R27, PT, PT, R27, 0x100, RZ ;
+    IADD3 R28, PT, PT, R28, 0x400, RZ ;
+    IADD3 R29, PT, PT, R29, 0x20, RZ ;
+    BRA.U UP3, stage_cand ;
+    BAR.SYNC.DEFER_BLOCKING 0x0 ;
+
+    // ===== group loop over NHG head groups (reuse staged KV) =====
+    R2UR UR7, R72 ;
+    MOV R77, RZ ;                             // gp = 0 (reuses block_stride reg, dead after staging)
+group_loop:
+    UIADD3 UR7, UPT, UPT, UR7, -0x1, URZ ;
+    UISETP.NE.AND UP1, UPT, UR7, URZ, UPT ;
+
+    // ===== Phase 1: QK. NoPE fp8 (inline dequant, HMMA bf16) + RoPE bf16 =====
+    MOV R0, RZ ; MOV R1, RZ ; MOV R2, RZ ; MOV R3, RZ ;
+    LDC.64 R58, c[0x0][0x380] ; IADD.64 R58, R58, R64 ;
+    IMAD R36, R77, 0x4000, RZ ; MOV R37, RZ ; IADD.64 R58, R58, R36 ;
+    SHF.L.U32 R36, R74, 0x4, RZ ; MOV R37, RZ ; IADD.64 R58, R58, R36 ;      // Q A-frag ptr
+    IMAD R60, R73, 0x8, R75 ; IMAD R60, R60, 0x1c0, RZ ; IMAD R60, R76, 0x2, R60 ;  // NoPE B-frag = cand*448 + 2t
+    IMAD R62, R73, 0x8, R75 ; IMAD R62, R62, 0x20, RZ ; IADD3 R62, PT, PT, R62, 0x9000, RZ ;  // scale ptr = SCALE + cand*32
+    UMOV UR9, 0x7 ;                            // 7 NoPE 64-blocks
+qk_blk:
+    UIADD3 UR9, UPT, UPT, UR9, -0x1, URZ ;
+    UISETP.NE.AND UP2, UPT, UR9, URZ, UPT ;
+    LDS R16, [R62] ;                          // scale mult (f32) for this block
+    IADD3 R62, PT, PT, R62, 0x4, RZ ;
+    UMOV UR8, 0x4 ;                            // 4 k-tiles/block
+qk_kt:
+    UIADD3 UR8, UPT, UPT, UR8, -0x1, URZ ;
+    UISETP.NE.AND UP0, UPT, UR8, URZ, UPT ;
+    LDS.U16 R10, [R60+0x0] ;
+    F2FP.F16.E4M3.UNPACK_B R11, R10 ;
+    HADD2.F32 R12, -RZ, R11.H0_H0 ;
+    SHF.R.U32.HI R13, RZ, 0x10, R11 ; HADD2.F32 R13, -RZ, R13.H0_H0 ;
+    FMUL R12, R12, R16 ; FMUL R13, R13, R16 ;
+    F2FP.BF16.F32.PACK_AB R8, R13, R12 ;       // b0 (dims 2t,2t+1)
+    LDS.U16 R10, [R60+0x8] ;
+    F2FP.F16.E4M3.UNPACK_B R11, R10 ;
+    HADD2.F32 R12, -RZ, R11.H0_H0 ;
+    SHF.R.U32.HI R13, RZ, 0x10, R11 ; HADD2.F32 R13, -RZ, R13.H0_H0 ;
+    FMUL R12, R12, R16 ; FMUL R13, R13, R16 ;
+    F2FP.BF16.F32.PACK_AB R9, R13, R12 ;       // b1 (dims 2t+8,2t+9)
+    LDG.E.128 R4, desc[UR4][R58.64] ;          // Q A-frag bf16
+    HMMA.16816.F32.BF16 R0, R4, R8, R0 ;
+    IADD3 R60, PT, PT, R60, 0x10, RZ ;
+    IADD.64 R58, R58, 0x200 ;
+    BRA.U UP0, qk_kt ;
+    BRA.U UP2, qk_blk ;
+    // RoPE: 4 k-tiles bf16 (B-frag from KV_ROPE), Q A-frag continues
+    IMAD R60, R73, 0x8, R75 ; IMAD R60, R60, 0x80, RZ ; IMAD R60, R76, 0x4, R60 ; IADD3 R60, PT, PT, R60, 0x7000, RZ ;
+    UMOV UR8, 0x4 ;
+qk_rope:
+    UIADD3 UR8, UPT, UPT, UR8, -0x1, URZ ;
+    UISETP.NE.AND UP0, UPT, UR8, URZ, UPT ;
+    LDS R8, [R60] ; LDS R9, [R60+0x10] ;
+    LDG.E.128 R4, desc[UR4][R58.64] ;
+    HMMA.16816.F32.BF16 R0, R4, R8, R0 ;
+    IADD3 R60, PT, PT, R60, 0x20, RZ ;
+    IADD.64 R58, R58, 0x200 ;
+    BRA.U UP0, qk_rope ;
+    // store C-frag scores -> SCORES smem [16][64]
+    IMAD R36, R73, 0x8, RZ ; IMAD R36, R75, 0x40, R36 ; IMAD R36, R76, 0x2, R36 ;
+    SHF.L.U32 R36, R36, 0x2, RZ ; IADD3 R36, PT, PT, R36, 0x9800, RZ ;
+    STS.64 [R36], R0 ;
+    IADD3 R38, PT, PT, R36, 0x800, RZ ; STS.64 [R38], R2 ;
+    BAR.SYNC.DEFER_BLOCKING 0x0 ;
+
+    // ===== Phase 2: softmax / online-merge (warp 0) =====
+    @P4 BRA skip_sm ;
+    LOP3.LUT R10, R74, 0xf, RZ, 0xc0, !PT ;
+    ISETP.LT.U32.AND P5, PT, R74, 0x10, PT ;
+    LDC R11, c[0x0][0x3b0] ;
+    IMAD R38, R77, 0x40, RZ ; MOV R39, RZ ;
+    IADD3 R38, PT, PT, R38, R68, RZ ;
+    LDC.64 R12, c[0x0][0x398] ; IMAD.WIDE.U32 R12, R10, 0x4, R12 ; IADD.64 R12, R12, R38 ;
+    LDG.E R14, desc[UR4][R12.64] ;
+    LDC.64 R16, c[0x0][0x3a0] ; IMAD.WIDE.U32 R16, R10, 0x4, R16 ; IADD.64 R16, R16, R38 ;
+    LDG.E R15, desc[UR4][R16.64] ;
+    MOV R20, 0x3fb8aa3b ; FMUL R14, R14, R20 ;
+    MOV R26, 0xff800000 ;
+    IMAD R22, R10, 0x100, RZ ; IADD3 R22, PT, PT, R22, 0x9800, RZ ;
+    MOV R24, 0xb040 ;
+    MOV R28, 0xff800000 ;
+    UMOV UR8, 0x20 ;
+sm_max:
+    UIADD3 UR8, UPT, UPT, UR8, -0x1, URZ ;
+    UISETP.NE.AND UP0, UPT, UR8, URZ, UPT ;
+    LDS R30, [R22] ; LDS R31, [R22+0x4] ;
+    LDS R32, [R24] ; LDS R33, [R24+0x4] ;
+    FMUL R30, R30, R11 ; FMUL R31, R31, R11 ;
+    ISETP.LT.AND P0, PT, R32, RZ, PT ; @P0 MOV R30, R26 ;
+    ISETP.LT.AND P1, PT, R33, RZ, PT ; @P1 MOV R31, R26 ;
+    FMNMX R28, R28, R30, !PT ; FMNMX R28, R28, R31, !PT ;
+    IADD3 R22, PT, PT, R22, 0x8, RZ ;
+    IADD3 R24, PT, PT, R24, 0x8, RZ ;
+    BRA.U UP0, sm_max ;
+    FMNMX R40, R14, R28, !PT ;
+    FADD R41, R14, -R40 ; MUFU.EX2 R41, R41 ;
+    IMAD R22, R10, 0x100, RZ ; IADD3 R22, PT, PT, R22, 0x9800, RZ ;
+    MOV R24, 0xb040 ;
+    IMAD R34, R10, 0x80, RZ ; IADD3 R34, PT, PT, R34, 0xa800, RZ ;
+    MOV R42, RZ ;
+    UMOV UR8, 0x20 ;
+sm_exp:
+    UIADD3 UR8, UPT, UPT, UR8, -0x1, URZ ;
+    UISETP.NE.AND UP0, UPT, UR8, URZ, UPT ;
+    LDS R30, [R22] ; LDS R31, [R22+0x4] ;
+    LDS R32, [R24] ; LDS R33, [R24+0x4] ;
+    FMUL R30, R30, R11 ; FMUL R31, R31, R11 ;
+    ISETP.LT.AND P0, PT, R32, RZ, PT ; @P0 MOV R30, R26 ;
+    ISETP.LT.AND P1, PT, R33, RZ, PT ; @P1 MOV R31, R26 ;
+    FADD R30, R30, -R40 ; MUFU.EX2 R30, R30 ;
+    FADD R31, R31, -R40 ; MUFU.EX2 R31, R31 ;
+    FADD R42, R42, R30 ; FADD R42, R42, R31 ;
+    F2FP.BF16.F32.PACK_AB R35, R31, R30 ;
+    @P5 STS [R34], R35 ;
+    IADD3 R22, PT, PT, R22, 0x8, RZ ;
+    IADD3 R24, PT, PT, R24, 0x8, RZ ;
+    IADD3 R34, PT, PT, R34, 0x4, RZ ;
+    BRA.U UP0, sm_exp ;
+    FFMA R43, R15, R41, R42 ;
+    MOV R20, 0x3f317218 ; FMUL R44, R40, R20 ;
+    @P5 STG.E desc[UR4][R12.64], R44 ;
+    @P5 STG.E desc[UR4][R16.64], R43 ;
+    IMAD R36, R10, 0x4, RZ ; IADD3 R36, PT, PT, R36, 0xb000, RZ ;
+    @P5 STS [R36], R41 ;
+skip_sm:
+    BAR.SYNC.DEFER_BLOCKING 0x0 ;
+
+    // ===== Phase 3: PV. warps 0-6 NoPE slices (fp8 dequant); warp 7 RoPE slices (bf16). =====
+    IMAD R56, R75, 0x4, RZ ; IADD3 R56, PT, PT, R56, 0xb000, RZ ;   // CORR + g*4
+    LDS R53, [R56] ; LDS R54, [R56+0x20] ;          // corr_g, corr_g8
+    IMAD R59, R75, 0x80, RZ ; IMAD R59, R76, 0x4, R59 ; IADD3 R59, PT, PT, R59, 0xa800, RZ ;  // abase_lane = PROBS + g*128 + 4t
+    LDC.64 R48, c[0x0][0x3a8] ;
+    IMAD R56, R75, 0x800, RZ ; IMAD R56, R73, 0x100, R56 ; IMAD R56, R76, 0x8, R56 ; MOV R57, RZ ;
+    IADD.64 R48, R48, R56 ;
+    IMAD R56, R77, 0x8000, RZ ; MOV R57, RZ ; IADD.64 R48, R48, R56 ;
+    IADD.64 R48, R48, R70 ;
+    IADD.64 R50, R48, 0x4000 ;                       // pg, pg8
+    ISETP.NE.AND P6, PT, R73, 0x7, PT ;              // P6 = wid != 7 (NoPE path)
+    @!P6 BRA pv_rope ;
+    // --- NoPE PV (warps 0-6): V fp8 (KV_NOPE) dequant inline; scale block = wid (fixed) ---
+    IMAD R52, R73, 0x40, RZ ; IADD3 R52, PT, PT, R52, R75, RZ ;      // dim = 64w + g  (+8 per slice)
+    IMAD R55, R76, 0x40, RZ ; IMAD R55, R73, 0x4, R55 ; IADD3 R55, PT, PT, R55, 0x9000, RZ ;  // sbase = SCALE + t*64 + w*4
+    UMOV UR9, 0x8 ;
+pv_slice_n:
+    UIADD3 UR9, UPT, UPT, UR9, -0x1, URZ ;
+    UISETP.NE.AND UP3, UPT, UR9, URZ, UPT ;
+    MOV R0, RZ ; MOV R1, RZ ; MOV R2, RZ ; MOV R3, RZ ;
+    MOV R46, R59 ;                                  // abase (P)
+    IMAD R42, R76, 0x380, RZ ; IADD3 R42, PT, PT, R42, R52, RZ ;     // vbase = t*896 + dim (KV_NOPE @0)
+    MOV R30, R55 ;                                  // sptr
+    UMOV UR8, 0x4 ;
+pv_kt_n:
+    UIADD3 UR8, UPT, UPT, UR8, -0x1, URZ ;
+    UISETP.NE.AND UP0, UPT, UR8, URZ, UPT ;
+    LDS R32, [R46] ; LDS R33, [R46+0x400] ; LDS R34, [R46+0x10] ; LDS R35, [R46+0x410] ;   // P A-frag
+    LDS R20, [R30] ; LDS R21, [R30+0x20] ; LDS R22, [R30+0x100] ; LDS R23, [R30+0x120] ;    // scale[2t,2t+1,2t+8,2t+9][w]
+    LDS.U8 R36, [R42+0x0] ; F2FP.F16.E4M3.UNPACK_B R10, R36 ; HADD2.F32 R36, -RZ, R10.H0_H0 ; FMUL R36, R36, R20 ;
+    LDS.U8 R37, [R42+0x1c0] ; F2FP.F16.E4M3.UNPACK_B R11, R37 ; HADD2.F32 R37, -RZ, R11.H0_H0 ; FMUL R37, R37, R21 ;
+    F2FP.BF16.F32.PACK_AB R40, R37, R36 ;           // b0 (cands 2t,2t+1)
+    LDS.U8 R38, [R42+0xe00] ; F2FP.F16.E4M3.UNPACK_B R10, R38 ; HADD2.F32 R38, -RZ, R10.H0_H0 ; FMUL R38, R38, R22 ;
+    LDS.U8 R39, [R42+0xfc0] ; F2FP.F16.E4M3.UNPACK_B R11, R39 ; HADD2.F32 R39, -RZ, R11.H0_H0 ; FMUL R39, R39, R23 ;
+    F2FP.BF16.F32.PACK_AB R41, R39, R38 ;           // b1 (cands 2t+8,2t+9)
+    HMMA.16816.F32.BF16 R0, R32, R40, R0 ;
+    IADD3 R46, PT, PT, R46, 0x20, RZ ;
+    IADD3 R42, PT, PT, R42, 0x1c00, RZ ;            // next k-tile: +16 cands*448
+    IADD3 R30, PT, PT, R30, 0x200, RZ ;             // next k-tile scale: +16 cands*32
+    BRA.U UP0, pv_kt_n ;
+    LDG.E.64 R44, desc[UR4][R48.64+0x0] ;
+    FFMA R0, R44, R53, R0 ; FFMA R1, R45, R53, R1 ;
+    LDG.E.64 R46, desc[UR4][R50.64+0x0] ;
+    FFMA R2, R46, R54, R2 ; FFMA R3, R47, R54, R3 ;
+    STG.E.64 desc[UR4][R48.64+0x0], R0 ;
+    STG.E.64 desc[UR4][R50.64+0x0], R2 ;
+    IADD3 R52, PT, PT, R52, 0x8, RZ ;               // next slice: +8 dims
+    IADD.64 R48, R48, 0x20 ; IADD.64 R50, R50, 0x20 ;
+    BRA.U UP3, pv_slice_n ;
+    BRA pv_done ;
+pv_rope:
+    // --- RoPE PV (warp 7): V bf16 from KV_ROPE. dim_local = 8s+g, cand stride 128B ---
+    SHF.L.U32 R58, R76, 0x8, RZ ; IADD3 R58, PT, PT, R58, R75, R75 ; IADD3 R58, PT, PT, R58, 0x7000, RZ ;  // vbase = t*256 + 2g + 0x7000
+    UMOV UR9, 0x8 ;
+pv_slice_r:
+    UIADD3 UR9, UPT, UPT, UR9, -0x1, URZ ;
+    UISETP.NE.AND UP3, UPT, UR9, URZ, UPT ;
+    MOV R0, RZ ; MOV R1, RZ ; MOV R2, RZ ; MOV R3, RZ ;
+    MOV R46, R59 ; MOV R42, R58 ;
+    UMOV UR8, 0x4 ;
+pv_kt_r:
+    UIADD3 UR8, UPT, UPT, UR8, -0x1, URZ ;
+    UISETP.NE.AND UP0, UPT, UR8, URZ, UPT ;
+    LDS R32, [R46] ; LDS R33, [R46+0x400] ; LDS R34, [R46+0x10] ; LDS R35, [R46+0x410] ;
+    LDS.U16 R36, [R42+0x0] ; LDS.U16 R37, [R42+0x80] ; SHF.L.U32 R37, R37, 0x10, RZ ; LOP3.LUT R40, R36, R37, RZ, 0xfc, !PT ;
+    LDS.U16 R38, [R42+0x400] ; LDS.U16 R39, [R42+0x480] ; SHF.L.U32 R39, R39, 0x10, RZ ; LOP3.LUT R41, R38, R39, RZ, 0xfc, !PT ;
+    HMMA.16816.F32.BF16 R0, R32, R40, R0 ;
+    IADD3 R46, PT, PT, R46, 0x20, RZ ;
+    IADD3 R42, PT, PT, R42, 0x800, RZ ;             // next k-tile: +16 cands*128
+    BRA.U UP0, pv_kt_r ;
+    LDG.E.64 R44, desc[UR4][R48.64+0x0] ;
+    FFMA R0, R44, R53, R0 ; FFMA R1, R45, R53, R1 ;
+    LDG.E.64 R46, desc[UR4][R50.64+0x0] ;
+    FFMA R2, R46, R54, R2 ; FFMA R3, R47, R54, R3 ;
+    STG.E.64 desc[UR4][R48.64+0x0], R0 ;
+    STG.E.64 desc[UR4][R50.64+0x0], R2 ;
+    IADD3 R58, PT, PT, R58, 0x10, RZ ;              // next slice: +8 dims (local)
+    IADD.64 R48, R48, 0x20 ; IADD.64 R50, R50, 0x20 ;
+    BRA.U UP3, pv_slice_r ;
+pv_done:
+    BAR.SYNC.DEFER_BLOCKING 0x0 ;
+    IADD3 R77, PT, PT, R77, 0x1, RZ ;
+    BRA.U UP1, group_loop ;
+    EXIT ;
+    BRA 0x0 ;
+.endentry
