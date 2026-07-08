@@ -54,11 +54,16 @@ Environment pins that go with the patch (both required on SM120):
 Everything stays **opt‑in** (`VLLM_MOE_W2=1` etc.); with the knobs off the only behavioural
 delta vs stock v0.24.0 are the SM120 fixes above.
 
-Not yet re‑integrated from the fork (upstream restructured the surrounding code; both are
-opt‑in extras, not correctness): the **confidence‑gate driver** in the model runner (the
-`moe_w2_gate` decision module ships, but nothing re‑forwards low‑confidence tokens yet) and
-the **cubit sparse‑MLA prefill callsites** (moot for now — upstream's FlashInfer SM120 prefill
-outbenches the fork's path, see below).
+The **confidence gate is fully wired** (2026‑07‑08 evening): `VLLM_MOE_W2_GATE=1` arms the
+FP4 re‑forward — low‑confidence decode steps force‑promote their routed experts to FP4 and
+replay the step once (inline on TP/single‑GPU incl. MTP verify steps; a worker‑driven
+full‑pipeline replay under PP, pure‑decode only). τ is runtime‑tunable via
+`VLLM_MOE_W2_GATE_TAU(_FILE)`. Live‑validated on the official checkpoint (1× PRO 6000, MTP
+k=2, graphs): fires/promotes/replays per τ, coherent output; arming the gate costs ~10%
+single‑stream (per‑step confidence sync) and the replays at τ=0.60 were throughput‑neutral
+on top of that (FP4 re‑decides lift MTP acceptance enough to pay for themselves); τ=0.75
+costs ~5% more. Still pending from the fork: the **cubit sparse‑MLA prefill callsites**
+(moot — upstream's FlashInfer SM120 prefill outbenches the fork's path, see below).
 
 ## Benchmarks vs the old fork (2026‑07‑08)
 

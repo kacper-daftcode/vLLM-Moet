@@ -40,9 +40,11 @@ adaptively:
   smaller at equal rel‑RMS) — see below.
 - **FP4 recovery — used surgically.** Decode is HBM‑bound and an FP4 read is 2× the bytes, so
   2‑bit is the *fast* default: a **delta cache** keeps the hot experts at FP4 (background
-  promote/evict thread, CUDA‑graph‑safe), and a **confidence gate** re‑runs low‑confidence
-  tokens at FP4. *Status on v0.24:* delta cache active; the gate's runner driver is not yet
-  re‑integrated (the decision module ships; re‑forward orchestration is pending).
+  promote/evict thread, CUDA‑graph‑safe), and a **confidence gate** (`VLLM_MOE_W2_GATE=1`)
+  re‑runs low‑confidence tokens at FP4 — force‑promote the step's routed experts, replay the
+  graph once, re‑decide. Works inline on TP/single‑GPU (incl. MTP verify steps) and as a
+  full‑pipeline replay under PP; τ tunable at runtime. Arming it costs ~10% single‑stream;
+  the τ=0.60 replays were throughput‑neutral on top (FP4 re‑decides lift MTP acceptance).
 - **The kernels.** `moe_w2_mm` (2‑bit MoE GEMM: PRMT‑LUT in‑register decode → `QMMA.SF`
   block‑scaled tensor cores, 4 CTA/SM) and `moe_w4_mm` (FP4 delta GEMM) — hand‑written SASS,
   shipped as sources + prebuilt cubins for every sharding (K = 6144/4096/2048/1024/512), so
