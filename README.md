@@ -10,17 +10,19 @@ to **2 bits** with **FP4 recovery**, on hand‑written SM120 SASS kernels.
 Official DeepSeek‑V4‑Flash checkpoint, 2‑bit experts + FP4 delta cache, MTP k=2, CUDA graphs
 (single‑stream medians; prefill = 8k‑token prompt, uncached; 2026‑07‑08):
 
-| hardware | decode | prefill 8k |
-|---|---:|---:|
-| **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **4 850 tok/s** |
-| **2× RTX PRO 6000 (TP2)** | **210 tok/s** | **5 790 tok/s** |
-| **4× RTX 5090 (TP4)** | **214 tok/s** | **5 560 tok/s** |
+| hardware | decode | prefill 8k | context |
+|---|---:|---:|---:|
+| **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **4 850 tok/s** | **512K** |
+| **2× RTX PRO 6000 (TP2)** | **210 tok/s** | **5 790 tok/s** | 512K |
+| **4× RTX 5090 (TP4)** | **214 tok/s** | **5 560 tok/s** | 16K+ |
 
 Four consumer 5090s match two PRO 6000s on decode. MTP acceptance ~2.6 tok/step across all
-configs. Methodology: **[docs/v024-port.md](docs/v024-port.md)**.
+configs. **512K on one card is live-validated**: needle retrieval PASS at 102K / 256K / 453K
+prompt tokens (depths 0.1 and 0.5; cold TTFT at 453K ≈ 2 min). Methodology:
+**[docs/v024-port.md](docs/v024-port.md)**.
 
 A 96 GB card cannot even load the official checkpoint (FP4 experts + FP8 dense ≈ 149 GiB);
-here it serves it at 161 tok/s.
+here it serves it at 161 tok/s with the full 512K window.
 
 ---
 

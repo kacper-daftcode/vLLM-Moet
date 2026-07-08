@@ -79,3 +79,12 @@ prefixes defeat the prefix cache). MTP acceptance ~2.6 tok/step in every config.
 
 Prefill rides upstream's FlashInfer SM120 sparse‑MLA path — which also makes a custom cubit
 MLA‑prefill kernel unnecessary on this base.
+
+**Long context (512K) on one 96 GB card** — validated live (`tools/needle_probe.py`, unique
+secret embedded in filler, greedy): PASS at **102 238 / 256 294 / 453 286 prompt tokens**
+(depth 0.1) and at 453K with the needle mid‑context (depth 0.5); cold TTFT 27 s / 64 s /
+~2 min. Server config for the 512K window on 1× PRO 6000: `--max-model-len 524288
+--gpu-memory-utilization 0.97 --max-num-batched-tokens 2048 --max-num-seqs 1` with
+`VLLM_MOE_W2=1 VLLM_MOE_W2_DELTA_GB=0` (the FP4 delta pool trades against KV headroom at
+extreme context; with delta 1 GiB use ≤256K). The KV fit comes from DS4's compressed KV +
+upstream's FP8 Lightning‑Indexer cache; vLLM reports 947K cached tokens in this config.
