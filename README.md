@@ -17,10 +17,10 @@ Official DeepSeek‑V4‑Flash checkpoint, 2‑bit experts + FP4 delta cache, MT
 | **4× RTX 5090 (TP4)** | **214 tok/s** | **5 560 tok/s** | 16K+ |
 
 Four consumer 5090s match two PRO 6000s on decode. MTP acceptance ~2.6 tok/step across all
-configs. Batch scaling on the single card: **933 tok/s aggregate at 32 concurrent streams**
-(156 → 290 → 493 → 659 → 933 for 1/4/8/16/32). **512K on one card is live-validated**:
-needle retrieval PASS at 102K / 256K / 453K prompt tokens (depths 0.1 and 0.5; cold TTFT at
-453K ≈ 2 min). Methodology: **[docs/v024-port.md](docs/v024-port.md)**.
+configs. Batch scaling at 32 concurrent streams: **933 tok/s aggregate on the single card,
+1 560 tok/s on 4× 5090** (each stream still ≥29 / ≥49 tok/s). **512K on one card is
+live-validated**: needle retrieval PASS at 102K / 256K / 453K prompt tokens (depths 0.1 and
+0.5; cold TTFT at 453K ≈ 2 min). Methodology: **[docs/v024-port.md](docs/v024-port.md)**.
 
 A 96 GB card cannot even load the official checkpoint (FP4 experts + FP8 dense ≈ 149 GiB);
 here it serves it at 161 tok/s with the full 512K window.

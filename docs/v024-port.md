@@ -80,17 +80,17 @@ prefixes defeat the prefix cache). MTP acceptance ~2.6 tok/step in every config.
 Prefill rides upstream's FlashInfer SM120 sparse‑MLA path — which also makes a custom cubit
 MLA‑prefill kernel unnecessary on this base.
 
-**Batch scaling, 1× RTX PRO 6000** (same knobs but `--max-num-seqs 32
---max-num-batched-tokens 2048`; N identical‑length greedy requests, 384 tok each, aggregate
-decode tok/s, median of 5):
+**Batch scaling** (same knobs but `--max-num-seqs 32 --max-num-batched-tokens 2048`;
+N identical‑length greedy requests, 384 tok each, aggregate decode tok/s, median of 5):
 
 | concurrency | 1 | 4 | 8 | 16 | 32 |
 |---|---:|---:|---:|---:|---:|
-| aggregate tok/s | 156 | 290 | 493 | 659 | **933** |
-| per‑request tok/s | 156 | 72 | 62 | 41 | 29 |
+| 1× RTX PRO 6000 | 156 | 290 | 493 | 659 | **933** |
+| 4× RTX 5090 (TP4) | 198 | 460 | 762 | 1 006 | **1 560** |
 
-6× aggregate from batch 1→32 — the 2‑bit expert reads amortize well across the batch
+6–8× aggregate from batch 1→32 — the 2‑bit expert reads amortize well across the batch
 (decode stays HBM‑bound; the per‑step expert working set grows sublinearly with batch).
+At 32 streams each request still gets ~29 tok/s (PRO 6000) / ~49 tok/s (TP4).
 
 **Long context (512K) on one 96 GB card** — validated live (`tools/needle_probe.py`, unique
 secret embedded in filler, greedy): PASS at **102 238 / 256 294 / 453 286 prompt tokens**
