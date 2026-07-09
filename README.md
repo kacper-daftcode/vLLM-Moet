@@ -17,7 +17,7 @@ Official DeepSeek‑V4‑Flash checkpoint, 2‑bit experts + FP4 delta cache, MT
 | **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | **512K** |
 | **2× RTX PRO 6000 (TP2)** | **210 tok/s** | **5 790 tok/s** (pre‑AFRAG) | 512K |
 | **4× RTX 5090 (TP4)** | **214 tok/s** | **6 100 tok/s** | 16K+ |
-| **1× RTX 5090 (32 GB)** | **~32 tok/s** (host‑resident base, see below) | — | 8K |
+| **1× RTX 5090 (32 GB)** | **~38 tok/s** (MTP + host‑resident base, see below) | — | 8K |
 
 **Batched serving** (aggregate decode tok/s at N concurrent streams; per‑stream in
 parentheses at N=32):
@@ -89,12 +89,13 @@ batched pinned‑H2D transfer (51.6 GiB/s on this box; a 64‑expert fetch is ~3
 the step's graph once — the replay is **bit‑identical** to a fully resident forward
 (unit‑tested). Prefill prefetches its per‑layer working set up front instead.
 
-Result on **1× RTX 5090 (32 GB)**: 22.9 GiB on GPU (dense FP8 + 14 GiB pool = 19% of
-experts), 72.7 GiB pinned host RAM, CUDA graphs on, coherent greedy output — **~32 tok/s**
-steady decode on a stable working set, 10–21 tok/s while the working set shifts (miss
-replays). Not a speed demon — a **capacity unlock**: the model this card cannot even hold
-now runs on it, and the same knob is the path to GLM‑5.2 (753B) on two 96 GB cards, where
-the pool covers ~58% of experts and misses become rare.
+Result on **1× RTX 5090 (32 GB)**: dense FP8 + an 11–14 GiB pool (19% of experts) on GPU,
+72.7 GiB pinned host RAM, CUDA graphs on, coherent greedy output — **~38 tok/s** steady
+decode with MTP k=2 (~32 without; acceptance 2.83 — the miss replay covers MTP verify steps
+too), 10–24 tok/s while the working set shifts (miss replays). Not a speed demon — a
+**capacity unlock**: the model this card cannot even hold now runs on it, and the same knob
+is the path to GLM‑5.2 (753B) on two 96 GB cards, where the pool covers ~58% of experts and
+misses become rare.
 
 ---
 
@@ -146,9 +147,10 @@ the VRAM left after KV allocation (0 at extreme context, ~1.6 GiB at 24K — no 
 delta-vs-KV bookkeeping; see [docs/v024-port.md](docs/v024-port.md)).
 
 Single‑5090 (host‑resident base): swap the delta knobs for
-`-e VLLM_MOE_W2_BASE_CACHE_GB=14 -e VLLM_MOE_W2_DELTA_GB=0` and use
+`-e VLLM_MOE_W2_BASE_CACHE_GB=11 -e VLLM_MOE_W2_DELTA_GB=0` and use
 `--max-model-len 8192 --gpu-memory-utilization 0.90 --max-num-seqs 2` (needs ~80 GiB free
-host RAM for the pinned base; TP/PP unsupported on this path yet, MTP off).
+host RAM for the pinned base; MTP works — keep the speculative‑config; PP unsupported on
+this path yet).
 
 ## Quality
 
