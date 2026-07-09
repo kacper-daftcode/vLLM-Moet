@@ -15,9 +15,13 @@ Built on and incorporating:
   2-bit MoE + FP4 delta cache + confidence gate + the cubit kernels, plus small SM120
   fixes to the upstream base (carried in the patch).
 
-- DeepGEMM (https://github.com/deepseek-ai/DeepGEMM) is referenced by the base for
-  Hopper/Blackwell-DC FP8 paths; it is not used or redistributed here (it has no SM120
-  backend — this project uses CUTLASS/Triton/cubit paths on SM120 instead).
+- DeepGEMM (https://github.com/deepseek-ai/DeepGEMM), MIT License, Copyright (c) 2025
+  DeepSeek. Used at runtime on SM120 — FP8 dense/einsum GEMMs, the indexer's MQA logits,
+  hc_prenorm, and the stock DEEPGEMM_MXFP4 MoE path the MTP drafter runs on — via the
+  nv-dev pin `a6b593d2`, whose SM120 backend was authored by the NVIDIA DevTech APAC team
+  (deepseek-ai/DeepGEMM PR #324). The prebuilt wheel
+  `patch/deep_gemm-2.5.0+a6b593d-cp312-cp312-linux_x86_64.whl` is redistributed here under
+  that MIT license and copyright.
 
 - The DeepSeek-V4-Flash model weights are NOT included or redistributed. Obtain the
   official checkpoint separately; the 2-bit planes are built from it at load time.
