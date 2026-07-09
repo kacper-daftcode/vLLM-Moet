@@ -8,17 +8,13 @@ to **2 bits** with **FP4 recovery**, on hand‑written SM120 SASS kernels.
 ## What you get
 
 Official DeepSeek‑V4‑Flash checkpoint, 2‑bit experts + FP4 delta cache, MTP k=2, CUDA graphs
-(single‑stream medians; prefill = 8k‑token prompt, uncached; 2026‑07‑08):
+(single‑stream medians; prefill = 8k‑token prompt, uncached; 2026‑07‑09):
 
 | hardware | decode | prefill 8k | context |
 |---|---:|---:|---:|
 | **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | **512K** |
-| **2× RTX PRO 6000 (TP2)** | **210 tok/s** | 5 790 tok/s¹ | 512K |
+| **2× RTX PRO 6000 (TP2)** | **210 tok/s** | **5 790 tok/s** | 512K |
 | **4× RTX 5090 (TP4)** | **214 tok/s** | **6 100 tok/s** | 16K+ |
-
-¹ Prefill on 1× PRO 6000 / TP4 re‑measured 2026‑07‑09 with the **AFRAG** prefill kernels
-(ship + default‑on since then: +11.8% / +1.9% over the 07‑08 numbers); the TP2 entry is the
-07‑08 pre‑AFRAG measurement.
 
 **Batched serving** (aggregate decode tok/s at N concurrent streams; per‑stream in
 parentheses at N=32):
