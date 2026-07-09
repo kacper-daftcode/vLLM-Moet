@@ -21,9 +21,25 @@ Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sas
 | `moe_w2_mm_k6144.cubin` | `moe_w2_mm_k6144.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
 | `moe_w2_mm_mc2_k6144.cubin` | `moe_w2_mm_mc2_k6144.sass` | `moe_w2_mm` | MC=2 (prefill), K=6144 |
 | `moe_w2_mm_mc4_k6144.cubin` | `moe_w2_mm_mc4_k6144.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 |
+| `moe_w2_mm_mc4afrag_k4096.cubin` | `moe_w2_mm_mc4afrag_k4096.sass` | `moe_w2_mm` | **AFRAG** prefill (fragment‑major A, 1×LDG.128/A‑frag), K=4096 — 1.21× vs MC4, bit‑identical |
+| `moe_w2_mm_mc4afrag_k2048.cubin` | `moe_w2_mm_mc4afrag_k2048.sass` | `moe_w2_mm` | **AFRAG** prefill, K=2048 — 1.22× vs MC4, bit‑identical |
+| `moe_w2_mm_mc4afrag_k4096.cubin` | `moe_w2_mm_mc4afrag_k4096.sass` | `moe_w2_mm` | **AFRAG** (prefill, fragment‑major A), K=4096 |
+| `moe_w2_mm_mc4afrag_k2048.cubin` | `moe_w2_mm_mc4afrag_k2048.sass` | `moe_w2_mm` | AFRAG (prefill), K=2048 |
+| `moe_w2_mm_mc4afrag_k1024.cubin` | `moe_w2_mm_mc4afrag_k1024.sass` | `moe_w2_mm` | AFRAG (prefill), K=1024 (TP2) |
+| `moe_w2_mm_mc4afrag_k512.cubin` | `moe_w2_mm_mc4afrag_k512.sass` | `moe_w2_mm` | AFRAG (prefill), K=512 (TP4), NWARP=4 |
+| `moe_w2_mm_mc4afrag_k6144.cubin` | `moe_w2_mm_mc4afrag_k6144.sass` | `moe_w2_mm` | AFRAG (prefill), K=6144 (GLM‑5.x) |
 
 2‑bit planes = sign‑symmetric `{−4,−1,1,4}` + UE8M0 block‑32 scales; PRMT‑LUT in‑register
 decode → `QMMA.SF` tensor‑core. Regcount 64 → 4 CTA/SM.
+
+**AFRAG** (`mc4afrag`) = MC=4 with **fragment‑major activations**: each lane's m16k32 QMMA
+A‑fragment loads in ONE `LDG.E.128` instead of 8 strided 4‑byte loads. Prefill moe_w2_mm is
+L1/load‑issue bound (DRAM ~36%, L2 hit ~81%), so this cuts the dominant load class ~4× at
+identical occupancy — measured **1.30×** (K=4096) / **1.27×** (K=2048) at the production
+prefill shape (624 pairs, expert‑sorted, locked clocks). Bit‑identical outputs vs `mc4`
+(validated per K incl. determinism; `MOEW2_MC=4 MOEW2_AFRAG=1 gen_moe_w2.py`). The glue
+repacks A with a single‑pass triton kernel (`_afrag_repack`, ~65 µs @ [9984,4096]) into
+dedicated `a1f/a2f` buffers; default ON via `VLLM_MOE_W2_AFRAG` (set `0` to fall back to mc4).
 
 **Contraction K & multi‑GPU.** K is the per‑cubin GEMM contraction: **4096** = w13/gate‑up (hidden
 H, never sharded) and **2048** = w2/down (intermediate I) on a single GPU. Under **tensor parallelism
@@ -44,6 +60,7 @@ by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, determi
 | `moe_w4_mm_k1024.cubin` | `moe_w4_mm_k1024.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=1024** (w2 under TP2) |
 | `moe_w4_mm_k512.cubin` | `moe_w4_mm_k512.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=512** (w2 under TP4), NWARP=4 |
 | `moe_w4_mm_k6144.cubin` | `moe_w4_mm_k6144.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
+| `moe_w4_mm_k8192.cubin` | `moe_w4_mm_k8192.sass` | `moe_w4_mm` | FP4 GEMM, **K=8192** (dense wo_b — dense‑FP4 PoC, pairs=1 desc) |
 
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
