@@ -95,10 +95,11 @@ decode with MTP k=2 (~32 without; acceptance 2.83 — the miss replay covers MTP
 too), 10–24 tok/s while the working set shifts (miss replays). Not a speed demon — a
 **capacity unlock**: the model this card cannot even hold now runs on it.
 
-The same knob puts **GLM‑5.2 (753B) on two 96 GB cards**: TP2 with a 48 GiB/rank pool
-(50.6% of experts; the 2‑bit base alone is ~190 GiB, matching the *entire* 2‑GPU VRAM
-budget) serves coherently at 32K context — ~19 tok/s on a warm working set, hit‑rate 91%
-of routings at half coverage. Numeric‑heavy quality wants the FP4 tier back on top (a
+The same knob puts **GLM‑5.2 (753B) on two 96 GB cards**: TP2 with a 42–48 GiB/rank pool
+(~50% of experts; the 2‑bit base alone is ~190 GiB, matching the *entire* 2‑GPU VRAM
+budget) serves coherently at 32K context — **~33 tok/s** with MTP k=2 (acceptance 3.0;
+~19 without), hit‑rate 91% of routings at half coverage, needle retrieval **4/4 PASS** at
+3.4K/8K/16K/27K prompt tokens. Numeric‑heavy quality wants the FP4 tier back on top (a
 three‑tier host→2‑bit→FP4 hierarchy — in progress); throughput scales with per‑step
 residency, which MTP‑draft prefetch will raise next.
 
