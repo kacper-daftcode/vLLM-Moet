@@ -154,9 +154,13 @@ Environment pins that go with the patch (both required on SM120):
   JIT sources are patched with `ModelType::GLM_NSA_NVFP4` (`tools/nvfp4_flashinfer_sm120/`) so
   the packed bulk expands in place before QK and the FP8‑MMA pipeline is unchanged. Live on
   GLM‑5.2 TP4 (128K ctx): KV pool **+38%** (415K → 571K tokens), decode parity (104 tok/s —
-  sparse reads only top‑2048), needle PASS to 126K, arithmetic + coherence intact. (Follow‑up:
-  move the write kernel into `vllm._C`; FlashInfer 0.6.14 ships an AOT `sparse_mla_sm120.so`
-  that must be removed so the patched JIT sources rebuild.)
+  sparse reads only top‑2048), needle PASS to 126K, arithmetic + coherence intact.
+  **Baked into `Dockerfile.sm120-v024`** (step 5): the image runs `patch_flashinfer.py`,
+  removes FlashInfer 0.6.14's AOT `sparse_mla_sm120.so` (it would be loaded INSTEAD of the
+  patched JIT sources — runtime `got 3` on the nvfp4 model type), precompiles the patched
+  module into the JIT cache, and prebuilds the write kernel
+  (`VLLM_NVFP4_DS_MLA_EXT_DIR=/opt/nvfp4-ds-mla`; JIT‑from‑source remains the fallback).
+  (Follow‑up: move the write kernel into `vllm._C`.)
 - **Deterministic MoE unpermute** — the routed‑expert scatter‑add uses a bijective
   `index_copy` instead of `index_add`, removing the atomic‑accumulation non‑determinism in
   free‑running decode (matters under PP where physical KV‑block assignment varies run to run).

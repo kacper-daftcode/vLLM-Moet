@@ -6,7 +6,10 @@
 #   2. DeepGEMM nv-dev a6b593d2 (the release pin 891d57b4 has no family-120
 #      host paths — vLLM issues #47130/#47436),
 #   3. flashinfer 0.6.14 (0.6.12 predates the SM120 DS4 attention kwargs),
-#   4. the prebuilt SM120 cubins at /cubit-share.
+#   4. the prebuilt SM120 cubins at /cubit-share,
+#   5. the NVFP4 KV cache (--kv-cache-dtype nvfp4) baked in: flashinfer's
+#      sparse-MLA JIT sources patched with ModelType::GLM_NSA_NVFP4 and
+#      precompiled, plus the prebuilt packed-write kernel.
 #
 # Build (from the repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v024 -t vllm-moet-sm120:v024 .
@@ -79,3 +82,25 @@ RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vll
 # 4. SM120 cubins (moe_w2/w4 GEMMs incl. K=6144 for GLM-5.x)
 COPY kernels/cubins-sm120/ /cubit-share/
 ENV VLLM_MOE_W2_CUBIT_DIR=/cubit-share
+
+# 5. NVFP4 KV cache (--kv-cache-dtype nvfp4) baked in:
+#    a) patch flashinfer's sparse-MLA JIT sources with ModelType::GLM_NSA_NVFP4
+#       (patch_flashinfer.py ships inside the vllm patch, step 3),
+#    b) drop the AOT sparse_mla_sm120.so — it would be loaded INSTEAD of the
+#       patched JIT sources (runtime "got 3" on the nvfp4 model type),
+#    c) precompile the patched JIT module for SM120 (~15 s at build; the .so
+#       lands in /root/.cache/flashinfer where the runtime looks it up, so
+#       the first serve pays no JIT compile; keep the .o files or ninja
+#       would re-trigger the build at load),
+#    d) prebuild the vllm-side packed-write kernel; VLLM_NVFP4_DS_MLA_EXT_DIR
+#       points the loader at it (JIT-from-source stays as the fallback).
+RUN SP="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
+    && cd "$SP" \
+    && python3 tools/nvfp4_flashinfer_sm120/patch_flashinfer.py \
+    && rm -f "$SP/flashinfer_jit_cache/jit_cache/sparse_mla_sm120/sparse_mla_sm120.so" \
+    && FLASHINFER_CUDA_ARCH_LIST=12.0f python3 -c \
+       "from flashinfer.jit.mla import gen_sparse_mla_sm120_module; gen_sparse_mla_sm120_module().build(verbose=False)" \
+    && mkdir -p /opt/nvfp4-ds-mla \
+    && TORCH_CUDA_ARCH_LIST=12.0a python3 -c \
+       "from torch.utils.cpp_extension import load; load(name='nvfp4_ds_mla_cache_ext', sources=['$SP/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu'], extra_cuda_cflags=['-O3', '--generate-code=arch=compute_120a,code=sm_120a'], build_directory='/opt/nvfp4-ds-mla')"
+ENV VLLM_NVFP4_DS_MLA_EXT_DIR=/opt/nvfp4-ds-mla

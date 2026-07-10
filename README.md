@@ -288,9 +288,10 @@ docker run --rm --gpus '"device=0,1,2,3"' --network host --ipc host --shm-size 6
   --port 8000
 ```
 
-(`--kv-cache-dtype nvfp4` enables the 352 B/token KV cache; it requires the FlashInfer JIT
-patch from `tools/nvfp4_flashinfer_sm120/` baked into the image and is currently validated to
-128K windows.)
+(`--kv-cache-dtype nvfp4` enables the 352 B/token KV cache; the image ships it ready — the
+FlashInfer JIT sources are patched and precompiled at build (`tools/nvfp4_flashinfer_sm120/`,
+added to the vLLM tree by the patch) and the packed-write kernel is prebuilt at
+`/opt/nvfp4-ds-mla`. Currently validated to 128K windows.)
 
 **GLM‑5.2 on 2× PRO 6000** (three‑tier + NVMe stores, the 128K/needle‑121K config from the
 table; ~140 GiB host RAM + ~580 GB NVMe for the packs, first boot writes them):
