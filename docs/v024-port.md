@@ -65,14 +65,19 @@ Environment pins that go with the patch (both required on SM120):
   via `ensure_resident`. TP MAX‑reduces the miss decision. Under **PP** a miss is local to
   its stage (per‑stage counter, inputs still held in the stage's static buffers), so each
   stage re‑runs only its own **segment** before activations flow downstream — no cross‑stage
-  collective; TP ranks within a stage replay together. The replay iterates to a **fixed
-  point** (bounded at 8, typically ≤1 extra pass): corrected early layers can re‑route later
-  layers onto experts the first pass never fetched, and those second‑order misses otherwise
-  zeroed contributions *inside* the replay — measured as cross‑request greedy
-  nondeterminism. Slots touched by any pass of a step are pinned against eviction until the
-  next step (the passes must not cannibalize each other's fetches); on tight pools an
-  emergency eviction pass (synchronous callers only) relaxes the 2‑tick coldness bound
-  rather than leave a miss UNRESTORED. Coexists with the FP4 need‑pool (explicit
+  collective; TP ranks within a stage replay together. The replay iterates toward a **fixed
+  point, adaptively**: corrected early layers can re‑route later layers onto experts the
+  first pass never fetched (second‑order misses, otherwise zeroed *inside* the replay —
+  measured as cross‑request greedy nondeterminism). The first‑order restore pass is
+  mandatory; further passes run only while the step is within `VLLM_MOE_W2_FP_THRESH` of
+  miss‑free (default 0 = mandatory pass only; file‑tunable via `…_FP_THRESH_FILE`;
+  `VLLM_MOE_W2_FP_MAX` bounds ping‑pong). An unconditional loop collapsed decode at low
+  coverage (GLM TP2 29→16 tok/s, DS4‑14 GiB 43→15 — chasing a moving target at up to 8
+  forwards/step); the live A/B behind the default: thresh 16 → 19.2, thresh 0 → 28.3 tok/s
+  at identical quality probes. Slots touched by any pass of a step are pinned against
+  eviction until the next step (the passes must not cannibalize each other's fetches); on
+  tight pools an emergency eviction pass (synchronous callers only) relaxes the 2‑tick
+  coldness bound rather than leave a miss UNRESTORED. Coexists with the FP4 need‑pool (explicit
   `VLLM_MOE_W2_DELTA_GB`, three‑tier stack). Opt‑in `VLLM_MOE_W2_PREFETCH=1` adds a
   draft‑affinity prefetcher: an in‑graph routing log feeds a token→experts table, and each
   decode step's input ids (under MTP: last step's sampled+draft tokens) prefetch predicted
@@ -83,13 +88,17 @@ Environment pins that go with the patch (both required on SM120):
   non‑linear in coverage while the token hit‑rate barely moves. Controlled A/B (DS4 1×5090,
   MTP k=2, idle box, fox 512, median of 10+, 2026‑07‑10):
 
-  | pool | coverage | token hit | decode |
+  | pool | coverage | token hit | decode (pre‑fix / shipped stack) |
   |---|---:|---:|---:|
-  | 11 GiB (util 0.90) | 15.2% | 96.5–97.7% | 32.7 tok/s |
-  | 14 GiB (util 0.95) | 19.3% | 98.7–98.9% | **43.4 tok/s** |
+  | 11 GiB (util 0.90) | 15.2% | 96.5–97.7% | 32.7 / **27–28 tok/s** |
+  | 14 GiB (util 0.95) | 19.3% | 98.7–98.9% | 43.4 / **~31 tok/s** |
 
-  +33% decode from 3 GiB of pool; 14 GiB does NOT fit at util 0.90 (KV needs 0.46 GiB after
-  graphs) — raise `--gpu-memory-utilization` alongside the pool. The engine logs pool
+  The pre‑fix column is the single‑replay stack (silently kept second‑order zeros — the
+  nondeterminism the fixed‑point restore later closed); the shipped column is the final
+  adaptive‑replay + NVMe‑store stack (2026‑07‑10 evening, same box/bench idiom). The pool
+  slope survives the stack change (+12–15% for 3 GiB). 14 GiB does NOT fit at util 0.90 (KV
+  needs 0.46 GiB after graphs) — raise `--gpu-memory-utilization` alongside the pool. The
+  engine logs pool
   coverage at startup and a windowed **`[base] KPI: replay X% of last N steps (avg Y missing
   pairs/step…)`** line every `VLLM_MOE_W2_KPI_EVERY` steps (default 500, always on) — the
   replay % is the number to watch when sizing a config; if it is high, grow the pool first.
@@ -108,8 +117,9 @@ Environment pins that go with the patch (both required on SM120):
   backend's −9%) and whose misses read into the arena slot (buffered by default;
   `VLLM_MOE_W2_TIER_DIRECT=1` for O_DIRECT). Same‑night A/B, DS4 1×5090 @ 11 GiB pool:
   pinned 33.0 / pack 25.5 / tiered+20 GiB arena **32.8 tok/s (parity)** at RSS 26–33 vs
-  42–44 GiB; GLM TP2 both stores on NVMe: expert‑store RAM ~568 → ~136 GiB, 29–30 tok/s,
-  needle 4/4 to 36K prompt tokens. Prefill batches are scan‑flagged (fill free arena slots,
+  42–44 GiB; GLM TP2 both stores on NVMe: expert‑store RAM ~568 → ~136 GiB, 28–32 tok/s
+  (tol 0–8, adaptive replay), needle 4/4 to **121K prompt tokens** at a served 128K window
+  (KV 157K tokens measured). Prefill batches are scan‑flagged (fill free arena slots,
   never evict the decode hot set — a caller flag, NOT a batch‑size heuristic: GLM's
   100+‑row decode replay fetches misclassified and froze the arena at −66%); the arena hot
   set persists to `<pack>.heat.json` and preheats on boot (57 GiB ≈ 35 s). **Boot‑from‑pack**

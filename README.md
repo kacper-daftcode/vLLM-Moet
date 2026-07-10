@@ -27,24 +27,27 @@ checkpoint (433 GB): the loader re‑quantizes modelopt NVFP4 experts (e2m1 × e
 per‑tensor scale_2) to the sign‑symmetric 2‑bit planes at load — f64‑exact vs the reference
 pipeline on real shards. Single‑stream, greedy, CUDA graphs (2026‑07‑09/10):
 
-| hardware | config | decode | context window |
+| hardware | config | decode | context window (served, needle‑validated) |
 |---|---|---:|---:|
-| **4× RTX PRO 6000 (TP4)** | 2‑bit + **MTP k=2** | **105 tok/s** | 128K (331K fits) |
+| **4× RTX PRO 6000 (TP4)** | 2‑bit + **MTP k=2** | **105 tok/s** | 128K (needle to 126K nvfp4 / 276K fp8; 331K fits) |
 | 4× RTX PRO 6000 (TP4) | + FP4 delta + confidence gate | **83–85 tok/s** | 128K |
-| **2× RTX PRO 6000 (TP2)** | **three‑tier residency** + MTP + gate | **45–52 tok/s** | 16K |
+| **2× RTX PRO 6000 (TP2)** | **three‑tier + NVMe stores** + MTP + gate | **28–32 tok/s** | **128K** (needle PASS to 121K) |
 
 - **4 cards:** prefill ~2.5k tok/s; MTP acceptance 2.3–2.8; needle retrieval **PASS to 126K**
   on the nvfp4 KV cache and **to 276K** on fp8 (331K window fits at util 0.95). GLM's nominal
   1M window is KV‑bound on 4 cards. Tool calling (`glm47`) + reasoning (`glm45`) parsers work
   out of the box — the endpoint drives coding agents (opencode) directly.
 - **2 cards — a model that doesn't fit, running anyway:** the 2‑bit planes alone (~190 GiB)
-  match the entire 2‑GPU VRAM budget. **Three tiers** make it work: pinned‑host 2‑bit base →
-  48 GiB/rank GPU expert cache (~51% coverage serving ~91% of token→expert routings warm) →
-  a small gate‑filled FP4 pool for precision. With MTP k=2 (acceptance 3.0) and miss‑tolerance
-  8: **45–52 tok/s** (strict zero‑tolerance: 21–24). Needle 4/4 PASS across the window.
-  Bare‑2‑bit quality artifacts ("capital of Poland: Krakow", garbled Polish) are corrected by
-  the FP4 tier. The window is KV‑budget‑bound, not architectural — the record config simply
-  allotted KV 8 GiB/rank; a larger window trades against expert‑cache coverage.
+  match the entire 2‑GPU VRAM budget. **Three tiers** make it work: NVMe pack + 57 GiB/rank
+  pinned arena for the 2‑bit base → 46 GiB/rank GPU expert cache → a small gate‑filled FP4
+  pool for precision (expert stores need ~136 GiB host RAM instead of ~568 pinned). The
+  single‑user window is real: `--max-model-len 131072` with 8 GiB/rank KV = **157K tokens of
+  KV measured**, needle retrieval **4/4 PASS at 36K / 86K / 121K prompt tokens** (fp8 KV,
+  tol=0). Decode, measured 2026‑07‑10 on the shipped stack (adaptive replay, MTP k=2,
+  acceptance ~2.9): **28.3 tok/s** strict (tol=0), **31.7** at miss‑tolerance 8 — arithmetic
+  and retrieval probes clean at both. Bare‑2‑bit quality artifacts ("capital of Poland:
+  Krakow", garbled Polish) are corrected by the FP4 tier. A second boot serves from the
+  quantization packs in **~7 min vs ~11** (no re‑quant, no ~405 GiB staging transient).
 - **NVFP4 KV cache** (`--kv-cache-dtype nvfp4`): packed 352 B/token vs 656 B `fp8_ds_mla` —
   **+38% KV pool** (415K → 571K tokens at equal settings) at decode parity, or the freed VRAM
   goes to the FP4 pool (the standing 4‑card config runs a 19.6 GiB/GPU pool + 175K‑token KV).
@@ -54,18 +57,12 @@ pipeline on real shards. Single‑stream, greedy, CUDA graphs (2026‑07‑09/10
 Official checkpoint, 2‑bit experts + FP4 delta cache, MTP k=2, CUDA graphs (single‑stream
 medians; prefill = 8k‑token prompt, uncached):
 
-| hardware | decode | prefill 8k | context window |
+| hardware | decode | prefill 8k | context window (served, needle‑validated) |
 |---|---:|---:|---:|
-| **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | **512K** (needle PASS to 453K) |
+| **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | **512K** (needle PASS to 453K; 947K‑token KV measured) |
 | 2× RTX PRO 6000 (TP2) | 210 tok/s | 5 790 tok/s | 512K |
-| 4× RTX 5090 (TP4) | 214 tok/s | 6 100 tok/s | KV‑bound† |
-| **1× RTX 5090 (32 GB)** | **~43 tok/s** (host‑resident base, 14 GiB pool) | — | KV‑bound† |
-
-† Older revisions printed the 16K/8K *benchmark windows* here as if they were limits — they
-are not. DS4's compressed KV is small (a single PRO 6000 reports **947K cached tokens**
-alongside the full model — hence 512K windows on one card), and the 5090 configs have
-gigabytes of KV headroom on the same math; a capacity + retrieval validation pass on the
-5090s is queued and this table will carry its measured numbers.
+| 4× RTX 5090 (TP4) | 214 tok/s | 6 100 tok/s | 16K as benched (84K‑token KV measured at boot) |
+| **1× RTX 5090 (32 GB)** | **~31 tok/s** (14 GiB pool + NVMe stores, ~30 GiB host RAM) | ~400–540 tok/s | **32K** (needle PASS at 29.7K; 131K‑token KV measured) |
 
 **Batched serving** (aggregate decode tok/s at N concurrent streams; per‑stream in
 parentheses at N=32):
@@ -138,19 +135,28 @@ coherence, retrieval; quantitative eval pending).
 
 **Pool size is the dominant knob — treat it as a config KPI.** The mandatory replay is paid
 *per step*, so decode tracks the fraction of **zero‑miss steps**, which falls off a cliff
-with coverage while the token hit‑rate barely moves: on DS4 (1× 5090, same box, same bench)
-an 11 GiB pool = 15% coverage = 96.5% token hit = **33 tok/s**, while 14 GiB = 19% = 98.8% =
-**43 tok/s** — +33% decode from 3 GiB of pool. The engine reports the KPI directly: pool
-coverage at startup and a periodic **`[base] KPI: replay X% of last N steps…`** line
-(cadence `VLLM_MOE_W2_KPI_EVERY`, default 500 steps). If replay % runs high, grow
-`VLLM_MOE_W2_BASE_CACHE_GB` (and free VRAM for it, e.g. `--gpu-memory-utilization 0.95`)
-before touching any other knob.
+with coverage while the token hit‑rate barely moves. On DS4 (1× 5090, NVMe‑store stack,
+same box, same bench): 11 GiB pool / util 0.90 = **27–28 tok/s**, 14 GiB / util 0.95 =
+**~31 tok/s**. The engine reports the KPI directly: pool coverage at startup and a periodic
+**`[base] KPI: replay X% of last N steps…`** line (cadence `VLLM_MOE_W2_KPI_EVERY`, default
+500 steps). If replay % runs high, grow `VLLM_MOE_W2_BASE_CACHE_GB` (and free VRAM for it,
+e.g. `--gpu-memory-utilization 0.95`) before touching any other knob.
+
+**Misses are restored to a deterministic fixed point — adaptively.** A replayed step can
+re‑route onto experts the first pass never fetched (second‑order misses); the runner now
+re‑checks after each replay and keeps replaying **only while the step is within
+`VLLM_MOE_W2_FP_THRESH` of miss‑free** (default 0 = the mandatory first‑order restore only;
+the threshold is runtime‑tunable via `VLLM_MOE_W2_FP_THRESH_FILE`). Measured on GLM TP2 by
+flipping the file on a live server: thresh 16 → 19.2 tok/s, thresh 0 → **28.3 tok/s** with
+identical quality probes — chasing second‑order residue cost ~35% decode for zeros the
+pre‑fix stack silently kept anyway. Residue is KPI‑visible (`fp-residue`).
 
 Results: **DeepSeek‑V4‑Flash 159B on one RTX 5090** (72.7 GiB of 2‑bit planes vs 32 GB of
-VRAM): ~43 tok/s steady with MTP (acceptance 2.7–2.8), coherent and deterministic.
-**GLM‑5.2 753B on two RTX PRO 6000**: 45–52 tok/s with the full three‑tier stack (host 2‑bit
-→ GPU 2‑bit cache → GPU FP4) — see the GLM table above. Neither model can otherwise run on
-that hardware at any precision.
+VRAM): ~31 tok/s steady with MTP, 32K window served, coherent — and ~30 GiB of host RAM
+with the NVMe stores (below, RSS‑measured) instead of ~80 GiB pinned.
+**GLM‑5.2 753B on two RTX PRO 6000**: 28–32 tok/s with the full three‑tier stack (NVMe 2‑bit
+base + pinned arena → GPU 2‑bit cache → GPU FP4) at a 128K single‑user window — see the GLM
+table above. Neither model can otherwise run on that hardware at any precision.
 
 ---
 
@@ -184,9 +190,9 @@ Same‑night A/B (DS4 1× 5090, 11 GiB GPU pool, MTP k=2):
 | pack only — page cache as the RAM tier | 25.5 tok/s | 15 GiB |
 | pack + **20 GiB pinned arena** | **32.8 tok/s (parity)** | 26–33 GiB |
 
-GLM‑5.2 TP2 three‑tier with both stores on NVMe (57 GiB/rank arena): 29–30 tok/s steady,
-needle retrieval 4/4 to 36K prompt tokens. Enabling it is two env lines on any base‑cache
-config (DS4 shown; same two lines serve GLM TP2):
+GLM‑5.2 TP2 three‑tier with both stores on NVMe (57 GiB/rank arena): 28–32 tok/s steady,
+needle retrieval 4/4 to **121K prompt tokens** at a served 128K window. Enabling it is two
+env lines on any base‑cache config (DS4 shown; same two lines serve GLM TP2):
 
 ```bash
   -e VLLM_MOE_W2_STORE_DIR=/serve/packs \  # pack dir on a bind-mounted ext4/xfs
@@ -264,22 +270,28 @@ docker run --rm --gpus '"device=0,1,2,3"' --network host --ipc host --shm-size 6
 patch from `tools/nvfp4_flashinfer_sm120/` baked into the image and is currently validated to
 128K windows.)
 
-**GLM‑5.2 on 2× PRO 6000** (three‑tier; needs ~200 GiB free host RAM for the pinned base):
+**GLM‑5.2 on 2× PRO 6000** (three‑tier + NVMe stores, the 128K/needle‑121K config from the
+table; ~140 GiB host RAM + ~580 GB NVMe for the packs, first boot writes them):
 
 ```bash
 docker run --rm --gpus '"device=0,1"' --network host --ipc host --shm-size 64g \
-  -v /path/to/GLM-5.2-NVFP4:/model:ro \
-  -e VLLM_MOE_W2=1 -e VLLM_MOE_W2_BASE_CACHE_GB=48 -e VLLM_MOE_W2_DELTA_GB=2 \
+  -v /path/to/GLM-5.2-NVFP4:/model:ro -v /nvme/packs-glm:/packs \
+  -e VLLM_MOE_W2=1 -e VLLM_MOE_W2_BASE_CACHE_GB=46 -e VLLM_MOE_W2_DELTA_GB=2 \
   -e VLLM_MOE_W2_GATE=1 -e VLLM_MOE_W2_BASE_MISS_TOL=8 \
+  -e VLLM_MOE_W2_STORE_DIR=/packs -e VLLM_MOE_W2_BASE_RAM_GB=57 \
   vllm-moet-sm120:v024 \
   --model /model --served-model-name glm-5.2 --trust-remote-code \
   --tensor-parallel-size 2 --disable-custom-all-reduce \
-  --kv-cache-dtype fp8 --max-model-len 16384 --kv-cache-memory-bytes 8589934592 \
+  --kv-cache-dtype fp8 --max-model-len 131072 --kv-cache-memory-bytes 8589934592 \
   --gpu-memory-utilization 0.90 --max-num-batched-tokens 2048 --max-num-seqs 2 \
   --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
   --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
   --port 8000
 ```
+
+(31.7 tok/s at `MISS_TOL=8` as shown, 28.3 at strict `0` — both probe‑clean on this stack;
+drop the two `STORE_DIR`/`BASE_RAM_GB` lines for the all‑RAM variant, which then needs
+~200 GiB free host RAM and re‑quantizes on every boot.)
 
 **DeepSeek‑V4‑Flash on one PRO 6000** (161 tok/s, 512K window):
 
@@ -303,8 +315,8 @@ DS4 (host‑resident base): `-e VLLM_MOE_W2_BASE_CACHE_GB=14 -e VLLM_MOE_W2_DELT
 `--max-model-len 8192 --gpu-memory-utilization 0.95 --max-num-seqs 2` (~80 GiB free host
 RAM — **or add the two NVMe‑store lines from the section above and run in ~30 GiB**; MTP
 works). Do not shrink the pool below 14 GiB to "play it safe" — pool size is the dominant
-perf knob (see the KPI note above; 11 GiB costs ~25% decode) and 14 GiB needs util 0.95 to
-leave room for KV.
+perf knob (see the KPI note above; 11 GiB costs ~12% decode and doubles the missing pairs
+per step) and 14 GiB needs util 0.95 to leave room for KV.
 
 ## Quality
 
@@ -343,8 +355,8 @@ kernels here can be *written* through stock CUDA on sm_120 — the instructions 
 kernels don't; this toolchain is what makes them possible.
 
 ## Repository layout
-- **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (33 files,
-  +6.9k lines; applies clean on the tag). Goes with the pins above.
+- **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (34 files,
+  +7.0k lines; applies clean on the tag). Goes with the pins above.
 - **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
   cubins.
 - **`kernels/`** — SASS (`sass/`) + prebuilt SM120 cubins (`cubins-sm120/`, incl. the K=6144

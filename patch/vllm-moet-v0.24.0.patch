@@ -2297,10 +2297,10 @@ index 000000000..3ca45853b
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..6dd9ef388
+index 000000000..cbaad374d
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1220 @@
+@@ -0,0 +1,1288 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -2522,6 +2522,8 @@ index 000000000..6dd9ef388
 +        self._kpi_c_replays = 0
 +        self._kpi_unfixed = 0     # experts replay could NOT restore (window)
 +        self._kpi_2nd = 0         # extra replays for second-order misses
++        self._kpi_fp_giveup = 0   # steps that accepted second-order residue
++        self._kpi_fp_resid = 0    # residual missing pairs in those steps
 +        # Slots touched since step_begin(): promoted or hit by any pass of
 +        # the CURRENT step. Never evictable (even in the emergency pass) —
 +        # without this, a fixed-point iteration can evict pass-k's fetches
@@ -3192,6 +3194,10 @@ index 000000000..6dd9ef388
 +                   if self._kpi_unfixed else "")
 +        if self._kpi_2nd:
 +            unfixed += (f"; second-order replays: {self._kpi_2nd}")
++        if self._kpi_fp_giveup:
++            unfixed += (
++                f"; fp-residue: {self._kpi_fp_giveup} steps "
++                f"(avg {self._kpi_fp_resid / self._kpi_fp_giveup:.0f} pairs)")
 +        if self._kpi_prefetched:
 +            unfixed += (f"; draft-prefetched: {self._kpi_prefetched}")
 +        logger.info(
@@ -3207,23 +3213,31 @@ index 000000000..6dd9ef388
 +        self._kpi_steps = self._kpi_miss_pairs = self._kpi_replays = 0
 +        self._kpi_unfixed = 0
 +        self._kpi_2nd = 0
++        self._kpi_fp_giveup = 0
++        self._kpi_fp_resid = 0
 +        self._kpi_prefetched = 0
 +
-+    def kpi_second_order(self, n: int, capped: bool = False) -> None:
-+        """Runner reports n EXTRA fixed-point replays this step (a corrected
-+        pass re-routed onto still-missing experts). Chronic second-order
-+        replays = coverage too low for the model's routing volatility.
-+        `capped`: the loop exited at its bound with misses STILL present —
-+        the step's logits kept zeroed contributions (hard determinism/
-+        quality breach; logged loudly)."""
-+        self._kpi_2nd += n
-+        if capped:
++    def kpi_fp(self, replays: int, residual: int) -> None:
++        """Runner reports the step's fixed-point outcome: total replay
++        passes and the residual max-miss after the loop. residual==0 (or
++        within tol) = clean fixed point. residual > FP_THRESH = the
++        adaptive break: working set moving, second-order residue accepted
++        after the mandatory first-order restore (expected on fresh prose;
++        KPI-counted, not a warning). residual in (tol, FP_THRESH] = the
++        loop hit FP_MAX while within closing distance — pathological
++        ping-pong, logged loudly."""
++        if replays > 1:
++            self._kpi_2nd += replays - 1
++        if residual <= base_miss_tol():
++            return
++        self._kpi_fp_giveup += 1
++        self._kpi_fp_resid += residual
++        if residual <= fp_thresh():
 +            self._kpi_unfixed += 1
 +            logger.warning(
-+                "moe_w2 [%s]: fixed-point replay hit its cap with misses "
-+                "remaining — this step kept zeroed expert contributions "
-+                "(nondeterministic output). Pool badly undersized for this "
-+                "workload.", self._tag)
++                "moe_w2 [%s]: fixed-point replay hit FP_MAX with %d misses "
++                "remaining (within thresh) — ping-pong; step kept zeroed "
++                "contributions.", self._tag, residual)
 +
 +    # ---- observability ---------------------------------------------------
 +
@@ -3410,6 +3424,60 @@ index 000000000..6dd9ef388
 +    except (OSError, ValueError):
 +        pass
 +    return _base_tol_dyn
++
++
++# Adaptive fixed-point replay policy. Pass 1 is MANDATORY above the
++# tolerance band (it restores every first-order miss — the bulk of the
++# quality). Further passes chase SECOND-ORDER misses (corrected layers
++# re-routing onto unfetched experts) and only run while the step is within
++# FP_THRESH of miss-free: that yields strict, bit-deterministic fixed
++# points for extra passes, while on shifting content (fresh prose: 100+
++# missing pairs, residue stays large) the loop stops at 2 forwards/step —
++# the old single-replay cost — instead of burning 3x+ chasing a moving
++# target. The accepted residue is second-order only, small, and
++# KPI-visible ("fp-residue"). DEFAULT 0 = mandatory pass only: measured
++# A/B (GLM TP2 46 GiB pool, runtime thresh flip, same server, fox 384
++# med 5): thresh=16 -> 19.2 tok/s, thresh=0 -> 28.3 at unchanged quality
++# probes (needle 36K PASS, arithmetic ok) — the second-order chase cost
++# ~35% decode for residue the pre-fixed-point stack silently kept
++# anyway, plus first-order restoration on top. DS4 1x5090 14 GiB:
++# thresh-insensitive (31.2 vs 31.4 — residue >16 either way). Raise for
++# bit-determinism studies on converged working sets. THRESH is
++# file-tunable at runtime (sweep idiom of TAU/TOL); FP_MAX bounds
++# pathological ping-pong.
++_FP_MAX = int(os.getenv("VLLM_MOE_W2_FP_MAX", "8"))
++_FP_THRESH = int(os.getenv("VLLM_MOE_W2_FP_THRESH", "0"))
++_FP_THRESH_FILE = os.getenv("VLLM_MOE_W2_FP_THRESH_FILE", "")
++_fp_thresh_dyn = _FP_THRESH
++_fp_thresh_mtime = -1.0
++
++
++def fp_thresh() -> int:
++    global _fp_thresh_dyn, _fp_thresh_mtime
++    if not _FP_THRESH_FILE:
++        return _FP_THRESH
++    try:
++        m = os.path.getmtime(_FP_THRESH_FILE)
++        if m != _fp_thresh_mtime:
++            _fp_thresh_mtime = m
++            with open(_FP_THRESH_FILE) as f:
++                _fp_thresh_dyn = int(f.read().strip())
++            logger.info("moe_w2 base cache: fixed-point thresh -> %d",
++                        _fp_thresh_dyn)
++    except (OSError, ValueError):
++        pass
++    return _fp_thresh_dyn
++
++
++def fp_continue(passes: int, max_miss: int) -> bool:
++    """Should the runner run another replay pass? (adaptive policy above)"""
++    if max_miss <= base_miss_tol():
++        return False            # inside the tolerance band (or miss-free)
++    if passes == 0:
++        return True             # first-order restore is mandatory
++    if passes >= _FP_MAX:
++        return False            # hard bound on ping-pong
++    return max_miss <= fp_thresh()
 +
 +
 +# Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
@@ -4885,6 +4953,34 @@ index fe2b268cd..d56825ef8 100644
          )
          use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
              512,
+diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
+index 88f33ac02..546f92265 100644
+--- a/vllm/model_executor/models/deepseek_mtp.py
++++ b/vllm/model_executor/models/deepseek_mtp.py
+@@ -35,6 +35,7 @@ from .deepseek_v2 import (
+     _try_load_fp8_indexer_wk,
+     get_spec_layer_idx_from_weight_name,
+ )
++from .interfaces import SupportsPP
+ from .utils import get_pp_missing_layer_names, maybe_prefix
+ 
+ logger = init_logger(__name__)
+@@ -205,7 +206,14 @@ class DeepSeekMultiTokenPredictor(nn.Module):
+ 
+ 
+ @support_torch_compile
+-class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts):
++class DeepSeekMTP(nn.Module, DeepseekV2MixtureOfExperts, SupportsPP):
++    # Same PP story as DeepSeekV4MTP (vllm/models/deepseek_v4/nvidia/mtp.py):
++    # the MTP drafter runs WHOLE on the last PP rank (it consumes the
++    # target's last-rank hidden state), is never pipeline-split and never
++    # exchanges IntermediateTensors. Declaring SupportsPP only satisfies the
++    # generic verify_with_parallel_config gate so pipeline_parallel_size > 1
++    # works with method:"mtp" drafters (GLM-5.x glm_moe_dsa, DeepSeek V3
++    # family) — exercised by the base-cache PP path.
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+         self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
 index 64715deae..8c456a69a 100644
 --- a/vllm/models/deepseek_v4/nvidia/mtp.py
@@ -6520,7 +6616,7 @@ index dad1777b4..1f4b8b92b 100644
                              # Join offloader's copy stream after forward to avoid
                              # unjoined stream error. The last layer's start_prefetch
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..583fa2e33 100644
+index 74938a823..1e8deabc4 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -6670,7 +6766,7 @@ index 74938a823..583fa2e33 100644
          # Run the model.
          # Use persistent buffers for CUDA graphs.
          # When spec decode is enabled, defer connector finalization
-@@ -4337,6 +4404,131 @@ class GPUModelRunner(
+@@ -4337,6 +4404,128 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -6725,8 +6821,7 @@ index 74938a823..583fa2e33 100644
 +                    # replay; fetch + replay again until miss-free (typically
 +                    # converges in one extra pass).
 +                    _replays = 0
-+                    while (_max_miss > _w2d.base_miss_tol()
-+                           and _replays < 8):
++                    while _w2d.fp_continue(_replays, _max_miss):
 +                        _replays += 1
 +                        with set_forward_context(
 +                            attn_metadata,
@@ -6757,10 +6852,8 @@ index 74938a823..583fa2e33 100644
 +                            _max_miss = _miss
 +                        if _miss > 0:
 +                            _btier.force_promote(max_promote=None)
-+                    if _replays > 1:
-+                        _btier.kpi_second_order(
-+                            _replays - 1,
-+                            capped=_max_miss > _w2d.base_miss_tol())
++                    if _replays:
++                        _btier.kpi_fp(_replays, _max_miss)
 +            except Exception as e:  # noqa: BLE001 - never crash serving
 +                logger.warning(
 +                    "moe_w2 base-cache PP stage replay skipped: %s", e)
@@ -6802,7 +6895,7 @@ index 74938a823..583fa2e33 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4587,192 @@ class GPUModelRunner(
+@@ -4395,6 +4584,189 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -6861,8 +6954,7 @@ index 74938a823..583fa2e33 100644
 +                    # replay; fetch + replay until miss-free (typically one
 +                    # extra pass).
 +                    _replays = 0
-+                    while (_max_miss > _w2d.base_miss_tol()
-+                           and _replays < 8):
++                    while _w2d.fp_continue(_replays, _max_miss):
 +                        _replays += 1
 +                        with set_forward_context(
 +                            attn_metadata,
@@ -6899,10 +6991,8 @@ index 74938a823..583fa2e33 100644
 +                            _max_miss = _miss
 +                        if _miss > 0:
 +                            _btier.force_promote(max_promote=None)
-+                    if _replays > 1:
-+                        _btier.kpi_second_order(
-+                            _replays - 1,
-+                            capped=_max_miss > _w2d.base_miss_tol())
++                    if _replays:
++                        _btier.kpi_fp(_replays, _max_miss)
 +            except Exception as e:  # noqa: BLE001 - never crash serving
 +                logger.warning("moe_w2 base-cache miss replay skipped: %s", e)
 +
@@ -6995,7 +7085,7 @@ index 74938a823..583fa2e33 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4794,95 @@ class GPUModelRunner(
+@@ -4416,6 +4788,95 @@ class GPUModelRunner(
  
          return None
  
@@ -7091,7 +7181,7 @@ index 74938a823..583fa2e33 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +4908,12 @@ class GPUModelRunner(
+@@ -4441,6 +4902,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -7104,7 +7194,7 @@ index 74938a823..583fa2e33 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5078,23 @@ class GPUModelRunner(
+@@ -4605,6 +5072,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -7128,7 +7218,7 @@ index 74938a823..583fa2e33 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5186,35 @@ class GPUModelRunner(
+@@ -4696,13 +5180,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -7169,7 +7259,7 @@ index 74938a823..583fa2e33 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5223,33 @@ class GPUModelRunner(
+@@ -4711,16 +5217,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -7207,7 +7297,7 @@ index 74938a823..583fa2e33 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,15 +5260,136 @@ class GPUModelRunner(
+@@ -4731,15 +5254,136 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -7349,7 +7439,7 @@ index 74938a823..583fa2e33 100644
      def take_draft_token_ids(self) -> DraftTokenIds | None:
          if not self.num_spec_tokens or not self._draft_token_req_ids:
              return None
-@@ -5209,6 +5859,22 @@ class GPUModelRunner(
+@@ -5209,6 +5853,22 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -7372,7 +7462,7 @@ index 74938a823..583fa2e33 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5969,7 +6635,8 @@ class GPUModelRunner(
+@@ -5969,7 +6629,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -7382,7 +7472,7 @@ index 74938a823..583fa2e33 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7542,9 @@ class GPUModelRunner(
+@@ -6875,8 +7536,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -7394,7 +7484,7 @@ index 74938a823..583fa2e33 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7597,8 @@ class GPUModelRunner(
+@@ -6929,7 +7591,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
