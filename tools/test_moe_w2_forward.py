@@ -27,8 +27,11 @@ assert moe_w2_cubit._ensure_ready(), "cubins not found"
 dev = torch.device("cuda")
 torch.manual_seed(11)
 
-E, H, I = 32, 4096, 2048
-T, TOPK = 9, 6
+E = int(os.environ.get("E", "32"))
+H = int(os.environ.get("H", "4096"))     # 4096 DS4, 6144 GLM-5.x, 7168 Kimi-K2.x
+I = int(os.environ.get("I", "2048"))     # per-rank I under TP (1024 TP2, 512 TP4)
+T = int(os.environ.get("T", "9"))        # T>96 exercises the PREFILL tier (mc4/afrag)
+TOPK = 6
 LEVELS = torch.tensor([-4.0, -1.0, 1.0, 4.0], device=dev)
 
 w13_pack = torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, device=dev)
@@ -77,13 +80,23 @@ print(f"T={T} E={E}: max_rel={rel:.3e} cos={cos:.6f}")
 ok = rel < 0.06 and cos > 0.999
 
 # ---- delta tier: promote half the experts to full FP4, expect the mixed
-# reference (FP4 dequant for promoted, 2-bit for the rest)
+# reference (FP4 dequant for promoted, 2-bit for the rest).
+# DECODE-ONLY by design: the production forward routes every pair to the
+# 2-bit tier at prefill (T > 96), so the mixed reference does not apply there.
+if T > 96:
+    print("DELTA mixed: skipped (prefill tier is 2-bit-only by design)")
+    print("RESULT:", "PASS" if ok else "FAIL")
+    sys.exit(0 if ok else 1)
 from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
     mxfp4_to_nibbles, pack_fp4_fragment_major)
 
 os.environ["VLLM_MOE_W2_DELTA_GB"] = "1"
-tier = moe_w2_delta.DeltaTier(1, E, dev)
+# per-expert FP4 plane bytes for THIS model's shapes (the module defaults are
+# the DS4 TP1 sizes; production passes these via _fp4_tier_for_build)
+tier = moe_w2_delta.DeltaTier(1, E, dev,
+                              w13_bytes=2 * I * H // 2,
+                              w2_bytes=H * I // 2)
 moe_w2_delta._TIER = tier
 fp13 = torch.stack([pack_fp4_fragment_major(mxfp4_to_nibbles(w13_pack[e]))
                     for e in range(E)])
