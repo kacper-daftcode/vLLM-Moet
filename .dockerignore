@@ -2,3 +2,6 @@
 internal/
 docs/
 *.md
+patch/*.whl
+__pycache__/
+bench/results/

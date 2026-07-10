@@ -1,9 +1,11 @@
 vLLM-Moet
 Copyright 2026 the vLLM-Moet authors
 
-This product includes software developed for serving DeepSeek-V4-Flash on a single
-SM120 GPU: 2-bit MoE expert quantization, an FP4 "delta" tier, and hand-written SASS
-kernels (the `cubit` toolchain).
+This product includes software developed for serving frontier Mixture-of-Experts
+models (DeepSeek-V4-Flash, GLM-5.2, Kimi-K2.7-Code) on consumer/workstation SM120
+GPUs: 2-bit MoE expert quantization, an FP4 "delta" tier, tiered expert residency
+(host RAM / NVMe expert stores), and hand-written SASS kernels (the `cubit`
+toolchain).
 
 Built on and incorporating:
 
@@ -12,20 +14,21 @@ Built on and incorporating:
   `patch/vllm-moet-v0.24.0.patch` is applied on top of it. DeepSeek-V4 model support,
   sparse-MLA / MTP / indexer and SM120 enablement ship in upstream vLLM and were authored
   by vLLM contributors — not by this project. This project's own contribution is the
-  2-bit MoE + FP4 delta cache + confidence gate + the cubit kernels, plus small SM120
-  fixes to the upstream base (carried in the patch).
+  2-bit MoE + FP4 delta cache + confidence gate + expert stores + the cubit kernels,
+  plus small SM120 fixes to the upstream base (carried in the patch).
 
 - DeepGEMM (https://github.com/deepseek-ai/DeepGEMM), MIT License, Copyright (c) 2025
   DeepSeek. Used at runtime on SM120 — FP8 dense/einsum GEMMs, the indexer's MQA logits,
   hc_prenorm, and the stock DEEPGEMM_MXFP4 MoE path the MTP drafter runs on — via the
   nv-dev pin `a6b593d2`, whose SM120 backend was authored by the NVIDIA DevTech APAC team
-  (deepseek-ai/DeepGEMM PR #324). The prebuilt wheel
-  `patch/deep_gemm-2.5.0+a6b593d-cp312-cp312-linux_x86_64.whl` is redistributed here under
-  that MIT license and copyright.
+  (deepseek-ai/DeepGEMM PR #324). The Docker image builds it from source at that pin;
+  any prebuilt `deep_gemm` wheel distributed alongside this project is covered by that
+  MIT license and copyright.
 
-- The DeepSeek-V4-Flash model weights are NOT included or redistributed. Obtain the
-  official checkpoint separately; the 2-bit planes are built from it at load time.
+- Model weights (DeepSeek-V4-Flash, GLM-5.2, Kimi-K2.7-Code checkpoints) are NOT
+  included or redistributed. Obtain the official checkpoints separately; the 2-bit
+  planes are built from them at load time.
 
 cubit (the SASS assembler and the hand-written kernels under `kernels/`) and the 2-bit
-MoE + FP4-delta quantization (`patch/vllm-new-files/`) are the original contribution of
-this project.
+MoE + FP4-delta + expert-store code added by `patch/vllm-moet-v0.24.0.patch` are the
+original contribution of this project.

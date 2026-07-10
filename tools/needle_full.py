@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""needle_probe z budżetem na reasoning: PASS gdy sekret pada w finalnej
-odpowiedzi (po </think>) albo w ogóle w treści przy finish=stop."""
+"""needle_probe with a reasoning budget: PASS when the secret appears in the
+final answer (after </think>) or anywhere in the content when finish=stop.
+
+Usage: needle_full.py <port> <n_words> [depth]  (served model name: glm-5.2)"""
 import json
 import random
 import sys

@@ -24,10 +24,6 @@ END = "<!-- bench:table:end -->"
 README = os.path.join(common.REPO_DIR, "README.md")
 
 
-def _fmt_int(v):
-    return f"{int(round(v)):,}".replace(",", " ") if v is not None else "—"
-
-
 def _fmt_tok(v):
     if v is None:
         return "—"

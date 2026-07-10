@@ -2,8 +2,9 @@
 
 The project targets **official vLLM v0.24.0**, which ships DeepSeek‑V4 + SM120 natively
 (`vllm/models/deepseek_v4/`, FlashInfer SM120 sparse‑MLA, GLM‑5.x `GlmMoeDsaForCausalLM`).
-Our overlay is a **3.7k‑line patch**: the 2‑bit expert planes, the FP4 delta cache, the
-confidence gate, the cubit dispatch — plus the SM120 fixes below.
+Our overlay is a **7.4k‑line patch** (37 files): the 2‑bit expert planes, the FP4 delta
+cache, the confidence gate, the cubit dispatch, the expert stores — plus the SM120 fixes
+below.
 
 ## Apply
 

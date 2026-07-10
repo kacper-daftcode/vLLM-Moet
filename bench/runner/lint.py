@@ -179,22 +179,23 @@ def main():
             lint_results(release)
 
     if args.release:
-        present = {}
+        rank = {"ok": 2, "partial": 1}
+        best: dict = {}
         for _box_id, res in common.iter_results(args.release):
             rid = res.get("recipe")
-            ok = res.get("status") in ("ok", "partial")
-            present[rid] = present.get(rid) or ok
+            st = res.get("status")
+            if rank.get(st, 0) > rank.get(best.get(rid), 0):
+                best[rid] = st
         for entry in mx["entries"]:
             if not entry.get("blocking"):
                 continue
             rid = entry["recipe"]
-            if not present.get(rid):
+            st = best.get(rid)
+            if st not in ("ok", "partial"):
                 err(f"release {args.release}: blocking recipe {rid} has no "
                     "successful result")
-            else:
-                st = present[rid]
-                if st != "ok":
-                    warn(f"release {args.release}: {rid} best status is {st}")
+            elif st != "ok":
+                warn(f"release {args.release}: {rid} best status is {st}")
 
     print(f"\nlint: {len(ERRORS)} error(s), {len(WARNINGS)} warning(s)")
     sys.exit(1 if ERRORS else 0)
