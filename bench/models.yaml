@@ -1,0 +1,21 @@
+# Model registry: the single mapping from the model names recipes use to
+# their HuggingFace checkpoints. Used by docker/serve_recipe.py (customer
+# path: download-if-missing) and linted against every recipe's `model` /
+# `requires.extra_models`.
+#
+# approx_gb = checkpoint size on disk (what the download will pull) — the
+# launcher prints it before a cold download so nobody is surprised by 595 GB.
+
+models:
+  DeepSeek-V4-Flash:
+    hf_repo: deepseek-ai/DeepSeek-V4-Flash
+    approx_gb: 149
+  GLM-5.2-NVFP4:
+    hf_repo: nvidia/GLM-5.2-NVFP4
+    approx_gb: 433
+  Kimi-K2.7-Code-NVFP4:
+    hf_repo: nvidia/Kimi-K2.7-Code-NVFP4
+    approx_gb: 595
+  Kimi-K2.7-Code-eagle3:
+    hf_repo: AQ-MedAI/Kimi-K2.7-Code-eagle3
+    approx_gb: 4

@@ -1,0 +1,15 @@
+# Smoke suite: is the config alive and sane. Not a release artifact.
+
+id: quick
+probes:
+  - kind: decode
+    runs: 3
+    max_tokens: 256
+  - kind: prefill
+    words: 4000
+    runs: 1
+  - kind: needle
+    sizes_words: [6000]
+    depth: 0.5
+    max_tokens: 512
+  - kind: arithmetic

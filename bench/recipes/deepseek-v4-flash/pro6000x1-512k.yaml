@@ -1,0 +1,37 @@
+# DS4-Flash, single 96 GB card, max-context config (the "512K on one card" claim).
+id: deepseek-v4-flash/pro6000x1-512k
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "1x RTX PRO 6000 - 512K window (delta pool traded for KV)"
+
+requires:
+  gpus: 1
+  vram_gb: 96
+
+context: 524288
+load_timeout_s: 2400
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "0"     # the FP4 pool trades against KV headroom at extreme context
+
+serve_args:
+  - --trust-remote-code
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 524288
+  - --gpu-memory-utilization 0.97
+  - --max-num-batched-tokens 2048
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [100000, 250000, 440000]
+    depth: 0.5
+    max_tokens: 512

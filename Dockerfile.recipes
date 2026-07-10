@@ -1,0 +1,41 @@
+# vLLM-Moet "recipes" image — the customer-facing way to run a supported,
+# benchmarked configuration with one command. It layers the recipe registry
+# and a launcher on top of the serving image from Dockerfile.sm120-v024:
+# the launcher downloads the model from HuggingFace into the /models volume
+# (if missing), applies the recipe's exact knobs, and execs vllm serve.
+#
+# Build (base image first, from the repo root):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v024 -t vllm-moet-sm120:v024 .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.recipes   -t vllm-moet-recipes:v024 .
+#
+# Run a recipe (example: Kimi-K2.7-Code on 4x 96 GB; ~595 GB download on
+# first run — point /models at a big disk):
+#   docker run --rm --gpus all --network host --ipc host --shm-size 64g \
+#     -v /srv/models:/models -e HF_TOKEN=... \
+#     vllm-moet-recipes:v024  kimi-k2.7-code-nvfp4/pro6000x4-tp4-256k
+#
+# Discover configs:            docker run --rm vllm-moet-recipes:v024 --list
+# Inspect without serving:     ... vllm-moet-recipes:v024 <recipe> --print
+# Override any knob:           -e VLLM_MOE_W2_DELTA_GB=0 (container env wins)
+# Host quirks pass through:    -e NCCL_P2P_DISABLE=1 (needed on some hosts)
+# Planes cache (fast reload):  -v /srv/planes:/planes -e PLANES_CACHE=/planes
+# Extra vllm args:             ... <recipe> -- --api-key secret
+#
+# The recipes are the configurations the release was benchmarked with —
+# numbers and full reports live in bench/results/ and docs/benchmarks/.
+
+ARG BASE=vllm-moet-sm120:v024
+FROM ${BASE}
+
+RUN pip install --no-cache-dir --break-system-packages \
+        "huggingface_hub[hf_transfer]>=0.34"
+
+COPY bench/recipes/ /opt/vllm-moet/recipes/
+COPY bench/models.yaml /opt/vllm-moet/models.yaml
+COPY docker/serve_recipe.py /opt/vllm-moet/serve_recipe.py
+
+# Weights land here; mount a real disk over it (anonymous volume otherwise).
+VOLUME /models
+
+ENTRYPOINT ["python3", "/opt/vllm-moet/serve_recipe.py"]
+CMD ["--list"]

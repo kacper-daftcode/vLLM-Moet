@@ -1,0 +1,36 @@
+id: deepseek-v4-flash/5090x4-tp4
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "4x RTX 5090 TP4 - consumer-card throughput"
+
+requires:
+  gpus: 4
+  vram_gb: 32
+
+context: 16384
+load_timeout_s: 2400
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "1"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 4
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 16384
+  - --gpu-memory-utilization 0.95
+  - --max-num-batched-tokens 1024
+  - --max-num-seqs 4
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  batch_decode:
+    concurrency: [1, 4]
+  needle:
+    sizes_words: [8000, 12000]

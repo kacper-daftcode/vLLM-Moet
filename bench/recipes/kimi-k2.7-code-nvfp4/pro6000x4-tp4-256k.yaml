@@ -1,0 +1,61 @@
+# Kimi-K2.7-Code (1T) TP4, full native 256K window - the headline config.
+# Validated bring-up: docs/kimi-k27-code-plan.md section 0.
+id: kimi-k2.7-code-nvfp4/pro6000x4-tp4-256k
+model: Kimi-K2.7-Code-NVFP4
+served_name: kimi-k2.7-code
+summary: "4x RTX PRO 6000 TP4 - GPU-resident 2-bit + FP4 delta, 256K window"
+
+requires:
+  gpus: 4
+  vram_gb: 96
+
+context: 262144
+load_timeout_s: 3600            # ~25 min cold / ~14.5 min on planes cache
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "auto"
+  VLLM_MOE_W2_DELTA_RESERVE_GB: "6"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 4
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 262144
+  - --gpu-memory-utilization 0.94
+  - --max-num-batched-tokens 2048
+  - --max-num-seqs 8
+  - --no-scheduler-reserve-full-isl
+  - --enable-auto-tool-choice
+  - --tool-call-parser kimi_k2
+  - --reasoning-parser kimi_k2
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  batch_decode:
+    concurrency: [1, 4, 8]      # mns 8 in this config
+  needle:
+    sizes_words: [6000, 24000, 60000, 96000, 144000, 186000]
+    depth: 0.5
+    max_tokens: 512             # thinking off; reasoning models need headroom
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["needle.all_pass", "arithmetic.score>=4", "coherence.pass"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_DELTA_GB
+      values: ["auto", "0"]
+    - kind: env
+      name: VLLM_MOE_W2_AFRAG
+      values: ["1", "0"]
+      restart: true
+
+notes: |
+  No MTP - the checkpoint ships no drafter head (the Eagle3 external drafter
+  is the -eagle3 variant). 248K needle passes but replies drift after the
+  correct passphrase (YaRN edge quality, not retrieval) - keep the largest
+  release-gated needle at ~186K words (~248K tokens is 1.33 tok/word here).

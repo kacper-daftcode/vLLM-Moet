@@ -1,0 +1,33 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "glm-5.2-nvfp4/pro6000x4-tp4-mtp",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "README.md GLM section (2026-07-09)",
+ "summary": "4x RTX PRO 6000 TP4 - 2-bit base + MTP k=2, 128K window",
+ "context": 131072,
+ "probes": {
+  "decode": {
+   "median_tok_s": 105,
+   "max_tokens": 512
+  },
+  "prefill": {
+   "words": 8000,
+   "median_tok_s": 2500
+  },
+  "needle": {
+   "cases": [
+    {
+     "prompt_tokens": 276000,
+     "depth": 0.5,
+     "pass": true
+    }
+   ],
+   "all_pass": true
+  }
+ },
+ "notes": "MTP acceptance 2.3-2.8 content-dependent. Prefill ~2.5k tok/s on 8-13.5K prompts. Needle PASS to 276K prompt tokens on fp8 KV (126K on the nvfp4 KV variant). Bare 2-bit base without MTP: 56 tok/s (eager 12 -> graphs 4.7x)."
+}

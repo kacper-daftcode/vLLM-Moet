@@ -1,0 +1,27 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "kimi-k2.7-code-nvfp4/pro6000x4-tp4-eagle3",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "docs/kimi-k27-code-plan.md P6 Eagle3 trial (2026-07-10)",
+ "summary": "4x RTX PRO 6000 TP4 - + Eagle3 drafter (k=3, drafter TP4)",
+ "context": 262144,
+ "probes": {
+  "decode": {
+   "median_tok_s": 57,
+   "min_tok_s": 38,
+   "max_tok_s": 63,
+   "spread_pct": 44,
+   "distinct_outputs": "6/6",
+   "max_tokens": 512
+  }
+ },
+ "notes": "Acceptance length 3.4-3.7 of 4 (82-90% draft acceptance) but net +12% median with 38-63 tok/s run-to-run spread; variance root-caused to the FP4 delta tier's runtime precision flips - this recipe now pins VLLM_MOE_W2_DELTA_GB=0 for reproducibility. drafter TP1 LOST to baseline (~42 tok/s).",
+ "server_metrics": {
+  "spec_acceptance_length": 3.5,
+  "draft_acceptance_pct": 86.0
+ }
+}

@@ -1,0 +1,51 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "deepseek-v4-flash/pro6000x1-24k",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "README.md + docs/v024-port.md (2026-07-08/09)",
+ "summary": "1x RTX PRO 6000 - throughput (24K ctx, FP4 delta auto, MTP k=2)",
+ "context": 24576,
+ "probes": {
+  "decode": {
+   "median_tok_s": 161.2,
+   "max_tokens": 512
+  },
+  "prefill": {
+   "words": 8000,
+   "median_tok_s": 5340
+  },
+  "batch_decode": {
+   "levels": {
+    "1": {
+     "aggregate_tok_s": 156,
+     "per_stream_tok_s": 156
+    },
+    "4": {
+     "aggregate_tok_s": 290,
+     "per_stream_tok_s": 72.5
+    },
+    "8": {
+     "aggregate_tok_s": 493,
+     "per_stream_tok_s": 61.6
+    },
+    "16": {
+     "aggregate_tok_s": 659,
+     "per_stream_tok_s": 41.2
+    },
+    "32": {
+     "aggregate_tok_s": 933,
+     "per_stream_tok_s": 29.2
+    }
+   },
+   "max_tokens": 384
+  }
+ },
+ "notes": "Batch-scaling row measured with --max-num-seqs 32 --max-num-batched-tokens 2048 (same knobs otherwise). Decode with delta auto at 24K/util 0.95 was 166 tok/s in the auto-sizing note; the headline 161.2 is the fixed 1 GiB pool config.",
+ "server_metrics": {
+  "spec_acceptance_length": 2.6
+ }
+}

@@ -1,0 +1,51 @@
+# The capacity-unlock claim: 159B on a single 32 GB card, 2-bit base in host RAM.
+id: deepseek-v4-flash/5090x1-basecache
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "1x RTX 5090 (32 GB) - host-resident 2-bit base, GPU as expert cache"
+
+requires:
+  gpus: 1
+  vram_gb: 32
+  host_ram_gb: 96              # ~73 GiB pinned base + headroom
+
+context: 8192
+load_timeout_s: 3600
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_BASE_CACHE_GB: "11"
+  VLLM_MOE_W2_DELTA_GB: "0"
+
+serve_args:
+  - --trust-remote-code
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 8192
+  - --gpu-memory-utilization 0.90
+  - --max-num-batched-tokens 1024
+  - --max-num-seqs 2
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+# Cache tiers converge over traffic - warm the pool before measuring.
+warmup:
+  decode_requests: 8
+
+suite_params:
+  decode:
+    runs: 7                    # higher spread while the working set settles
+  batch_decode:
+    concurrency: [1, 2]
+  needle:
+    sizes_words: [6000]
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_BASE_CACHE_GB
+      values: ["11", "14"]

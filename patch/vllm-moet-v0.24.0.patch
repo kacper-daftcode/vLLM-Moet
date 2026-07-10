@@ -924,10 +924,18 @@ index 27a85bb3d..88f310c4f 100755
      # JIT all the required kernels before model execution so there is no
      # JIT'ing in the hot-path. However, this warmup increases the engine
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index 051468ed1..d16061d3c 100644
+index 051468ed1..33902056c 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
-@@ -1001,12 +1001,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
+@@ -188,6 +188,7 @@ return curr_o @ W_O
+ """
+ 
+ import functools
++import os
+ from abc import abstractmethod
+ from dataclasses import dataclass
+ from enum import Enum
+@@ -1001,12 +1002,21 @@ class MLAAttention(nn.Module, AttentionLayerBase):
          kv_cache_dtype = kv_cache_dtype_str_to_dtype(
              self.kv_cache_dtype, vllm_config.model_config
          )
@@ -949,6 +957,29 @@ index 051468ed1..d16061d3c 100644
          )
  
      def _v_up_proj(self, x: torch.Tensor, out: torch.Tensor):
+@@ -1424,6 +1434,13 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+         cache_config = vllm_config.cache_config
+         model_config = vllm_config.model_config
+ 
++        # VLLM_MLA_CHUNKED_WORKSPACE_TOKENS: cap override (in tokens) for the
++        # chunked-context workspace. Diagnostic/workaround knob for the
++        # multi-chunk context path; raising it makes contexts up to the cap
++        # single-chunk at the cost of workspace + up-projection memory.
++        workspace_cap = int(
++            os.environ.get("VLLM_MLA_CHUNKED_WORKSPACE_TOKENS", 64 * 1024)
++        )
+         chunked_prefill_workspace_size = min(
+             # Try for 8 full length request or at least 4 pages per-request
+             max(
+@@ -1438,7 +1455,7 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
+             # which would result in up-projected context being
+             #   2*(192*128)*(64*1024) = 3gb
+             # (assuming 192 QK head dim, 128 heads, and fp16)
+-            64 * 1024,
++            workspace_cap,
+         )
+ 
+         # Enforce that we enough for at least 1 page per request
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
 index 7cdb04cfb..64813139b 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
@@ -1014,10 +1045,121 @@ index 7cdb04cfb..64813139b 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index d51a2dd31..f4fa6a809 100644
+index d51a2dd31..322e29c0a 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
-@@ -1421,6 +1421,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import os
+ from fnmatch import fnmatch
+ from typing import TYPE_CHECKING, Any, cast
+ 
+@@ -129,6 +130,92 @@ class ModelOptKVCacheMethod(BaseKVCacheMethod):
+         super().__init__(quant_config)
+ 
+ 
++def _maybe_dense_fp8_method(prefix: str, layer):
++    """VLLM_MOE_W2_DENSE_FP8=1: serve the checkpoint's excluded BF16 dense
++    GEMMs (attention projections, shared experts, the first dense MLP) with
++    ONLINE-quantized FP8 (per-tensor weight scale at load, dynamic per-token
++    activations) instead of UnquantizedLinearMethod.
++
++    Motivation (Kimi-K2.7 on the 2-bit expert path): the BF16 dense stack is
++    ~77% of decode bytes/token/rank — attention 3.1 GB + shared experts
++    1.3 GB vs 1.5 GB for the 2-bit experts — so FP8 halves the dominant read
++    stream (~+50% decode ceiling) and frees ~2.3 GiB VRAM/rank. The DSv3
++    family is FP8-native (trained with FP8 GEMMs; DS4-Flash/GLM ship FP8
++    dense), so quality exposure is second-order vs the 2-bit experts.
++
++    Deliberately NOT overridden: lm_head/embeddings (logit sensitivity,
++    ParallelLMHead is excluded by the isinstance check), vision tower and
++    mm_projector (name filter), router gates (never ask for a quant method),
++    and kv_b_proj — the MLA impl unpacks its weight into the w_kc/w_vc
++    einsum operands at load, and it is only ~4 MB/layer/rank anyway.
++    """
++    mode = os.getenv("VLLM_MOE_W2_DENSE_FP8", "0")
++    if mode not in ("1", "attn", "l0"):
++        return None
++    if not isinstance(layer, LinearBase):
++        return None
++    p = prefix or ""
++    if ".kv_b_proj" in p:
++        return None
++    # "l0": ONLY the first dense MLP — bisection mode (no shared experts,
++    # no attention; the plain-Linear proof case). "1": + shared experts.
++    # "attn": + attention projections. Bring-up so far: both "1" and "attn"
++    # produced NaN logits — suspects are the MoE runner touching shared
++    # expert weights outside LinearMethod.apply, and the MLA absorption
++    # reading module weights raw; "l0" isolates the base mechanism.
++    targets = ".layers.0." in p and ".mlp." in p
++    if mode in ("1", "attn"):
++        targets = targets or ".shared_experts." in p
++    if mode == "attn":
++        targets = targets or ".self_attn." in p
++    if targets:
++        return _OnlineFp8LinearMethod.build()
++    return None
++
++
++class _OnlineFp8LinearMethod:
++    """Fp8LinearMethod wrapper that quantizes BF16 weights itself.
++
++    The stock non-serialized Fp8 flow relies on the model loader's
++    online-quantize hook (engaged only when the top-level quantization is
++    "fp8"); under the modelopt config that hook never runs, so
++    process_weights_after_loading reaches process_fp8_weight_tensor_strategy
++    with the create_weights sentinel scales (float32 lowest) and the layer
++    serves garbage. Here the BF16 weight is quantized explicitly (dynamic
++    per-tensor scale) and handed to the scaled-mm kernel directly.
++    """
++
++    _cls = None
++
++    @classmethod
++    def build(cls):
++        if cls._cls is None:
++            from vllm.model_executor.layers.quantization.fp8 import (
++                Fp8Config,
++                Fp8LinearMethod,
++            )
++            from vllm.model_executor.utils import replace_parameter
++
++            class OnlineFp8LinearMethod(Fp8LinearMethod):
++                def process_weights_after_loading(self, layer) -> None:
++                    w = layer.weight
++                    if w.dtype == torch.float8_e4m3fn:
++                        return super().process_weights_after_loading(layer)
++                    from vllm import _custom_ops as ops
++                    qw, ws = ops.scaled_fp8_quant(
++                        w.to(torch.bfloat16), scale=None)
++                    replace_parameter(layer, "weight", qw.t())
++                    replace_parameter(layer, "weight_scale",
++                                      ws.reshape(1).to(torch.float32))
++                    layer.input_scale = None
++                    self.fp8_linear.process_weights_after_loading(layer)
++
++            cls._cls = OnlineFp8LinearMethod
++        from vllm.model_executor.layers.quantization.fp8 import Fp8Config
++        return cls._cls(Fp8Config(is_checkpoint_fp8_serialized=False,
++                                  activation_scheme="dynamic"))
++
++
+ class ModelOptQuantConfigBase(QuantizationConfig):
+     LinearMethodCls: type = LinearMethodBase
+     FusedMoEMethodCls: type = FusedMoEMethodBase
+@@ -188,6 +275,9 @@ class ModelOptQuantConfigBase(QuantizationConfig):
+ 
+         # handle exclusion
+         if self.is_layer_excluded(prefix):
++            dense_fp8 = _maybe_dense_fp8_method(prefix, layer)
++            if dense_fp8 is not None:
++                return dense_fp8
+             if isinstance(layer, (LinearBase, ParallelLMHead)):
+                 return UnquantizedLinearMethod()
+             return None
+@@ -1421,6 +1511,12 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          self,
          routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
      ) -> mk.FusedMoEPrepareAndFinalizeModular | None:
@@ -1030,7 +1172,7 @@ index d51a2dd31..f4fa6a809 100644
          raise ValueError(
              f"{self.__class__.__name__} uses the new modular kernel initialization "
              "logic. This function should not be called."
-@@ -1548,10 +1554,40 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1548,10 +1644,40 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          )
          layer.register_parameter("w2_input_scale", w2_input_scale)
  
@@ -1071,7 +1213,7 @@ index d51a2dd31..f4fa6a809 100644
  
          # Use a single gscale for w13.
          if self.moe.is_act_and_mul and not torch.allclose(
-@@ -1655,6 +1691,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
+@@ -1655,6 +1781,19 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -1091,6 +1233,16 @@ index d51a2dd31..f4fa6a809 100644
          assert not self.is_monolithic
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
+@@ -2473,6 +2612,9 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfigBase):
+ 
+         # Excluded layers
+         if self.is_layer_excluded(prefix):
++            dense_fp8 = _maybe_dense_fp8_method(prefix, layer)
++            if dense_fp8 is not None:
++                return dense_fp8
+             if isinstance(layer, (LinearBase, ParallelLMHead)):
+                 return UnquantizedLinearMethod()
+             return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
 index 1b2a8a74b..3afdb16fd 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
@@ -1170,10 +1322,10 @@ index 32a2d8689..3e83d5a87 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..3ca45853b
+index 000000000..631549c0e
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1121 @@
+@@ -0,0 +1,1171 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1273,14 +1425,21 @@ index 000000000..3ca45853b
 +@functools.cache
 +def _layer_cutoff() -> int:
 +    """Main-stack layer count: layers >= this are the MTP drafter. Taken from
-+    the model config when available (43 for DS4-Flash, 78 for GLM-5.2);
-+    VLLM_MOE_W2_NUM_LAYERS overrides."""
++    the model config when available (43 for DS4-Flash, 78 for GLM-5.2, 61 for
++    Kimi-K2.7); VLLM_MOE_W2_NUM_LAYERS overrides.
++
++    get_text_config() unwraps composite VLM configs (KimiK25Config keeps
++    num_hidden_layers on .text_config; a bare hf_config lookup would raise
++    and silently fall back to 43, sending layers 43+ down the stock path);
++    for text-only configs it returns self."""
 +    v = os.getenv("VLLM_MOE_W2_NUM_LAYERS")
 +    if v is not None:
 +        return int(v)
 +    try:
 +        from vllm.config import get_current_vllm_config
-+        n = get_current_vllm_config().model_config.hf_config.num_hidden_layers
++        cfg = get_current_vllm_config().model_config.hf_config
++        cfg = cfg.get_text_config()
++        n = cfg.num_hidden_layers
 +        if n:
 +            return int(n)
 +    except Exception:  # noqa: BLE001
@@ -1338,11 +1497,11 @@ index 000000000..3ca45853b
 +        for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
 +                           ("w2mc2", b"moe_w2_mm"), ("w2mc4", b"moe_w2_mm")):
 +            # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
-+            # 6144 GLM-5.x); down needs K=I/TP (2048 @ TP1, 1024 @ TP2,
-+            # 512 @ TP4). Cubins are loaded opportunistically -- the plane
-+            # builders assert the shapes the model actually needs are present
-+            # (_assert_kernels fails loudly at weight load).
-+            for k in (6144, 4096, 2048, 1024, 512):
++            # 6144 GLM-5.x, 7168 Kimi-K2.x); down needs K=I/TP (2048 @ TP1,
++            # 1024 @ TP2, 512 @ TP4). Cubins are loaded opportunistically --
++            # the plane builders assert the shapes the model actually needs
++            # are present (_assert_kernels fails loudly at weight load).
++            for k in (7168, 6144, 4096, 2048, 1024, 512):
 +                if tier in ("w2mc2", "w2mc4"):
 +                    fname = f"moe_w2_mm_{tier[2:]}_k{k}.cubin"
 +                else:
@@ -1360,7 +1519,7 @@ index 000000000..3ca45853b
 +        global _afrag_ok
 +        if _AFRAG:
 +            try:
-+                for k in (6144, 4096, 2048, 1024, 512):
++                for k in (7168, 6144, 4096, 2048, 1024, 512):
 +                    path = os.path.join(_DIR, f"moe_w2_mm_mc4afrag_k{k}.cubin")
 +                    if not os.path.exists(path):
 +                        continue
@@ -1662,12 +1821,42 @@ index 000000000..3ca45853b
 +                          "w2_weight_scale")):
 +        return
 +
++    # Planes cache (VLLM_MOE_W2_PLANES_CACHE): the requant below is
++    # deterministic given (checkpoint, TP layout, zero mode), so cached
++    # planes can be streamed back instead of rebuilt (~9 min saved on
++    # Kimi-K2.7 restarts). Complements the pack store's boot-from-pack
++    # above: the cache serves GPU-RESIDENT plane configs (planes must be
++    # materialized), the pack store serves host-resident tiers (planes
++    # never materialize). CPU tensors from the cache feed the same
++    # _stage_fp4_host/_finish_layer sinks (their copy_ calls are
++    # device-agnostic).
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_planes_cache as planes_cache)
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
++    if planes_cache.enabled() and lidx is not None:
++        cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
++            E, N13, K13, N2, K2, want_fp4=tier is not None))
++        if cached is not None:
++            planes13 = cached["planes13"].view(E, -1).to(dev)
++            sc13 = cached["sc13"].view(E, -1).to(dev)
++            planes2 = cached["planes2"].view(E, -1).to(dev)
++            sc2 = cached["sc2"].view(E, -1).to(dev)
++            if tier is not None:
++                _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
++                                sc13, cached["fp2"].view(E, -1), sc2)
++            _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
++                          sc2, N13, K13, N2, K2, E,
++                          ("w13_weight", "w13_weight_scale", "w2_weight",
++                           "w2_weight_scale"))
++            logger.info("moe_w2: layer %d planes from cache", lidx)
++            return
++
 +    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
 +    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
 +    planes2 = torch.empty(E, N2 * K2 // 4, dtype=torch.uint8, device=dev)
 +    sc2 = torch.empty(E, N2 * K2 // 32, dtype=torch.uint8, device=dev)
 +
-+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
 +        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
@@ -1702,6 +1891,11 @@ index 000000000..3ca45853b
 +            sc2[e0 + i] = pack_scales(sbytes)
 +            if fp2 is not None:
 +                fp2[e0 + i] = pack_fp4_fragment_major(nib)
++
++    if planes_cache.enabled() and lidx is not None:
++        planes_cache.store(lidx, dict(planes13=planes13, sc13=sc13,
++                                      planes2=planes2, sc2=sc2,
++                                      fp13=fp13, fp2=fp2))
 +
 +    if tier is not None:
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -1770,7 +1964,7 @@ index 000000000..3ca45853b
 +# --------------------------------------------------------------------------
 +
 +def _workspaces(slots: int, tokens: int, dev, inter: int = 2048,
-+                hidden: int = 4096) -> dict:
++                hidden: int = 4096, n_experts: int = 256) -> dict:
 +    # `inter` = per-rank expert intermediate size I (2048 on 1 GPU; 1024 @ TP2,
 +    # 512 @ TP4 as the experts shard). The hidden H (4096 DS4, 6144 GLM-5.x) is
 +    # NOT sharded, so the A-side (a1), x-quant (xq) and w2 output (c2) buffers
@@ -1778,14 +1972,17 @@ index 000000000..3ca45853b
 +    # activation (act/a2 = I) and its group-128 scales (as2 = I/128) follow the
 +    # shard.
 +    if (_WS.get("slots", 0) < slots or _WS.get("tokens", 0) < tokens
-+            or _WS.get("inter") != inter or _WS.get("hidden") != hidden):
++            or _WS.get("inter") != inter or _WS.get("hidden") != hidden
++            or _WS.get("n_experts", 0) < n_experts):
 +        slots = max(slots, _WS.get("slots", 0))
 +        tokens = max(tokens, _WS.get("tokens", 0))
++        n_experts = max(n_experts, _WS.get("n_experts", 0))
 +        _WS.update(
 +            slots=slots,
 +            tokens=tokens,
 +            inter=inter,
 +            hidden=hidden,
++            n_experts=n_experts,
 +            # token-side quant buffers; the LAST row is the permanent zero
 +            # pad row (gather source for filler slots) — quant only ever
 +            # writes rows [:T].
@@ -1811,7 +2008,11 @@ index 000000000..3ca45853b
 +                           device=dev),
 +            desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64,
 +                             device=dev),
-+            no_slots=torch.full((256,), -1, dtype=torch.int32, device=dev),
++            # -1 slot row for the tier-less desc path; sized to the MODEL's
++            # expert count (256 = DS4 default; 384 Kimi-K2.x reads past a
++            # fixed 256-row table).
++            no_slots=torch.full((max(n_experts, 256),), -1,
++                                dtype=torch.int32, device=dev),
 +        )
 +        if _afrag_ok:
 +            # AFRAG destination buffers: the triton repack streams row-major
@@ -2086,7 +2287,8 @@ index 000000000..3ca45853b
 +    # st["K2"] = per-rank expert intermediate I (w2 contraction), st["K13"] =
 +    # hidden H (w13 contraction) -> size the workspaces for the model's shapes
 +    # (and correctly under tensor parallelism).
-+    ws = _workspaces(slots, T, dev, inter=st["K2"], hidden=st["K13"])
++    ws = _workspaces(slots, T, dev, inter=st["K2"], hidden=st["K13"],
++                     n_experts=st["E"])
 +
 +    # ---- activation quant (group-128) into the padded buffer; the buffer's
 +    # last row is the permanent zero pad row for filler slots.
@@ -3779,10 +3981,10 @@ index 000000000..8891cf5fd
 +                fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 000000000..698df163f
+index 000000000..da9d22e2d
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
-@@ -0,0 +1,225 @@
+@@ -0,0 +1,253 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
@@ -3901,6 +4103,19 @@ index 000000000..698df163f
 +    per-block-32 UE8M0 scale along K -> e2m1 snap -> tensor-sym {-4,-1,1,4}
 +    via _NIBBLE_TO_CODE. Load-time-only f64 math so midpoint comparisons and
 +    tie-breaks match the numpy prototype the sweep validated exactly.
++
++    ZERO-SIGN BALANCING (Kimi-K2.7-NVFP4 finding): the tensor-sym codebook
++    has no zero level, so exact zeros map to +-1 by their SIGN BIT. That is
++    unbiased only while +0/-0 are balanced (GLM/DS4 checkpoints are). The
++    modelopt INT4->BF16->NVFP4 Kimi-K2.7 export writes ALL zeros as +0
++    (~13.3% of expert mass) -> sign-preserving mapping would inject a +0.134
++    unit-space bias per tensor, 3x the asym-codebook bias that degenerates
++    GLM (tools/sweep_nvfp4_codebook.py reproduces both numbers). When a
++    tensor's exact zeros are one-signed (>95%), assign them +-1 ALTERNATING
++    by k-position parity instead: net bias ~0 (block-local cancellation),
++    identical L2 (|err| = 1 unit either way), deterministic. Balanced-zero
++    checkpoints keep the validated sign-preserving map bit-exactly.
++    VLLM_MOE_W2_ZERO_MODE={auto,sign,alt} overrides (default auto).
 +    """
 +    assert w.dtype == torch.float64
 +    N, K = w.shape
@@ -3919,6 +4134,21 @@ index 000000000..698df163f
 +    mag = torch.bucketize(u.abs().reshape(N, K),
 +                          _E2M1_MID.to(w.device)).to(torch.uint8)
 +    neg = torch.signbit(u).reshape(N, K)
++
++    import os
++    zero_mode = os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto")
++    if zero_mode != "sign":
++        zero = (u == 0.0).reshape(N, K)
++        nz = int(zero.sum())
++        if nz:
++            nneg = int(neg[zero].sum())
++            one_signed = min(nneg, nz - nneg) < 0.05 * nz
++            if zero_mode == "alt" or (zero_mode == "auto" and one_signed):
++                # k-position parity: deterministic, block-local ~balance
++                parity = (torch.arange(K, device=w.device, dtype=torch.uint8)
++                          & 1).view(1, K).expand(N, K)
++                neg = torch.where(zero, parity.bool(), neg)
++
 +    nibbles = mag | (neg.to(torch.uint8) << 3)
 +    codes = _NIBBLE_TO_CODE.to(w.device)[nibbles.long()]
 +    return codes, scale_bytes, (nibbles if want_nibbles else None)
@@ -4008,12 +4238,217 @@ index 000000000..698df163f
 +    vals = levels[codes.long()]
 +    s = torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)
 +    return vals * s
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
+new file mode 100644
+index 000000000..4834c6010
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
+@@ -0,0 +1,199 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Disk cache for built 2-bit expert planes (+ optional FP4 delta planes).
++
++The load-time requant (f64 dequant -> sign-symmetric 2-bit -> fragment-major
++pack) costs ~9 min per restart on Kimi-K2.7 (23,040 expert-layer pairs).
++The result is deterministic given (checkpoint, TP layout, zero mode,
++codebook), so it is cached to disk after the first build and streamed back
++on later restarts, skipping the requant entirely.
++
++Opt-in via VLLM_MOE_W2_PLANES_CACHE=<dir>. Layout:
++
++  <dir>/tp{W}-rank{R}/meta.json          # cache key for this rank
++  <dir>/tp{W}-rank{R}/layer{L}.<part>.bin  # raw u8 tensors
++
++Parts per layer: planes13, sc13, planes2, sc2 and, when the FP4 delta tier
++was enabled at build time, fp13, fp2. A layer HITS when meta matches and
++every required part exists with the exact expected size (computed from the
++layer's weight shapes); anything else is a MISS for that layer and it
++rebuilds (and rewrites) from the checkpoint as before. Writes go through a
++background thread (tmp file + atomic rename), are best-effort, and never
++fail the load. Note the vLLM weight loader still reads the checkpoint
++shards on a hit — only the requant is skipped (loader-level skip is a
++possible follow-up).
++
++Sizes (Kimi-K2.7 @ TP4): 2-bit ~70 GiB/rank, FP4 ~126 GiB/rank.
++"""
++
++import hashlib
++import json
++import os
++import queue
++import re
++import threading
++
++import numpy as np
++import torch
++
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
++_VERSION = "tsym4-fragmajor-v1"
++_PARTS_2BIT = ("planes13", "sc13", "planes2", "sc2")
++_PARTS_FP4 = ("fp13", "fp2")
++
++_meta_written = False
++_writer: "queue.Queue[tuple[str, torch.Tensor] | None] | None" = None
++_broken = False
++
++
++def enabled() -> bool:
++    return bool(os.getenv("VLLM_MOE_W2_PLANES_CACHE"))
++
++
++def layer_idx_from_name(layer_name: str) -> int | None:
++    m = re.search(r"\.layers\.(\d+)\.", layer_name or "")
++    return int(m.group(1)) if m else None
++
++
++def _tp_ids() -> tuple[int, int]:
++    from vllm.distributed.parallel_state import (
++        get_tensor_model_parallel_rank,
++        get_tensor_model_parallel_world_size,
++    )
++    return get_tensor_model_parallel_world_size(), \
++        get_tensor_model_parallel_rank()
++
++
++def _ckpt_id() -> str:
++    """Identity of the checkpoint the planes derive from: model path +
++    sha1 of the safetensors index (covers shard layout and tensor set)."""
++    from vllm.config import get_current_vllm_config
++    model = get_current_vllm_config().model_config.model
++    h = hashlib.sha1(model.encode())
++    idx = os.path.join(model, "model.safetensors.index.json")
++    if os.path.exists(idx):
++        with open(idx, "rb") as f:
++            h.update(f.read())
++    return h.hexdigest()
++
++
++def _meta() -> dict:
++    world, rank = _tp_ids()
++    return dict(
++        version=_VERSION,
++        ckpt_id=_ckpt_id(),
++        world=world,
++        rank=rank,
++        zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
++    )
++
++
++def _rank_dir() -> str:
++    world, rank = _tp_ids()
++    return os.path.join(os.environ["VLLM_MOE_W2_PLANES_CACHE"],
++                        f"tp{world}-rank{rank}")
++
++
++def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
++                   want_fp4: bool) -> dict[str, int]:
++    exp = {
++        "planes13": E * N13 * K13 // 4,
++        "sc13": E * N13 * K13 // 32,
++        "planes2": E * N2 * K2 // 4,
++        "sc2": E * N2 * K2 // 32,
++    }
++    if want_fp4:
++        exp["fp13"] = E * N13 * K13 // 2
++        exp["fp2"] = E * N2 * K2 // 2
++    return exp
++
++
++def try_load(layer_idx: int,
++             sizes: dict[str, int]) -> dict[str, torch.Tensor] | None:
++    """CPU u8 tensors for a cached layer, or None (miss). Never raises."""
++    if not enabled() or _broken:
++        return None
++    try:
++        d = _rank_dir()
++        mp = os.path.join(d, "meta.json")
++        if not os.path.exists(mp):
++            return None
++        if json.load(open(mp)) != _meta():
++            _mark_broken(f"meta mismatch in {d} (stale cache?) — rebuilding")
++            return None
++        out = {}
++        for part, nbytes in sizes.items():
++            p = os.path.join(d, f"layer{layer_idx}.{part}.bin")
++            if not os.path.exists(p):
++                logger.info("moe_w2 planes cache: MISS layer %d (%s absent)",
++                            layer_idx, part)
++                return None
++            if os.path.getsize(p) != nbytes:
++                logger.info(
++                    "moe_w2 planes cache: MISS layer %d (%s size %d != %d)",
++                    layer_idx, part, os.path.getsize(p), nbytes)
++                return None
++            out[part] = torch.from_numpy(np.fromfile(p, dtype=np.uint8))
++        return out
++    except Exception as e:  # noqa: BLE001
++        logger.warning("moe_w2 planes cache: read failed (%s) — rebuilding",
++                       e)
++        return None
++
++
++def _mark_broken(msg: str) -> None:
++    global _broken
++    if not _broken:
++        _broken = True
++        logger.warning("moe_w2 planes cache: %s", msg)
++
++
++def _writer_loop() -> None:
++    while True:
++        item = _writer.get()
++        if item is None:
++            return
++        path, cpu = item
++        try:
++            tmp = path + ".tmp"
++            cpu.numpy().tofile(tmp)
++            os.replace(tmp, path)
++        except Exception as e:  # noqa: BLE001
++            _mark_broken(f"write failed for {path}: {e}")
++
++
++def store(layer_idx: int, tensors: dict[str, torch.Tensor]) -> None:
++    """Queue a built layer's planes for background writing. Never raises;
++    tensors may live on GPU (copied to CPU here, synchronously)."""
++    global _meta_written, _writer
++    if not enabled() or _broken:
++        return
++    try:
++        d = _rank_dir()
++        os.makedirs(d, exist_ok=True)
++        if not _meta_written:
++            mp = os.path.join(d, "meta.json")
++            if os.path.exists(mp) and json.load(open(mp)) != _meta():
++                # stale cache from another checkpoint/config: start over
++                for f in os.listdir(d):
++                    os.unlink(os.path.join(d, f))
++            with open(mp + ".tmp", "w") as f:
++                json.dump(_meta(), f)
++            os.replace(mp + ".tmp", mp)
++            _meta_written = True
++        if _writer is None:
++            # maxsize bounds the transient host copies (~3 GiB at Kimi TP4
++            # layer sizes) and back-pressures the build if the disk lags.
++            _writer = queue.Queue(maxsize=2)
++            threading.Thread(target=_writer_loop, daemon=True,
++                             name="moe-w2-planes-cache").start()
++        for part, t in tensors.items():
++            if t is None:
++                continue
++            path = os.path.join(d, f"layer{layer_idx}.{part}.bin")
++            _writer.put((path, t.detach().reshape(-1).cpu()))
++    except Exception as e:  # noqa: BLE001
++        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 000000000..32d8ed0df
+index 000000000..41a5a0535
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,629 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Host-side expert stores for the 2-bit MoE tiers (moe_w2_delta.DeltaTier).
@@ -4606,6 +5041,13 @@ index 000000000..32d8ed0df
 +    (plus a pinned arena for the BASE tier when VLLM_MOE_W2_BASE_RAM_GB
 +    is set), else the classic pinned/pageable host store. Env read at call
 +    time so tests can toggle backends without reimporting the module."""
++    if os.getenv("VLLM_MOE_W2_BASE_NVME_RATIO", "").strip():
++        logger.error(
++            "VLLM_MOE_W2_BASE_NVME_RATIO (the RAM:NVMe interleaved-split "
++            "experiment, moe_w2_nvme) is superseded by the pack store and "
++            "IGNORED. Equivalent config: VLLM_MOE_W2_STORE_DIR=<dir> + "
++            "VLLM_MOE_W2_BASE_RAM_GB=<pinned GiB> (the arena fraction is "
++            "the RAM share; it also persists quantization across boots).")
 +    dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
 +    if not dir_:
 +        return PinnedHostStore(slot_bytes, pinned=pinned)
@@ -6582,6 +7024,48 @@ index 000000000..931614177
 +        return max(1, int(raw_value))
 +    except ValueError:
 +        return 8192
+diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
+index cf4338fb1..f0577501e 100644
+--- a/vllm/v1/attention/ops/merge_attn_states.py
++++ b/vllm/v1/attention/ops/merge_attn_states.py
+@@ -46,6 +46,19 @@ def merge_attn_states(
+             When provided, output must be FP8 dtype.
+     """
+ 
++    # Both the CUDA and Triton kernels index prefix_output AND suffix_output
++    # with a single shared head stride taken from prefix_output.stride(1).
++    # The MLA chunked-context path violates that assumption: FA2 chunk
++    # outputs are unpadded slices of padded buffers (head stride 192 for a
++    # 128-wide head), while the merged intermediate from a previous
++    # merge_attn_states call is allocated contiguous (head stride 128). With
++    # mismatched strides the suffix is read at the wrong offsets and the
++    # merged output is corrupt. Normalize to a common layout first; this is
++    # a no-op copy-wise unless the strides actually differ.
++    if prefix_output.stride() != suffix_output.stride():
++        prefix_output = prefix_output.contiguous()
++        suffix_output = suffix_output.contiguous()
++
+     # NOTE(DefTruth): Currently, custom merge_attn_states CUDA kernel
+     # does not support FP8 dtype for inputs, fallback to use Triton kernel.
+     # However, when output_scale is provided, the inputs are still BF16/FP16
+diff --git a/vllm/v1/attention/ops/triton_decode_attention.py b/vllm/v1/attention/ops/triton_decode_attention.py
+index dbe3c5705..f12d719fb 100644
+--- a/vllm/v1/attention/ops/triton_decode_attention.py
++++ b/vllm/v1/attention/ops/triton_decode_attention.py
+@@ -530,6 +530,13 @@ def _decode_grouped_att_m_fwd(
+         # like non-MLA D_QK=576, BLOCK_DMODEL=1024, BLOCK_H=16
+         # exceeds 101376 bytes limit
+         num_stages = 1
++    elif (not is_hip_ and BLOCK_DMODEL + BLOCK_DPE >= 576
++          and torch.cuda.get_device_capability()[0] == 12):
++        # SM12x (consumer Blackwell) has 99 KiB smem/block; the MLA 512+64
++        # tile at num_stages=2 needs 100 KiB (102400 > 101376) -> same
++        # single-stage fallback as the BLOCK_DMODEL>=1024 case above.
++        # Hit by dense-MLA models (DeepSeek-V3 dims: Kimi-K2.x) on SM120.
++        num_stages = 1
+ 
+     _fwd_grouped_kernel_stage1[grid](
+         q,
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
 index 5a2a5c5e2..33c628e8e 100644
 --- a/vllm/v1/kv_cache_interface.py

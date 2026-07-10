@@ -1,0 +1,56 @@
+# GLM-5.2 (753B) TP4 with MTP - the fast config (105 tok/s class).
+id: glm-5.2-nvfp4/pro6000x4-tp4-mtp
+model: GLM-5.2-NVFP4
+served_name: glm-5.2
+summary: "4x RTX PRO 6000 TP4 - 2-bit base + MTP k=2, 128K window"
+
+requires:
+  gpus: 4
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 3600
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "0"     # bare 2-bit base; the quality tier is the -quality variant
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 4
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.93
+  - --max-num-batched-tokens 1024
+  - --max-num-seqs 4
+  - --no-scheduler-reserve-full-isl
+  - --tool-call-parser glm47
+  - --reasoning-parser glm45
+  - --speculative-config {"method":"mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  batch_decode:
+    concurrency: [1, 4]         # mns 4 in this config
+  needle:
+    sizes_words: [8000, 48000, 100000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["needle.all_pass", "arithmetic.score>=2"]
+  axes:
+    - kind: serve_json
+      arg: --speculative-config
+      key: num_speculative_tokens
+      values: [1, 2, 3]
+      restart: true
+
+notes: |
+  Serve flags reconstructed from README/docs (the 2026-07-09 runs predate the
+  harness); verify against the next live run. --kv-cache-dtype nvfp4 is the
+  +38% KV pool variant (415K->571K tokens at decode parity) - worth its own
+  recipe once re-validated on the release candidate.

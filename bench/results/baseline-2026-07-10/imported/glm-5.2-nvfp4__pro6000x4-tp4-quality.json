@@ -1,0 +1,22 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "glm-5.2-nvfp4/pro6000x4-tp4-quality",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "README.md GLM section (2026-07-09)",
+ "summary": "4x RTX PRO 6000 TP4 - + FP4 delta (auto) + confidence gate tau=0.60",
+ "context": 131072,
+ "probes": {
+  "decode": {
+   "median_tok_s": 84,
+   "min_tok_s": 83,
+   "max_tok_s": 85,
+   "spread_pct": 2.4,
+   "max_tokens": 512
+  }
+ },
+ "notes": "The quality tier: FP4 re-decides low-confidence steps; recovers numeric-heavy quality at 83-85 tok/s."
+}

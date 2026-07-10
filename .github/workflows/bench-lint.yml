@@ -1,0 +1,48 @@
+# Bookkeeping CI for the bench system. GPU runs are operator-driven
+# (bench/README.md); this workflow only guarantees the data is well-formed
+# and the README/report never drift from the committed results.
+name: bench-lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "bench/**"
+      - "docker/**"
+      - "Dockerfile.recipes"
+      - "README.md"
+      - "docs/benchmarks/**"
+      - ".github/workflows/bench-lint.yml"
+
+jobs:
+  lint-and-render-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyyaml
+      - name: Lint recipes, boxes, suites, matrix, results
+        run: python3 bench/runner/lint.py
+      - name: Verify README table + report match committed results
+        run: python3 bench/runner/render.py --check
+      - name: Smoke the recipe launcher (--list + --print on every recipe)
+        env:
+          VLLM_MOET_HOME: bench
+          MODELS_DIR: /tmp/models
+          SKIP_GPU_CHECK: "1"
+        run: |
+          python3 docker/serve_recipe.py --list
+          for r in $(python3 - <<'EOF'
+          import os
+          for m in sorted(os.listdir("bench/recipes")):
+              for f in sorted(os.listdir(f"bench/recipes/{m}")):
+                  if f.endswith(".yaml"):
+                      print(f"{m}/{f[:-5]}")
+          EOF
+          ); do
+            echo "== $r"
+            python3 docker/serve_recipe.py "$r" --print
+          done

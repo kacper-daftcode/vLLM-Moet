@@ -21,11 +21,15 @@ Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sas
 | `moe_w2_mm_k6144.cubin` | `moe_w2_mm_k6144.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
 | `moe_w2_mm_mc2_k6144.cubin` | `moe_w2_mm_mc2_k6144.sass` | `moe_w2_mm` | MC=2 (prefill), K=6144 |
 | `moe_w2_mm_mc4_k6144.cubin` | `moe_w2_mm_mc4_k6144.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 |
+| `moe_w2_mm_k7168.cubin` | `moe_w2_mm_k7168.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
+| `moe_w2_mm_mc2_k7168.cubin` | `moe_w2_mm_mc2_k7168.sass` | `moe_w2_mm` | MC=2 (prefill), K=7168 |
+| `moe_w2_mm_mc4_k7168.cubin` | `moe_w2_mm_mc4_k7168.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 |
 | `moe_w2_mm_mc4afrag_k4096.cubin` | `moe_w2_mm_mc4afrag_k4096.sass` | `moe_w2_mm` | **AFRAG** (prefill, fragment‑major A), K=4096 |
 | `moe_w2_mm_mc4afrag_k2048.cubin` | `moe_w2_mm_mc4afrag_k2048.sass` | `moe_w2_mm` | AFRAG (prefill), K=2048 |
 | `moe_w2_mm_mc4afrag_k1024.cubin` | `moe_w2_mm_mc4afrag_k1024.sass` | `moe_w2_mm` | AFRAG (prefill), K=1024 (TP2) |
 | `moe_w2_mm_mc4afrag_k512.cubin` | `moe_w2_mm_mc4afrag_k512.sass` | `moe_w2_mm` | AFRAG (prefill), K=512 (TP4), NWARP=4 |
 | `moe_w2_mm_mc4afrag_k6144.cubin` | `moe_w2_mm_mc4afrag_k6144.sass` | `moe_w2_mm` | AFRAG (prefill), K=6144 (GLM‑5.x) |
+| `moe_w2_mm_mc4afrag_k7168.cubin` | `moe_w2_mm_mc4afrag_k7168.sass` | `moe_w2_mm` | AFRAG (prefill), K=7168 (Kimi‑K2.x) |
 
 2‑bit planes = sign‑symmetric `{−4,−1,1,4}` + UE8M0 block‑32 scales; PRMT‑LUT in‑register
 decode → `QMMA.SF` tensor‑core. Regcount 64 → 4 CTA/SM.
@@ -58,6 +62,7 @@ by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, determi
 | `moe_w4_mm_k1024.cubin` | `moe_w4_mm_k1024.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=1024** (w2 under TP2) |
 | `moe_w4_mm_k512.cubin` | `moe_w4_mm_k512.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=512** (w2 under TP4), NWARP=4 |
 | `moe_w4_mm_k6144.cubin` | `moe_w4_mm_k6144.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
+| `moe_w4_mm_k7168.cubin` | `moe_w4_mm_k7168.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
 | `moe_w4_mm_k8192.cubin` | `moe_w4_mm_k8192.sass` | `moe_w4_mm` | FP4 GEMM, **K=8192** (dense wo_b — dense‑FP4 PoC, pairs=1 desc) |
 
 ## Sparse‑MLA prefill (SM120)

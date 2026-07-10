@@ -1,0 +1,50 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "deepseek-v4-flash/5090x4-tp4",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "README.md + docs/v024-port.md (2026-07-08/09)",
+ "summary": "4x RTX 5090 TP4 - consumer-card throughput",
+ "context": 16384,
+ "probes": {
+  "decode": {
+   "median_tok_s": 214.4,
+   "max_tokens": 512
+  },
+  "prefill": {
+   "words": 8000,
+   "median_tok_s": 6101
+  },
+  "batch_decode": {
+   "levels": {
+    "1": {
+     "aggregate_tok_s": 198,
+     "per_stream_tok_s": 198
+    },
+    "4": {
+     "aggregate_tok_s": 460,
+     "per_stream_tok_s": 115
+    },
+    "8": {
+     "aggregate_tok_s": 762,
+     "per_stream_tok_s": 95.3
+    },
+    "16": {
+     "aggregate_tok_s": 1006,
+     "per_stream_tok_s": 62.9
+    },
+    "32": {
+     "aggregate_tok_s": 1560,
+     "per_stream_tok_s": 48.8
+    }
+   },
+   "max_tokens": 384
+  }
+ },
+ "server_metrics": {
+  "spec_acceptance_length": 2.6
+ }
+}

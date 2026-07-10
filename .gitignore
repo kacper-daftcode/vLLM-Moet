@@ -14,3 +14,6 @@ internal/
 
 # local artifacts (wheels kept out of git)
 patch/*.whl
+
+# bench: smoke-test results are transient (real releases are committed)
+bench/results/smoke/

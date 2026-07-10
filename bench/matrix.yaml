@@ -1,0 +1,48 @@
+# The release matrix: every supported (model, config) claim and where it runs.
+#
+# blocking: true  -> lint.py --release fails if this entry has no result for the
+#                    release (on at least one capable box). These are the
+#                    configurations the README advertises.
+# retune: true    -> flag for the operator: run sweep.py for this entry before
+#                    the headline bench (knobs likely stale for this release).
+#
+# current_release is set at step 1 of the release process (bench/README.md);
+# render.py uses it (and previous_release for the regression column).
+
+# baseline-2026-07-10 holds the pre-harness numbers imported from README/docs
+# history (provenance: imported); the first harness-driven release re-measures
+# everything live and sets previous_release to the baseline.
+current_release: baseline-2026-07-10
+previous_release: null
+regression_threshold_pct: 5
+
+entries:
+  # --- DeepSeek-V4-Flash (159B) ---------------------------------------------
+  - recipe: deepseek-v4-flash/pro6000x1-24k
+    blocking: true             # the README headline row (161 tok/s class)
+  - recipe: deepseek-v4-flash/pro6000x1-512k
+    blocking: true             # the "512K on one card" claim
+  - recipe: deepseek-v4-flash/pro6000x2-tp2
+    blocking: false            # covered historically; re-block when a 2-card box is standing
+  - recipe: deepseek-v4-flash/5090x4-tp4
+    blocking: false            # needs the 4x5090 box
+  - recipe: deepseek-v4-flash/5090x1-basecache
+    blocking: false            # capacity-unlock claim; re-run on the 5090 box
+
+  # --- GLM-5.2 (753B) ---------------------------------------------------------
+  - recipe: glm-5.2-nvfp4/pro6000x4-tp4-mtp
+    blocking: true
+  - recipe: glm-5.2-nvfp4/pro6000x4-tp4-quality
+    blocking: false            # the delta+gate quality tier; numbers move with tau
+    retune: true
+  - recipe: glm-5.2-nvfp4/pro6000x2-basecache
+    blocking: true             # the "753B on two cards" claim
+
+  # --- Kimi-K2.7-Code (1T) ----------------------------------------------------
+  - recipe: kimi-k2.7-code-nvfp4/pro6000x4-tp4-256k
+    blocking: true
+  - recipe: kimi-k2.7-code-nvfp4/pro6000x4-tp4-eagle3
+    blocking: false            # +12% median but 38-63 tok/s variance; keep observational
+    retune: true
+  - recipe: kimi-k2.7-code-nvfp4/pro6000x2-basecache
+    blocking: false            # functional, pool still converging; promote once warm numbers stand

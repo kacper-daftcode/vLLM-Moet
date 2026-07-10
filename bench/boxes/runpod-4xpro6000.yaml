@@ -1,0 +1,39 @@
+# RunPod box: 4x RTX PRO 6000 Blackwell Server 96 GB, ~1.5 TB RAM, EPYC.
+# Host quirks live HERE so recipes stay portable across boxes.
+
+id: runpod-4xpro6000
+gpus:
+  name: "RTX PRO 6000 Blackwell"
+  count: 4
+  vram_gb: 96
+host_ram_gb: 1511
+
+runtime: venv                       # venv | docker
+venv: /root/venv-moet
+# docker_image: vllm-moet-sm120:v024   # used when runtime: docker
+
+# Applied to every serve on this box, before the recipe's env.
+env:
+  NCCL_P2P_DISABLE: "1"             # this host: P2P silently corrupt (D2D copies garble); SHM transport
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_MOE_W2_CUBIT_DIR: /root/vLLM-Moet/kernels/cubins-sm120
+  # venv-only: flashinfer JIT arch detect needs a CUDA >=12.9 toolchain on PATH
+  # (the docker image ships nvcc; drop these four under runtime: docker).
+  FLASHINFER_CUDA_ARCH_LIST: "12.0f"
+  CUDA_HOME: /root/venv-moet/lib/python3.12/site-packages/nvidia/cu13
+  PATH_PREPEND: /root/venv-moet/lib/python3.12/site-packages/nvidia/cu13/bin
+  LD_LIBRARY_PATH_PREPEND: /root/venv-moet/lib/python3.12/site-packages/nvidia/cu13/lib
+
+# Local weight paths; a recipe whose model is not listed is skipped.
+models:
+  GLM-5.2-NVFP4: /root/models/GLM-5.2-NVFP4
+  Kimi-K2.7-Code-NVFP4: /root/models/Kimi-K2.7-Code-NVFP4
+  Kimi-K2.7-Code-eagle3: /root/models/Kimi-K2.7-Code-eagle3
+
+# Optional per-model planes caches (fast restarts; keyed safely, see
+# moe_w2_planes_cache.py). Referenced from recipes as {planes_cache}.
+planes_cache:
+  Kimi-K2.7-Code-NVFP4: /root/models/.planes-cache-kimi
+  GLM-5.2-NVFP4: /root/models/.planes-cache-glm
+
+log_dir: /root/logs/bench

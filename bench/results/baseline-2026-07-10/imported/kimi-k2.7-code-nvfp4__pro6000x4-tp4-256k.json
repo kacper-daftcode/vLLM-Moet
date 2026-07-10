@@ -1,0 +1,87 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "kimi-k2.7-code-nvfp4/pro6000x4-tp4-256k",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "docs/kimi-k27-code-plan.md section 0 (2026-07-10)",
+ "summary": "4x RTX PRO 6000 TP4 - GPU-resident 2-bit + FP4 delta, 256K window",
+ "context": 262144,
+ "probes": {
+  "decode": {
+   "median_tok_s": 51,
+   "max_tokens": 512
+  },
+  "prefill": {
+   "words": 8000,
+   "median_tok_s": 2448
+  },
+  "batch_decode": {
+   "levels": {
+    "1": {
+     "aggregate_tok_s": 52,
+     "per_stream_tok_s": 52
+    },
+    "4": {
+     "aggregate_tok_s": 149,
+     "per_stream_tok_s": 37.3
+    },
+    "8": {
+     "aggregate_tok_s": 222,
+     "per_stream_tok_s": 27.7
+    }
+   },
+   "max_tokens": 256
+  },
+  "needle": {
+   "cases": [
+    {
+     "prompt_tokens": 8000,
+     "depth": 0.5,
+     "pass": true
+    },
+    {
+     "prompt_tokens": 32000,
+     "depth": 0.5,
+     "pass": true
+    },
+    {
+     "prompt_tokens": 80000,
+     "depth": 0.5,
+     "pass": true
+    },
+    {
+     "prompt_tokens": 128000,
+     "depth": 0.5,
+     "pass": true,
+     "ttft_gen_s": 84.5
+    },
+    {
+     "prompt_tokens": 192000,
+     "depth": 0.5,
+     "pass": true
+    },
+    {
+     "prompt_tokens": 248000,
+     "depth": 0.5,
+     "pass": true,
+     "ttft_gen_s": 629
+    }
+   ],
+   "all_pass": true
+  },
+  "arithmetic": {
+   "score": 5,
+   "of": 5
+  },
+  "coherence": {
+   "degenerate": 0,
+   "of": 12,
+   "pass": true
+  }
+ },
+ "notes": "No MTP (checkpoint ships no drafter head). Needle 192K/248K are post-stride-fix with the default 64Ki chunked workspace; 248K reply drifts after the correct passphrase (YaRN edge). Load ~25 min cold, ~14.5 min on the planes cache. Tool-calling round trip (kimi_k2) PASS; generated code executes.",
+ "load_time_s": 1500
+}

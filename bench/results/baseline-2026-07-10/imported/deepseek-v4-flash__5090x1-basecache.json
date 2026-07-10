@@ -1,0 +1,22 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "deepseek-v4-flash/5090x1-basecache",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "README.md single-5090 section (2026-07-09/10)",
+ "summary": "1x RTX 5090 (32 GB) - host-resident 2-bit base, GPU as expert cache",
+ "context": 8192,
+ "probes": {
+  "decode": {
+   "median_tok_s": 38,
+   "max_tokens": 512
+  }
+ },
+ "notes": "~38 tok/s steady with MTP k=2 (~32 without), 10-24 tok/s while the working set shifts; 96% pool hit at 19% coverage; 72.7 GiB pinned host base.",
+ "server_metrics": {
+  "spec_acceptance_length": 2.83
+ }
+}

@@ -1,0 +1,62 @@
+# Kimi-K2.7-Code on 2 cards: host-resident 2-bit base + GPU expert cache.
+# Functional bring-up config (14.4 tok/s with the pool still converging);
+# blocking once warm numbers stand - see matrix.yaml.
+id: kimi-k2.7-code-nvfp4/pro6000x2-basecache
+model: Kimi-K2.7-Code-NVFP4
+served_name: kimi-k2.7-code
+summary: "2x RTX PRO 6000 TP2 - host-resident base, 52 GiB/rank cache (~39% coverage)"
+
+requires:
+  gpus: 2
+  vram_gb: 96
+  host_ram_gb: 384              # ~266 GiB pinned base + headroom
+
+context: 16384
+load_timeout_s: 3600
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_BASE_CACHE_GB: "52"
+  VLLM_MOE_W2_DELTA_GB: "0"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 16384
+  - --gpu-memory-utilization 0.93
+  - --max-num-batched-tokens 1024
+  - --max-num-seqs 4
+  - --no-scheduler-reserve-full-isl
+  - --enable-auto-tool-choice
+  - --tool-call-parser kimi_k2
+  - --reasoning-parser kimi_k2
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 16           # 384-expert routing: give the pool real traffic
+
+suite_params:
+  decode:
+    runs: 7
+  batch_decode:
+    concurrency: [1, 4]
+  needle:
+    sizes_words: [6000, 11000]
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["needle.all_pass", "coherence.pass"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_BASE_CACHE_GB
+      values: ["48", "52"]
+
+notes: |
+  Routing concentration at 384 experts top-8 is a different regime than
+  DS4/GLM - the 19%-coverage~=96%-hit heuristic must be re-established here
+  (docs/kimi-k27-code-plan.md P5). Pool hit-rate log lines are attached to
+  the result for exactly that.

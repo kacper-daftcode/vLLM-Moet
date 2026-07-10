@@ -1,0 +1,29 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "kimi-k2.7-code-nvfp4/pro6000x2-basecache",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "docs/kimi-k27-code-plan.md section 0 (2026-07-10)",
+ "summary": "2x RTX PRO 6000 TP2 - host-resident base, 52 GiB/rank cache (~39% coverage)",
+ "context": 16384,
+ "probes": {
+  "decode": {
+   "median_tok_s": 14.4,
+   "max_tokens": 512
+  },
+  "needle": {
+   "cases": [
+    {
+     "prompt_tokens": 8000,
+     "depth": 0.5,
+     "pass": true
+    }
+   ],
+   "all_pass": true
+  }
+ },
+ "notes": "Functional bring-up: pool still converging (miss replays); wants the planes cache + longer warm before real numbers. 384-expert routing concentration to be re-established (plan P5)."
+}

@@ -1,0 +1,35 @@
+{
+ "schema": 1,
+ "release": "baseline-2026-07-10",
+ "box": "imported",
+ "recipe": "deepseek-v4-flash/pro6000x2-tp2",
+ "suite": "standard",
+ "provenance": "imported",
+ "status": "ok",
+ "source": "README.md + docs/v024-port.md (2026-07-08)",
+ "summary": "2x RTX PRO 6000 TP2 - throughput",
+ "context": 24576,
+ "probes": {
+  "decode": {
+   "median_tok_s": 209.6,
+   "max_tokens": 512
+  },
+  "prefill": {
+   "words": 8000,
+   "median_tok_s": 5791
+  },
+  "batch_decode": {
+   "levels": {
+    "3": {
+     "aggregate_tok_s": 380,
+     "per_stream_tok_s": 126.7
+    }
+   },
+   "max_tokens": 384
+  }
+ },
+ "notes": "Prefill is PRE-AFRAG (TP2 was not re-measured after AFRAG shipped 2026-07-09); conservative. Batch level is the conc-3 aggregate from the 2026-07-08 table.",
+ "server_metrics": {
+  "spec_acceptance_length": 2.6
+ }
+}

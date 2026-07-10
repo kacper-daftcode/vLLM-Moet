@@ -30,10 +30,19 @@ ctx = " ".join(filler[:at]) + "\n\n" + needle + "\n\n" + " ".join(filler[at:])
 user = (ctx + "\n\nQuestion: What is the vault passphrase? "
         "Reply with ONLY the passphrase, nothing else.")
 
+import os
+MODEL = os.environ.get("BENCH_MODEL")
+if not MODEL:
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{PORT}/v1/models", timeout=30) as _r:
+        MODEL = json.load(_r)["data"][0]["id"]
 body = json.dumps({
-    "model": "deepseek-v4-flash",
+    "model": MODEL,
     "messages": [{"role": "user", "content": user}],
-    "max_tokens": 32, "temperature": 0,
+    # reasoning models (Kimi-K2.x) burn budget on thinking before the
+    # answer: give headroom and scan reasoning+content for the secret.
+    "max_tokens": int(os.environ.get("NEEDLE_MAX_TOKENS", "512")),
+    "temperature": 0,
     "chat_template_kwargs": {"thinking": False},
 }).encode()
 req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
@@ -41,7 +50,9 @@ req = urllib.request.Request(f"http://127.0.0.1:{PORT}/v1/chat/completions",
 t0 = time.perf_counter()
 r = json.loads(urllib.request.urlopen(req, timeout=1800).read())
 dt = time.perf_counter() - t0
-msg = r["choices"][0]["message"]["content"]
+m = r["choices"][0]["message"]
+msg = (m.get("content") or "") + " || " + (m.get("reasoning") or
+                                           m.get("reasoning_content") or "")
 pt = r.get("usage", {}).get("prompt_tokens", 0)
 ok = SECRET in msg
 print(f"prompt_tokens={pt} depth={DEPTH} ttft+gen={dt:.1f}s")

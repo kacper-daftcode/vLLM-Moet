@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
-"""Decode tok/s: short prompt, long ignore_eos generation; median of N runs."""
+"""Decode tok/s: short prompt, long ignore_eos generation; median of N runs.
+
+Usage: bench_tok.py [port] [runs] [max_tokens] [model]
+(model defaults to $BENCH_MODEL, then the server's first /v1/models entry)
+"""
 import json
+import os
 import sys
 import time
 import urllib.request
@@ -8,9 +13,14 @@ import urllib.request
 port = sys.argv[1] if len(sys.argv) > 1 else "8091"
 runs = int(sys.argv[2]) if len(sys.argv) > 2 else 3
 max_tokens = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+model = sys.argv[4] if len(sys.argv) > 4 else os.environ.get("BENCH_MODEL")
+if not model:
+    with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/v1/models", timeout=30) as r:
+        model = json.load(r)["data"][0]["id"]
 url = f"http://127.0.0.1:{port}/v1/completions"
 body = {
-    "model": "deepseek-v4-flash",
+    "model": model,
     "prompt": "The quick brown fox",
     "max_tokens": max_tokens,
     "temperature": 0.0,
