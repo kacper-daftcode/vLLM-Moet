@@ -72,23 +72,14 @@ RUN pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.14
         --index-url https://flashinfer.ai/whl/cu130 \
         "flashinfer-jit-cache==0.6.14+cu130"
 
-# 3. our patch, applied to the installed package (pure-Python delta)
+# 3. our patch, applied to the installed package (pure-Python delta;
+#    includes the DSpark speculative-decoding backport)
 COPY patch/vllm-moet-v0.24.0.patch /tmp/vllm-moet.patch
 RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
     && git apply --verbose /tmp/vllm-moet.patch \
     && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_cubit; print('moe_w2 hook OK')" \
-    && rm /tmp/vllm-moet.patch
-
-# 3b. DSpark speculative decoding backport (upstream PRs 46995 + 47093 + 47513
-#     rebased onto this tree: DS4 mtp.* + speculators-format drafters, padded
-#     full-graph drafting, confidence scheduler) + SM120 fixes (sparse-SWA
-#     non-causal topk width 512, dense-drafter fp8 KV normalization,
-#     flashinfer builder fp8_ds_mla mapping, K=384 cubin family for DS4-Pro TP8).
-COPY patch/vllm-moet-dspark.patch /tmp/vllm-moet-dspark.patch
-RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
-    && git apply --verbose /tmp/vllm-moet-dspark.patch \
     && python3 -c "import vllm.v1.worker.gpu.spec_decode.dspark.speculator; print('dspark OK')" \
-    && rm /tmp/vllm-moet-dspark.patch
+    && rm /tmp/vllm-moet.patch
 
 # 4. SM120 cubins (moe_w2/w4 GEMMs incl. K=6144 for GLM-5.x)
 COPY kernels/cubins-sm120/ /cubit-share/

@@ -871,11 +871,302 @@ index b63d861..3cad1f0 100644
                  ):
                      # `output` is managed by pytorch's cudagraph pool
                      output = self.runnable(*args, **kwargs)
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index de505e1..f0b49e2 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -54,6 +54,7 @@ MTPModelTypes = Literal[
+ ]
+ NgramGPUTypes = Literal["ngram_gpu"]
+ DFlashModelTypes = Literal["dflash"]
++DSparkModelTypes = Literal["dspark"]
+ EagleModelTypes = Literal[
+     "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+ ]
+@@ -66,6 +67,7 @@ SpeculativeMethod = Literal[
+     "custom_class",
+     EagleModelTypes,
+     NgramGPUTypes,
++    DSparkModelTypes,
+ ]
+ RejectionSampleMethod = Literal["standard", "synthetic"]
+ DraftSampleMethod = Literal["greedy", "probabilistic"]
+@@ -217,6 +219,43 @@ class SpeculativeConfig:
+     synthetic_acceptance_rates. Only valid when rejection_sample_method is 'synthetic'.
+     Mutually exclusive with synthetic_acceptance_rates."""
+ 
++    dspark_scheduler: bool = False
++    """Enable the DSpark hardware-aware confidence scheduler: adaptive
++    per-step verification width from the profiled cost table, online
++    engine-overhead estimate, and calibrated confidence-head survival.
++    Also captures FULL decode CUDA graphs at every verification width and,
++    when no num_speculative_tokens_per_batch_size is configured, auto-derives
++    the dynamic-SD batch-size table from the startup profile."""
++
++    dspark_per_request: bool = False
++    """DSpark: allocate per-request verification widths (paper Algorithm 1)
++    within the batch-level width budget via a global greedy over calibrated
++    prefix-survival probabilities. Requires dspark_scheduler."""
++
++    dspark_pad_to_bucket: bool = False
++    """DSpark: execute ragged per-request widths as a single uniform padded
++    forward at the scheduler-optimal width (pads route KV to the dummy slot
++    and are excluded from sampling), keeping FULL-graph execution. Requires
++    dspark_per_request."""
++
++    dspark_confidence_threshold: float = 0.0
++    """DSpark: per-request confidence threshold (0 disables). Requires
++    dspark_scheduler. This single knob drives two different mechanisms
++    depending on dspark_per_request:
++
++    - With dspark_per_request: it sets per-request VERIFICATION WIDTHS -- each
++      request keeps the prefix whose calibrated survival >= threshold.
++    - Without dspark_per_request: it masks drafts within the batch-uniform
++      width -- positions whose raw survival < threshold are force-rejected.
++
++    Primarily for acceptance-rate studies."""
++
++    dspark_budget_frac: float = 1.0
++    """DSpark: fraction of the batch verification-token budget the
++    per-request allocator may spend. 1.0 is lossless (equivalent to the
++    uniform batch width); lower values trade accepted tokens for higher
++    acceptance rates."""
++
+     @staticmethod
+     def _acceptance_length_to_rates(length: float, n: int) -> list[float]:
+         """Mean acceptance length to unconditional per-position rates, using
+@@ -289,6 +328,7 @@ class SpeculativeConfig:
+             "eagle3",
+             "extract_hidden_states",
+             "dflash",
++            "dspark",
+         )
+         factors.append(uses_aux_hidden_states)
+ 
+@@ -561,6 +601,42 @@ class SpeculativeConfig:
+ 
+         return hf_config
+ 
++    def _validate_dspark(self):
++        # Called at the end of __post_init__, once method is fully resolved.
++        if self.method != "dspark":
++            if (
++                self.dspark_scheduler
++                or self.dspark_per_request
++                or self.dspark_pad_to_bucket
++                or self.dspark_confidence_threshold != 0.0
++                or self.dspark_budget_frac != 1.0
++            ):
++                raise ValueError(
++                    f"dspark_* options require method='dspark' (got {self.method!r})."
++                )
++            return
++        if self.dspark_per_request and not self.dspark_scheduler:
++            raise ValueError("dspark_per_request requires dspark_scheduler=True.")
++        if self.dspark_pad_to_bucket and not self.dspark_per_request:
++            raise ValueError("dspark_pad_to_bucket requires dspark_per_request=True.")
++        if self.dspark_confidence_threshold > 0.0 and not self.dspark_scheduler:
++            raise ValueError(
++                "dspark_confidence_threshold requires dspark_scheduler=True."
++            )
++        if self.dspark_budget_frac < 1.0 and not self.dspark_per_request:
++            raise ValueError(
++                "dspark_budget_frac < 1.0 requires dspark_per_request=True."
++            )
++        if not 0.0 < self.dspark_budget_frac <= 1.0:
++            raise ValueError(
++                f"dspark_budget_frac must be in (0, 1], got {self.dspark_budget_frac}."
++            )
++        if not 0.0 <= self.dspark_confidence_threshold <= 1.0:
++            raise ValueError(
++                f"dspark_confidence_threshold must be in [0, 1], got "
++                f"{self.dspark_confidence_threshold}."
++            )
++
+     def __post_init__(self):
+         # Note: "method" is a new parameter that helps to extend the
+         # configuration of non-model-based proposers, and the "model" parameter
+@@ -606,6 +682,13 @@ class SpeculativeConfig:
+                 # --quantization fp8 with a bf16 checkpoint.
+                 if not self.quantization:
+                     self.quantization = self.target_model_config.quantization
++            elif self.method == "dspark":
++                # DeepSeek DSpark can ship the weights inside the target checkpoint
++                if self.target_model_config is None:
++                    raise ValueError("target_model_config must be present for dspark")
++                self.model = self.target_model_config.model
++                if not self.quantization:
++                    self.quantization = self.target_model_config.quantization
+             elif self.method in ("ngram", "[ngram]"):
+                 self.model = "ngram"
+             elif self.method == "ngram_gpu":
+@@ -733,18 +816,24 @@ class SpeculativeConfig:
+                 )
+ 
+                 # Automatically detect the method
+-                if self.method in ("eagle", "eagle3", "dflash"):
++                if self.method in ("eagle", "eagle3", "dflash", "dspark"):
+                     pass
+                 # examples:
+                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
+                 # yuhuili/EAGLE3-LLaMA3.1-Instruct-8B
+                 # AngelSlim/Qwen3-8B_eagle3
++                # deepseek-ai/dspark_qwen3_8b_block7
+                 elif "eagle-" in self.draft_model_config.model.lower():
+                     self.method = "eagle"
+                 elif "eagle3" in self.draft_model_config.model.lower():
+                     self.method = "eagle3"
+                 elif "dflash" in self.draft_model_config.model.lower():
+                     self.method = "dflash"
++                elif (
++                    "dspark" in self.draft_model_config.model.lower()
++                    or "Qwen3DSparkModel" in self.draft_model_config.architectures
++                ):
++                    self.method = "dspark"
+                 elif self.draft_model_config.hf_config.model_type == "medusa":
+                     self.method = "medusa"
+                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
+@@ -791,7 +880,18 @@ class SpeculativeConfig:
+                         self.draft_model_config.hf_config = eagle_config
+                         self.update_arch_()
+ 
+-                if self.method == "dflash":
++                if self.method == "dspark" and (
++                    "Qwen3DSparkModel" not in self.draft_model_config.architectures
++                ):
++                    # DeepSeek-V4 DSpark reuses the full DeepSeek-V4 config
++                    # and its weights ship in the target checkpoint.
++                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
++                    self.draft_model_config.hf_config.architectures = [
++                        "DSparkDraftModel"
++                    ]
++                    self.update_arch_()
++
++                if self.method in ("dflash", "dspark"):
+                     self.parallel_drafting = True
+ 
+                 if self.num_speculative_tokens is not None and hasattr(
+@@ -845,6 +945,7 @@ class SpeculativeConfig:
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+                     )
+                 )
++        self._validate_dspark()
+         return self
+ 
+     def _validate_suffix_decoding(self):
+@@ -1107,11 +1208,17 @@ class SpeculativeConfig:
+         )
+ 
+     def use_eagle(self) -> bool:
+-        return self.method in ("eagle", "eagle3", "mtp", "dflash")
++        # NOTE: This method is usually a stand-in for "speculative decoding using
++        # target model hidden states"
++        # TODO(ben): Refactor this so the naming is clearer
++        return self.method in ("eagle", "eagle3", "mtp", "dflash", "dspark")
+ 
+     def use_dflash(self) -> bool:
+         return self.method == "dflash"
+ 
++    def use_dspark(self) -> bool:
++        return self.method == "dspark"
++
+     def uses_dynamic_speculative_decoding(self) -> bool:
+         return self.num_speculative_tokens_per_batch_size is not None
+ 
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index ba7d26c..70a85dd 100644
+index ba7d26c..67d3b5e 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
-@@ -2161,7 +2161,15 @@ class VllmConfig:
+@@ -524,6 +524,16 @@ class VllmConfig:
+         if use_v2_model_runner is not None:
+             return use_v2_model_runner
+ 
++        # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
++        # is not otherwise a default-V2 architecture, so force V2 for it. If V2
++        # is unsupported for the rest of the config, _validate_v2_model_runner
++        # raises rather than silently falling back to V1 (which can't run dspark).
++        if (
++            self.speculative_config is not None
++            and self.speculative_config.method == "dspark"
++        ):
++            return True
++
+         if self.model_config is not None and self.model_config.is_diffusion:
+             return True
+ 
+@@ -763,6 +773,14 @@ class VllmConfig:
+             or not self.compilation_config.cudagraph_mode.has_full_cudagraphs()
+         ):
+             return
++        if (
++            speculative_config.method == "dspark"
++            and speculative_config.dspark_scheduler
++        ):
++            # DSpark's scheduler captures FULL decode graphs at every width
++            # dynamic SD can schedule, so no downgrade is needed; without it
++            # the extra graphs are not captured and the downgrade applies.
++            return
+ 
+         logger.warning_once(
+             "Dynamic speculative decoding changes the target verification "
+@@ -946,10 +964,11 @@ class VllmConfig:
+                     self.speculative_config.method not in get_args(EagleModelTypes)
+                     and self.speculative_config.method not in get_args(NgramGPUTypes)
+                     and self.speculative_config.method != "draft_model"
++                    and self.speculative_config.method != "dspark"
+                 ):
+                     raise ValueError(
+                         "Currently, async scheduling is only supported "
+-                        "with EAGLE/MTP/Draft Model/NGram GPU kind of "
++                        "with EAGLE/MTP/Draft Model/NGram GPU/DSpark kind of "
+                         "speculative decoding"
+                     )
+                 if self.speculative_config.disable_padded_drafter_batch:
+@@ -977,6 +996,7 @@ class VllmConfig:
+                 self.speculative_config is not None
+                 and self.speculative_config.method not in get_args(EagleModelTypes)
+                 and self.speculative_config.method not in get_args(NgramGPUTypes)
++                and self.speculative_config.method != "dspark"
+             ):
+                 logger.warning_once(
+                     "Async scheduling not supported with %s-based "
+@@ -2028,17 +2048,30 @@ class VllmConfig:
+             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
+             if speculative_config.method in ("ngram", "ngram_gpu"):
+                 unsupported.append("ngram/ngram_gpu speculative decoding")
+-            elif speculative_config.method not in ("eagle", "eagle3", "mtp", "dflash"):
++            elif speculative_config.method not in (
++                "eagle",
++                "eagle3",
++                "mtp",
++                "dflash",
++                "dspark",
++            ):
+                 unsupported.append(f"speculative method '{speculative_config.method}'")
+ 
+-            if speculative_config.uses_dynamic_speculative_decoding():
++            # Dynamic SD on the V2 runner: the engine-side width control
++            # flows through the existing variable cu_num_logits plumbing;
++            # DSpark additionally keeps the trimmed verify graph-native.
++            if speculative_config.uses_dynamic_speculative_decoding() and not (
++                speculative_config.method == "dspark"
++                and speculative_config.dspark_scheduler
++            ):
+                 unsupported.append("dynamic speculative decoding")
+ 
+-            # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle)
+-            # DFlash uses parallel drafting natively in V2 via DFlashSpeculator.
++            # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
++            # DFlash and DSpark use parallel drafting natively in V2 via their
++            # own speculators.
+             if (
+                 speculative_config.parallel_drafting
+-                and speculative_config.method != "dflash"
++                and speculative_config.method not in ("dflash", "dspark")
+             ):
+                 unsupported.append("parallel drafting for EAGLE speculative decoding")
+ 
+@@ -2161,7 +2194,15 @@ class VllmConfig:
      def validate_nvfp4_kv_cache_with_mla(self) -> "VllmConfig":
          if self.model_config is None:
              return self
@@ -6524,6 +6815,898 @@ index 88f33ac..546f922 100644
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
          self.config = vllm_config.model_config.hf_config
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 820260f..6340e22 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -345,7 +345,7 @@ class DFlashQwen3Model(nn.Module):
+         self,
+         context_states: torch.Tensor,
+         context_positions: torch.Tensor,
+-        context_slot_mapping: torch.Tensor | None = None,
++        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+     ) -> None:
+         """Precompute K/V for context states write them into each layer's KV cache.
+ 
+@@ -424,7 +424,13 @@ class DFlashQwen3Model(nn.Module):
+ 
+         # --- Per-layer cache insert ---
+         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
++        per_layer = isinstance(context_slot_mapping, (list, tuple))
+         for i in range(L):
++            slot_mapping = (
++                context_slot_mapping[i] if per_layer else context_slot_mapping
++            )
++            if slot_mapping is None:
++                continue  # dummy run: skip cache ops
+             attn = self._attn_layers[i]
+             kv_cache = attn.kv_cache
+             attn.impl.do_kv_cache_update(
+@@ -432,7 +438,7 @@ class DFlashQwen3Model(nn.Module):
+                 all_k_final[i],
+                 all_v[i],
+                 kv_cache,
+-                context_slot_mapping,
++                slot_mapping,
+             )
+ 
+     def forward(
+@@ -559,7 +565,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+         self,
+         context_states: torch.Tensor,
+         context_positions: torch.Tensor,
+-        context_slot_mapping: torch.Tensor | None = None,
++        context_slot_mapping: torch.Tensor | list[torch.Tensor | None] | None = None,
+     ) -> None:
+         """Precompute projected + RoPE'd K/V and write to cache."""
+         self.model.precompute_and_store_context_kv(
+diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
+new file mode 100644
+index 0000000..b387bae
+--- /dev/null
++++ b/vllm/model_executor/models/qwen3_dspark.py
+@@ -0,0 +1,220 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Qwen3 DSpark draft model for semi-autoregressive drafting.
++
++DSpark drafts a whole block in one parallel pass (DFlash-style: context-KV
++precompute + a non-causal query-block forward) and then injects intra-block
++dependency with a lightweight sequential Markov head.
++
++The parallel backbone is a standard Qwen3 decoder stack reused from the
++DFlash Qwen3 draft (see qwen3_dflash.py). DSpark adds:
++  * ``markov_head``: low-rank V x r / r x V transition bias added to the base
++    logits, sampled left-to-right by the speculator (the sequential stage).
++  * ``confidence_head``: per-position survival logit over
++    ``[hidden ; markov_embed(prev token)]``, used by the DSpark scheduler to
++    pick per-step draft lengths.
++
++DSparkMarkovHead is shared with the DSV4-style DSpark model.
++"""
++
++from collections.abc import Iterable
++
++import torch
++import torch.nn as nn
++
++from vllm.config import VllmConfig
++from vllm.logger import init_logger
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++
++from .qwen3_dflash import DFlashQwen3ForCausalLM, DFlashQwen3Model
++from .utils import AutoWeightsLoader, maybe_prefix, process_eagle_weight
++
++logger = init_logger(__name__)
++
++
++class DSparkMarkovHead(nn.Module):
++    """Sequential transition-bias head (low-rank V x r, r x V).
++
++    ``markov_w1[token]`` embeds the previously sampled token (target vocab,
++    ``vocab_size``); ``markov_w2`` projects it to a draft-vocab bias
++    (``draft_vocab_size``) added to the base draft logits. The two sizes
++    coincide for full-vocab drafts.
++    """
++
++    def __init__(
++        self,
++        vocab_size: int,
++        draft_vocab_size: int,
++        markov_rank: int,
++        prefix: str,
++    ) -> None:
++        super().__init__()
++        # TODO(ben): profile for which (if any) it makes sense to replicate or TP-shard
++        self.markov_w1 = VocabParallelEmbedding(
++            vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w1")
++        )
++        self.markov_w2 = ParallelLMHead(
++            draft_vocab_size, markov_rank, prefix=maybe_prefix(prefix, "markov_w2")
++        )
++
++    def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
++        """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
++        return self.markov_w1(token_ids)
++
++    def bias(self, markov_embed: torch.Tensor, logits_processor) -> torch.Tensor:
++        """Vocab-size transition bias from a Markov embedding ([B, r] -> [B, V])."""
++        return logits_processor(self.markov_w2, markov_embed)
++
++
++class DSparkConfidenceHead(nn.Module):
++    """Per-position survival logit ``w . [h_k ; markov_embed(x_{k-1})] + b``.
++
++    Sigmoid of the output estimates the conditional probability that draft
++    position ``k`` survives target verification given all earlier block
++    tokens were accepted.
++    """
++
++    def __init__(self, hidden_size: int, markov_rank: int) -> None:
++        super().__init__()
++        self.proj = nn.Linear(hidden_size + markov_rank, 1, bias=True)
++
++    def forward(self, hidden: torch.Tensor, markov_embed: torch.Tensor) -> torch.Tensor:
++        return self.proj(torch.cat([hidden, markov_embed], dim=-1)).squeeze(-1)
++
++
++class Qwen3DSparkModel(DFlashQwen3Model):
++    """DFlash Qwen3 backbone + DSpark Markov head."""
++
++    def __init__(
++        self,
++        *,
++        vllm_config: VllmConfig,
++        start_layer_id: int = 0,
++        prefix: str = "",
++    ) -> None:
++        super().__init__(
++            vllm_config=vllm_config, start_layer_id=start_layer_id, prefix=prefix
++        )
++        config = self.config
++        draft_vocab_size = (
++            getattr(config, "draft_vocab_size", None) or config.vocab_size
++        )
++        self.markov_head = DSparkMarkovHead(
++            config.vocab_size,
++            draft_vocab_size,
++            config.markov_rank,
++            prefix=maybe_prefix(prefix, "markov_head"),
++        )
++        if getattr(config, "enable_confidence_head", False):
++            self.confidence_head = DSparkConfidenceHead(
++                config.hidden_size, config.markov_rank
++            )
++        else:
++            self.confidence_head = None
++
++
++class Qwen3DSparkForCausalLM(DFlashQwen3ForCausalLM):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        nn.Module.__init__(self)
++        self.draft_model_config = vllm_config.speculative_config.draft_model_config
++        self.config = self.draft_model_config.hf_config
++        if getattr(self.config, "draft_vocab_size", None) is None:
++            self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
++        target_layer_num = vllm_config.model_config.get_num_layers(
++            vllm_config.parallel_config
++        )
++        self.model = Qwen3DSparkModel(
++            vllm_config=vllm_config,
++            prefix=maybe_prefix(prefix, "model"),
++            start_layer_id=target_layer_num,
++        )
++
++        logit_scale = getattr(self.config, "logit_scale", 1.0)
++        self.lm_head = ParallelLMHead(
++            self.config.draft_vocab_size,
++            self.config.hidden_size,
++            prefix=maybe_prefix(prefix, "lm_head"),
++        )
++        self.logits_processor = LogitsProcessor(
++            self.config.draft_vocab_size, scale=logit_scale
++        )
++        target_vocab_size = vllm_config.model_config.get_vocab_size()
++        if self.config.draft_vocab_size != target_vocab_size:
++            self.draft_id_to_target_id = nn.Parameter(
++                torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
++                requires_grad=False,
++            )
++        else:
++            self.draft_id_to_target_id = None
++        if self.model.confidence_head is None:
++            # Signals to the DSpark scheduler that this checkpoint cannot
++            # provide survival estimates (load_draft_model guards on it).
++            self.compute_confidence = None
++
++    def get_draft_kv_cache_layer_names(self) -> list[str]:
++        return [layer.self_attn.attn.layer_name for layer in self.model.layers]
++
++    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        # Draft-vocab logits without the d2t scatter: the speculator adds the
++        # Markov bias in draft space, then remaps via map_draft_to_target.
++        return self.logits_processor(self.lm_head, hidden_states)
++
++    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
++        # Map draft-vocab ids to target ids (identity for full-vocab drafts).
++        if self.draft_id_to_target_id is None:
++            return draft_ids
++        return draft_ids + self.draft_id_to_target_id[draft_ids]
++
++    def compute_confidence(
++        self, hidden_states: torch.Tensor, markov_embed: torch.Tensor
++    ) -> torch.Tensor:
++        return self.model.confidence_head(hidden_states, markov_embed)
++
++    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.markov_head.embed(token_ids)
++
++    def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
++        return self.model.markov_head.bias(markov_embed, self.logits_processor)
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
++        model_weights = {}
++        includes_embed_tokens = False
++        includes_lm_head = False
++        includes_draft_id_mapping = False
++        for name, loaded_weight in weights:
++            # t2d is training-only; the draft remaps via d2t at sampling time.
++            if "t2d" in name:
++                continue
++            if "d2t" in name:
++                name = name.replace("d2t", "draft_id_to_target_id")
++                includes_draft_id_mapping = True
++            elif "lm_head" not in name:
++                name = "model." + name
++            if "embed_tokens" in name:
++                includes_embed_tokens = True
++            if "lm_head" in name:
++                includes_lm_head = True
++            model_weights[name] = loaded_weight
++            # Sets has_own_embed_tokens / has_own_lm_head so load_dspark_model
++            # knows whether to keep these or alias the target's.
++            process_eagle_weight(self, name)
++
++        # mask_embedding is an unused placeholder param; DSpark masks via the vocab row.
++        # embed_tokens / lm_head are optional; when omitted they are shared from
++        # the target by load_dspark_model, so skip the unloaded params here.
++        skip_substrs = ["mask_embedding"]
++        if self.model.confidence_head is None:
++            skip_substrs.append("confidence_head")
++        if not includes_embed_tokens:
++            skip_substrs.append("embed_tokens")
++        if not includes_lm_head:
++            skip_substrs.append("lm_head")
++        if not includes_draft_id_mapping:
++            skip_substrs.append("draft_id_to_target_id")
++        loader = AutoWeightsLoader(self, skip_substrs=skip_substrs)
++        loader.load_weights(model_weights.items())
++        self.model._build_fused_kv_buffers()
+diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
+index a18d54a..92e3bed 100644
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -604,6 +604,8 @@ _SPECULATIVE_DECODING_MODELS = {
+     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
+     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
+     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
++    "DSparkDraftModel": ("vllm.models.deepseek_v4", "DSparkDeepseekV4ForCausalLM"),
++    "Qwen3DSparkModel": ("qwen3_dspark", "Qwen3DSparkForCausalLM"),
+     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+     "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+     "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+diff --git a/vllm/models/deepseek_v4/__init__.py b/vllm/models/deepseek_v4/__init__.py
+index 44e486d..d03eba3 100644
+--- a/vllm/models/deepseek_v4/__init__.py
++++ b/vllm/models/deepseek_v4/__init__.py
+@@ -17,14 +17,23 @@ from .quant_config import DeepseekV4FP8Config
+ if current_platform.is_rocm():
+     from .amd.model import DeepseekV4ForCausalLM
+     from .amd.mtp import DeepSeekV4MTP
++
++    # DSpark is NVIDIA-only for now.
++    DSparkDeepseekV4ForCausalLM = None  # type: ignore[assignment]
+ elif current_platform.is_xpu():
+     from .xpu.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+     from .xpu.mtp import DeepSeekV4MTP  # type: ignore[assignment]
++
++    DSparkDeepseekV4ForCausalLM = None  # type: ignore[assignment]
+ else:
++    from .nvidia.dspark import (  # type: ignore[assignment]
++        DSparkDeepseekV4ForCausalLM,
++    )
+     from .nvidia.model import DeepseekV4ForCausalLM  # type: ignore[assignment]
+     from .nvidia.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+ 
+ __all__ = [
++    "DSparkDeepseekV4ForCausalLM",
+     "DeepSeekV4MTP",
+     "DeepseekV4FP8Config",
+     "DeepseekV4ForCausalLM",
+diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
+new file mode 100644
+index 0000000..be4a87b
+--- /dev/null
++++ b/vllm/models/deepseek_v4/nvidia/dspark.py
+@@ -0,0 +1,488 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark draft model for DeepSeek-V4 (semi-autoregressive speculative decoding).
++
++See: qwen3_dspark.py for base architecture. This one is specialized to the DSV4 DSpark,
++which reuses the target model's architecture similarly to MTP.
++
++To implement non-causal attention, we leverage the sparse attention implementation to
++include the future query tokens in the top-k indices for each query token.
++"""
++
++from collections.abc import Iterable
++
++import regex as re
++import torch
++import torch.nn as nn
++
++from vllm.config import VllmConfig, get_current_vllm_config
++from vllm.distributed import (
++    get_tensor_model_parallel_rank,
++    get_tensor_model_parallel_world_size,
++)
++from vllm.logger import init_logger
++from vllm.model_executor.kernels.mhc.tilelang import (
++    hc_head_fused_kernel_tilelang,
++    mhc_post_tilelang,
++)
++from vllm.model_executor.layers.fused_moe import (
++    fused_moe_make_expert_params_mapping,
++)
++from vllm.model_executor.layers.layernorm import RMSNorm
++from vllm.model_executor.layers.linear import ReplicatedLinear
++from vllm.model_executor.layers.logits_processor import LogitsProcessor
++from vllm.model_executor.layers.vocab_parallel_embedding import (
++    ParallelLMHead,
++    VocabParallelEmbedding,
++)
++from vllm.model_executor.model_loader.weight_utils import default_weight_loader
++from vllm.model_executor.models.qwen3_dspark import (
++    DSparkMarkovHead,
++)
++from vllm.model_executor.models.utils import maybe_prefix
++
++from .model import (
++    DeepseekV4DecoderLayer,
++    make_deepseek_v4_expert_params_mapping,
++)
++
++logger = init_logger(__name__)
++
++# MoE expert scale suffix differs by expert dtype (mirrors deepseek_v4 loaders):
++# fp4 experts register ``.weight_scale``; block-fp8 experts ``.weight_scale_inv``.
++_EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
++
++
++class DSparkDeepseekV4Model(nn.Module):
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        assert vllm_config.speculative_config is not None
++        config = vllm_config.speculative_config.draft_model_config.hf_config
++        self.config = config
++        self.hidden_size = config.hidden_size
++        self.hc_mult = config.hc_mult
++        self.hc_eps = config.hc_eps
++        self.rms_norm_eps = config.rms_norm_eps
++        self.num_hidden_layers = config.num_hidden_layers
++        self.target_layer_ids = tuple(config.dspark_target_layer_ids)
++
++        self.num_dspark_layers = getattr(config, "n_mtp_layers", None) or 3
++
++        # Shared with the target (aliased by the speculator's loading utility).
++        self.embed_tokens = VocabParallelEmbedding(
++            config.vocab_size,
++            config.hidden_size,
++            prefix=maybe_prefix(prefix, "embed_tokens"),
++        )
++
++        self.main_proj = ReplicatedLinear(
++            config.hidden_size * len(self.target_layer_ids),
++            config.hidden_size,
++            bias=False,
++            return_bias=False,
++            quant_config=vllm_config.quant_config,
++            prefix=maybe_prefix(prefix, "main_proj"),
++        )
++        self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++
++        current_vllm_config = get_current_vllm_config()
++        self.layers = nn.ModuleList(
++            [
++                DeepseekV4DecoderLayer(
++                    current_vllm_config,
++                    prefix=maybe_prefix(prefix, f"layers.{self.num_hidden_layers + i}"),
++                )
++                for i in range(self.num_dspark_layers)
++            ]
++        )
++
++        # Heads: final norm + hc_head, and the Markov head
++        # Loaded from the "final" MTP layer weights (mtp.*) in the target checkpoint
++        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
++        hc_dim = self.hc_mult * config.hidden_size
++        self.hc_head_fn = nn.Parameter(
++            torch.empty(self.hc_mult, hc_dim, dtype=torch.float32),
++            requires_grad=False,
++        )
++        self.hc_head_base = nn.Parameter(
++            torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
++        )
++        self.hc_head_scale = nn.Parameter(
++            torch.empty(1, dtype=torch.float32), requires_grad=False
++        )
++        draft_vocab_size = (
++            getattr(config, "draft_vocab_size", None) or config.vocab_size
++        )
++        self.markov_head = DSparkMarkovHead(
++            config.vocab_size,
++            draft_vocab_size,
++            config.dspark_markov_rank,
++            prefix=maybe_prefix(prefix, "markov_head"),
++        )
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.embed_tokens(input_ids)
++
++    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
++        """main_x = main_norm(main_proj(concat of target aux hidden states)).
++
++        ``aux_hidden_states`` is [T, hidden_size * len(target_layer_ids)].
++        """
++        return self.main_norm(self.main_proj(aux_hidden_states))
++
++    @torch.inference_mode()
++    def precompute_and_store_context_kv(
++        self,
++        main_x: torch.Tensor,
++        context_positions: torch.Tensor,
++        context_slot_mappings: list[torch.Tensor | None] | None = None,
++    ) -> None:
++        """Insert the sliding-window context KV for every draft layer.
++
++        Mirrors the reference DSparkAttention: each layer derives its context KV
++        from the SAME projected target hidden ``main_x``, via that layer's own
++        ``wkv`` + ``kv_norm`` + RoPE + quant, then writes it at the
++        layer's context slots.
++
++        ``context_slot_mappings`` is a per-layer list (each entry is the context
++        slot mapping for that layer's kv-cache group, since the hybrid manager may
++        place draft layers in different groups). ``None`` (or a ``None`` entry)
++        runs the projection to reserve workspace but writes nothing (profiling).
++        """
++        for i, layer in enumerate(self.layers):
++            slot_mapping = (
++                None if context_slot_mappings is None else context_slot_mappings[i]
++            )
++            attn = layer.attn
++            # Optimized DSV4 MLA path: wkv part of the fused wq_a|wkv projection
++            # (q_lora part discarded), then RoPE/quant/insert via the fused op.
++            qr_kv, _ = attn.fused_wqa_wkv(main_x)
++            kv = qr_kv[..., attn.q_lora_rank :]
++            kv = attn.kv_norm(kv)
++            if slot_mapping is None:
++                continue
++            _insert_context_kv(attn, kv, context_positions, slot_mapping)
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if inputs_embeds is None:
++            inputs_embeds = self.embed_input_ids(input_ids)
++        # Expand to hc_mult copies for hyper-connections ([T, H] -> [T, hc, H]).
++        hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
++
++        residual = post_mix = res_mix = None
++        for layer in self.layers:
++            hidden_states, residual, post_mix, res_mix = layer(
++                hidden_states,
++                positions,
++                input_ids,
++                post_mix,
++                res_mix,
++                residual,
++            )
++        hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
++        # hc_head reduces the hc copies; return the PRE-norm head hidden
++        hidden_states = hc_head_fused_kernel_tilelang(
++            hidden_states,
++            self.hc_head_fn,
++            self.hc_head_scale,
++            self.hc_head_base,
++            self.rms_norm_eps,
++            self.hc_eps,
++        )
++        return hidden_states
++
++
++def _insert_context_kv(
++    attn: nn.Module,
++    kv: torch.Tensor,
++    positions: torch.Tensor,
++    slot_mapping: torch.Tensor,
++) -> None:
++    """RoPE + quant + paged-cache insert of (already kv_norm'd) context KV.
++
++    Reuses the DSV4 fused insert ops (which also process a query; we pass a dummy
++    query and discard it, since context tokens have no query). Mirrors
++    ``DeepseekV4Attention._fused_qnorm_rope_kv_insert``.
++    """
++    swa_cache = attn.swa_cache_layer.kv_cache
++    block_size = attn.swa_cache_layer.block_size
++    cos_sin_cache = attn.rotary_emb.cos_sin_cache
++    cache_dtype = swa_cache.dtype
++    n_ctx = kv.shape[0]
++    dummy_q = torch.zeros(
++        (n_ctx, attn.n_local_heads, attn.head_dim),
++        dtype=kv.dtype,
++        device=kv.device,
++    )
++    if cache_dtype == torch.uint8:
++        # fp8_ds_mla UE8M0 paged layout
++        swa_2d = swa_cache.view(swa_cache.shape[0], -1)
++        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
++            dummy_q,
++            kv,
++            swa_2d,
++            slot_mapping,
++            positions,
++            cos_sin_cache,
++            attn.padded_heads,
++            attn.eps,
++            block_size,
++        )
++    elif cache_dtype == torch.bfloat16:
++        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
++        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_bf16_insert(
++            dummy_q,
++            kv,
++            swa_3d,
++            slot_mapping,
++            positions,
++            cos_sin_cache,
++            attn.eps,
++            block_size,
++        )
++    else:  # per-tensor fp8 (torch.float8_e4m3fn)
++        # TODO(ben): double-check if this is being dispatched correctly for FI backend
++        swa_3d = swa_cache.view(-1, block_size, attn.head_dim)
++        dummy_q_fp8 = torch.zeros_like(dummy_q, dtype=torch.float8_e4m3fn)
++        torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_full_cache_fp8_insert(
++            dummy_q,
++            kv,
++            dummy_q_fp8,
++            swa_3d,
++            slot_mapping,
++            positions,
++            cos_sin_cache,
++            attn._flashinfer_fp8_kv_scale,
++            attn._flashinfer_fp8_q_scale_inv,
++            attn.eps,
++            block_size,
++        )
++
++
++class DSparkDeepseekV4ForCausalLM(nn.Module):
++    # Draft weights ship in the target checkpoint (mtp.*) without embed/head, so
++    # load_dspark_model always aliases the target's.
++    has_own_embed_tokens = False
++    has_own_lm_head = False
++
++    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
++        super().__init__()
++        assert vllm_config.speculative_config is not None
++        self.draft_model_config = vllm_config.speculative_config.draft_model_config
++        self.config = self.draft_model_config.hf_config
++        self.model = DSparkDeepseekV4Model(
++            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
++        )
++        # Shared with the target (aliased by the speculator's load utility).
++        self.lm_head = ParallelLMHead(
++            self.config.vocab_size,
++            self.config.hidden_size,
++            prefix=maybe_prefix(prefix, "lm_head"),
++        )
++        self.logits_processor = LogitsProcessor(self.config.vocab_size)
++
++    # --- Hooks used by the speculator -------------------------------------
++
++    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.embed_input_ids(input_ids)
++
++    def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
++        return self.model.combine_hidden_states(aux_hidden_states)
++
++    def get_draft_kv_cache_layer_names(self) -> list[str]:
++        # DSV4 MLA path: each draft layer's sliding-window cache is a separate
++        # layer, named by its prefix.
++        return [layer.attn.swa_cache_layer.prefix for layer in self.model.layers]
++
++    def precompute_and_store_context_kv(
++        self,
++        context_states: torch.Tensor,
++        context_positions: torch.Tensor,
++        context_slot_mappings: list[torch.Tensor | None] | None = None,
++    ) -> None:
++        self.model.precompute_and_store_context_kv(
++            context_states, context_positions, context_slot_mappings
++        )
++
++    def forward(
++        self,
++        input_ids: torch.Tensor,
++        positions: torch.Tensor,
++        inputs_embeds: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        # Returns the pre-norm hc_head hidden ([T, hidden_size]).
++        return self.model(input_ids, positions, inputs_embeds)
++
++    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        """Base logits U_k = lm_head(norm(head_hidden))."""
++        return self.logits_processor(self.lm_head, self.model.norm(hidden_states))
++
++    def compute_draft_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
++        # Full-vocab draft: base logits, no d2t scatter.
++        return self.compute_logits(hidden_states)
++
++    def map_draft_to_target(self, draft_ids: torch.Tensor) -> torch.Tensor:
++        return draft_ids  # full-vocab: draft ids are target ids
++
++    def markov_embed(self, token_ids: torch.Tensor) -> torch.Tensor:
++        return self.model.markov_head.embed(token_ids)
++
++    def markov_bias(self, markov_embed: torch.Tensor) -> torch.Tensor:
++        return self.model.markov_head.bias(markov_embed, self.logits_processor)
++
++    # --- Weight loading ----------------------------------------------------
++
++    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
++        """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint.
++
++        Non-mtp weights (embed/head/main layers) belong to the target model and
++        are skipped here. ``embed_tokens``/``lm_head`` are aliased from the target.
++        """
++        first_layer = self.model.layers[0]
++        use_mega_moe = first_layer.ffn.use_mega_moe
++        if use_mega_moe:
++            expert_mapping = make_deepseek_v4_expert_params_mapping(
++                self.config.n_routed_experts
++            )
++        else:
++            expert_mapping = fused_moe_make_expert_params_mapping(
++                self,
++                ckpt_gate_proj_name="w1",
++                ckpt_down_proj_name="w2",
++                ckpt_up_proj_name="w3",
++                num_experts=self.config.n_routed_experts,
++            )
++        expert_scale_suffix = (
++            ".weight_scale"
++            if getattr(self.config, "expert_dtype", "fp4") == "fp4"
++            else ".weight_scale_inv"
++        )
++
++        # (param_name, ckpt_shard_name, shard_id) for non-expert stacked params.
++        stacked_params_mapping = [
++            ("gate_up_proj", "w1", 0),
++            ("gate_up_proj", "w3", 1),
++            ("attn.fused_wqa_wkv", "attn.wq_a", 0),
++            ("attn.fused_wqa_wkv", "attn.wkv", 1),
++        ]
++
++        params_dict = dict(self.named_parameters())
++        loaded_params: set[str] = set()
++
++        tp_size = get_tensor_model_parallel_world_size()
++        tp_rank = get_tensor_model_parallel_rank()
++        n_local_head = self.config.num_attention_heads // tp_size
++        head_start = n_local_head * tp_rank
++        head_end = n_local_head * (tp_rank + 1)
++
++        for name, loaded_weight in weights:
++            mapped = self._remap_dspark_name(name)
++            if mapped is None:
++                continue
++            name = mapped
++
++            # ``.scale`` -> per-method scale suffix.
++            if name.endswith(".scale"):
++                suffix = (
++                    expert_scale_suffix
++                    if _EXPERT_SCALE_RE.search(name)
++                    else ".weight_scale_inv"
++                )
++                name = name.removesuffix(".scale") + suffix
++
++            # E8M0 expert scales: keep raw exponent bytes.
++            if ".experts." in name:
++                if (
++                    "weight_scale" in name
++                    and loaded_weight.dtype == torch.float8_e8m0fnu
++                ):
++                    loaded_weight = loaded_weight.view(torch.uint8)
++                for param_name, weight_name, expert_id, shard_id in expert_mapping:
++                    if weight_name not in name:
++                        continue
++                    name_mapped = name.replace(weight_name, param_name)
++                    param = params_dict[name_mapped]
++                    success = param.weight_loader(
++                        param,
++                        loaded_weight,
++                        name_mapped,
++                        shard_id=shard_id,
++                        expert_id=expert_id,
++                        return_success=True,
++                    )
++                    if success:
++                        loaded_params.add(name_mapped)
++                        break
++                continue
++
++            # Stacked rules only apply to decoder-layer weights. Head-stack params
++            # (main_proj/norm/hc_head/markov_head) load directly — otherwise e.g.
++            # "markov_w1" would collide with the "w1" shard rule.
++            is_layer_param = name.startswith("model.layers.")
++            for param_name, weight_name, stacked_shard_id in stacked_params_mapping:
++                if not is_layer_param or weight_name not in name:
++                    continue
++                name = name.replace(weight_name, param_name)
++                param = params_dict[name]
++                param.weight_loader(param, loaded_weight, stacked_shard_id)
++                loaded_params.add(name)
++                break
++            else:
++                if "attn_sink" in name:
++                    narrow = loaded_weight[head_start:head_end]
++                    params_dict[name][: narrow.shape[0]].copy_(narrow)
++                    loaded_params.add(name)
++                    continue
++                if ".shared_experts.w2" in name:
++                    name = name.replace(
++                        ".shared_experts.w2", ".shared_experts.down_proj"
++                    )
++                if name.endswith(".ffn.gate.bias"):
++                    name = name.replace(
++                        ".ffn.gate.bias", ".ffn.gate.e_score_correction_bias"
++                    )
++                param = params_dict[name]
++                weight_loader = getattr(param, "weight_loader", default_weight_loader)
++                weight_loader(param, loaded_weight)
++                loaded_params.add(name)
++
++        self._finalize_moe()
++        logger.info_once("DSpark draft model loaded: %d params", len(loaded_params))
++        return loaded_params
++
++    def _finalize_moe(self) -> None:
++        for layer in self.model.layers:
++            layer.ffn.finalize_mega_moe_weights()
++
++    def _remap_dspark_name(self, name: str) -> str | None:
++        """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
++
++        Returns None for non-mtp weights (owned by the target model).
++        """
++        m = re.match(r"mtp\.(\d+)\.(.*)", name)
++        if m is None:
++            return None
++        stage = int(m.group(1))
++        rest = m.group(2)
++        # The confidence head is not wired into inference yet; drop its weights.
++        if rest.startswith("confidence_head."):
++            return None
++        # Head-stack params live at model level (mtp.last), context combiner at
++        # model level (mtp.0); everything else is a per-layer decoder block.
++        head_prefixes = (
++            "norm.",
++            "hc_head_fn",
++            "hc_head_base",
++            "hc_head_scale",
++            "markov_head.",
++        )
++        if rest.startswith(("main_proj.", "main_norm.")) or rest.startswith(
++            head_prefixes
++        ):
++            return f"model.{rest}"
++        return f"model.layers.{stage}.{rest}"
+diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
+index aa60ad3..fa6da8c 100644
+--- a/vllm/models/deepseek_v4/nvidia/model.py
++++ b/vllm/models/deepseek_v4/nvidia/model.py
+@@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+     VocabParallelEmbedding,
+ )
+ from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+-from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsPP
++from vllm.model_executor.models.interfaces import (
++    EagleModelMixin,
++    MixtureOfExperts,
++    SupportsEagle3,
++    SupportsPP,
++)
+ from vllm.model_executor.models.utils import (
+     AutoWeightsLoader,
+     PPMissingLayer,
+@@ -917,7 +922,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+         return x, residual, post_mix, res_mix
+ 
+ 
+-class DeepseekV4Model(nn.Module):
++class DeepseekV4Model(nn.Module, EagleModelMixin):
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+         super().__init__()
+ 
+@@ -1058,7 +1063,12 @@ class DeepseekV4Model(nn.Module):
+             input_ids = input_ids.to(torch.int64)
+ 
+         residual, post_mix, res_mix = None, None, None
+-        for layer in islice(self.layers, self.start_layer, self.end_layer):
++        aux_hidden_states: list[torch.Tensor] = []
++        final_aux_recon: torch.Tensor | None = None  # avoid duplicate mhc_post call
++        for idx, layer in enumerate(
++            islice(self.layers, self.start_layer, self.end_layer),
++            start=self.start_layer,
++        ):
+             hidden_states, residual, post_mix, res_mix = layer(
+                 hidden_states,
+                 positions,
+@@ -1067,10 +1077,21 @@ class DeepseekV4Model(nn.Module):
+                 res_mix,
+                 residual,
+             )
++            if idx + 1 in self.aux_hidden_state_layers:
++                # Reconstruct the aux hidden state for draft models
++                aux_recon = mhc_post_tilelang(
++                    hidden_states, residual, post_mix, res_mix
++                )
++                aux_hidden_states.append(aux_recon.mean(dim=1))
++                final_aux_recon = aux_recon
+         if layer is not None:
+-            hidden_states = mhc_post_tilelang(
+-                hidden_states, residual, post_mix, res_mix
+-            )
++            # Reuse if the last layer was captured as an aux hidden state
++            if self.end_layer in self.aux_hidden_state_layers:
++                hidden_states = final_aux_recon
++            else:
++                hidden_states = mhc_post_tilelang(
++                    hidden_states, residual, post_mix, res_mix
++                )
+ 
+         if not get_pp_group().is_last_rank:
+             return IntermediateTensors({"hidden_states": hidden_states})
+@@ -1088,6 +1109,8 @@ class DeepseekV4Model(nn.Module):
+             self.hc_eps,
+         )
+         hidden_states = self.norm(hidden_states)
++        if len(aux_hidden_states) > 0:
++            return hidden_states, aux_hidden_states
+         return hidden_states
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+@@ -1314,7 +1337,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
+             moe.experts.update_expert_map()
+ 
+ 
+-class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
++class DeepseekV4ForCausalLM(
++    nn.Module, SupportsPP, SupportsEagle3, DeepseekV4MixtureOfExperts
++):
+     model_cls = DeepseekV4Model
+ 
+     # Default mapper assumes the original FP4-expert checkpoint layout.
 diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
 index 64715de..8c456a6 100644
 --- a/vllm/models/deepseek_v4/nvidia/mtp.py
@@ -6573,6 +7756,73 @@ index 18e3b10..d536692 100644
      return einsum_recipe, tma_aligned_scales
  
  
+diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
+index 0dc3ccc..fb75a27 100644
+--- a/vllm/transformers_utils/configs/speculators/algos.py
++++ b/vllm/transformers_utils/configs/speculators/algos.py
+@@ -118,3 +118,47 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
+         "mask_token_id": config_dict["mask_token_id"],
+         "target_layer_ids": [i - 1 for i in aux_layer_ids],
+     }
++
++
++@register_speculator("dspark")
++def update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
++    """
++    Apply DSpark specific configuration transformations to the `dict` used to
++    construct the Transformers PreTrainedConfig.
++
++    DSpark extends DFlash with a Markov logit-bias head, reusing the same
++    Qwen3DSparkModel loader and DSparkSpeculator runtime as the dense DSpark
++    checkpoints (e.g. deepseek-ai/dspark_qwen3_8b_block7).
++
++    DSpark specific fields:
++    - draft_vocab_size: draft vocab size; when smaller than the target vocab the
++        checkpoint also ships d2t/t2d remap tables.
++    - mask_token_id (required): token id for parallel-drafting mask slots.
++    - markov_rank / markov_head_type: low-rank Markov logit-bias head.
++    - block_size: semi-autoregressive draft block size.
++    - enable_confidence_head / confidence_head_with_markov: confidence head.
++    - aux_hidden_state_layer_ids (required): target layer indices feeding the
++        drafter. Mapped to both eagle_aux_hidden_state_layer_ids and
++        target_layer_ids (DSpark's i-1 layer semantics).
++    """
++    pre_trained_config["architectures"] = ["Qwen3DSparkModel"]
++    # Speculators DSpark uses the 1+N fill-in block (anchor is a bonus token).
++    pre_trained_config["dspark_bonus_anchor"] = True
++
++    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
++    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
++    # DSpark indexes target layers as aux_id - 1 (matches the dense configs).
++    pre_trained_config["target_layer_ids"] = [i - 1 for i in aux_layer_ids]
++
++    for key in (
++        "draft_vocab_size",
++        "target_hidden_size",
++        "mask_token_id",
++        "markov_rank",
++        "markov_head_type",
++        "block_size",
++        "enable_confidence_head",
++        "confidence_head_with_markov",
++    ):
++        if config_dict.get(key) is not None:
++            pre_trained_config[key] = config_dict[key]
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 8031900..40193a3 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -408,7 +408,9 @@ class FlashInferBackend(AttentionBackend):
+ 
+     @staticmethod
+     def get_dtype_for_flashinfer(kv_cache_dtype: str) -> torch.dtype:
+-        if kv_cache_dtype in ("fp8", "fp8_e4m3"):
++        # "fp8_ds_mla" is the target's packed sparse-MLA format; dense layers
++        # sharing the cache config (e.g. DSpark draft heads) store plain e4m3.
++        if kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_ds_mla"):
+             return torch.float8_e4m3fn
+         elif kv_cache_dtype == "fp8_e5m2":
+             return torch.float8_e5m2
 diff --git a/vllm/v1/attention/backends/mla/cubit_sparse_mla.py b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 new file mode 100644
 index 0000000..16d22c7
@@ -8125,6 +9375,214 @@ index 0000000..9316141
 +        return max(1, int(raw_value))
 +    except ValueError:
 +        return 8192
+diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
+index df23f34..962c098 100644
+--- a/vllm/v1/attention/backends/mla/sparse_swa.py
++++ b/vllm/v1/attention/backends/mla/sparse_swa.py
+@@ -306,16 +306,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+         )
+ 
+         # Handle MTP: adjust decode_threshold like the indexer does
++        spec_config = self.vllm_config.speculative_config
+         self.num_speculative_tokens = (
+-            self.vllm_config.speculative_config.num_speculative_tokens
+-            if self.vllm_config.speculative_config
+-            else 0
++            spec_config.num_speculative_tokens if spec_config else 0
++        )
++        # Decode can have query_len up to
++        #   1 + (2 if parallel drafting else 1) * num_speculative_tokens.
++        # This MUST match the flashmla_sparse / indexer threshold so that
++        # all backends agree on the decode/prefill split.
++        spec_mult = (
++            2 if (spec_config is not None and spec_config.parallel_drafting) else 1
+         )
+-        # With MTP, decode can have query_len up to 1 + num_speculative_tokens.
+-        # Must match the threshold used by the indexer and flashmla_sparse so
+-        # that all backends agree on the decode/prefill split.
+         self.decode_threshold = (
+-            self.reorder_batch_threshold + self.num_speculative_tokens
++            self.reorder_batch_threshold + spec_mult * self.num_speculative_tokens
+         )
+ 
+         hf_config = self.vllm_config.model_config.hf_config
+@@ -368,6 +371,25 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+             device=self.device,
+         )
+ 
++        # DSpark draft: the block is non-causal (every query attends to the
++        # trailing window of context PLUS all query tokens, including future ones),
++        # so its per-token index list is wider than `window_size`. The kernel pads
++        # the q-head count to B_TOPK (64/128), which requires the index width to be
++        # a multiple of 128.
++        self.is_dspark = spec_config is not None and spec_config.use_dspark()
++        # SM120 backport: the flashinfer sparse-MLA decode kernels dispatch only
++        # for topk in {128, 512, 1024}; the natural width of 256 would fall
++        # through to the >64-token prefill kernel and crash. Pad to 512 -- the
++        # kernel reads at most topk_length entries per token, so the padding
++        # costs nothing at runtime.
++        self.noncausal_index_width = (
++            max(512, cdiv(self.window_size + self.num_speculative_tokens, 128) * 128)
++            if self.is_dspark
++            else 0
++        )
++        self.decode_swa_indices_noncausal: torch.Tensor | None = None
++        self._max_tokens = max_tokens
++
+     def build(
+         self,
+         common_prefix_len: int,
+@@ -407,23 +429,56 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+         is_valid_token = self.is_valid_token[: slot_mapping.shape[0]]
+         is_valid_token.copy_(slot_mapping >= 0)
+ 
++        non_causal = not common_attn_metadata.causal
++        decode_swa_indices = self.decode_swa_indices
+         if num_decode_tokens > 0:
+             self.decode_swa_lens[num_decode_tokens:] = 0
+-            _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
+-                self.decode_swa_indices,
+-                self.decode_swa_indices.stride(0),
+-                self.decode_swa_lens,
+-                self.window_size,
+-                query_start_loc,
+-                seq_lens,
+-                token_to_req_indices,
+-                is_valid_token,
+-                block_table,
+-                block_table.stride(0),
+-                self.block_size,
+-                token_offset=0,
+-                TRITON_BLOCK_SIZE=1024,
+-            )
++            if non_causal:
++                assert self.is_dspark, (
++                    "Non-causal DeepseekV4 SWA is only supported for the DSpark "
++                    "speculation mode, but causal=False was set without DSpark."
++                )
++                if self.decode_swa_indices_noncausal is None:
++                    self.decode_swa_indices_noncausal = torch.zeros(
++                        self._max_tokens,
++                        1,
++                        self.noncausal_index_width,
++                        dtype=torch.int32,
++                        device=self.device,
++                    )
++                decode_swa_indices = self.decode_swa_indices_noncausal
++                _compute_dspark_noncausal_swa_indices_kernel[(num_decode_tokens,)](
++                    decode_swa_indices,
++                    decode_swa_indices.stride(0),
++                    self.decode_swa_lens,
++                    self.window_size,
++                    self.noncausal_index_width,
++                    query_start_loc,
++                    seq_lens,
++                    token_to_req_indices,
++                    is_valid_token,
++                    block_table,
++                    block_table.stride(0),
++                    self.block_size,
++                    token_offset=0,
++                    TRITON_BLOCK_SIZE=1024,
++                )
++            else:
++                _compute_swa_indices_and_lens_kernel[(num_decode_tokens,)](
++                    decode_swa_indices,
++                    decode_swa_indices.stride(0),
++                    self.decode_swa_lens,
++                    self.window_size,
++                    query_start_loc,
++                    seq_lens,
++                    token_to_req_indices,
++                    is_valid_token,
++                    block_table,
++                    block_table.stride(0),
++                    self.block_size,
++                    token_offset=0,
++                    TRITON_BLOCK_SIZE=1024,
++                )
+ 
+         # Prefill SWA indices live in paged coordinates. `token_offset` lets
+         # the kernel read is_valid_token / token_to_req_indices at absolute
+@@ -471,7 +526,7 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
+             slot_mapping=slot_mapping,
+             is_valid_token=is_valid_token,
+             token_to_req_indices=token_to_req_indices,
+-            decode_swa_indices=self.decode_swa_indices[:num_decode_tokens],
++            decode_swa_indices=decode_swa_indices[:num_decode_tokens],
+             decode_swa_lens=self.decode_swa_lens[:num_decode_tokens],
+             prefill_swa_indices=(
+                 self.prefill_swa_indices[:num_prefill_tokens]
+@@ -665,3 +720,69 @@ def _compute_swa_indices_and_lens_kernel(
+             slot_ids,
+             mask=offset < window_size,
+         )
++
++
++# TODO(ben): unify this kernel to reduce duplication
++@triton.jit(do_not_specialize=["token_offset"])
++def _compute_dspark_noncausal_swa_indices_kernel(
++    swa_indices_ptr,
++    swa_indices_stride,
++    swa_lens_ptr,
++    window_size,
++    index_width,
++    query_start_loc_ptr,
++    seq_lens_ptr,
++    token_to_req_indices_ptr,
++    is_valid_token_ptr,
++    block_table_ptr,
++    block_table_stride,
++    block_size,
++    token_offset,
++    TRITON_BLOCK_SIZE: tl.constexpr,
++):
++    """Non-causal per-token indices for the DSpark draft block.
++
++    Here, we populate the topk indices with the trailing window of context tokens,
++    plus all query tokens (including future ones).
++    """
++    pid = tl.program_id(0)
++    token_idx = pid + token_offset
++    is_valid = tl.load(is_valid_token_ptr + token_idx)
++    if not is_valid:
++        tl.store(swa_lens_ptr + pid, 0)
++        return
++
++    req_idx = tl.load(token_to_req_indices_ptr + token_idx)
++
++    query_start = tl.load(query_start_loc_ptr + req_idx)
++    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
++    query_len = query_end - query_start
++
++    seq_len = tl.load(seq_lens_ptr + req_idx)
++    prefix_len = seq_len - query_len
++
++    # Block-anchored window (shared by every token in the block) + full block.
++    start_pos = tl.maximum(prefix_len - window_size, 0)
++    end_pos = seq_len
++
++    swa_len = end_pos - start_pos
++    tl.store(swa_lens_ptr + pid, swa_len)
++
++    for i in range(0, index_width, TRITON_BLOCK_SIZE):
++        offset = i + tl.arange(0, TRITON_BLOCK_SIZE)
++
++        pos_offset = start_pos + offset
++        block_indices = pos_offset // block_size
++        block_numbers = tl.load(
++            block_table_ptr + req_idx * block_table_stride + block_indices,
++            mask=pos_offset < end_pos,
++        )
++        block_offsets = pos_offset % block_size
++        slot_ids = block_numbers * block_size + block_offsets
++
++        slot_ids = tl.where(offset < swa_len, slot_ids, -1)
++        tl.store(
++            swa_indices_ptr + pid * swa_indices_stride + offset,
++            slot_ids,
++            mask=offset < index_width,
++        )
 diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
 index cf4338f..f057750 100644
 --- a/vllm/v1/attention/ops/merge_attn_states.py
@@ -8167,6 +9625,125 @@ index dbe3c57..f12d719 100644
  
      _fwd_grouped_kernel_stage1[grid](
          q,
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 90d93a1..418f333 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -57,7 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
+ from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
+ from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
+ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+-from vllm.v1.spec_decode.dynamic.utils import build_dynamic_sd_schedule_lookup
++from vllm.v1.spec_decode.dynamic.utils import (
++    DSparkLiveRederivation,
++    build_dynamic_sd_schedule_lookup,
++)
+ from vllm.v1.spec_decode.metrics import SpecDecodingStats
+ from vllm.v1.structured_output import StructuredOutputManager
+ from vllm.v1.utils import record_function_or_nullcontext
+@@ -247,6 +250,13 @@ class Scheduler(SchedulerInterface):
+                 # decoding instead of standard next-token sampling, so it has a query
+                 # for the last sampled token plus queries for each draft token.
+                 self.num_lookahead_tokens = self.num_spec_tokens + 1
++            if speculative_config.use_dspark():
++                # DSpark drafts a block of num_spec_tokens query tokens in which the
++                # anchor itself is the first prediction position (no separate bonus
++                # query), so it needs exactly num_spec_tokens lookahead slots.
++                self.num_lookahead_tokens = self.num_spec_tokens
++                # Live dynamic-SD re-derivation, armed by set_dspark_cost_profile.
++                self._dspark_rederive: DSparkLiveRederivation | None = None
+ 
+         # Create the KV cache manager.
+         if hash_block_size is None:
+@@ -1573,6 +1583,11 @@ class Scheduler(SchedulerInterface):
+                     num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
+                     request_id=req_id,
+                 )
++                rederive = getattr(self, "_dspark_rederive", None)
++                if rederive is not None:
++                    lookup = rederive.observe(num_draft_tokens, num_accepted)
++                    if lookup is not None:
++                        self.dynamic_sd_lookup = lookup
+ 
+             # Free encoder inputs only after the step has actually executed.
+             if request.has_encoder_inputs:
+@@ -2263,6 +2278,17 @@ class Scheduler(SchedulerInterface):
+             perf_stats=perf_stats,
+         )
+ 
++    def set_dspark_cost_profile(
++        self, r_grid: list[int], times_by_l: list[list[float]]
++    ) -> None:
++        """Arm live dynamic-SD re-derivation from realized acceptance."""
++        self._dspark_rederive = DSparkLiveRederivation(
++            r_grid,
++            times_by_l,
++            self.scheduler_config.max_num_seqs,
++            self.num_spec_tokens,
++        )
++
+     def make_spec_decoding_stats(
+         self,
+         spec_decoding_stats: SpecDecodingStats | None,
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index f97f697..df38279 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -147,6 +147,43 @@ class EngineCore:
+             kv_cache_config, vllm_config
+         )
+ 
++        # DSpark: if no dynamic-SD table was configured, adopt the one the
++        # worker auto-derived from its startup cost profile, so scheduled
++        # verification widths always land on captured graph shapes.
++        spec_cfg = vllm_config.speculative_config
++        dspark_cost_profile = None
++        if (
++            spec_cfg is not None
++            and spec_cfg.method == "dspark"
++            and spec_cfg.dspark_scheduler
++            and spec_cfg.num_speculative_tokens_per_batch_size is None
++        ):
++            if vllm_config.parallel_config.world_size == 1:
++                tables = self.model_executor.collective_rpc(
++                    "get_dspark_dynamic_sd_table"
++                )
++                if tables and tables[0]:
++                    spec_cfg.num_speculative_tokens_per_batch_size = tables[0]
++                    logger.info(
++                        "DSpark: adopting auto-derived dynamic-SD table: %s",
++                        tables[0],
++                    )
++                    # Also hand over the raw cost profile: the schedule is
++                    # re-derived from realized acceptance at runtime.
++                    profiles = self.model_executor.collective_rpc(
++                        "get_dspark_cost_profile"
++                    )
++                    if profiles and profiles[0]:
++                        dspark_cost_profile = profiles[0]
++            else:
++                # Workers hold separate config copies under the multiproc
++                # executor, so the K-hint gate would not see the injected
++                # table; skip auto-adoption. (Broadcast: follow-up.)
++                logger.warning(
++                    "DSpark: auto-derived dynamic-SD table is only supported "
++                    "with a single worker (world_size==1); skipping."
++                )
++
+         self.scheduler: SchedulerInterface = Scheduler(
+             vllm_config=vllm_config,
+             kv_cache_config=kv_cache_config,
+@@ -156,6 +193,10 @@ class EngineCore:
+             block_size=scheduler_block_size,
+             hash_block_size=hash_block_size,
+         )
++        if dspark_cost_profile is not None and hasattr(
++            self.scheduler, "set_dspark_cost_profile"
++        ):
++            self.scheduler.set_dspark_cost_profile(*dspark_cost_profile)
+         self.use_spec_decode = vllm_config.speculative_config is not None
+         self.check_for_draft_tokens = (
+             self.use_spec_decode or vllm_config.model_config.is_diffusion
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
 index 5a2a5c5..33c628e 100644
 --- a/vllm/v1/kv_cache_interface.py
@@ -8182,11 +9759,225 @@ index 5a2a5c5..33c628e 100644
          if self.cache_dtype_str == "fp8_ds_mla":
              if self.model_version == "deepseek_v4":
                  # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+diff --git a/vllm/v1/spec_decode/dynamic/utils.py b/vllm/v1/spec_decode/dynamic/utils.py
+index de869b1..348eaf2 100644
+--- a/vllm/v1/spec_decode/dynamic/utils.py
++++ b/vllm/v1/spec_decode/dynamic/utils.py
+@@ -1,8 +1,16 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++from vllm.logger import init_logger
++
++logger = init_logger(__name__)
++
+ DynamicSDSchedule = list[tuple[int, int, int]]
+ 
++# Prefix-survival prior seeding dynamic-SD derivation until realized
++# acceptance is measured (shape from DSpark-V4-Flash/Qwen3 measurements).
++DEFAULT_SURVIVAL_PRIOR = [0.78, 0.55, 0.37, 0.24, 0.16, 0.11, 0.08]
++
+ 
+ def validate_and_normalize_dynamic_sd_schedule(
+     num_speculative_tokens_per_batch_size: object,
+@@ -146,3 +154,116 @@ def build_dynamic_sd_schedule_lookup(
+         )
+ 
+     return dense_schedule
++
++
++def derive_dynamic_sd_schedule(
++    r_grid: list[int],
++    times_by_l: list[list[float]],
++    survival: list[float],
++    max_num_reqs: int,
++    overhead_c0: float = 0.003,
++    overhead_c1: float = 5e-5,
++) -> DynamicSDSchedule:
++    """Derive a batch-size -> K schedule from a profiled cost table.
++
++    ``times_by_l[k][i]`` is the step time at ``r_grid[i]`` requests for
++    verification width ``1+k``; ``survival`` is the per-position prefix
++    acceptance probability (a startup prior, or measured live). For each
++    request bucket pick the K maximizing expected tokens/sec, then collapse
++    adjacent equal-K buckets into inclusive ranges covering 1..max_num_reqs.
++    """
++    gamma = len(times_by_l) - 1
++    accept = [0.0]
++    run = 0.0
++    for s in survival[:gamma]:
++        run += s
++        accept.append(run)
++    while len(accept) < gamma + 1:
++        accept.append(accept[-1])
++    table: list[list[int]] = []
++    start = 1
++    for i, r in enumerate(r_grid):
++        best_k, best = gamma, -1.0
++        for k in range(gamma + 1):
++            t = times_by_l[k][i]
++            if t <= 0.0:
++                continue
++            tokens = r * (1.0 + accept[k])
++            tput = tokens / (t + overhead_c0 + overhead_c1 * tokens)
++            if tput > best:
++                best, best_k = tput, k
++        end = r if i < len(r_grid) - 1 else max_num_reqs
++        if table and table[-1][2] == best_k:
++            table[-1][1] = end
++        else:
++            table.append([start, end, best_k])
++        start = end + 1
++    return [tuple(row) for row in table]
++
++
++class DSparkLiveRederivation:
++    """Re-derives the dynamic-SD schedule from realized acceptance.
++
++    The worker's startup cost profile is static (hardware); the acceptance
++    curve is measured from live traffic, so the batch-size -> K schedule
++    tracks the actual workload with no prior/tuning dependence.
++    """
++
++    # Re-derive after this many observed drafts, updating positions with at
++    # least this many observations.
++    REDERIVE_DRAFTS = 16384
++    MIN_POSITION_OBS = 512.0
++
++    def __init__(
++        self,
++        r_grid: list[int],
++        times_by_l: list[list[float]],
++        max_num_seqs: int,
++        num_spec_tokens: int,
++    ) -> None:
++        gamma = len(times_by_l) - 1
++        self._cost_profile = (r_grid, times_by_l)
++        self._max_num_seqs = max_num_seqs
++        self._num_spec_tokens = num_spec_tokens
++        self._acc_counts = [0.0] * gamma
++        self._obs_counts = [0.0] * gamma
++        self._rederive_ct = 0
++        self._rederived_once = False
++        self._survival = list(DEFAULT_SURVIVAL_PRIOR[:gamma])
++        while len(self._survival) < gamma:
++            self._survival.append(self._survival[-1] * 0.7)
++
++    def observe(self, num_draft_tokens: int, num_accepted: int) -> list[int] | None:
++        """Account one verified draft; returns a new dense lookup on re-derive."""
++        obs, acc = self._obs_counts, self._acc_counts
++        gamma = len(obs)
++        for j in range(min(num_draft_tokens, gamma)):
++            obs[j] += 1.0
++        for j in range(min(num_accepted, gamma)):
++            acc[j] += 1.0
++        self._rederive_ct += 1
++        if self._rederive_ct < self.REDERIVE_DRAFTS:
++            return None
++        self._rederive_ct = 0
++        for j in range(gamma):
++            if obs[j] >= self.MIN_POSITION_OBS:
++                self._survival[j] = acc[j] / obs[j]
++            # Decay so the estimate keeps tracking workload drift.
++            obs[j] *= 0.5
++            acc[j] *= 0.5
++        r_grid, times_by_l = self._cost_profile
++        table = derive_dynamic_sd_schedule(
++            r_grid, times_by_l, self._survival, self._max_num_seqs
++        )
++        log = logger.debug if self._rederived_once else logger.info
++        self._rederived_once = True
++        log(
++            "DSpark dynamic-SD re-derived from live acceptance %s: %s",
++            [round(s, 2) for s in self._survival],
++            table,
++        )
++        return build_dynamic_sd_schedule_lookup(
++            table,
++            vllm_max_batch_size=self._max_num_seqs,
++            vllm_num_speculative_tokens=self._num_spec_tokens,
++        )
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index dad1777..1f4b8b9 100644
+index dad1777..358acf4 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
-@@ -317,7 +317,12 @@ class CudaGraphManager:
+@@ -109,6 +109,13 @@ def get_uniform_token_count(
+ 
+ 
+ class CudaGraphManager:
++    # Request-count buckets for extra uniform-decode FULL graph capture.
++    # DSpark cost-table profiling must measure exactly at these buckets
++    # (its ceiling-bucket lookup assumes r_grid == capture grid).
++    UNIFORM_DECODE_REQUEST_BUCKETS: tuple[int, ...] = (
++        1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128, 192, 256,
++    )  # fmt: skip
++
+     def __init__(
+         self,
+         vllm_config: VllmConfig,
+@@ -116,6 +123,7 @@ class CudaGraphManager:
+         cudagraph_mode: CUDAGraphMode,
+         decode_query_len: int,
+         lora_capture_cases: list[int] | None = None,
++        extra_uniform_decode_lens: list[int] | None = None,
+     ):
+         self.vllm_config = vllm_config
+         self.device = device
+@@ -124,6 +132,15 @@ class CudaGraphManager:
+         assert self.compilation_config is not None
+         self.cudagraph_mode = cudagraph_mode
+         self.decode_query_len = decode_query_len
++        # Extra uniform-decode query lengths to capture FULL graphs for
++        # (padded/variable-length speculation): a uniform batch at one of
++        # these lengths replays FULL instead of falling to PIECEWISE/eager.
++        self.extra_uniform_decode_lens = [
++            q
++            for q in (extra_uniform_decode_lens or [])
++            if q >= 1 and q != decode_query_len
++        ]
++        self._uniform_candidates: dict[int, list[BatchExecutionDescriptor]] = {}
+ 
+         self.dp_size = vllm_config.parallel_config.data_parallel_size
+         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+@@ -235,6 +252,37 @@ class CudaGraphManager:
+                 descs_by_mode[mixed_mode].append(desc)
+                 descs_by_token_lora[(num_tokens, num_active_loras)].append(desc)
+ 
++        # Capture the decode routine at the extra query lengths over a coarse
++        # request grid so trimmed spec-decode batches stay on FULL graphs.
++        if separate_decode_routine and decode_mode and self.extra_uniform_decode_lens:
++            max_size = max(capture_sizes)
++            req_buckets = sorted(
++                {
++                    r
++                    for r in self.UNIFORM_DECODE_REQUEST_BUCKETS
++                    if r <= self.max_num_reqs
++                }
++                | {self.max_num_reqs}
++            )
++            for q, num_active_loras in product(
++                self.extra_uniform_decode_lens, self.lora_capture_cases
++            ):
++                for r in req_buckets:
++                    if r * q > max_size:
++                        break
++                    desc = BatchExecutionDescriptor(
++                        cg_mode=decode_mode,
++                        num_tokens=r * q,
++                        num_reqs=r,
++                        uniform_token_count=q,
++                        num_active_loras=num_active_loras,
++                    )
++                    descs_by_mode[decode_mode].append(desc)
++                    self._uniform_candidates.setdefault(q, []).append(desc)
++            # First-fit dispatch scans each per-q list in ascending token order.
++            for uniform_descs in self._uniform_candidates.values():
++                uniform_descs.sort(key=lambda d: d.num_tokens)
++
+         if not descs_by_token_lora:
+             return
+ 
+@@ -317,7 +365,12 @@ class CudaGraphManager:
                          # Sync offloader's copy stream before capture.
                          # Ensure any pre-capture prefetches from offloader are complete.
                          get_offloader().sync_prev_onload()
@@ -8200,6 +9991,1741 @@ index dad1777..1f4b8b9 100644
                              forward_fn(CUDAGraphMode.NONE)
                              # Join offloader's copy stream after forward to avoid
                              # unjoined stream error. The last layer's start_prefetch
+@@ -339,6 +392,19 @@ class CudaGraphManager:
+         """Find matching cudagraph descriptor from priority-ordered candidates."""
+ 
+         effective_loras = self._resolve_effective_loras(num_active_loras)
++        if (
++            self._graphs_captured
++            and num_tokens > 0
++            and uniform_token_count is not None
++            and uniform_token_count in self._uniform_candidates
++        ):
++            # Uniform batch at an extra decode query length: first-fit the
++            # smallest captured FULL decode graph that fits (ascending order).
++            for desc in self._uniform_candidates[uniform_token_count]:
++                if desc.num_tokens >= num_tokens and _is_compatible(
++                    desc, num_reqs, num_tokens, uniform_token_count, effective_loras
++                ):
++                    return desc
+         key = (num_tokens, effective_loras)
+         if self._graphs_captured and num_tokens > 0 and key in self._candidates:
+             for desc in self._candidates[key]:
+@@ -396,6 +462,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+         cudagraph_mode: CUDAGraphMode,
+         decode_query_len: int,
+         lora_capture_cases: list[int] | None = None,
++        extra_uniform_decode_lens: list[int] | None = None,
+     ):
+         super().__init__(
+             vllm_config,
+@@ -403,6 +470,7 @@ class ModelCudaGraphManager(CudaGraphManager):
+             cudagraph_mode,
+             decode_query_len,
+             lora_capture_cases=lora_capture_cases,
++            extra_uniform_decode_lens=extra_uniform_decode_lens,
+         )
+         self.hidden_states: torch.Tensor | None = None
+         self.aux_hidden_states: list[torch.Tensor] = []
+diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
+index 6b750fe..167ad68 100644
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -93,6 +93,11 @@ class InputBatch:
+     # Whether any requests in batch use structured output.
+     has_structured_output_reqs: bool
+ 
++    # Padded speculation: the UNPADDED per-request query cumsum. When set,
++    # query_start_loc describes the padded layout (real tokens a prefix of
++    # each uniform span) and token accounting must use this tensor instead.
++    real_query_start_loc: torch.Tensor | None = None
++
+     @classmethod
+     def make_dummy(
+         cls,
+@@ -303,6 +308,7 @@ def _combine_sampled_and_draft_tokens_kernel(
+     logits_indices_ptr,
+     BLOCK_SIZE: tl.constexpr,
+     NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
++    PREFIX_MODE: tl.constexpr = False,
+ ):
+     batch_idx = tl.program_id(0)
+     req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
+@@ -313,10 +319,15 @@ def _combine_sampled_and_draft_tokens_kernel(
+     num_logits = cu_num_logits_end - cu_num_logits_start
+     num_draft_tokens = num_logits - NUM_NEW_SAMPLED_TOKENS
+ 
+-    # Compute the logits indices.
++    # Compute the logits indices. In suffix mode (default) the real tokens
++    # occupy the END of the request's query span; in prefix mode (padded
++    # speculation: span is [real 1+n_draft | pads]) they occupy the START.
+     block = tl.arange(0, BLOCK_SIZE)
+     query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
+-    logits_start = query_end - num_logits
++    if PREFIX_MODE:
++        logits_start = tl.load(query_start_loc_ptr + batch_idx)
++    else:
++        logits_start = query_end - num_logits
+     tl.store(
+         logits_indices_ptr + cu_num_logits_start + block,
+         logits_start + block,
+@@ -332,7 +343,7 @@ def _combine_sampled_and_draft_tokens_kernel(
+     if NUM_NEW_SAMPLED_TOKENS > 0:
+         # Write the last sampled token ID to input_ids.
+         last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
+-        tl.store(input_ids_ptr + query_end - num_logits, last_token_id)
++        tl.store(input_ids_ptr + logits_start, last_token_id)
+ 
+     # Write the draft tokens (if any) to input_ids.
+     if num_draft_tokens > 0:
+@@ -342,7 +353,7 @@ def _combine_sampled_and_draft_tokens_kernel(
+             mask=mask,
+         )
+         tl.store(
+-            input_ids_ptr + query_end - num_draft_tokens + block,
++            input_ids_ptr + logits_start + NUM_NEW_SAMPLED_TOKENS + block,
+             draft_tokens,
+             mask=mask,
+         )
+@@ -359,6 +370,7 @@ def combine_sampled_and_draft_tokens(
+     cu_num_logits: torch.Tensor,
+     num_logits: int,
+     num_new_sampled_tokens: int = 1,  # excl accepted draft tokens, a.k.a bonus tokens
++    prefix_mode: bool = False,
+ ) -> torch.Tensor:
+     assert num_new_sampled_tokens in (0, 1), (
+         f"num_new_sampled_tokens must be 0 or 1, got {num_new_sampled_tokens}"
+@@ -384,6 +396,7 @@ def combine_sampled_and_draft_tokens(
+         cu_num_logits,
+         logits_indices,
+         NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
++        PREFIX_MODE=prefix_mode,
+         # NOTE(woosuk): Add num_new_sampled_tokens to ensure the block covers the
+         # last sampled token in addition to all draft tokens.
+         BLOCK_SIZE=triton.next_power_of_2(
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 30ca2dd..894e258 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -47,6 +47,7 @@ from vllm.tasks import SupportedTask
+ from vllm.utils.math_utils import cdiv
+ from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
+ from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
++from vllm.v1.attention.backends.utils import PAD_SLOT_ID
+ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+ from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
+@@ -102,6 +103,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+ from vllm.v1.worker.gpu.sample.sampler import Sampler
+ from vllm.v1.worker.gpu.shutdown import free_before_shutdown
+ from vllm.v1.worker.gpu.spec_decode import init_speculator
++from vllm.v1.worker.gpu.spec_decode.dspark.scheduler import derive_dynamic_sd_table
+ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+     set_eagle3_aux_hidden_state_layers,
+ )
+@@ -186,13 +188,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+ 
+         # Speculative decoding.
+         self.speculator = None
++        self._dspark_padbucket = False
++        self._dspark_dyn_sd_table: list[tuple[int, int, int]] | None = None
++        self._pad_q: int | None = None
+         self.use_aux_hidden_state_outputs = False
+         self.num_speculative_steps = vllm_config.num_speculative_tokens
+         if self.speculative_config is not None:
+             if self.is_last_pp_rank:
+                 self.speculator = init_speculator(self.vllm_config, self.device)
++                # DSpark pad-to-bucket: pad ragged spec batches to a uniform
++                # width so they dispatch to that width's FULL graph.
++                self._dspark_padbucket = (
++                    self.speculative_config is not None
++                    and getattr(self.speculative_config, "dspark_pad_to_bucket", False)
++                )
+ 
+-            if self.speculative_config.method in ("eagle3", "dflash"):
++            if self.speculative_config.method in ("eagle3", "dflash", "dspark"):
+                 # Drafting may require auxiliary hidden states from target model outputs
+                 self.use_aux_hidden_state_outputs = True
+                 if self.use_pp:
+@@ -469,6 +480,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cudagraph_mode,
+             decode_query_len=self.decode_query_len,
+             lora_capture_cases=self.lora_capture_cases,
++            # Also capture FULL decode graphs at the trimmed verify widths
++            # DSpark's scheduler may emit (absent on other speculators).
++            extra_uniform_decode_lens=getattr(
++                self.speculator, "extra_uniform_decode_lens", None
++            ),
+         )
+         if self.speculator is not None:
+             self.speculator.init_cudagraph_manager(cudagraph_mode)
+@@ -685,6 +701,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         # NOTE(woosuk): It is TBD whether we keep this API or not.
+         return 0
+ 
++    @torch.inference_mode()
++    def _profile_dspark_cost_table(self) -> None:
++        """Build the DSpark scheduler's shape-aware cost table T(R, L).
++
++        Called once after CUDA graph capture (graphs warm, KV cache live): for
++        each verify length L in [0, gamma] and request count R, time a uniform
++        decode step at query length 1+L (forced via a temporary
++        decode_query_len). Timing the real dispatched shape captures the
++        FULL/PIECEWISE/eager cliffs a 1-D T(num_tokens) table cannot. The dummy
++        step always drafts full gamma, so the L=0 row slightly over-estimates
++        the true no-spec cost.
++        """
++        spec = self.speculator
++        if not getattr(spec, "dspark_scheduler_enabled", False):
++            return
++        gamma = self.num_speculative_steps
++        # Measure exactly at the capture buckets: runtime pads R up to the next
++        # captured bucket, so ceiling-bucket lookup gives the dispatched cost;
++        # interpolating across the FULL/eager cliff would underestimate it.
++        buckets = ModelCudaGraphManager.UNIFORM_DECODE_REQUEST_BUCKETS
++        r_grid = sorted(
++            {r for r in buckets if 1 <= r <= self.max_num_reqs} | {self.max_num_reqs}
++        )
++        saved_qlen = self.decode_query_len
++        times_by_l: list[list[float]] = []
++        try:
++            for length in range(gamma + 1):
++                q = 1 + length
++                self.decode_query_len = q
++                row: list[float] = []
++                for r in r_grid:
++                    nt = r * q
++                    if nt > self.max_num_tokens:
++                        row.append(row[-1] if row else 0.0)
++                        continue
++                    for _ in range(2):  # warmup
++                        self._dummy_run(nt, uniform_decode=True)
++                    torch.accelerator.synchronize()
++                    t0 = time.perf_counter()
++                    iters = 3
++                    for _ in range(iters):
++                        self._dummy_run(nt, uniform_decode=True)
++                    torch.accelerator.synchronize()
++                    row.append((time.perf_counter() - t0) / iters)
++                times_by_l.append(row)
++        finally:
++            self.decode_query_len = saved_qlen
++        spec.set_cost_table(r_grid, times_by_l)
++        self._dspark_cost_profile = (r_grid, times_by_l)
++        self._dspark_dyn_sd_table = derive_dynamic_sd_table(
++            r_grid, times_by_l, self.num_speculative_steps, self.max_num_reqs
++        )
++        logger.info(
++            "DSpark auto-derived dynamic-SD table (batch-size ranges -> K): %s",
++            self._dspark_dyn_sd_table,
++        )
++        logger.info(
++            "DSpark shape-aware cost table: r_grid=%s; T(R=%d) by L = %s ms",
++            r_grid,
++            r_grid[-1],
++            [round(times_by_l[L][-1] * 1e3, 1) for L in range(gamma + 1)],
++        )
++
++    def get_dspark_dynamic_sd_table(self) -> list[tuple[int, int, int]] | None:
++        return self._dspark_dyn_sd_table
++
++    def get_dspark_cost_profile(
++        self,
++    ) -> tuple[list[int], list[list[float]]] | None:
++        return getattr(self, "_dspark_cost_profile", None)
++
+     @torch.inference_mode()
+     def capture_model(self) -> int:
+         assert self.cudagraph_manager is not None
+@@ -717,6 +804,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             )
+             if self.speculator is not None:
+                 self.speculator.capture(attn_states)
++                self._profile_dspark_cost_table()
+ 
+         end_time = time.perf_counter()
+         end_free_gpu_memory = torch.cuda.mem_get_info()[0]
+@@ -895,6 +983,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 idx_mapping, total_num_logits, cu_num_logits, max_expand_len
+             )
+ 
++        # DSpark pad-to-bucket: run a ragged spec-decode batch at one uniform
++        # width (chosen pre-dispatch in execute_model). The padded layout
++        # drives positions/seq_lens/attention; cu_num_logits stays REAL (real
++        # tokens are a prefix of each span) for logits and token accounting.
++        real_query_start_loc = None
++        pad_q = getattr(self, "_pad_q", None)
++        self._pad_q = None
++        if pad_q is not None and num_draft_tokens_per_req is not None:
++            real_qsl_np = np.zeros(num_reqs + 1, dtype=np.int32)
++            np.cumsum(num_scheduled_tokens, out=real_qsl_np[1:])
++            real_query_start_loc = async_copy_to_gpu(real_qsl_np, device=self.device)
++            num_scheduled_tokens = np.full(num_reqs, pad_q, dtype=np.int32)
++            num_tokens = num_reqs * pad_q
++
+         # Get query_start_loc.
+         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
+         num_reqs_padded = batch_desc.num_reqs or num_reqs
+@@ -960,7 +1062,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             cu_num_logits,
+             total_num_logits,
+             self.model_state.num_new_sampled_tokens_per_step,
++            prefix_mode=real_query_start_loc is not None,
+         )
++        if real_query_start_loc is not None:
++            # Fill padded tails with the drafting mask token; pads are
++            # excluded from logits by the prefix-mode logits indices.
++            ids2d = self.input_buffers.input_ids[:num_tokens].view(num_reqs, pad_q)
++            real_lens = cu_num_logits[1:] - cu_num_logits[:-1]
++            pad_mask = torch.arange(
++                pad_q, device=self.device, dtype=torch.int32
++            ).unsqueeze(0) >= real_lens.unsqueeze(1)
++            ids2d.masked_fill_(pad_mask, self.speculator.parallel_drafting_token_id)
+ 
+         # CPU upper bound on seq_lens; padded entries left at zero.
+         num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
+@@ -991,6 +1103,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             num_draft_tokens_per_req=num_draft_tokens_per_req,
+             query_start_loc=query_start_loc,
+             query_start_loc_np=query_start_loc_np,
++            real_query_start_loc=real_query_start_loc,
+             seq_lens=seq_lens,
+             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+             dcp_local_seq_lens=dcp_local_seq_lens,
+@@ -1064,6 +1177,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 input_batch,
+                 # Draft logits are needed for probabilistic rejection sampling.
+                 self.speculator.draft_logits,
++                # DSpark confidence-threshold mode: positions beyond a
++                # request's valid count are pads to force-reject.
++                valid_draft_len=getattr(self.speculator, "valid_draft_len", None),
+             )
+ 
+         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+@@ -1107,6 +1223,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         is_profile: bool = False,
+     ) -> ModelRunnerOutput | IntermediateTensors | None:
+         if not dummy_run:
++            # Dynamic SD: hand the speculator the engine-scheduled next-step
++            # width (K=0 skips the draft forward). Gated on the LIVE config --
++            # the table may be auto-injected after worker init via the shared
++            # config object -- and never written on the static path, where it
++            # would pin the worker-side scheduler to full gamma.
++            spec_cfg = self.vllm_config.speculative_config
++            if (
++                hasattr(self.speculator, "next_k_hint")
++                and spec_cfg is not None
++                and spec_cfg.uses_dynamic_speculative_decoding()
++            ):
++                self.speculator.next_k_hint = (
++                    scheduler_output.num_spec_tokens_to_schedule
++                )
+             # Update the request states.
+             self.update_pp_decode_requests()
+             self.finish_requests(scheduler_output)
+@@ -1125,6 +1255,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
+         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+ 
++        # DSpark pad-to-bucket: pad a ragged all-decode spec batch to uniform
++        # width max(1+l_r) so it dispatches to that width's FULL graph.
++        # Decided here (pre-dispatch); consumed by prepare_inputs.
++        self._pad_q = None
++        if (
++            self._dspark_padbucket
++            and not dummy_run
++            and uniform_tok_count is None
++            and scheduler_output.scheduled_spec_decode_tokens
++            and max_query_len <= self.decode_query_len
++            # DP ranks must replay the same graph shapes; a rank-local pad
++            # decision would diverge dispatch across ranks.
++            and self.dp_size == 1
++        ):
++            sched_drafts = scheduler_output.scheduled_spec_decode_tokens
++            all_decode = all(
++                n == 1 + len(sched_drafts.get(rid, ()))
++                for rid, n in scheduler_output.num_scheduled_tokens.items()
++            )
++            if all_decode:
++                self._pad_q = max_query_len
++                num_toks = num_reqs * max_query_len
++                uniform_tok_count = max_query_len
++
+         num_active_loras = 0
+         if self.lora_config:
+             req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+@@ -1160,6 +1314,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             # Prepare all the inputs and copy to the input buffers.
+             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+             block_tables, slot_mappings = self.prepare_attn(input_batch)
++            if input_batch.real_query_start_loc is not None:
++                # Pad positions overshoot the real sequence and may compute
++                # slots in unallocated pages: route their KV writes to the
++                # dummy slot.
++                npq = input_batch.num_tokens // input_batch.num_reqs
++                real_lens = (
++                    input_batch.cu_num_logits[1:] - input_batch.cu_num_logits[:-1]
++                )
++                pad_flat = (
++                    torch.arange(npq, device=self.device, dtype=torch.int32).unsqueeze(
++                        0
++                    )
++                    >= real_lens.unsqueeze(1)
++                ).reshape(-1)
++                slot_mappings[..., : input_batch.num_tokens].masked_fill_(
++                    pad_flat, PAD_SLOT_ID
++                )
+ 
+             if self.lora_config:
+                 # Activate LoRA adapters.
+@@ -1424,7 +1595,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             sampler_output.sampled_token_ids,
+             num_sampled,
+             num_rejected,
+-            input_batch.query_start_loc,
++            # Account computed tokens by the REAL layout (padded query lens
++            # would overcount).
++            input_batch.real_query_start_loc
++            if input_batch.real_query_start_loc is not None
++            else input_batch.query_start_loc,
+         )
+ 
+         if self.speculator is not None:
+@@ -1451,14 +1626,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+                 self.sampler.sampling_states.seeds.gpu,
+                 mm_inputs=mm_inputs,
+             )
+-            self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
++            # DSpark may trim the draft to a uniform L < num_speculative_steps
++            # per step: write the first L columns and propagate L as the verify
++            # length. L == full width is the unchanged fixed-gamma path.
++            n_draft = draft_tokens.shape[1]
++            self.req_states.draft_tokens[input_batch.idx_mapping, :n_draft] = (
++                draft_tokens
++            )
++        else:
++            n_draft = self.num_speculative_steps
+ 
+         if self.num_speculative_steps > 0:
+             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
+             # not have a speculator (i.e. self.speculator is None)
+             self.draft_tokens_handler.set_draft_tokens(
+                 input_batch,
+-                self.req_states.draft_tokens[input_batch.idx_mapping],
++                self.req_states.draft_tokens[input_batch.idx_mapping, :n_draft],
++                # DSpark Algorithm-1 per-request lengths; absent/None on the
++                # uniform path.
++                lengths=getattr(self.speculator, "_perreq_batch_len", None),
+             )
+ 
+         # Post-step KV connector related operations.
+diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
+index fab53fe..7bacdbc 100644
+--- a/vllm/v1/worker/gpu/sample/gumbel.py
++++ b/vllm/v1/worker/gpu/sample/gumbel.py
+@@ -213,6 +213,11 @@ def gumbel_sample(
+     output_processed_logits_col: torch.Tensor | None = None,
+     use_fp64: bool = False,
+ ) -> torch.Tensor:
++    # Enforce contiguity on non-strided input tensors
++    expanded_idx_mapping = expanded_idx_mapping.contiguous()
++    pos = pos.contiguous()
++    if output_processed_logits_col is not None:
++        output_processed_logits_col = output_processed_logits_col.contiguous()
+     num_tokens, vocab_size = logits.shape
+     BLOCK_SIZE = 1024
+     num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
+diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
+index 09153dd..c70f169 100644
+--- a/vllm/v1/worker/gpu/spec_decode/__init__.py
++++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
+@@ -14,6 +14,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
+         )
+ 
+         return DFlashSpeculator(vllm_config, device)
++    elif speculative_config.method == "dspark":
++        from vllm.v1.worker.gpu.spec_decode.dspark.speculator import (
++            DSparkSpeculator,
++        )
++
++        return DSparkSpeculator(vllm_config, device)
+     elif speculative_config.use_gemma4_mtp():
+         from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
+             Gemma4Speculator,
+diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+index 1bd1308..9014fc0 100644
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -29,6 +29,8 @@ logger = init_logger(__name__)
+ 
+ 
+ class DFlashSpeculator(DraftModelSpeculator):
++    _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
++
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         super().__init__(vllm_config, device)
+ 
+@@ -48,15 +50,17 @@ class DFlashSpeculator(DraftModelSpeculator):
+ 
+         self.dflash_causal = get_dflash_causal(self.draft_model_config)
+ 
+-        # Buffers for context K/V precomputation. Populated by prepare_dflash_inputs,
+-        # and processed by the model's precompute_and_store_context_kv method.
+-        # NOT captured by CUDA graphs.
++        # Whether the anchor query position is itself a prediction. DFlash default uses
++        # the anchor as the bonus token (only mask tokens predict); DSpark samples from
++        # the anchor and the N-1 mask token positions. See _prepare_dflash_inputs_kernel
++        self.sample_from_anchor = False
++
++        # Context positions for the K/V precompute. Populated by
++        # prepare_dflash_inputs, and processed by the model's
++        # precompute_and_store_context_kv method. NOT captured by CUDA graphs.
+         self.context_positions = torch.zeros(
+             self.max_num_tokens, dtype=torch.int64, device=device
+         )
+-        self.context_slot_mapping = torch.zeros(
+-            self.max_num_tokens, dtype=torch.int64, device=device
+-        )
+ 
+         # Per-mask-token sampling buffers. Flattened from (num_reqs, num_spec_tokens).
+         max_num_sampled_tokens = self.max_num_reqs * self.num_speculative_steps
+@@ -94,7 +98,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+         )
+ 
+     def capture(self, attn_states: dict | None = None) -> None:
+-        logger.info("Capturing model for DFlash speculator...")
++        logger.info("Capturing model for %s speculator...", self._speculator_name)
+         # Reset sampling indices to zero to prevent stale values from prior
+         # dummy runs from being baked into the captured graph.
+         self.sample_indices.zero_()
+@@ -108,7 +112,7 @@ class DFlashSpeculator(DraftModelSpeculator):
+             self.attn_groups,
+             self.kv_cache_config,
+             self.max_model_len,
+-            progress_bar_desc="Capturing dflash CUDA graphs",
++            progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
+         )
+ 
+     def load_draft_model(
+@@ -126,18 +130,39 @@ class DFlashSpeculator(DraftModelSpeculator):
+     ) -> None:
+         super().set_attn(model_state, kv_cache_config, block_tables)
+ 
+-        # DFlash precomputes context K/V with a single block_size; mixing
+-        # kv-cache groups would silently corrupt the cache for the non-matching group.
+-        draft_groups = [gid for gid, g in enumerate(self.attn_groups) if g]
+-        assert len(draft_groups) == 1, (
+-            "DFlash currently requires all draft attention layers to share "
+-            "a single kv-cache group."
+-        )
+-        self.draft_kv_cache_group_id = draft_groups[0]
++        self.draft_kv_cache_group_ids = [
++            gid for gid, g in enumerate(self.attn_groups) if g
++        ]
++        assert self.draft_kv_cache_group_ids, "No draft attention groups found."
++        self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
+         self.draft_block_size = self.block_tables.block_sizes[
+             self.draft_kv_cache_group_id
+         ]
+ 
++        # Per-group context slot buffers for the precompute (one row per group).
++        self._context_slot_mappings = torch.zeros(
++            len(self.draft_kv_cache_group_ids),
++            self.max_num_tokens,
++            dtype=torch.int64,
++            device=self.device,
++        )
++
++        # Map each draft decoder layer to the index (within draft_kv_cache_group_ids)
++        # of the kv-cache group its cache belongs to. Models that share a single group
++        # leave this as None and share one context slot mapping.
++        self._layer_group_idx: list[int] | None = None
++        if hasattr(self.model, "get_draft_kv_cache_layer_names"):
++            name_to_gid = {
++                ln: gid
++                for gid, group in enumerate(kv_cache_config.kv_cache_groups)
++                for ln in group.layer_names
++            }
++            gid_to_idx = {gid: i for i, gid in enumerate(self.draft_kv_cache_group_ids)}
++            self._layer_group_idx = [
++                gid_to_idx[name_to_gid[name]]
++                for name in self.model.get_draft_kv_cache_layer_names()
++            ]
++
+     @torch.inference_mode()
+     def _run_model(
+         self,
+@@ -183,9 +208,11 @@ class DFlashSpeculator(DraftModelSpeculator):
+ 
+         num_sample = num_reqs * self.num_speculative_steps
+         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
++        # sample_pos is the predicted token's position Q; verification keys
++        # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
+         draft_tokens = self.sample_draft(
+             sample_hidden_states,
+-            self.sample_pos[:num_sample],
++            self.sample_pos[:num_sample] - 2,
+             self.sample_idx_mapping[:num_sample],
+             self.temperature,
+             self.seeds,
+@@ -244,6 +271,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+         is_profile: bool = False,
+     ) -> torch.Tensor:
+         num_reqs = input_batch.num_reqs
++        draft_len = self._schedule_draft_len(
++            input_batch, num_sampled, num_rejected, dummy_run
++        )
+         num_target_tokens = input_batch.num_tokens
+         num_query_tokens = num_reqs * self.num_query_per_req
+         max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+@@ -291,42 +321,56 @@ class DFlashSpeculator(DraftModelSpeculator):
+         # The query slot mapping is written into the shared BlockTables slot_mappings.
+         # That buffer's address is what the captured CUDA graph reads from at replay.
+         assert self.draft_kv_cache_group_id >= 0
+-        query_slot_mapping = self.block_tables.slot_mappings[
+-            self.draft_kv_cache_group_id
+-        ]
+-        prepare_dflash_inputs(
+-            self.input_buffers,
+-            query_slot_mapping,
+-            self.context_positions,
+-            self.context_slot_mapping,
+-            self.sample_indices,
+-            self.sample_pos,
+-            self.sample_idx_mapping,
+-            input_batch,
+-            num_sampled,
+-            num_rejected,
+-            last_sampled,
+-            next_prefill_tokens,
+-            self.block_tables.input_block_tables[self.draft_kv_cache_group_id],
+-            self.draft_block_size,
+-            self.parallel_drafting_token_id,
+-            self.num_query_per_req,
+-            self.num_speculative_steps,
+-            self.max_num_reqs,
+-            self.max_num_tokens,
+-        )
++        # Support multiple draft KV cache groups by preparing inputs once for each
++        for i, gid in enumerate(self.draft_kv_cache_group_ids):
++            prepare_dflash_inputs(
++                self.input_buffers,
++                self.block_tables.slot_mappings[gid],
++                self.context_positions,
++                self._context_slot_mappings[i],
++                self.sample_indices,
++                self.sample_pos,
++                self.sample_idx_mapping,
++                input_batch,
++                num_sampled,
++                num_rejected,
++                last_sampled,
++                next_prefill_tokens,
++                self.block_tables.input_block_tables[gid],
++                self.block_tables.block_sizes[gid],
++                self.parallel_drafting_token_id,
++                self.num_query_per_req,
++                self.num_speculative_steps,
++                self.max_num_reqs,
++                self.max_num_tokens,
++                self.max_model_len,
++                self.sample_from_anchor,
++            )
+ 
+         # Pre-insert context K/V into the cache. Runs eagerly outside the captured graph
+         # because the context shape varies per step. During dummy runs the block tables
+         # are placeholders, so we skip the cache write to avoid clobbering real entries.
++        # Each layer uses the context slots of its own kv-cache group.
++        if dummy_run:
++            context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
++        elif self._layer_group_idx is not None:
++            context_slots = [
++                self._context_slot_mappings[gidx][:num_target_tokens]
++                for gidx in self._layer_group_idx
++            ]
++        else:
++            context_slots = self._context_slot_mappings[0][:num_target_tokens]
+         self.model.precompute_and_store_context_kv(
+             self.hidden_states[:num_target_tokens],
+             self.context_positions[:num_target_tokens],
+-            context_slot_mapping=(
+-                None if dummy_run else self.context_slot_mapping[:num_target_tokens]
+-            ),
++            context_slots,
+         )
+ 
++        if draft_len == 0:
++            # Scheduler gate: context KV was refreshed above but the draft
++            # forward is skipped -> empty draft, engine runs a normal decode.
++            return self._finalize_draft(input_batch, num_reqs, 0, dummy_run)
++
+         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
+         batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+             self.query_cudagraph_manager,
+@@ -367,6 +411,26 @@ class DFlashSpeculator(DraftModelSpeculator):
+                 cudagraph_runtime_mode=batch_desc.cg_mode,
+             )
+ 
++        return self._finalize_draft(input_batch, num_reqs, draft_len, dummy_run)
++
++    def _schedule_draft_len(
++        self,
++        input_batch: InputBatch,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++        dummy_run: bool,
++    ) -> int:
++        """Pick this step's draft length; 0 skips the draft forward."""
++        return self.num_speculative_steps
++
++    def _finalize_draft(
++        self,
++        input_batch: InputBatch,
++        num_reqs: int,
++        draft_len: int,
++        dummy_run: bool,
++    ) -> torch.Tensor:
++        """Post-draft hook: trim/mask the draft block before returning it."""
+         return self.draft_tokens[:num_reqs]
+ 
+ 
+@@ -391,6 +455,7 @@ def _prepare_dflash_inputs_kernel(
+     next_prefill_tokens_ptr,
+     num_sampled_ptr,
+     num_rejected_ptr,
++    cu_num_logits_ptr,
+     # Block table for slot mapping lookup.
+     block_table_ptr,
+     block_table_stride,
+@@ -401,8 +466,11 @@ def _prepare_dflash_inputs_kernel(
+     num_speculative_steps,
+     max_num_reqs,
+     max_num_tokens,
++    max_model_len,
++    SAMPLE_FROM_ANCHOR: tl.constexpr,
+     PAD_SLOT_ID: tl.constexpr,
+     BLOCK_SIZE: tl.constexpr,
++    HAS_REAL_LENS: tl.constexpr = False,
+ ):
+     req_idx = tl.program_id(0)
+     block_idx = tl.program_id(1)
+@@ -412,9 +480,17 @@ def _prepare_dflash_inputs_kernel(
+     ctx_start = tl.load(target_query_start_loc_ptr + req_idx)
+     ctx_end = tl.load(target_query_start_loc_ptr + req_idx + 1)
+     num_ctx = ctx_end - ctx_start
++    span_len = num_ctx
++    if HAS_REAL_LENS:
++        # Padded speculation: the target span is padded to a uniform width
++        # with the real tokens as a PREFIX; the real length comes from
++        # cu_num_logits. All downstream indexing derives from num_ctx.
++        num_ctx = tl.load(cu_num_logits_ptr + req_idx + 1) - tl.load(
++            cu_num_logits_ptr + req_idx
++        )
+ 
+     num_rejected = tl.load(num_rejected_ptr + req_idx)
+-    valid_ctx_end = ctx_end - num_rejected
++    valid_ctx_end = ctx_start + num_ctx - num_rejected
+ 
+     num_sampled = tl.load(num_sampled_ptr + req_idx)
+     if num_sampled > 0:
+@@ -444,6 +520,17 @@ def _prepare_dflash_inputs_kernel(
+     ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
+     tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+     tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
++    if HAS_REAL_LENS:
++        # Neutralize the padded tail of the context arrays: stale entries from
++        # prior steps would otherwise write garbage draft-context KV into
++        # other requests' pages via precompute_and_store_context_kv.
++        is_pad_ctx = (j >= num_ctx) & (j < span_len)
++        tl.store(out_context_positions_ptr + ctx_start + j, 0, mask=is_pad_ctx)
++        tl.store(
++            out_context_slot_mapping_ptr + ctx_start + j,
++            PAD_SLOT_ID,
++            mask=is_pad_ctx,
++        )
+ 
+     # --- Query positions / input_ids / slots ---
+     query_pos = last_valid_pos + 1 + query_off
+@@ -461,14 +548,21 @@ def _prepare_dflash_inputs_kernel(
+     q_slot = q_block_id * block_size + (query_pos % block_size)
+ 
+     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
+-    tl.store(out_query_positions_ptr + query_idx, query_pos, mask=is_query)
++    clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
++    tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
+     tl.store(out_query_slot_mapping_ptr + query_idx, q_slot, mask=is_query)
+ 
+-    # --- Sample indices / positions / idx_mapping (mask tokens only) ---
+-    is_sample = is_query & (query_off > 0)
+-    sample_idx = req_idx * num_speculative_steps + (query_off - 1)
++    # --- Sample indices / positions / idx_mapping ---
++    # When SAMPLE_FROM_ANCHOR (DSpark), so we sample at EVERY query position
++    # and each position k predicts the NEXT token (sampled position = query_pos + 1).
++    # Otherwise (DFlash default) the anchor is the bonus token and only the mask tokens
++    # at offsets > 0 are sampled from, each AT its own position.
++    sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
++    is_sample = is_query & (query_off >= sample_off)
++    sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
++    sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
+     tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
+-    tl.store(out_sample_pos_ptr + sample_idx, query_pos, mask=is_sample)
++    tl.store(out_sample_pos_ptr + sample_idx, sample_pos, mask=is_sample)
+     tl.store(out_sample_idx_mapping_ptr + sample_idx, req_state_idx, mask=is_sample)
+ 
+     if block_idx == 0:
+@@ -533,6 +627,8 @@ def prepare_dflash_inputs(
+     num_speculative_steps: int,
+     max_num_reqs: int,
+     max_num_tokens: int,
++    max_model_len: int,
++    sample_from_anchor: bool = False,
+ ) -> None:
+     num_reqs = input_batch.num_reqs
+     assert num_reqs > 0
+@@ -560,6 +656,7 @@ def prepare_dflash_inputs(
+         next_prefill_tokens,
+         num_sampled,
+         num_rejected,
++        input_batch.cu_num_logits,
+         block_table,
+         block_table.stride(0),
+         parallel_drafting_token_id,
+@@ -568,6 +665,10 @@ def prepare_dflash_inputs(
+         num_speculative_steps,
+         max_num_reqs,
+         max_num_tokens,
++        max_model_len,
++        SAMPLE_FROM_ANCHOR=sample_from_anchor,
+         PAD_SLOT_ID=PAD_SLOT_ID,
+         BLOCK_SIZE=BLOCK_SIZE,
++        # Padded speculation: spans are padded, real lengths in cu_num_logits.
++        HAS_REAL_LENS=input_batch.real_query_start_loc is not None,
+     )
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
+new file mode 100644
+index 0000000..208f01a
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
+@@ -0,0 +1,2 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
+new file mode 100644
+index 0000000..28a3417
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
+@@ -0,0 +1,373 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark hardware-aware confidence scheduler policy.
++
++Owns all scheduler state for the DSpark speculator: the shape-aware cost table,
++the online engine-overhead regression, the survival EMA + calibration, the
++hysteresis incumbent, and per-request width allocation. The speculator keeps
++only the GPU-graph-written survival buffer and the width plumbing the runner
++consumes, driving this policy through a thin method surface.
++"""
++
++import torch
++
++from vllm.config import SpeculativeConfig
++from vllm.v1.spec_decode.dynamic.utils import (
++    DEFAULT_SURVIVAL_PRIOR,
++    derive_dynamic_sd_schedule,
++)
++
++# Survival EMA: slow blend so the per-step length choice does not chase jitter.
++SURVIVAL_EMA_DECAY = 0.9
++SURVIVAL_EMA_GAIN = 0.1
++# Consume/launch the host survival readout every N steps (staleness-tolerant).
++READOUT_CADENCE = 4
++# Online calibration ratio EMA (realized/predicted survival).
++CALIBRATION_DECAY = 0.8
++CALIBRATION_GAIN = 0.2
++# Minimum observations in an interval before trusting a calibration update.
++CALIBRATION_MIN_OBS = 64.0
++# Clamp the realized/predicted ratio to reject noisy intervals.
++CALIBRATION_RATIO_MIN = 0.25
++CALIBRATION_RATIO_MAX = 4.0
++# Overhead regression ring: bounded sample history for the (c0, c1) fit.
++OVERHEAD_RING_SIZE = 129
++# Discard overhead residuals above this many seconds as idle-gap outliers.
++OVERHEAD_SAMPLE_GATE = 0.25
++# Minimum ring occupancy before the regression is meaningful.
++OVERHEAD_MIN_SAMPLES = 16
++# Cap the per-token overhead slope c1 (a physical sampler/detok upper bound).
++OVERHEAD_C1_CLAMP = 1e-3
++# Keep the incumbent length unless a challenger clears this relative margin.
++HYSTERESIS_MARGIN = 0.05
++# Prefix-survival prior (measured V4-Flash/Qwen3) seeding the dynamic-SD table;
++# online calibration corrects the runtime estimate, not this table.
++SURVIVAL_PRIOR = DEFAULT_SURVIVAL_PRIOR
++# Engine-overhead prior (per-step, per-token seconds) for the dynamic-SD table.
++DERIVATION_OVERHEAD_C0 = 0.003
++DERIVATION_OVERHEAD_C1 = 5e-5
++
++
++def schedule_uniform_length(
++    accept: list[float],
++    num_reqs: int,
++    gamma: int,
++    r_grid: list[int] | None,
++    times_by_l: list[list[float]] | None,
++    overhead: tuple[float, float] = (0.0, 0.0),
++    current: int | None = None,
++    hysteresis: float = HYSTERESIS_MARGIN,
++) -> tuple[int, float]:
++    """Hardware-aware per-step *uniform* verify length L in [0, gamma].
++
++    Picks the batch-uniform L maximizing accepted-tokens / step-time from
++    ``accept`` (``accept[L]`` = summed prefix-survival over the first L
++    positions) and the shape-aware cost table ``times_by_l[L][i]`` = step time
++    at ``r_grid[i]`` requests for verify query length ``1+L``. Each L is a
++    fixed CUDA-graph-captured shape; L=0 skips drafting; falls back to gamma
++    without a table. Shape-awareness matters: full-gamma verify replays the
++    fast FULL decode graph while a trimmed L may fall to PIECEWISE, and the
++    eager cutoff depends on (R, L) -- a 1-D T(num_tokens) expresses neither.
++
++    ``overhead`` is (c0, c1): per-step constant + per-generated-token cost.
++    Folding c1 into c0 would wrongly pin L at gamma.
++
++    Returns (best_l, predicted step time of best_l including overhead).
++    """
++    if not r_grid or not times_by_l:
++        return gamma, 0.0
++
++    def cost(length: int) -> float:
++        # Ceiling-bucket lookup, NOT interpolation: dispatch pads R up to the next
++        # captured bucket, so cost is a step function of R; interpolating smooths
++        # across the FULL-graph/eager cliff and underestimates eager shapes.
++        row = times_by_l[length]
++        for i, r in enumerate(r_grid):
++            if num_reqs <= r:
++                return row[i]
++        return row[-1] * (num_reqs / r_grid[-1])
++
++    c0, c1 = overhead
++    best_l, best_tput, best_cost = gamma, -1.0, 0.0
++    cur_tput, cur_cost = -1.0, 0.0
++    for length in range(gamma + 1):
++        c = cost(length)
++        if c <= 0.0:
++            continue
++        tokens = num_reqs * (1.0 + accept[length])
++        c += c0 + c1 * tokens
++        tput = tokens / c
++        if tput > best_tput:
++            best_tput, best_l, best_cost = tput, length, c
++        if length == current:
++            cur_tput, cur_cost = tput, c
++    # Hysteresis: re-evaluated at the current num_reqs so genuine load shifts
++    # still switch immediately, but survival-EMA jitter cannot flap the length.
++    if (
++        current is not None
++        and cur_tput > 0.0
++        and best_tput <= cur_tput * (1.0 + hysteresis)
++    ):
++        return current, cur_cost
++    return best_l, best_cost
++
++
++def derive_dynamic_sd_table(
++    r_grid: list[int],
++    times_by_l: list[list[float]],
++    gamma: int,
++    max_num_reqs: int,
++) -> list[tuple[int, int, int]]:
++    """Derive the dynamic-SD batch-size table from the startup profile:
++    per-bucket throughput-optimal K under the survival/overhead priors,
++    adjacent equal-K buckets collapsed (ceiling-bucket semantics matching
++    dispatch, so every scheduled K runs on a captured shape).
++    """
++    return derive_dynamic_sd_schedule(
++        r_grid,
++        times_by_l,
++        list(SURVIVAL_PRIOR[:gamma]),
++        max_num_reqs,
++        overhead_c0=DERIVATION_OVERHEAD_C0,
++        overhead_c1=DERIVATION_OVERHEAD_C1,
++    )
++
++
++def allocate_widths(
++    survival_view: torch.Tensor,
++    cal_t: torch.Tensor,
++    num_reqs: int,
++    length: int,
++    tau: float,
++    budget_frac: float,
++) -> torch.Tensor:
++    """Per-request keep lengths (paper Algorithm 1) via a global survival top-k.
++
++    With ``tau > 0`` returns a static confidence-threshold width; otherwise
++    distributes ``num_reqs*length*budget_frac`` tokens over the freshest
++    calibrated survivals. Survival is a cumprod, so thresholding yields
++    valid prefixes.
++    """
++    a = survival_view * cal_t
++    if tau > 0.0:
++        return (a >= tau).sum(dim=1, dtype=torch.int32)
++    a = a[:, :length]
++    budget = min(int(num_reqs * length * budget_frac) + 1, num_reqs * length)
++    flat = a.reshape(-1)
++    if budget < flat.numel():
++        th = torch.topk(flat, budget, sorted=False).values.min()
++        return (a >= th).sum(dim=1, dtype=torch.int32)
++    return torch.full((num_reqs,), length, dtype=torch.int32, device=a.device)
++
++
++class DSparkScheduler:
++    """Confidence-scheduler policy for the DSpark speculator (see module docstring)."""
++
++    def __init__(
++        self,
++        spec_config: SpeculativeConfig,
++        gamma: int,
++        max_num_reqs: int,
++        device: torch.device,
++    ):
++        self.gamma = gamma
++        self.device = device
++        # CPU-testability seam: on CPU use a pageable host buffer and an
++        # always-ready readout (copies are synchronous) so the stateful core is
++        # unit-testable without a GPU; the CUDA path is byte-identical.
++        self._is_cuda = device.type == "cuda"
++        self.perreq = spec_config.dspark_per_request
++        self.tau = spec_config.dspark_confidence_threshold
++        self._budget_frac = spec_config.dspark_budget_frac
++
++        # Shape-aware cost table T(R, L), installed after CUDA graph capture.
++        self._cost_r_grid: list[int] | None = None
++        self._cost_times_by_l: list[list[float]] | None = None
++
++        # Survival EMA: on-GPU accumulator + stale CPU readout consumed by decide.
++        self._surv_ema_t: torch.Tensor | None = None
++        self._surv_ema: list[float] | None = None
++        self._ema_ct = 0
++        # Host readout rows: [survival EMA; realized-acceptance counts; observation
++        # counts; predicted-survival sum]; the latter three feed online calibration.
++        self._surv_host = torch.empty(
++            4, gamma, dtype=torch.float32, pin_memory=self._is_cuda
++        )
++        self._surv_evt = torch.cuda.Event() if self._is_cuda else None
++        self._surv_inflight = False
++
++        # Calibration state (realized vs predicted survival over the same set).
++        self._acc_counts = torch.zeros(gamma, dtype=torch.float32, device=device)
++        self._obs_counts = torch.zeros(gamma, dtype=torch.float32, device=device)
++        self._pred_counts = torch.zeros(gamma, dtype=torch.float32, device=device)
++        self._surv_state = torch.zeros(
++            max_num_reqs, gamma, dtype=torch.float32, device=device
++        )
++        self._pos_arange = torch.arange(1, gamma + 1, dtype=torch.int32, device=device)
++        self._cal = [1.0] * gamma
++        self._cal_prev_acc = [0.0] * gamma
++        self._cal_prev_obs = [0.0] * gamma
++        self._cal_prev_pred = [0.0] * gamma
++        self._cal_t = torch.ones(gamma, dtype=torch.float32, device=device)
++
++        # Online engine-overhead regression O = c0 + c1 * generated_tokens over a
++        # ring of (tokens, residual) samples (median-free least squares).
++        self._o_c0 = 0.0
++        self._o_c1 = 0.0
++        self._o_samples: list[tuple[float, float]] = []
++        self._last_t: float | None = None
++        self._last_pred = 0.0
++        self._last_gpu_pred = 0.0
++        self._last_tokens = 0.0
++        # Hysteresis incumbent and last committed verify length.
++        self._last_l: int | None = None
++        self._prev_sched_l = 0
++
++    def set_cost_table(self, r_grid: list[int], times_by_l: list[list[float]]) -> None:
++        """Install the shape-aware cost table T(R, L) [seconds]."""
++        if r_grid and times_by_l and all(len(row) == len(r_grid) for row in times_by_l):
++            self._cost_r_grid = list(r_grid)
++            self._cost_times_by_l = [list(row) for row in times_by_l]
++
++    def observe_verified(
++        self,
++        num_reqs: int,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++        prev_widths: torch.Tensor,
++        idx_mapping: torch.Tensor,
++    ) -> None:
++        # Accumulate realized prefix survival from the step just verified: request
++        # r survived position j iff it accepted >= j draft tokens; position j was
++        # observed iff verified at its full scheduled width and j <= width_r.
++        if self._prev_sched_l <= 0:
++            return
++        prev = prev_widths[idx_mapping]
++        full = (num_sampled[:num_reqs] + num_rejected[:num_reqs]) == (1 + prev)
++        accepted = (num_sampled[:num_reqs] - 1).clamp_(min=0)
++        observed_j = (prev.unsqueeze(1) >= self._pos_arange) & full.unsqueeze(1)
++        surv_j = (accepted.unsqueeze(1) >= self._pos_arange) & observed_j
++        self._acc_counts += surv_j.sum(dim=0, dtype=torch.float32)
++        self._obs_counts += observed_j.sum(dim=0, dtype=torch.float32)
++        self._pred_counts += (self._surv_state[idx_mapping] * observed_j).sum(dim=0)
++
++    def begin_step(self, now: float, num_reqs: int) -> int:
++        """Observe engine overhead, then choose this step's uniform verify length."""
++        # Overhead observation: wall dt minus the prior step's GPU-only prediction,
++        # regressed against generated tokens (the O the GPU table cannot see).
++        if self._last_t is not None and self._last_gpu_pred > 0.0:
++            o = (now - self._last_t) - self._last_gpu_pred
++            if 0.0 <= o < OVERHEAD_SAMPLE_GATE:
++                self._o_samples.append((self._last_tokens, o))
++                if len(self._o_samples) > OVERHEAD_RING_SIZE:
++                    del self._o_samples[0]
++                if len(self._o_samples) >= OVERHEAD_MIN_SAMPLES:
++                    n = len(self._o_samples)
++                    mx = sum(x for x, _ in self._o_samples) / n
++                    my = sum(y for _, y in self._o_samples) / n
++                    var = sum((x - mx) ** 2 for x, _ in self._o_samples)
++                    if var > 1e-6:
++                        cov = sum((x - mx) * (y - my) for x, y in self._o_samples)
++                        self._o_c1 = min(max(cov / var, 0.0), OVERHEAD_C1_CLAMP)
++                    self._o_c0 = max(my - self._o_c1 * mx, 0.0)
++        self._last_t = now
++
++        length = self.gamma
++        if self._surv_ema is not None:
++            # accept[L] = expected accepted draft tokens/req (cumulative CALIBRATED
++            # prefix-survival over the first L positions).
++            accept = [0.0]
++            run = 0.0
++            for s, k in zip(self._surv_ema, self._cal):
++                run += min(s * k, 1.0)
++                accept.append(run)
++            length, self._last_pred = schedule_uniform_length(
++                accept,
++                num_reqs,
++                self.gamma,
++                self._cost_r_grid,
++                self._cost_times_by_l,
++                overhead=(self._o_c0, self._o_c1),
++                current=self._last_l,
++            )
++            self._last_l = length
++            self._last_tokens = num_reqs * (1.0 + accept[length])
++            self._last_gpu_pred = self._last_pred - (
++                self._o_c0 + self._o_c1 * self._last_tokens
++            )
++        return length
++
++    def skip_next_overhead_sample(self) -> None:
++        # Engine-forced width (dynamic SD): no GPU-cost prediction was made, so the
++        # next overhead observation has nothing to regress against.
++        self._last_gpu_pred = 0.0
++
++    def update_survival(
++        self, survival_batch_view: torch.Tensor, idx_mapping: torch.Tensor
++    ) -> None:
++        # EMA the drafted step's survival, consume any landed host readout (+ online
++        # calibration), launch the next readout on cadence, and persist predictions
++        # req-state-indexed for the next step's realized-vs-predicted accumulation.
++        m = survival_batch_view.mean(dim=0)
++        if self._surv_ema_t is None:
++            self._surv_ema_t = m.clone()
++        else:
++            self._surv_ema_t.mul_(SURVIVAL_EMA_DECAY).add_(m, alpha=SURVIVAL_EMA_GAIN)
++        self._ema_ct += 1
++        # On CPU the host copies are synchronous, so a launched readout is always
++        # ready; on CUDA this is exactly self._surv_evt.query() (byte-identical).
++        if self._surv_inflight and (not self._is_cuda or self._surv_evt.query()):
++            rows = self._surv_host.tolist()
++            self._surv_ema = rows[0]
++            cal_moved = False
++            for j in range(self.gamma):
++                d_obs = rows[2][j] - self._cal_prev_obs[j]
++                d_acc = rows[1][j] - self._cal_prev_acc[j]
++                d_pred = rows[3][j] - self._cal_prev_pred[j]
++                if d_obs >= CALIBRATION_MIN_OBS and d_pred > 1e-3:
++                    ratio = min(
++                        max(d_acc / d_pred, CALIBRATION_RATIO_MIN),
++                        CALIBRATION_RATIO_MAX,
++                    )
++                    self._cal[j] = (
++                        CALIBRATION_DECAY * self._cal[j] + CALIBRATION_GAIN * ratio
++                    )
++                    self._cal_prev_obs[j] = rows[2][j]
++                    self._cal_prev_acc[j] = rows[1][j]
++                    self._cal_prev_pred[j] = rows[3][j]
++                    cal_moved = True
++            if cal_moved:
++                self._cal_t.copy_(torch.tensor(self._cal, dtype=torch.float32))
++            self._surv_inflight = False
++        if not self._surv_inflight and self._ema_ct % READOUT_CADENCE == 0:
++            self._surv_host[0].copy_(self._surv_ema_t, non_blocking=True)
++            self._surv_host[1].copy_(self._acc_counts, non_blocking=True)
++            self._surv_host[2].copy_(self._obs_counts, non_blocking=True)
++            self._surv_host[3].copy_(self._pred_counts, non_blocking=True)
++            if self._is_cuda:
++                self._surv_evt.record()
++            self._surv_inflight = True
++        self._surv_state[idx_mapping] = survival_batch_view
++
++    def allocate(
++        self, survival_batch_view: torch.Tensor, num_reqs: int, length: int
++    ) -> torch.Tensor:
++        return allocate_widths(
++            survival_batch_view,
++            self._cal_t,
++            num_reqs,
++            length,
++            self.tau,
++            self._budget_frac,
++        )
++
++    def confidence_widths(
++        self, survival_batch_view: torch.Tensor, length: int
++    ) -> torch.Tensor:
++        # Static confidence-threshold prefix width (survival is a cumprod).
++        return (survival_batch_view[:, :length] >= self.tau).sum(
++            dim=1, dtype=torch.int32
++        )
++
++    def commit_length(self, length: int) -> None:
++        self._prev_sched_l = length
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+new file mode 100644
+index 0000000..88841d5
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
+@@ -0,0 +1,302 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""DSpark speculator: semi-autoregressive parallel drafting.
++
++DSpark drafts a block of ``num_speculative_tokens`` tokens in one parallel pass
++(reusing the DFlash machinery: context-KV precompute + a query-block forward),
++then injects intra-block dependency with a lightweight sequential Markov head.
++
++Differences from DFlash:
++  * Anchor-as-first-prediction: each request emits exactly ``N =
++    num_speculative_tokens`` query tokens (anchor + N-1 noise), NOT ``1 + N``.
++    Every query position is a prediction (the anchor predicts the first draft
++    token), so we sample at all N positions and ``sample_pos = query_pos + 1``
++    (standard next-token), whereas DFlash's masks sit AT the predicted position.
++    This is the ``sample_from_anchor`` path in the shared prepare-inputs kernel.
++    Speculators-format checkpoints instead use the DFlash ``1 + N`` fill-in
++    layout (anchor is the bonus token).
++  * Sequential Markov sampling: instead of DFlash's single parallel sample, we
++    sample left-to-right, adding a prefix-dependent Markov bias derived from the
++    previously sampled token at each step.
++
++CUDA graphs (FULL, mirroring DFlash) cover the whole draft step: the parallel
++backbone forward AND the sequential Markov sampling.
++"""
++
++import time
++from typing import Any
++
++import torch
++
++from vllm.config import VllmConfig
++from vllm.config.compilation import CUDAGraphMode
++from vllm.v1.worker.gpu.input_batch import InputBatch
++from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
++from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
++from vllm.v1.worker.gpu.spec_decode.dspark.scheduler import DSparkScheduler
++from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
++
++
++class DSparkSpeculator(DFlashSpeculator):
++    _speculator_name = "DSpark"
++
++    def __init__(self, vllm_config: VllmConfig, device: torch.device):
++        super().__init__(vllm_config, device)
++
++        # Anchor-as-first (N slots) unless the checkpoint uses the 1+N fill-in
++        # block, where the anchor is a separate bonus token.
++        self.sample_from_anchor = not getattr(
++            self.draft_model_config.hf_config, "dspark_bonus_anchor", False
++        )
++        if self.sample_from_anchor:
++            self.num_query_per_req = self.num_speculative_steps
++        else:
++            self.num_query_per_req = 1 + self.num_speculative_steps
++
++        # DSpark consumes mean-pooled target aux hidden states at the target
++        # layers, combined to hidden_size via main_proj. Store that combined
++        # main_x (hidden_size wide). DSpark does not use the same pre-allocated buffer
++        # that DeepSeek-V4's MTP uses.
++        draft_hidden = self.draft_model_config.get_hidden_size()
++        self.hidden_states = torch.zeros(
++            self.max_num_tokens, draft_hidden, dtype=self.dtype, device=device
++        )
++
++        self.dflash_causal = False
++
++        self._step_cols = torch.arange(
++            self.num_speculative_steps, dtype=torch.int32, device=device
++        )
++
++        self._anchor_idx = (
++            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
++            * self.num_query_per_req
++        )
++
++        # Reduced-vocab probabilistic drafting only; set in load_draft_model.
++        self._d2t_scatter_index: torch.Tensor | None = None
++        self._draft_scatter_buf: torch.Tensor | None = None
++
++        # Confidence head + hardware-aware scheduler (opt-in): adapts a
++        # per-step uniform verify length L; DSparkScheduler owns all policy
++        # state. Read at init so the confidence ops enter the draft graph.
++        spec_cfg = vllm_config.speculative_config
++        assert spec_cfg is not None
++        self._sched = spec_cfg.dspark_scheduler
++        self.dspark_scheduler_enabled = self._sched
++        if self._sched:
++            gamma = self.num_speculative_steps
++            self._survival = torch.zeros(
++                self.max_num_reqs, gamma, dtype=torch.float32, device=device
++            )
++            self._scheduler = DSparkScheduler(
++                spec_cfg, gamma, self.max_num_reqs, device
++            )
++            # Positions beyond valid_draft_len[r] are pads the rejection
++            # sampler force-rejects. Created only with a confidence threshold;
++            # otherwise the runner passes None and the mask path costs nothing.
++            self._tau = spec_cfg.dspark_confidence_threshold
++            self._perreq = spec_cfg.dspark_per_request
++            if self._tau > 0.0:
++                self.valid_draft_len = torch.full(
++                    (self.max_num_reqs,), gamma, dtype=torch.int32, device=device
++                )
++            # Dynamic SD: the runner writes the engine-scheduled next-step width
++            # here (0 -> skip drafting); the engine decision is authoritative.
++            self.next_k_hint: int | None = None
++            # Ask the runner to capture FULL decode graphs at every trimmed width
++            # 1+L (L in 0..gamma-1); 1+gamma is already the decode_query_len graph.
++            self.extra_uniform_decode_lens = list(range(1, gamma + 1))
++            # perreq_len is req-state-indexed; _perreq_batch_len is the batch-ordered
++            # view handed to the draft-tokens handler in the same step.
++            self.perreq_len = torch.zeros(
++                self.max_num_reqs, dtype=torch.int32, device=device
++            )
++            self._perreq_batch_len: torch.Tensor | None = None
++
++    def set_cost_table(self, r_grid: list[int], times_by_l: list[list[float]]) -> None:
++        """Install the shape-aware cost table T(R, L) on the scheduler policy."""
++        self._scheduler.set_cost_table(r_grid, times_by_l)
++
++    def load_draft_model(
++        self,
++        target_model: torch.nn.Module,
++        target_attn_layer_names: set[str],
++    ) -> torch.nn.Module:
++        model = load_dspark_model(target_model, self.vllm_config)
++        if self._sched and getattr(model, "compute_confidence", None) is None:
++            raise ValueError(
++                "dspark_scheduler requires a draft model with a confidence "
++                f"head; {type(model).__name__} does not implement "
++                "compute_confidence."
++            )
++        # Reduced draft vocab: probabilistic rejection sampling indexes draft
++        # logits by target id, so precompute the draft->target column map and a
++        # scratch buffer to scatter logits into target vocab before sampling.
++        if self.draft_logits is not None and model.draft_id_to_target_id is not None:
++            d2t = model.draft_id_to_target_id
++            self._d2t_scatter_index = (
++                torch.arange(d2t.shape[0], device=d2t.device) + d2t
++            )
++            # -inf once; the per-step scatter overwrites the draft->target
++            # columns. Kept separate from draft_logits to avoid aliasing.
++            self._draft_scatter_buf = torch.full(
++                (self.max_num_reqs, self.vocab_size),
++                float("-inf"),
++                dtype=self.draft_logits.dtype,
++                device=self.device,
++            )
++        return model
++
++    def _schedule_draft_len(
++        self,
++        input_batch: InputBatch,
++        num_sampled: torch.Tensor,
++        num_rejected: torch.Tensor,
++        dummy_run: bool,
++    ) -> int:
++        # Pick this step's uniform verify length L in [0, gamma]: L < gamma
++        # trims the verify tail, L == 0 skips drafting. Observe realized
++        # survival from the just-verified step first, then decide.
++        if not self._sched or dummy_run:
++            return self.num_speculative_steps
++        now = time.perf_counter()
++        self._scheduler.observe_verified(
++            input_batch.num_reqs,
++            num_sampled,
++            num_rejected,
++            self.perreq_len,
++            input_batch.idx_mapping,
++        )
++        length = self._scheduler.begin_step(now, input_batch.num_reqs)
++        if self.next_k_hint is not None:
++            # Dynamic SD: the engine's scheduled width is authoritative.
++            length = min(self.next_k_hint, self.num_speculative_steps)
++            self._scheduler.skip_next_overhead_sample()
++        return length
++
++    def _finalize_draft(
++        self,
++        input_batch: InputBatch,
++        num_reqs: int,
++        draft_len: int,
++        dummy_run: bool,
++    ) -> torch.Tensor:
++        if not self._sched or dummy_run:
++            return self.draft_tokens[:num_reqs]
++        length = draft_len
++        if length == 0:
++            # Draft forward skipped -> empty draft; the engine runs a
++            # normal decode step for this batch.
++            self._scheduler.commit_length(0)
++            self.perreq_len[input_batch.idx_mapping] = 0
++            self._perreq_batch_len = None
++            return self.draft_tokens[:num_reqs, :0]
++        # The full block always runs under its captured graph, so survival is
++        # measured for all gamma positions; update the EMA, then allocate.
++        sv = self._survival[:num_reqs]
++        self._scheduler.update_survival(sv, input_batch.idx_mapping)
++        if self._perreq:
++            # Per-request allocation (paper Algorithm 1) within the batch
++            # width budget; ragged lengths cut the returned full-width block.
++            keep = self._scheduler.allocate(sv, num_reqs, length)
++            self.perreq_len[input_batch.idx_mapping] = keep
++            self._perreq_batch_len = keep
++            length = self.num_speculative_steps
++        elif self._tau > 0.0:
++            # Per-request confidence cutoff: keep each request's prefix while
++            # survival >= tau, pad the rest to the uniform width.
++            keep_len = self._scheduler.confidence_widths(sv, length)
++            pad = self._step_cols[:length].unsqueeze(0) >= keep_len.unsqueeze(1)
++            self.draft_tokens[:num_reqs, :length].masked_fill_(
++                pad, self.parallel_drafting_token_id
++            )
++            self.valid_draft_len[input_batch.idx_mapping] = keep_len
++        if not self._perreq:
++            self.perreq_len[input_batch.idx_mapping] = length
++            self._perreq_batch_len = None
++        self._scheduler.commit_length(length)
++        # Trim to the chosen verify length; with the multi-width FULL graphs
++        # captured, the trimmed verify replays FULL, else it falls to PIECEWISE.
++        return self.draft_tokens[:num_reqs, :length]
++
++    def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
++        # Sequential Markov sampling over the backbone's output hidden states.
++        n_spec = self.num_speculative_steps
++        num_sample = num_reqs * n_spec
++        # Per-(req, position) head hidden, ordered (req, step).
++        sample_hidden = head_hidden[self.sample_indices[:num_sample]]
++        # Draft-vocab logits; sampled ids are remapped to target vocab below.
++        base_logits = self.model.compute_draft_logits(sample_hidden)
++        vocab_size = base_logits.shape[-1]
++        base_logits = base_logits.view(num_reqs, n_spec, vocab_size)
++
++        idx_map = self.sample_idx_mapping[:num_sample].view(num_reqs, n_spec)
++        sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
++
++        # Anchor (bonus) token per request = the input id at query offset 0,
++        # read via the precomputed persistent index (fixed buffer for capture).
++        prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++        # Per-position head hidden [num_reqs, n_spec, hidden] for the confidence head.
++        sh = sample_hidden.view(num_reqs, n_spec, -1) if self._sched else None
++        surv_run: torch.Tensor | None = None
++
++        for i in range(n_spec):
++            # Sequential stage: Markov bias from the previously sampled token.
++            markov_embed = self.model.markov_embed(prev)
++            if self._sched:
++                # Confidence head -> per-position acceptance prob; cumulative product
++                # is the prefix-survival prob the scheduler turns into a verify length.
++                conf_i = self.model.compute_confidence(sh[:, i], markov_embed)
++                conf_i = conf_i.reshape(num_reqs).sigmoid()
++                surv_run = conf_i if surv_run is None else surv_run * conf_i
++                self._survival[:num_reqs, i] = surv_run
++            bias = self.model.markov_bias(markov_embed)
++            logits_i = base_logits[:, i] + bias
++            if self.draft_logits is not None:
++                # Probabilistic: sample in target vocab (a reduced draft vocab is
++                # scattered into its target columns; full vocab is already there).
++                if self._d2t_scatter_index is not None:
++                    assert self._draft_scatter_buf is not None
++                    buf = self._draft_scatter_buf[:num_reqs]
++                    buf.index_copy_(1, self._d2t_scatter_index, logits_i.to(buf.dtype))
++                    logits_i = buf
++                # sample_pos is the predicted token's position Q; the target
++                # verifies it with the predecessor's Gumbel key (Q-1). Pass Q-1.
++                draft_sampled_i = gumbel_sample(
++                    logits_i,
++                    idx_map[:, i],
++                    self.temperature,
++                    self.seeds,
++                    sample_pos[:, i] - 1,
++                    apply_temperature=True,
++                    output_processed_logits=self.draft_logits,
++                    output_processed_logits_col=self._step_cols[i],
++                    use_fp64=self.use_fp64_gumbel,
++                )
++            else:
++                draft_sampled_i = self.model.map_draft_to_target(
++                    logits_i.argmax(dim=-1)
++                )
++            self.draft_tokens[:num_reqs, i] = draft_sampled_i
++            prev = draft_sampled_i
++
++    def _generate_draft(
++        self,
++        num_reqs: int,
++        num_tokens_padded: int,
++        attn_metadata: dict[str, Any] | None,
++        slot_mappings: dict[str, torch.Tensor] | None,
++        num_tokens_across_dp: torch.Tensor | None,
++        cudagraph_runtime_mode: CUDAGraphMode = CUDAGraphMode.NONE,
++    ) -> None:
++        # Full draft step (captured under CUDA graph): parallel backbone forward
++        # then sequential Markov sampling over its hidden state outputs.
++        head_hidden = self._run_model(
++            num_tokens_padded,
++            attn_metadata,
++            slot_mappings,
++            num_tokens_across_dp,
++            cudagraph_runtime_mode,
++        )
++        self._sample_sequential(num_reqs, head_hidden)
+diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+new file mode 100644
+index 0000000..b5f2a54
+--- /dev/null
++++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
+@@ -0,0 +1,76 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import torch.nn as nn
++
++from vllm.config import VllmConfig, replace
++from vllm.distributed.parallel_state import get_pp_group
++from vllm.model_executor.model_loader import get_model
++from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
++
++
++def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
++    speculative_config = vllm_config.speculative_config
++    assert speculative_config is not None
++    draft_model_config = speculative_config.draft_model_config
++
++    from vllm.compilation.backends import set_model_tag
++
++    # DSpark uses non-causal attention.
++    causal = False
++    # The target's sparse-MLA layers promote the shared cache_config dtype to
++    # the packed "fp8_ds_mla" format, which no dense attention backend
++    # supports. Dense drafters (Qwen3-style DSpark heads) get a config with
++    # the dtype normalized back to plain fp8.
++    cache_config = vllm_config.cache_config
++    if (
++        cache_config is not None
++        and cache_config.cache_dtype == "fp8_ds_mla"
++        and "DSparkDraftModel" not in (draft_model_config.architectures or [])
++    ):
++        cache_config = replace(cache_config, cache_dtype="fp8")
++    draft_vllm_config = replace(
++        vllm_config,
++        cache_config=cache_config,
++        attention_config=replace(
++            vllm_config.attention_config,
++            use_non_causal=not causal,
++            backend=speculative_config.attention_backend,
++        ),
++    )
++
++    with set_model_tag("dspark_head"):
++        draft_model = get_model(
++            vllm_config=draft_vllm_config, model_config=draft_model_config
++        )
++
++    if get_pp_group().world_size != 1:
++        raise NotImplementedError("DSpark does not support pipeline parallelism.")
++
++    target_language_model = (
++        target_model.get_language_model()
++        if hasattr(target_model, "get_language_model")
++        else target_model
++    )
++    target_inner = target_language_model.model
++    draft_inner = draft_model.model
++
++    target_embed = getattr(target_inner, "embed_tokens", None)
++    draft_embed = getattr(draft_inner, "embed_tokens", None)
++    if target_embed is not None and _should_share(
++        draft_model, "has_own_embed_tokens", draft_embed, target_embed
++    ):
++        if draft_embed is not None:
++            del draft_inner.embed_tokens
++        draft_inner.embed_tokens = target_embed
++
++    target_lm_head = getattr(target_model, "lm_head", None)
++    draft_lm_head = getattr(draft_model, "lm_head", None)
++    if target_lm_head is not None and _should_share(
++        draft_model, "has_own_lm_head", draft_lm_head, target_lm_head
++    ):
++        if draft_lm_head is not None:
++            del draft_model.lm_head
++        draft_model.lm_head = target_lm_head
++
++    return draft_model
+diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+index 360f649..66d0ba8 100644
+--- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+@@ -44,6 +44,15 @@ def get_eagle3_aux_layers_from_config(
+         if dflash_config and isinstance(dflash_config, dict):
+             # Add 1 to convert DFlash's aux layer id semantics
+             layer_ids = [i + 1 for i in (dflash_config.get("target_layer_ids") or [])]
++    if not layer_ids:
++        dspark_layer_ids = getattr(hf_config, "dspark_target_layer_ids", None)
++        if dspark_layer_ids:
++            layer_ids = [i + 1 for i in dspark_layer_ids]
++    if not layer_ids:
++        # Dense DSpark (e.g. Qwen3) also uses different aux layer semantics.
++        target_layer_ids = getattr(hf_config, "target_layer_ids", None)
++        if target_layer_ids:
++            layer_ids = [i + 1 for i in target_layer_ids]
+     if layer_ids and isinstance(layer_ids, (list, tuple)):
+         return tuple(layer_ids)
+     return None
+diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+index 3868604..5e7cadc 100644
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -100,12 +100,22 @@ class RejectionSampler:
+         logits: torch.Tensor,
+         input_batch: InputBatch,
+         draft_logits: torch.Tensor | None = None,
++        valid_draft_len: torch.Tensor | None = None,
+     ) -> SamplerOutput:
+         # NOTE(woosuk): We intentionally compute num_nans before sampling to make clear
+         # that num_nans is computed before applying penalties and temperature.
+         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+ 
+         draft_sampled = input_batch.input_ids[input_batch.logits_indices]
++        if valid_draft_len is not None:
++            # Draft position i (1-indexed) of request r is a pad iff
++            # i > valid_draft_len[r]; the -1 sentinel makes the kernel
++            # force-reject pads and resample at the first pad position.
++            keep = (
++                input_batch.expanded_local_pos
++                <= valid_draft_len[input_batch.expanded_idx_mapping]
++            )
++            draft_sampled = torch.where(keep, draft_sampled, -1)
+         pos = input_batch.positions[input_batch.logits_indices]
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
+index 4ab45b2..35a8963 100644
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py
+@@ -16,35 +16,58 @@ class DraftTokensHandler:
+ 
+         self.req_ids: list[str] = []
+         self.draft_tokens_np: np.ndarray | None = None
++        self.lengths_np: np.ndarray | None = None
+         self.num_draft_tokens: int = 0
+ 
+     def set_draft_tokens(
+-        self, input_batch: InputBatch, draft_tokens: torch.Tensor
++        self,
++        input_batch: InputBatch,
++        draft_tokens: torch.Tensor,
++        lengths: torch.Tensor | None = None,
+     ) -> None:
+         self.req_ids = input_batch.req_ids
+         self.num_draft_tokens = draft_tokens.shape[1]
+-        if not input_batch.has_structured_output_reqs:
++        self.lengths_np = None
++        needs_copy = input_batch.has_structured_output_reqs or lengths is not None
++        if not needs_copy:
+             # No draft token validation needs to be performed by
+             # the scheduler for this batch.
+             self.draft_tokens_np = None
+             return
+ 
+-        # For spec decoding + structured outputs, we must transfer the
+-        # draft tokens back to the scheduler for grammar validation.
++        # For spec decoding + structured outputs (and for per-request draft
++        # lengths), transfer back to the scheduler asynchronously.
+         current_stream = torch.cuda.current_stream(self.device)
+         self.copy_stream.wait_stream(current_stream)
+         with torch.cuda.stream(self.copy_stream):
+-            self.draft_tokens_np = async_copy_to_np(draft_tokens)
+-            # draft_tokens is a temporary allocation on the main stream and read here on
+-            # copy_stream; without record_stream, the caching allocator may reuse its
+-            # memory before the async copy executes.
+-            draft_tokens.record_stream(self.copy_stream)
++            if input_batch.has_structured_output_reqs:
++                self.draft_tokens_np = async_copy_to_np(draft_tokens)
++                # draft_tokens is a temporary allocation on the main stream and
++                # read here on copy_stream; without record_stream, the caching
++                # allocator may reuse its memory before the async copy executes.
++                draft_tokens.record_stream(self.copy_stream)
++            else:
++                self.draft_tokens_np = None
++            if lengths is not None:
++                self.lengths_np = async_copy_to_np(lengths)
++                lengths.record_stream(self.copy_stream)
+             self.copy_event.record()
+ 
+     def get_draft_tokens(self) -> DraftTokenIds | None:
+-        if self.draft_tokens_np is not None:
++        lengths = None
++        if self.lengths_np is not None or self.draft_tokens_np is not None:
+             self.copy_event.synchronize()
+-            draft_token_ids = self.draft_tokens_np.tolist()
++            if self.lengths_np is not None:
++                lengths = [int(n) for n in self.lengths_np]
++        if self.draft_tokens_np is not None:
++            rows = self.draft_tokens_np.tolist()
++            if lengths is not None:
++                draft_token_ids = [row[:n] for row, n in zip(rows, lengths)]
++            else:
++                draft_token_ids = rows
++        elif lengths is not None:
++            # Per-request draft counts; ids stay GPU-side (-1 placeholders).
++            draft_token_ids = [[-1] * n for n in lengths]
+         else:
+             # This case only happens when async scheduling is disabled.
+             draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
+@@ -54,17 +77,23 @@ class DraftTokensHandler:
+ def get_parallel_drafting_token_id(hf_config) -> int:
+     """Resolve the mask token id used for parallel drafting slots.
+ 
+-    Checks (in order): `dflash_config.mask_token_id`, `pard_token`,
+-    `ptd_token_id`. Raises ValueError if none are present.
++    Checks (in order): `dflash_config.mask_token_id`, top-level `mask_token_id`,
++    `dspark_noise_token_id`, `pard_token`, `ptd_token_id`. Raises ValueError if
++    none are present.
+     """
+     dflash_config = getattr(hf_config, "dflash_config", None) or {}
+     if "mask_token_id" in dflash_config:
+         return int(dflash_config["mask_token_id"])
++    if getattr(hf_config, "mask_token_id", None) is not None:
++        return int(hf_config.mask_token_id)
++    if hasattr(hf_config, "dspark_noise_token_id"):
++        return int(hf_config.dspark_noise_token_id)
+     if hasattr(hf_config, "pard_token"):
+         return int(hf_config.pard_token)
+     if hasattr(hf_config, "ptd_token_id"):
+         return int(hf_config.ptd_token_id)
+     raise ValueError(
+         "Model config must specify `dflash_config.mask_token_id`,"
+-        " `pard_token`, or `ptd_token_id` for parallel drafting."
++        " `mask_token_id`, `dspark_noise_token_id`, `pard_token`, or"
++        " `ptd_token_id` for parallel drafting."
+     )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index 74938a8..27135b7 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
@@ -9131,7 +12657,7 @@ index 657fc82..dee74ff 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a3..22ce29d 100644
+index 5e266a3..75eb17b 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -616,6 +616,31 @@ class Worker(WorkerBase):
@@ -9166,7 +12692,24 @@ index 5e266a3..22ce29d 100644
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-@@ -905,6 +930,8 @@ class Worker(WorkerBase):
+@@ -788,6 +813,16 @@ class Worker(WorkerBase):
+     def get_model(self) -> nn.Module:
+         return self.model_runner.get_model()
+ 
++    def get_dspark_dynamic_sd_table(self) -> list[tuple[int, int, int]] | None:
++        getter = getattr(self.model_runner, "get_dspark_dynamic_sd_table", None)
++        return getter() if getter is not None else None
++
++    def get_dspark_cost_profile(
++        self,
++    ) -> tuple[list[int], list[list[float]]] | None:
++        getter = getattr(self.model_runner, "get_dspark_cost_profile", None)
++        return getter() if getter is not None else None
++
+     def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
+         return self.model_runner.get_supported_tasks()
+ 
+@@ -905,6 +940,8 @@ class Worker(WorkerBase):
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
@@ -9175,7 +12718,7 @@ index 5e266a3..22ce29d 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -914,15 +941,69 @@ class Worker(WorkerBase):
+@@ -914,15 +951,69 @@ class Worker(WorkerBase):
              and not get_pp_group().is_last_rank
          )
  
