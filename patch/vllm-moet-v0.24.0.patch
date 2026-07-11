@@ -1331,10 +1331,10 @@ index 32a2d86..3e83d5a 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..6753062
+index 0000000..edeaf92
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1328 @@
+@@ -0,0 +1,1372 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1663,19 +1663,23 @@ index 0000000..6753062
 +
 +
 +def plan_pack_skip(layer) -> bool:
-+    """CREATE-time twin of _try_skip_requant: assign this layer's key (the
-+    same build-order counter process_weights_after_loading uses), probe the
-+    pack sidecars, and when every serving store already holds the layer,
-+    stub the four big params and disarm their loaders. Returns True when
-+    the layer will boot from the pack with zero checkpoint staging."""
++    """CREATE-time twin of the boot-from-cache paths: assign this layer's
++    key (the same build-order counter process_weights_after_loading uses),
++    probe whichever store this config will serve from — the pack sidecars
++    (BASE cache / host-resident) or the planes cache (GPU-resident) — and
++    when the layer is already served, stub the four big params and disarm
++    their loaders. Returns True when the layer boots with zero checkpoint
++    staging."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_planes_cache as _pc)
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_store import (
 +        pack_has_layer)
 +    global _n_created
 +    key = _n_created
 +    _n_created += 1
 +    layer._moe_w2_create_key = key
-+    if not (enabled() and moe_w2_delta.base_enabled()):
++    if not enabled():
 +        return False
 +    try:
 +        E, N13, K13h = layer.w13_weight.shape
@@ -1685,15 +1689,27 @@ index 0000000..6753062
 +    K13, K2 = K13h * 2, K2h * 2
 +    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
 +    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
-+    n_keys = _layer_cutoff() + 1
-+    if not pack_has_layer("base", key, n_keys, E,
-+                          c13len + s13len + c2len + s2len):
-+        return False
-+    if moe_w2_delta.enabled():
-+        # over-base FP4 need-pool: its slots carry their own scales
-+        # ([fp4_13|sc13|fp4_2|sc2]) — mirror _fp4_tier_for_build's sizing
-+        fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
-+        if not pack_has_layer("fp4", key, n_keys, E, fslot):
++    if moe_w2_delta.base_enabled():
++        # host-resident: the pack store serves the base (and the FP4
++        # need-pool when configured) — probe the sidecars.
++        n_keys = _layer_cutoff() + 1
++        if not pack_has_layer("base", key, n_keys, E,
++                              c13len + s13len + c2len + s2len):
++            return False
++        if moe_w2_delta.enabled():
++            # over-base FP4 need-pool: its slots carry their own scales
++            # ([fp4_13|sc13|fp4_2|sc2]) — mirror _fp4_tier_for_build's sizing
++            fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
++            if not pack_has_layer("fp4", key, n_keys, E, fslot):
++                return False
++    else:
++        # GPU-resident: the planes cache is the only source that can
++        # replace the checkpoint requant — probe it (keyed by transformer
++        # layer index, sized exactly like process-time try_load).
++        lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
++        if lidx is None or not _pc.cache_has_layer(
++                lidx, _pc.expected_sizes(
++                    E, N13, K13, N2, K2, want_fp4=moe_w2_delta.enabled())):
 +            return False
 +    for pname in ("w13_weight", "w13_weight_scale",
 +                  "w2_weight", "w2_weight_scale"):
@@ -1915,6 +1931,40 @@ index 0000000..6753062
 +                   f"w2_{scale_suffix}"))
 +
 +
++def _consume_planes_cache(layer, layer_key: int, dev,
++                          E: int, N13: int, K13: int, N2: int,
++                          K2: int) -> bool:
++    """Serve one layer's planes from the planes cache (GPU-resident
++    configs). CPU tensors from the cache feed the same _stage_fp4_host/
++    _finish_layer sinks as a fresh requant (their copy_ calls are
++    device-agnostic). Shared by the staged path (cache hit replaces the
++    requant) and the loader-skip path (stubs; the cache is the ONLY
++    source). Returns True on a hit."""
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_planes_cache as planes_cache)
++    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
++    if not planes_cache.enabled() or lidx is None:
++        return False
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
++        E, N13, K13, N2, K2, want_fp4=tier is not None))
++    if cached is None:
++        return False
++    planes13 = cached["planes13"].view(E, -1).to(dev)
++    sc13 = cached["sc13"].view(E, -1).to(dev)
++    planes2 = cached["planes2"].view(E, -1).to(dev)
++    sc2 = cached["sc2"].view(E, -1).to(dev)
++    if tier is not None:
++        _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
++                        sc13, cached["fp2"].view(E, -1), sc2)
++    _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
++                  sc2, N13, K13, N2, K2, E,
++                  ("w13_weight", "w13_weight_scale", "w2_weight",
++                   "w2_weight_scale"))
++    logger.info("moe_w2: layer %d planes from cache", lidx)
++    return True
++
++
 +def build_layer_planes_nvfp4(layer, layer_key: int) -> None:
 +    """NVFP4 (modelopt) checkpoint variant of build_layer_planes
 +    (ModelOptNvFp4FusedMoE: nvidia/GLM-5.2-NVFP4 — e2m1 codes + e4m3
@@ -1935,18 +1985,29 @@ index 0000000..6753062
 +    dev = torch.device("cuda")
 +    if getattr(layer, "_moe_w2_pack_skip", False):
 +        # loader-level skip: the params are 0-byte stubs (plan_pack_skip),
-+        # shapes travel via the create-time stash. The pack MUST still
-+        # serve the layer — there is no checkpoint copy to fall back to.
++        # shapes travel via the create-time stash. The probed store MUST
++        # still serve the layer — there is no checkpoint copy to fall
++        # back to.
 +        E, N13, K13, N2, K2 = layer._moe_w2_shapes
 +        _require_kernels(K13, K2, need_w4=moe_w2_delta.enabled())
-+        assert _try_skip_requant(
-+            layer, layer_key, E, N13, K13, N2, K2,
-+            ("w13_weight", "w13_weight_scale", "w2_weight",
-+             "w2_weight_scale")), (
-+            f"moe_w2: layer {layer_key} was loader-skipped on a pack "
-+            f"sidecar hit but the pack no longer serves it (dir/sidecar "
-+            f"changed mid-load?) — restart without the stale "
-+            f"VLLM_MOE_W2_STORE_DIR state")
++        if moe_w2_delta.base_enabled():
++            assert _try_skip_requant(
++                layer, layer_key, E, N13, K13, N2, K2,
++                ("w13_weight", "w13_weight_scale", "w2_weight",
++                 "w2_weight_scale")), (
++                f"moe_w2: layer {layer_key} was loader-skipped on a pack "
++                f"sidecar hit but the pack no longer serves it "
++                f"(dir/sidecar changed mid-load?) — restart without the "
++                f"stale VLLM_MOE_W2_STORE_DIR state")
++            return
++        # GPU-resident: materialize the planes from the planes cache
++        # (probed at create time; a miss here means the cache dir changed
++        # under a live load).
++        assert _consume_planes_cache(layer, layer_key, dev,
++                                     E, N13, K13, N2, K2), (
++            f"moe_w2: layer {layer_key} was loader-skipped on a planes-"
++            f"cache hit but the cache no longer serves it — restart "
++            f"without the stale VLLM_MOE_W2_PLANES_CACHE state")
 +        return
 +    w13 = layer.w13_weight.data                 # [E, 2I, H/2] u8 (cpu)
 +    s13 = layer.w13_weight_scale.data           # [E, 2I, H/16] e4m3
@@ -1973,30 +2034,13 @@ index 0000000..6753062
 +    # Kimi-K2.7 restarts). Complements the pack store's boot-from-pack
 +    # above: the cache serves GPU-RESIDENT plane configs (planes must be
 +    # materialized), the pack store serves host-resident tiers (planes
-+    # never materialize). CPU tensors from the cache feed the same
-+    # _stage_fp4_host/_finish_layer sinks (their copy_ calls are
-+    # device-agnostic).
++    # never materialize).
++    if _consume_planes_cache(layer, layer_key, dev, E, N13, K13, N2, K2):
++        return
 +    from vllm.model_executor.layers.quantization.utils import (
 +        moe_w2_planes_cache as planes_cache)
-+    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    lidx = planes_cache.layer_idx_from_name(getattr(layer, "layer_name", ""))
-+    if planes_cache.enabled() and lidx is not None:
-+        cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
-+            E, N13, K13, N2, K2, want_fp4=tier is not None))
-+        if cached is not None:
-+            planes13 = cached["planes13"].view(E, -1).to(dev)
-+            sc13 = cached["sc13"].view(E, -1).to(dev)
-+            planes2 = cached["planes2"].view(E, -1).to(dev)
-+            sc2 = cached["sc2"].view(E, -1).to(dev)
-+            if tier is not None:
-+                _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
-+                                sc13, cached["fp2"].view(E, -1), sc2)
-+            _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
-+                          sc2, N13, K13, N2, K2, E,
-+                          ("w13_weight", "w13_weight_scale", "w2_weight",
-+                           "w2_weight_scale"))
-+            logger.info("moe_w2: layer %d planes from cache", lidx)
-+            return
++    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +
 +    planes13 = torch.empty(E, N13 * K13 // 4, dtype=torch.uint8, device=dev)
 +    sc13 = torch.empty(E, N13 * K13 // 32, dtype=torch.uint8, device=dev)
@@ -4953,10 +4997,10 @@ index 0000000..da9d22e
 +    return vals * s
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 new file mode 100644
-index 0000000..4834c60
+index 0000000..0442af5
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
-@@ -0,0 +1,199 @@
+@@ -0,0 +1,220 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Disk cache for built 2-bit expert planes (+ optional FP4 delta planes).
@@ -5068,6 +5112,27 @@ index 0000000..4834c60
 +        exp["fp13"] = E * N13 * K13 // 2
 +        exp["fp2"] = E * N2 * K2 // 2
 +    return exp
++
++
++def cache_has_layer(layer_idx: int, sizes: dict[str, int]) -> bool:
++    """Presence probe for the loader-level skip: would try_load hit, without
++    reading a byte of plane data? Same validity rules (meta match + every
++    required part at its exact expected size); os.path.getsize only. Never
++    raises."""
++    if not enabled() or _broken:
++        return False
++    try:
++        d = _rank_dir()
++        mp = os.path.join(d, "meta.json")
++        if not os.path.exists(mp) or json.load(open(mp)) != _meta():
++            return False
++        for part, nbytes in sizes.items():
++            p = os.path.join(d, f"layer{layer_idx}.{part}.bin")
++            if not os.path.exists(p) or os.path.getsize(p) != nbytes:
++                return False
++        return True
++    except Exception:  # noqa: BLE001 - probe only, staging path still works
++        return False
 +
 +
 +def try_load(layer_idx: int,
