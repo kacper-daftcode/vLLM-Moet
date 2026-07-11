@@ -137,6 +137,16 @@ Environment pins that go with the patch (both required on SM120):
   preheat, both IO modes). Ops: packs on a bind‑mounted real FS (not overlayfs); ~1 TB NVMe
   for the full GLM stack; parity holds even on a Gen3‑x4 drive (3.7 GB/s) — steady‑state
   misses ride the page cache, cold shifts pay drive speed.
+  Cold rebuilds are bounded separately from steady reads: eviction is requested for each
+  released safetensors shard and each durable pack layer, then retried after the model
+  consumer unwinds,
+  checkpoint prefetch is refused, requested multi-thread shard loading is serialized, and
+  arena/shard/layer operations preflight a default 16 GiB host + 4 GiB hard cgroup
+  `memory.max` reserve. `memory.high` is traced as a soft reclaim/throttle boundary and does
+  not reduce that hard allocation budget. The
+  safety controls are `VLLM_MOE_W2_CACHE_CONTROL`,
+  `VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB`, and
+  `VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB`; cache control defaults to fail-closed `required`.
 - **Deterministic unpermute**: the MoE output scatter used atomic `index_add_`, so identical
   runs wobbled (~1.6e‑2 on prefill) and greedy decode was not reproducible (surfaced by the
   PP determinism investigation; never PP‑specific). Valid `sorted_ids` form a permutation of

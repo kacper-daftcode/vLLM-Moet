@@ -214,6 +214,22 @@ Operational notes:
   drive on a PCIe **Gen3 x4** link (3.7 GB/s). Cold working‑set shifts and first‑touch
   prefills do pay drive speed. `VLLM_MOE_W2_TIER_DIRECT=1` switches misses to O_DIRECT
   (hard RAM budget, page cache stays flat; raw drive latency on every miss).
+- **Cold pack rebuilds fail closed instead of consuming the host.** While W2 + a pack store
+  are active, the sequential safetensors loader preflights every shard, requests eviction of
+  each released shard with `POSIX_FADV_DONTNEED`, and retries after the model consumer unwinds;
+  the pack writer does `fdatasync` + `DONTNEED` after
+  every completed layer. Explicit checkpoint prefetch is refused and a requested
+  multi-thread load is serialized. The final mmap-backed tensor per shard is cloned under the
+  same guard so the consumer cannot keep the whole file mapped. Pinned-arena allocations and
+  indivisible shard/layer I/O
+  keep a **16 GiB host MemAvailable floor** and **4 GiB hard cgroup `memory.max`
+  headroom** by default. `memory.high` remains an observable soft reclaim/throttle boundary;
+  it does not reduce the hard allocation budget. Tune the floors with
+  `VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB` and
+  `VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB`; `VLLM_MOE_W2_CACHE_CONTROL=required` is the safe
+  default (`best-effort` or `off` are explicit unsafe overrides). Linux cgroup-v2 page cache is
+  accounted in `memory.current`; every check logs anon/file/file-mapped/swap/events plus its
+  available/headroom/transient budget for a cold-restage memory trace.
 - **Prefill can't wipe the arena** (scan discipline: prefill working sets fill free slots
   but never evict the decode hot set), and the arena's hot set persists to
   `<pack>.heat.json` and **preheats on boot** (57 GiB ≈ 35 s; `VLLM_MOE_W2_TIER_PREHEAT=0`
