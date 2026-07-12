@@ -19,7 +19,7 @@ cannot even fit on. Three ideas carry it:
    parsing.
 
 > **v0.25.0 upgrade candidate:** [`Dockerfile.sm120-v025`](Dockerfile.sm120-v025)
-> and [`docs/v025-port.md`](docs/v025-port.md) carry the rebased 60-file overlay
+> and [`docs/v025-port.md`](docs/v025-port.md) carry the rebased 61-file overlay
 > on official vLLM v0.25.0. The results below remain v0.24 measurements until
 > the candidate passes its own SM120 model-load, 128K, quality, and performance
 > gates; the v0.24 image stays the rollback.
@@ -437,7 +437,8 @@ Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recip
 - **`patch/vllm-moet-v0.25.0.patch`** — the v0.25 candidate delta (61 files,
   +13,342/-134 source lines) against exact official tag commit `702f4814`.
 - **`Dockerfile.sm120-v025`** — pinned official v0.25.0 image plus the candidate
-  overlay; built and qualified side-by-side with v0.24.
+  overlay; the exact image is built side-by-side with v0.24 and still requires
+  its documented disposable serve gate before production promotion.
 - **`docs/v025-port.md`** — exact identities, absorbed-upstream inventory,
   compatibility decisions, completed source gates, and remaining promotion gates.
 - **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (37 files,
