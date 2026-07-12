@@ -97,6 +97,32 @@ The source port passed:
 These are source gates only. They do **not** establish CUDA kernel, model-load,
 quality, context, or throughput parity.
 
+## Bounded SM120 image receipt (2026-07-12)
+
+The digest-pinned recipe built on taro as
+`vllm-moet-sm120:v025-w2candidate-25ac6fea`, local image ID
+`sha256:1b3dc4a340a6`. On its RTX 5090 (SM120), the exact image passed:
+
+- stable-libtorch native extension import with zero allocated GPU bytes;
+- the baked 22 passed / 1 skipped W2 suite and 6 passed DSpark suite;
+- bounded W2/W4 decode (`max_rel` 0.01358 / cosine 0.999911), full-FP4 delta
+  (`0.01611` / `0.999906`), and split-FP4 delta (`0.01333` / `0.999922`);
+- split three-tier mixed dispatch, base-miss zeroing, coupled eviction, and
+  clean interpreter shutdown;
+- byte-identical pinned, pack, reboot, tiered arena, eviction, overflow,
+  scan-resistance, and preheat store paths;
+- baked NVFP4 packed-cache writes and FlashInfer sparse-MLA JIT-cache load.
+
+The first v0.25 candidate exposed the manager teardown abort after its
+three-tier assertions passed. The same test exited clean on frozen v0.24; the
+explicit stop/join fix then exited clean on corrected v0.25 and is covered by
+two CPU regressions. The superseded image tag was removed. Throughout these
+bounded checks, taro's live llama-swap Qwen process stayed at 23,114 MiB and
+was not restarted or rerouted.
+
+This receipt still does **not** establish a DS4 checkpoint load, 128K context,
+quality, or performance result on v0.25.
+
 ## Promotion gates
 
 The v0.25 candidate must stay side-by-side with the live v0.24 image. Promotion
