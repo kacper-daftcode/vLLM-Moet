@@ -13,6 +13,8 @@ on:
       - "Dockerfile.recipes"
       - "README.md"
       - "docs/benchmarks/**"
+      - "patch/**"
+      - "tools/check_patch_files.py"
       - ".github/workflows/bench-lint.yml"
 
 jobs:
@@ -24,6 +26,8 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyyaml
+      - name: Patch file list matches patch/FILES.txt (lost-line guard)
+        run: python3 tools/check_patch_files.py
       - name: Lint recipes, boxes, suites, matrix, results
         run: python3 bench/runner/lint.py
       - name: Verify README table + report match committed results

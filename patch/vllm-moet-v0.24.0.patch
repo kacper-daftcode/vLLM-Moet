@@ -2686,10 +2686,10 @@ index 32a2d86899ccf066ec1d37473bb7af3df12a8714..3e83d5a87056b05fea995ab96eba4c9d
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df9ecf7c68
+index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb362c4f58
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1973 @@
+@@ -0,0 +1,2113 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2966,6 +2966,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +        for tier, kern in (
 +            ("w2", b"moe_w2_mm"),
 +            ("w4", b"moe_w4_mm"),
++            ("w4s", b"moe_w4s_mm"),
 +            ("w2mc2", b"moe_w2_mm"),
 +            ("w2mc4", b"moe_w2_mm"),
 +        ):
@@ -3033,9 +3034,11 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +def _require_kernels(K13: int, K2: int, need_w4: bool) -> None:
 +    """Fail loudly at weight load when the cubins this model's shapes need are
 +    missing from _DIR (they are loaded opportunistically in _ensure_ready)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    need = [("w2", K13), ("w2", K2), ("w2mc4", K13), ("w2mc4", K2)]
 +    if need_w4:
-+        need += [("w4", K13), ("w4", K2)]
++        w4tier = "w4s" if moe_w2_delta.split_enabled() else "w4"
++        need += [(w4tier, K13), (w4tier, K2)]
 +    missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
 +    assert not missing, (
 +        f"moe_w2_cubit: missing cubins for K13={K13}/K2={K2}: {missing} "
@@ -3048,12 +3051,20 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    N13*K13, n2k2 = N2*K2 elements). Over the base cache the FP4 slots must
 +    carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
 +    base planes, and with them the GPU-resident scale planes the standalone
-+    delta shares, are host-resident there."""
++    delta shares, are host-resident there. Split mode (DELTA_SPLIT): slots
++    hold 2-bit REFINEMENT planes — half the nibble bytes."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-+
-+    sc13, sc2 = (n13k13 // 32, n2k2 // 32) if moe_w2_delta.base_enabled() else (0, 0)
++    sc13, sc2 = (
++        (n13k13 // 32, n2k2 // 32)
++        if moe_w2_delta.base_enabled()
++        else (0, 0)
++    )
++    div = 4 if moe_w2_delta.split_enabled() else 2
 +    return moe_w2_delta.get_tier(
-+        n_experts=E, dev=dev, w13_bytes=n13k13 // 2 + sc13, w2_bytes=n2k2 // 2 + sc2
++        n_experts=E,
++        dev=dev,
++        w13_bytes=n13k13 // div + sc13,
++        w2_bytes=n2k2 // div + sc2,
 +    )
 +
 +
@@ -3067,6 +3078,18 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +        tier.add_layer_host_sections(layer_key, (fp13, sc13), (fp2, sc2))
 +    else:
 +        tier.add_layer_host_planes(layer_key, fp13, fp2)
++
++
++def _pack_fp4_plane(nib):
++    """One expert's FP4-tier plane row from its e2m1 nibbles: the full
++    fragment-major nibble plane (moe_w4_mm), or — split mode — the 2-bit
++    REFINEMENT plane (moe_w4s_mm reads it alongside the resident base)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
++        nibbles_to_refinement, pack_fp4_fragment_major)
++    if moe_w2_delta.split_enabled():
++        return pack_fragment_major(nibbles_to_refinement(nib))
++    return pack_fp4_fragment_major(nib)
 +
 +
 +# Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
@@ -3460,8 +3483,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
-+        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
-+        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
++        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
++        _div = 4 if moe_w2_delta.split_enabled() else 2
++        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
 +
 +    chunk = 32
 +    for e0 in range(0, E, chunk):
@@ -3473,7 +3498,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            planes13[e0 + i] = pack_fragment_major(mxfp4_to_codes(wg[i]))
 +            sc13[e0 + i] = pack_scales(sg[i])
 +            if fp13 is not None:
-+                fp13[e0 + i] = pack_fp4_fragment_major(nib)
++                fp13[e0 + i] = _pack_fp4_plane(nib)
 +        wg = w2[e0:e1].to(dev, non_blocking=True)
 +        sg = s2[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
@@ -3481,7 +3506,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            planes2[e0 + i] = pack_fragment_major(mxfp4_to_codes(wg[i]))
 +            sc2[e0 + i] = pack_scales(sg[i])
 +            if fp2 is not None:
-+                fp2[e0 + i] = pack_fp4_fragment_major(nib)
++                fp2[e0 + i] = _pack_fp4_plane(nib)
 +
 +    if tier is not None:
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -3556,8 +3581,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
-+        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
-+        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
++        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
++        _div = 4 if moe_w2_delta.split_enabled() else 2
++        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
 +
 +    # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
 +    # temporaries -> smaller H2D chunks, per-expert quantize.
@@ -3573,7 +3600,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            planes13[e0 + i] = pack_fragment_major(codes)
 +            sc13[e0 + i] = pack_scales(sbytes)
 +            if fp13 is not None:
-+                fp13[e0 + i] = pack_fp4_fragment_major(nib)
++                fp13[e0 + i] = _pack_fp4_plane(nib)
 +        wg = w2[e0:e1].to(dev, non_blocking=True)
 +        sg = s2[e0:e1].to(dev, non_blocking=True)
 +        for i in range(e1 - e0):
@@ -3583,7 +3610,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            planes2[e0 + i] = pack_fragment_major(codes)
 +            sc2[e0 + i] = pack_scales(sbytes)
 +            if fp2 is not None:
-+                fp2[e0 + i] = pack_fp4_fragment_major(nib)
++                fp2[e0 + i] = _pack_fp4_plane(nib)
 +
 +    if tier is not None:
 +        _stage_fp4_host(tier, layer_key, fp13, sc13, fp2, sc2)
@@ -3765,8 +3792,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +
 +    fp13 = fp2 = None
 +    if tier is not None:
-+        fp13 = torch.empty(E, N13 * K13 // 2, dtype=torch.uint8, device=dev)
-+        fp2 = torch.empty(E, N2 * K2 // 2, dtype=torch.uint8, device=dev)
++        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
++        _div = 4 if moe_w2_delta.split_enabled() else 2
++        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
 +
 +    # f64 temporaries are 16x the packed nibbles -> small H2D chunks,
 +    # per-expert quantize (mirrors the fp8 loader).
@@ -3785,7 +3814,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            planes13[e0 + i] = pack_fragment_major(codes)
 +            sc13[e0 + i] = pack_scales(sbytes)
 +            if fp13 is not None:
-+                fp13[e0 + i] = pack_fp4_fragment_major(nib)
++                fp13[e0 + i] = _pack_fp4_plane(nib)
 +        wg = w2[e0:e1].to(dev, non_blocking=True)
 +        sg = s2[e0:e1].to(dev, non_blocking=True)
 +        s2g = s2_2[e0:e1].to(dev, non_blocking=True)
@@ -3796,7 +3825,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            planes2[e0 + i] = pack_fragment_major(codes)
 +            sc2[e0 + i] = pack_scales(sbytes)
 +            if fp2 is not None:
-+                fp2[e0 + i] = pack_fp4_fragment_major(nib)
++                fp2[e0 + i] = _pack_fp4_plane(nib)
 +
 +    if planes_cache.enabled() and lidx is not None:
 +        planes_cache.store(
@@ -3982,6 +4011,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            ),
 +            c2=torch.zeros(slots + 4, hidden, dtype=torch.bfloat16, device=dev),
 +            desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64, device=dev),
++            # split-FP4 (moe_w4s_mm) desc tables: 8 u64 per pair, 64 B ABI
++            desc4s=torch.empty(
++                2, slots // _BLOCK, 8, dtype=torch.int64, device=dev
++            ),
 +            # -1 slot row for the tier-less desc path; sized to the MODEL's
 +            # expert count (256 = DS4 default; 384 Kimi-K2.x reads past a
 +            # fixed 256-row table).
@@ -4124,6 +4157,58 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +        tl.store(d + 3, s, mask=mask)
 +        tl.store(d + 4, c, mask=mask)
 +        tl.store(d + 5, m, mask=mask)
++
++
++@triton.jit
++def _desc_build_kernel_w4s(
++    eids_ptr, npost_ptr, slot_ptr, d_ptr,
++    a1b, as1b, c13b, a2b, as2b, c2b,
++    p13b, s13b, p2b, s2b, poolb,
++    p13s, s13s, p2s, s2s,
++    slot_bytes, w13r_bytes,
++    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
++    n_experts, pairs, cap8, mblock,
++    BLOCK: tl.constexpr,
++):
++    """Split-FP4 desc tables (moe_w4s_mm, 8 x u64 per pair, 64 B ABI):
++    {a, as, base, ref, bs, c, m_rows, pad}. `base`/`bs` point at the
++    RESIDENT 2-bit plane / scale rows (exactly the w2 tier's pointers);
++    `ref` at the delta slot's refinement sections ([ref13 | ref2],
++    w13r_bytes = ref13 section size). Written alongside the main kernel's
++    w2 tables; pairs not FP4-resident get m=0 (w4s early-EXITs)."""
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    slot = tl.load(slot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    live = p < npost // mblock
++    is4 = slot >= 0
++    m4 = tl.where(live & is4, mblock, 0).to(tl.int64)
++    base = p.to(tl.int64) * mblock
++    ref = poolb + tl.maximum(slot, 0) * slot_bytes
++    a1 = a1b + base * a1_rb
++    as1 = as1b + base * as1_rb
++    c13 = c13b + base * c13_rb
++    a2 = a2b + base * a2_rb
++    as2 = as2b + base * as2_rb
++    c2 = c2b + base * c2_rb
++    for gi in tl.static_range(2):
++        d = d_ptr + gi * cap8 + p * 8
++        if gi == 0:
++            bb, rr, ss, a, as_, c = (p13b + e * p13s, ref, s13b + e * s13s,
++                                     a1, as1, c13)
++        else:
++            bb, rr, ss, a, as_, c = (p2b + e * p2s, ref + w13r_bytes,
++                                     s2b + e * s2s, a2, as2, c2)
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, bb, mask=mask)
++        tl.store(d + 3, rr, mask=mask)
++        tl.store(d + 4, ss, mask=mask)
++        tl.store(d + 5, c, mask=mask)
++        tl.store(d + 6, m4, mask=mask)
++        tl.store(d + 7, tl.zeros_like(m4), mask=mask)
 +
 +
 +@triton.jit
@@ -4405,6 +4490,7 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    d = ws["desc"]
 +    cap = d.shape[1]
 +    miss_rows = None
++    use_w4s = False
 +    if base_mode:
 +        # BASE cache: 2-bit planes come from the base tier's GPU pool; a live
 +        # pair with a non-resident expert contributes zero and bumps the miss
@@ -4591,6 +4677,50 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +            mblock,
 +            BLOCK=256,
 +        )
++        use_w4s = (
++            tier is not None
++            and not bulk_prefill
++            and not base_mode
++            and moe_w2_delta.split_enabled()
++        )
++        if use_w4s:
++            # split-FP4: the extra 8-field tables for moe_w4s_mm (base/bs =
++            # the resident plane rows, ref = the slot's refinement sections)
++            d4s = ws["desc4s"]
++            _desc_build_kernel_w4s[(triton.cdiv(pairs, 256),)](
++                expert_blocks,
++                num_post,
++                slot_row,
++                d4s,
++                a1_base.data_ptr(),
++                ws["as1"].data_ptr(),
++                ws["c13"].data_ptr(),
++                a2_base.data_ptr(),
++                ws["as2"].data_ptr(),
++                ws["c2"].data_ptr(),
++                st["planes13"].data_ptr(),
++                st["sc13"].data_ptr(),
++                st["planes2"].data_ptr(),
++                st["sc2"].data_ptr(),
++                pool_ptr,
++                st["planes13"].shape[1],
++                st["sc13"].shape[1],
++                st["planes2"].shape[1],
++                st["sc2"].shape[1],
++                tier.slot_bytes,
++                tier.w13_bytes,
++                st["K13"],
++                (st["K13"] // 128) * 4,
++                4 * st["K2"],
++                st["K2"],
++                (st["K2"] // 128) * 4,
++                2 * st["K13"],
++                st["E"],
++                pairs,
++                d4s.shape[1] * 8,
++                mblock,
++                BLOCK=256,
++            )
 +
 +    # ---- w13 GEMMs (both tiers) -> fused silu*up -> quant -> w2 GEMMs
 +    # AFRAG prefill: single-pass triton repack row-major a1/a2 -> fragment-major
@@ -4603,7 +4733,12 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +        _afrag_repack(ws["a1"], ws["a1f"], pairs, st["K13"])
 +    _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
 +    if tier is not None and not bulk_prefill:
-+        _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
++        if use_w4s:
++            _launch(
++                "w4s", st["K13"], ws["desc4s"][0], st["N13"], pairs, stream
++            )
++        else:
++            _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
 +    act = ws["act"][:slots]
 +    torch.ops._C.silu_and_mul(act, ws["c13"][:slots])
 +    _, qs2 = per_token_group_quant_fp8(act, 128, out_q=ws["a2"][:slots])
@@ -4612,7 +4747,12 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +        _afrag_repack(ws["a2"], ws["a2f"], pairs, st["K2"])
 +    _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
 +    if tier is not None and not bulk_prefill:
-+        _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
++        if use_w4s:
++            _launch(
++                "w4s", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream
++            )
++        else:
++            _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
 +
 +    # ---- weighted unpermute (pad slots masked out), DETERMINISTIC.
 +    # The old `out.index_add_(0, rows, c2*w)` scattered with atomics, so the
@@ -4665,10 +4805,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9140e34dd96f431e99a5ed5a1ad5994169a71a8c
+index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb252545c51890
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1835 @@
+@@ -0,0 +1,1859 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -6387,6 +6527,30 @@ index 0000000000000000000000000000000000000000..9140e34dd96f431e99a5ed5a1ad59941
 +# set DELTA_GB and must not silently grow an FP4 pool out of the default.
 +_GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
 +
++# SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT=1, default off): the delta tier stores
++# 2-bit REFINEMENT planes instead of full e2m1 nibble planes and dispatches
++# moe_w4s_mm, which reads them alongside the GPU-RESIDENT 2-bit base planes
++# (nested codebook; see moe_w2_planes.nibbles_to_refinement) — half the
++# pool bytes per expert = 2x FP4 coverage at equal VRAM, at ~+16-23%
++# kernel-time on the FP4-served pairs (decode ALU; read bytes unchanged).
++# Requires the base planes resident on GPU, so it is INERT over the base
++# cache (the base slot could be evicted under the refinement's feet;
++# residency coupling is future work).
++_SPLIT = os.getenv("VLLM_MOE_W2_DELTA_SPLIT", "0") == "1"
++
++
++def split_enabled() -> bool:
++    if not _SPLIT:
++        return False
++    if base_enabled():
++        logger.warning_once(
++            "VLLM_MOE_W2_DELTA_SPLIT=1 is unsupported over the base cache "
++            "(VLLM_MOE_W2_BASE_CACHE_GB>0) — the resident 2-bit base the "
++            "split kernel refines does not exist there. Flag ignored; the "
++            "FP4 tier serves full nibble planes via moe_w4_mm.")
++        return False
++    return True
++
 +
 +def enabled() -> bool:
 +    if os.getenv("VLLM_MOE_W2_DELTA", "1") != "1":
@@ -6960,10 +7124,10 @@ index 0000000000000000000000000000000000000000..6e1c3ea63fd8222f06cf50d42bc3bf91
 +            f"(top-{_PILOT_K}, n={tot[1]})")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..da9d22e2d0a19e44df2eafa68de1dd2304a0f35c
+index 0000000000000000000000000000000000000000..634454b8d06d651814193baf9e5a1fec815a39f5
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,286 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
@@ -7004,6 +7168,39 @@ index 0000000000000000000000000000000000000000..da9d22e2d0a19e44df2eafa68de1dd23
 +
 +# 2-bit code -> e2m1 nibble of the reconstructed level (for golden tests)
 +_CODE_TO_NIBBLE = torch.tensor([0xE, 0xA, 0x2, 0x6], dtype=torch.uint8)
++
++# --- split-FP4 refinement (moe_w4s_mm) -------------------------------------
++# e2m1 magnitude index -> 2-bit refinement code within the base-code class.
++# Small classes (codes +-1, mags {0,.5,1,1.5,2}) have 5 members for 4 codes:
++# magnitude 0 MERGES into 0.5 (measured least-mass adjacent pair on real GLM
++# packs, 3.6% of elements; unit err 0.5 where the 2-bit base gives them 1.0).
++# Big classes (codes +-4, mags {3,4,6}) fit with a spare code. The kernel's
++# decode pools are pool_S={.5,1,1.5,2} and pool_B={3,4,6,6} indexed by ref;
++# sign comes from the base code. Nesting invariant (code is a pure function
++# of the nibble) holds pack-wide: kernels/gen/moe_w4s_nesting_study.py.
++_MAG_TO_REF = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
++# ref -> reconstructed |value|, per class (golden tests / references)
++_REF_TO_VAL_SMALL = torch.tensor([0.5, 1.0, 1.5, 2.0])
++_REF_TO_VAL_BIG = torch.tensor([3.0, 4.0, 6.0, 6.0])
++
++
++def nibbles_to_refinement(nib: torch.Tensor) -> torch.Tensor:
++    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for moe_w4s_mm
++    (the base 2-bit plane supplies class+sign; see _MAG_TO_REF above)."""
++    return _MAG_TO_REF.to(nib.device)[(nib & 7).long()]
++
++
++def split_fp4_dequant(nib: torch.Tensor) -> torch.Tensor:
++    """Values the SPLIT decode reconstructs from e2m1 nibbles (mag 0 -> 0.5
++    merge included) — the reference for split-path golden tests."""
++    dev = nib.device
++    mag = (nib & 7).long()
++    code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
++    ref = _MAG_TO_REF.to(dev)[mag].long()
++    big = (code == 0) | (code == 3)
++    val = torch.where(big, _REF_TO_VAL_BIG.to(dev)[ref],
++                      _REF_TO_VAL_SMALL.to(dev)[ref])
++    return torch.where(code <= 1, -val, val)
 +
 +# 2-bit code -> e4m3 byte (the kernel's PRMT LUT): -4,-1,1,4
 +PRMT_LUT_WORD = 0x4838B8C8
@@ -7219,10 +7416,10 @@ index 0000000000000000000000000000000000000000..da9d22e2d0a19e44df2eafa68de1dd23
 +    return vals * s
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a051e898609aece01db9edad4c1963c435ed135d
+index 0000000000000000000000000000000000000000..9bffa48fa7ca77211fc19c701e6b50ac08f1ce8a
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
-@@ -0,0 +1,253 @@
+@@ -0,0 +1,259 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Disk cache for built 2-bit expert planes (+ optional FP4 delta planes).
@@ -7325,6 +7522,7 @@ index 0000000000000000000000000000000000000000..a051e898609aece01db9edad4c1963c4
 +
 +
 +def _meta() -> dict:
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    world, rank = _tp_ids()
 +    return dict(
 +        version=_VERSION,
@@ -7332,6 +7530,9 @@ index 0000000000000000000000000000000000000000..a051e898609aece01db9edad4c1963c4
 +        world=world,
 +        rank=rank,
 +        zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
++        # split-FP4 stores 2-bit refinement planes in fp13/fp2 (half the
++        # bytes) — a cache built in the other mode must MISS wholesale
++        fp4_split=moe_w2_delta.split_enabled(),
 +    )
 +
 +
@@ -7348,6 +7549,7 @@ index 0000000000000000000000000000000000000000..a051e898609aece01db9edad4c1963c4
 +
 +def expected_sizes(E: int, N13: int, K13: int, N2: int, K2: int,
 +                   want_fp4: bool) -> dict[str, int]:
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    exp = {
 +        "planes13": E * N13 * K13 // 4,
 +        "sc13": E * N13 * K13 // 32,
@@ -7355,8 +7557,9 @@ index 0000000000000000000000000000000000000000..a051e898609aece01db9edad4c1963c4
 +        "sc2": E * N2 * K2 // 32,
 +    }
 +    if want_fp4:
-+        exp["fp13"] = E * N13 * K13 // 2
-+        exp["fp2"] = E * N2 * K2 // 2
++        div = 4 if moe_w2_delta.split_enabled() else 2
++        exp["fp13"] = E * N13 * K13 // div
++        exp["fp2"] = E * N2 * K2 // div
 +    return exp
 +
 +

@@ -139,5 +139,57 @@ cos2 = torch.nn.functional.cosine_similarity(
 print(f"DELTA mixed ({len(promoted)}/{E} promoted): max_rel={rel2:.3e} "
       f"cos={cos2:.6f}")
 ok = ok and rel2 < 0.06 and cos2 > 0.999
+
+# ---- SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT): the delta slots hold 2-bit
+# REFINEMENT planes and moe_w4s_mm reads them alongside the resident base.
+# Reference: split_fp4_dequant (true FP4 modulo the mag-0 -> 0.5 merge).
+from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
+    nibbles_to_refinement, split_fp4_dequant)
+
+moe_w2_delta._SPLIT = True          # env is read at import; force for test
+assert moe_w2_delta.split_enabled()
+tier_s = moe_w2_delta.DeltaTier(1, E, dev,
+                                w13_bytes=2 * I * H // 4,
+                                w2_bytes=H * I // 4)
+moe_w2_delta._TIER = tier_s
+rf13 = torch.stack([pack_fragment_major(
+    nibbles_to_refinement(mxfp4_to_nibbles(w13_pack[e]))) for e in range(E)])
+rf2 = torch.stack([pack_fragment_major(
+    nibbles_to_refinement(mxfp4_to_nibbles(w2_pack[e]))) for e in range(E)])
+assert rf13.shape[1] == 2 * I * H // 4 and rf2.shape[1] == H * I // 4
+tier_s.add_layer_host_planes(0, rf13, rf2)
+for e in promoted:
+    slot = tier_s._take_slot(set())
+    tier_s._promote(0, e, slot)
+torch.cuda.synchronize()
+
+
+def dequant_split(pack, sc):
+    nib = mxfp4_to_nibbles(pack)
+    return (split_fp4_dequant(nib)
+            * torch.exp2(sc.float() - 127.0).repeat_interleave(32, -1))
+
+
+got3 = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+ref3 = torch.zeros(T, H, device=dev)
+for t in range(T):
+    for j in range(TOPK):
+        e = int(topk_ids[t, j])
+        dq = dequant_split if e in promoted else dequant
+        w13d = dq(w13_pack[e], s13[e])
+        c13 = a_deq[t] @ w13d.T
+        act = torch.nn.functional.silu(c13[:I]) * c13[I:]
+        q2, qs2 = per_token_group_quant_fp8(act.to(torch.bfloat16).unsqueeze(0), 128)
+        act_deq = q2.float() * qs2.repeat_interleave(128, 1)
+        w2d = dq(w2_pack[e], s2[e])
+        ref3[t] += float(topk_w[t, j]) * (act_deq[0] @ w2d.T)
+
+rel3 = (got3.float() - ref3).abs().max().item() / ref3.abs().max().item()
+cos3 = torch.nn.functional.cosine_similarity(
+    got3.float().flatten(), ref3.flatten(), dim=0).item()
+print(f"SPLIT mixed ({len(promoted)}/{E} promoted, slots {rf13.shape[1]}+"
+      f"{rf2.shape[1]} B): max_rel={rel3:.3e} cos={cos3:.6f}")
+ok = ok and rel3 < 0.06 and cos3 > 0.999
+moe_w2_delta._SPLIT = False
 print("RESULT:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)
