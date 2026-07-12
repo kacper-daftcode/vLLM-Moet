@@ -18,6 +18,71 @@ runs on the *same* serving stack (only `MODEL_DIR` differs).
 3. **Arithmetic** — 5 multi‑step problems (the official model itself tops out at 3/5).
 4. **Long context** — passphrase needle at 100K/250K/440K depths (`tools/needle_probe.py`).
 
+## DS4-W2 reliability methodology (P1/P2 release gate)
+
+The release gate uses `tools/ds4_eval/`; it is stricter than a transcript spot check. Every warm
+run must first pass the fixed ten-prompt `ds4-w2-prewarm-v4` suite (temperature 0, top-p 1, seed
+`20260711`, independent of the eval seed). There are no hidden retries: the first bad response
+aborts and its receipt remains on disk. The run manifest binds the result to immutable server
+provenance, including the boot, container and image identities, complete source-diff hash,
+checkpoint and pack fingerprints, launcher hash, runtime argv, W2 environment, and engine settings.
+
+Before looking at quality results, register one pool policy and retain its SHA-256. The same frozen
+policy evaluates the configured live metrics before and after scoring. The release policy requires
+full FP4 occupancy, zero unrestored BASE experts, and measured eviction progress so a stale
+saturated pool cannot pass; replay and second-order residue remain recorded in every snapshot even
+when they are not rejection thresholds. A failed pre- or post-gate invalidates the run regardless
+of its answers. At the default continuation threshold (`FP_THRESH=0`), second-order experts are
+fetched for later steps but their current-step contributions remain zero, so `UNRESTORED=0` is a
+mechanism-liveness gate rather than a miss-free or bit-deterministic claim. The three-seed quality
+receipts are the empirical acceptance test for that explicit throughput approximation.
+
+P1 scores the fixed 40-item set separately at eval seeds 42, 43, and 44 (120 responses total).
+Exact clean correctness is primary: the normalized terminal answer must match and the response
+must not be a sink. The answer-anywhere `lenient` score is diagnostic only and never rescues a
+sink. Sink rules catch max-token non-completions, repeated 3/4-grams, repeated lines, collapsed
+vocabulary, and special-token spew; duplicate IDs, missing rows, or conflicting token-count aliases
+fail closed. The corrected historical tau-0.67 baseline is **16/120 sinks (13.3%)** across those
+three seeds. It is context only, not a tau-0.75 control: its warmups and pool evidence do not meet
+the new comparability contract.
+The corrected baseline summary is published under
+[`evidence/public/ds4-w2-2026-07-11/baseline/`](../evidence/public/ds4-w2-2026-07-11/baseline/).
+
+Use repository-relative inputs and a localhost endpoint; write each seed to a new output directory:
+
+```bash
+PORT="${PORT:-18001}"
+python3 tools/ds4_eval/eval_rig.py \
+  --items tools/ds4_eval/items.json \
+  --server-provenance evidence/example-p1/server.json \
+  --pool-gate-policy evidence/example-p1/pool-gate.json \
+  --pool-command-json '["docker","logs","ds4-w2-candidate"]' \
+  --output-dir evidence/example-p1/seed-42 \
+  --run-label example-p1-s42 \
+  --url "http://localhost:${PORT}/v1/chat/completions" \
+  --model deepseek-v4-flash-w2 --mode warm --eval-seed 42 \
+  --eval-temperature 0.6 --eval-top-p 0.95 --eval-max-tokens 700 \
+  --expected-count 40
+```
+
+Repeat with seeds 43 and 44 and distinct labels/directories. P2 is a two-part contract on the same
+ready server: first run this quality gate, then run `tools/ds4_eval/context_probe.py` with MTP off,
+`--max-num-seqs 1`, a validated 131,072-token window, and 120,000-token needles at depths 0.1,
+0.5, and 0.9. The probe requires exact tokenizer/usage token counts and an exact terminal
+passphrase. A successful 128K boot without retrieval, or retrieval without the quality gate, is
+not a P2 verdict.
+
+The guarded single-RTX-5090 application of this protocol is recorded in
+[`ds4-w2-5090-2026-07-11.md`](benchmarks/ds4-w2-5090-2026-07-11.md), with sanitized machine
+receipts under [`evidence/public/ds4-w2-2026-07-11/`](../evidence/public/ds4-w2-2026-07-11/).
+The historical predecessor P1 series at 32K produced 119/120 machine-exact and 120/120
+semantically correct answers with 0/120 frozen-rule sink detections. The current integrated
+artifact's independent P2 series at 128K improved to 120/120 machine-exact and semantically
+correct, with 0/120 sink detections, thereby satisfying the P1 stability gate at the larger
+window. P2 then passed exact 120,000-token needles at depths 0.1, 0.5, and 0.9. Each case was
+calibrated with tokenizer-only requests before its sole inference; the public composite contains
+only fresh zero-tolerance receipts whose tokenizer and response-usage counts both equal 120,000.
+
 ## Bits‑vs‑quality ablation (same stack, only the expert codes change)
 | codebook | bits | MTP acc. length | draft accept % | arithmetic | coherence |
 |---|---|---|---|---|---|
