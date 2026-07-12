@@ -6,8 +6,8 @@ csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 tests/model_executor/layers/quantization/test_moe_w2_cgroup_memory.py
 tests/model_executor/layers/quantization/test_moe_w2_padded_routes.py
 tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
-tests/v1/core/test_scheduler.py
 tests/v1/spec_decode/test_dspark_scheduler.py
+tests/v1/spec_decode/test_mtp_structured_target_only.py
 tools/nvfp4_flashinfer_sm120/README.md
 tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 tools/nvfp4_flashinfer_sm120/patch_flashinfer.py

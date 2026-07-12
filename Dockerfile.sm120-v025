@@ -13,7 +13,7 @@ FROM ${VLLM_BASE}
 
 LABEL org.opencontainers.image.version="v0.25.0-w2candidate" \
       ai.kostudios.vllm-moet.base="vllm/vllm-openai:v0.25.0" \
-      ai.kostudios.vllm-moet.patch-sha256="95175e11073faaf8df95b9024265d7d2f39a4215e9a384d041c87cce933a41e9"
+      ai.kostudios.vllm-moet.patch-sha256="ea1e8462008e8d3530e8938483a4f8974258196acc6a0bbcc4124bc4a719ed5d"
 
 # v0.25.0 already vendors the same SM120-capable DeepGEMM commit used by the
 # v0.24 recipe (a6b593d2826719dcf4892609af7b84ee23aaf32a), so no replacement

@@ -11,8 +11,8 @@ rollback boundary until the v0.25 candidate passes the SM120 hardware canary.
 - Official tag commit: `702f4814fe54fabff350d43cb753ae3e47c0c276`
 - Linux/amd64 base image manifest: `sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97`
 - W2 overlay: `patch/vllm-moet-v0.25.0.patch`
-- Overlay SHA-256: `95175e11073faaf8df95b9024265d7d2f39a4215e9a384d041c87cce933a41e9`
-- Overlay scope: 61 files, 13,338 insertions, 134 deletions
+- Overlay SHA-256: `ea1e8462008e8d3530e8938483a4f8974258196acc6a0bbcc4124bc4a719ed5d`
+- Overlay scope: 61 files, 13,342 insertions, 134 deletions
 
 Apply it directly to an official checkout with:
 
@@ -108,9 +108,13 @@ quality, context, or throughput parity.
 ## Bounded SM120 image receipt (2026-07-12)
 
 This receipt belongs to the earlier `25ac6fea...` overlay, not the current
-`95175e11...` source candidate. It remains bounded evidence for that image. The
-structured-output scheduler delta was separately built and canaried on taro;
-the complete regenerated overlay has not yet been built or deployed.
+`ea1e8462...` source candidate. It remains bounded evidence for that image. The
+structured-output scheduler delta was separately built and canaried on taro.
+The complete regenerated overlay then built successfully as
+`vllm-moet-sm120:v025-w2candidate-ea1e8462`, image ID `sha256:3acf5a707966`;
+its label matches the full overlay hash and its installed scheduler guard
+imports successfully. That exact complete image has not been served or
+deployed.
 
 The digest-pinned recipe built on taro as
 `vllm-moet-sm120:v025-w2candidate-25ac6fea`, local image ID
