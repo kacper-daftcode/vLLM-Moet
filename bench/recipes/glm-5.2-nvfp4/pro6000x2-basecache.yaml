@@ -16,6 +16,7 @@ env:
   VLLM_MOE_W2_BASE_CACHE_GB: "44"
   VLLM_MOE_W2_DELTA_GB: "2"
   VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_BASE_MISS_TOL: "8"
   VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}"
 
 serve_args:

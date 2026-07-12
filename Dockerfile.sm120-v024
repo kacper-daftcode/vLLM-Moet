@@ -72,9 +72,9 @@ RUN pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.14
         --index-url https://flashinfer.ai/whl/cu130 \
         "flashinfer-jit-cache==0.6.14+cu130"
 
-# 3. Combined v0.24.0 patch: W2 streaming/recovery plus the DSpark speculative
-#    decoding backport (upstream PRs 46995 + 47093 + 47513) and SM120 fixes.
-#    Keeping one canonical patch makes the image label an exact source identity.
+# 3. Combined v0.24.0 patch: W2 streaming/recovery, the step-driven tier
+#    manager, the DSpark speculative backport, and SM120 fixes. One canonical
+#    patch keeps the image label an exact source identity.
 COPY patch/vllm-moet-v0.24.0.patch /tmp/vllm-moet.patch
 RUN cd "$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
     && git apply --verbose /tmp/vllm-moet.patch \
