@@ -434,8 +434,8 @@ Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recip
 <!-- bench:table:end -->
 
 ## Repository layout
-- **`patch/vllm-moet-v0.25.0.patch`** — the v0.25 candidate delta (60 files,
-  +13,287/-133 source lines) against exact official tag commit `702f4814`.
+- **`patch/vllm-moet-v0.25.0.patch`** — the v0.25 candidate delta (61 files,
+  +13,338/-134 source lines) against exact official tag commit `702f4814`.
 - **`Dockerfile.sm120-v025`** — pinned official v0.25.0 image plus the candidate
   overlay; built and qualified side-by-side with v0.24.
 - **`docs/v025-port.md`** — exact identities, absorbed-upstream inventory,

@@ -11,8 +11,8 @@ rollback boundary until the v0.25 candidate passes the SM120 hardware canary.
 - Official tag commit: `702f4814fe54fabff350d43cb753ae3e47c0c276`
 - Linux/amd64 base image manifest: `sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97`
 - W2 overlay: `patch/vllm-moet-v0.25.0.patch`
-- Overlay SHA-256: `f2989ad13b02f341420d6871abfc8c627d0e57b6b36d678ea99475a3c1fbfd58`
-- Overlay scope: 60 files, 13,287 insertions, 133 deletions
+- Overlay SHA-256: `95175e11073faaf8df95b9024265d7d2f39a4215e9a384d041c87cce933a41e9`
+- Overlay scope: 61 files, 13,338 insertions, 134 deletions
 
 Apply it directly to an official checkout with:
 
@@ -100,7 +100,7 @@ The source port passed:
 - 27 passed / 1 skipped focused W2 memory, padded-route, step-pin, and manager
   shutdown tests;
 - 6 passed CPU DSpark scheduling and live-re-derivation regressions;
-- clean patch application and a committed 60-file lost-line manifest.
+- clean patch application and a committed 61-file lost-line manifest.
 
 These are source gates only. They do **not** establish CUDA kernel, model-load,
 quality, context, or throughput parity.
@@ -108,9 +108,9 @@ quality, context, or throughput parity.
 ## Bounded SM120 image receipt (2026-07-12)
 
 This receipt belongs to the earlier `25ac6fea...` overlay, not the current
-`f2989ad1...` source candidate. It remains bounded evidence for that image; the
-starvation-corrected overlay has not been built, deployed, or canaried by this
-source-only port.
+`95175e11...` source candidate. It remains bounded evidence for that image. The
+structured-output scheduler delta was separately built and canaried on taro;
+the complete regenerated overlay has not yet been built or deployed.
 
 The digest-pinned recipe built on taro as
 `vllm-moet-sm120:v025-w2candidate-25ac6fea`, local image ID
@@ -135,6 +135,42 @@ was not restarted or rerouted.
 
 This receipt still does **not** establish a DS4 checkpoint load, 128K context,
 quality, or performance result on v0.25.
+
+## DS4 W2 speculative-decoding canary (2026-07-12)
+
+The later `f2989ad1...` candidate image was exercised against the real
+DeepSeek-V4-Flash W2 checkpoint on taro with a 100 GiB cgroup, 96 GiB
+`memory.high`, FP8 KV cache, 131,072-token model length, and one active
+sequence. Results are decode throughput after the first request:
+
+| Mode | Warm median | Change from no-spec |
+| --- | ---: | ---: |
+| No speculation | 23.56 tok/s | baseline |
+| n-gram, 3 tokens | 39.13 tok/s | +66.1% |
+| n-gram, 4 tokens | 41.05 tok/s | +74.3% |
+| native MTP, 1 token | 32.46 tok/s | +37.8% |
+
+The n-gram 3-token run also completed the exact 120K retrieval canary in
+250.3 seconds versus 260.8 seconds without speculation. Warm acceptance was
+98.2% for n-gram 3 and 97.8% for n-gram 4. None of the runs recorded cgroup
+high, max, OOM, or OOM-kill events.
+
+Native MTP exposed a vLLM 0.25 structured-output failure: consecutive forced
+tool calls could commit duplicate or otherwise grammar-invalid target/bonus
+blocks, causing xgrammar FSM rejection and HTTP 500. Copying the grammar mask,
+fencing its CUDA stream, and validating/rolling back a committed block did not
+fix the defect; the rollback variant also corrupted valid arguments. The
+correctness containment in this overlay discards drafts for structured-output
+requests before scheduling while preserving MTP for other requests.
+
+The contained image completed 20 consecutive forced tool calls with exact
+`report_result(ok=true, label="SPEC_OK")` arguments, 20 HTTP 200 responses,
+zero grammar rejections, and zero 500s. Ordinary MTP generation remained at a
+32.86 tok/s warm median (+39.5% from no-spec). The tool response retained
+`finish_reason="stop"`, which is the existing vLLM behavior for named tool
+choice; the tool call and arguments were present. After the canary, the
+disposable container was removed and taro's 8080, 8081, and 9090 production
+health checks all returned 200.
 
 ## Promotion gates
 
