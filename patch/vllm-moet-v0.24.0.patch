@@ -647,10 +647,10 @@ index 0000000..2b4a328
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 new file mode 100644
-index 0000000..fa3ca4c
+index 0000000..711fb77
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
-@@ -0,0 +1,463 @@
+@@ -0,0 +1,464 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -711,6 +711,7 @@ index 0000000..fa3ca4c
 +        tier._policy = "lru"
 +        tier._tick = 10
 +        tier._step_pins = {0, 1, 2}
++        tier._coupled_fp4 = None
 +        tier._seen_host = torch.zeros((1, 32), dtype=torch.uint8)
 +        tier._freq = torch.zeros((1, 32), dtype=torch.float32)
 +        tier._need = torch.zeros((1, 32), dtype=torch.float32)
