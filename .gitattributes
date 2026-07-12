@@ -1,0 +1,3 @@
+# Unified diffs contain a one-character context marker on blank context lines.
+# Validate whitespace after applying the patch to its source tree instead.
+patch/*.patch -whitespace
