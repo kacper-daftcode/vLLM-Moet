@@ -645,10 +645,10 @@ index 0000000000000000000000000000000000000000..3b8ae6c46ee523000d782e41b3c14ac4
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..d3f86f2ab2b767db24d897edc13e29dc1cb12e80
+index 0000000000000000000000000000000000000000..725f9782e998a31e4814f3f1bbca368bdefc7004
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
-@@ -0,0 +1,359 @@
+@@ -0,0 +1,380 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -700,7 +700,10 @@ index 0000000000000000000000000000000000000000..d3f86f2ab2b767db24d897edc13e29dc
 +        tier._lock = threading.Lock()
 +        tier.n_slots = 3
 +        tier._free = []
-+        tier._owner = [(0, 0, 0), (0, 1, 1), (0, 2, 2)]
++        tier._alloc_owner(tier.n_slots)
++        tier._owner_li[:] = torch.tensor([0, 0, 0])
++        tier._owner_ei[:] = torch.tensor([0, 1, 2])
++        tier._owner_tick[:] = torch.tensor([0, 1, 2])
 +        tier._policy = "lru"
 +        tier._tick = 10
 +        tier._step_pins = {0, 1, 2}
@@ -731,7 +734,7 @@ index 0000000000000000000000000000000000000000..d3f86f2ab2b767db24d897edc13e29dc
 +            self.assertEqual(tier._take_slots_batch(1, emergency=True), [expected])
 +
 +            # Mirror force_promote's ownership handoff and current-step pin.
-+            tier._owner[expected] = (0, expert, tier._tick)
++            tier._own(expected, 0, expert)
 +            tier.slot_table[0, expert] = expected
 +            tier._mirror[0, expert] = expected
 +            tier._step_pins.add(expected)
@@ -852,17 +855,17 @@ index 0000000000000000000000000000000000000000..d3f86f2ab2b767db24d897edc13e29dc
 +            and isinstance(node.func.value, ast.Attribute)
 +            and node.func.value.attr == "_step_pins"
 +        ]
-+        pin_adds = [
++        pin_mutations = [
 +            node
 +            for node in ast.walk(pool_lock)
 +            if isinstance(node, ast.Call)
 +            and isinstance(node.func, ast.Attribute)
-+            and node.func.attr == "add"
++            and node.func.attr in {"add", "update"}
 +            and isinstance(node.func.value, ast.Attribute)
 +            and node.func.value.attr == "_step_pins"
 +        ]
 +        self.assertEqual(len(pin_clears), 1)
-+        self.assertGreaterEqual(len(pin_adds), 2)
++        self.assertGreaterEqual(len(pin_mutations), 2)
 +        self.assertLess(pin_clears[0].lineno, take.lineno)
 +
 +    def test_manager_and_force_promote_pass_immutable_seen_sets(self):
@@ -909,10 +912,25 @@ index 0000000000000000000000000000000000000000..d3f86f2ab2b767db24d897edc13e29dc
 +        self.assertIsInstance(wrapper_kw.value, ast.Name)
 +        self.assertEqual(wrapper_kw.value.id, "seen_set")
 +
++        for name in ("_tick_once", "force_promote"):
++            assignments = [
++                node
++                for node in ast.walk(functions[name])
++                if isinstance(node, ast.Assign)
++                and any(
++                    isinstance(target, ast.Name) and target.id == "seen_set"
++                    for target in node.targets
++                )
++            ]
++            self.assertEqual(len(assignments), 1, name)
++
 +    def test_current_prefetch_hit_is_repinned_for_replay(self):
 +        tier = object.__new__(self.delta.DeltaTier)
 +        tier.dev = torch.device("cpu")
 +        tier._store = {0: object()}
++        tier.n_layers = 1
++        tier._store_mask_cache = None
++        tier._store_mask_n = -1
 +        tier._snap_lock = threading.Lock()
 +        tier._lock = threading.Lock()
 +        tier._stream = mock.Mock()
@@ -921,7 +939,10 @@ index 0000000000000000000000000000000000000000..d3f86f2ab2b767db24d897edc13e29dc
 +        tier._seen_host = torch.zeros_like(tier.seen)
 +        tier._mirror = torch.full((1, 4), -1, dtype=torch.int32)
 +        tier._mirror[0, 2] = 0
-+        tier._owner = [(0, 2, 3)]
++        tier._alloc_owner(1)
++        tier._owner_li[0] = 0
++        tier._owner_ei[0] = 2
++        tier._owner_tick[0] = 3
 +        tier._tick = 10
 +        tier._step_pins = {0}  # draft_prefetch pinned this current-step hit
 +        tier._need = torch.zeros((1, 4), dtype=torch.float32)
@@ -4561,10 +4582,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..62c021d2f2ae32b9c6ebe8b220aa6b208c1b5633
+index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c7802dc5280e
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1802 @@
+@@ -0,0 +1,1812 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -5115,6 +5136,10 @@ index 0000000000000000000000000000000000000000..62c021d2f2ae32b9c6ebe8b220aa6b20
 +            # token counts for the hit-rate below — read under the snap lock
 +            # so a concurrent snapshot can't swap the values underneath.
 +            cnt_raw = self._seen_host[seen[:, 0], seen[:, 1]]
++            # Keep eviction protection bound to this exact snapshot. Other
++            # snapshot users may overwrite the shared host buffer after the
++            # lock is released.
++            seen_set = {tuple(pair) for pair in seen.tolist()}
 +        if seen.numel() == 0:
 +            return
 +        if _CAPTURE and not self._cap_done:
@@ -5172,7 +5197,7 @@ index 0000000000000000000000000000000000000000..62c021d2f2ae32b9c6ebe8b220aa6b20
 +                for li, ei in cand:
 +                    if promoted >= _PROMOTE_PER_TICK:
 +                        break
-+                    slot = self._take_slot()
++                    slot = self._take_slot(seen_set)
 +                    if slot is None:
 +                        break
 +                    self._promote(li, ei, slot)
@@ -5372,7 +5397,10 @@ index 0000000000000000000000000000000000000000..62c021d2f2ae32b9c6ebe8b220aa6b20
 +        elif self._policy == "freq":
 +            key = self._freq[lic, eic].double()
 +        else:
-+            key = tk.clone()
++            # LRU ticks are int64, but masked candidates need an infinity
++            # sentinel below. Promote to float so a saturated LRU pool can
++            # exclude in-flight slots instead of raising on the assignment.
++            key = tk.double()
 +        # Hard exclusions: free markers, owners active in the current seen
 +        # window (their slots may be read by this step's graph/replay), and
 +        # step-pinned slots (touched by any pass of the current step).
@@ -5624,6 +5652,9 @@ index 0000000000000000000000000000000000000000..62c021d2f2ae32b9c6ebe8b220aa6b20
 +            seen = self._seen_host.nonzero()
 +        if seen.numel() == 0:
 +            return 0
++        # Eviction must use the immutable routing snapshot captured above,
++        # not the shared host buffer that another caller can overwrite.
++        seen_set = {tuple(pair) for pair in seen.tolist()}
 +        # Bound the working set to RECENT steps: `seen` otherwise accumulates
 +        # up to 4 manager ticks of routings (the manager zeroes it lazily), so
 +        # on deep/wide models a single fire tried to force-promote every
