@@ -647,10 +647,10 @@ index 0000000..2b4a328
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 new file mode 100644
-index 0000000..4da3005
+index 0000000..2c29d84
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,702 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -672,6 +672,7 @@ index 0000000..4da3005
 +GATE_PATH = ROOT / "vllm/model_executor/layers/quantization/utils/moe_w2_gate.py"
 +RUNNER_PATH = ROOT / "vllm/v1/worker/gpu_model_runner.py"
 +WORKER_PATH = ROOT / "vllm/v1/worker/gpu_worker.py"
++SPEC_CONFIG_PATH = ROOT / "vllm/config/speculative.py"
 +
 +
 +def _load_delta_module():
@@ -756,7 +757,27 @@ index 0000000..4da3005
 +        tier._seen_host[0, 2] = 1
 +        self.assertEqual(tier._take_slot({(0, 0)}), 1)
 +
-+    def test_target_boundary_clears_seen_but_preserves_pins(self):
++    def test_emergency_third_pass_drops_seen_but_keeps_step_pins(self):
++        seen_set = {(0, 0), (0, 1), (0, 2)}
++        tier = self._saturated_lru_tier()
++        tier._step_pins.clear()
++
++        # A verify step can mark the whole saturated pool. Once that step has
++        # drained, its immutable seen snapshot is recency information, not an
++        # in-flight reader, so the emergency restore must still find a victim.
++        self.assertEqual(
++            tier._take_slots_batch(1, emergency=True, seen_set=seen_set),
++            [0],
++        )
++
++        # Current-step pins remain a correctness exclusion in every pass.
++        tier = self._saturated_lru_tier()
++        self.assertEqual(
++            tier._take_slots_batch(1, emergency=True, seen_set=seen_set),
++            [],
++        )
++
++    def test_step_end_clears_seen_but_preserves_pins(self):
 +        tier = object.__new__(self.delta.DeltaTier)
 +        tier.dev = torch.device("cpu")
 +        tier._snap_lock = threading.Lock()
@@ -773,7 +794,7 @@ index 0000000..4da3005
 +                self.delta.torch.cuda, "stream", return_value=contextlib.nullcontext()
 +            ),
 +        ):
-+            tier.routing_step_begin()
++            tier.step_end()
 +
 +        self.assertEqual(tier.seen.count_nonzero().item(), 0)
 +        self.assertEqual(tier._step_pins, {1, 2})
@@ -782,6 +803,11 @@ index 0000000..4da3005
 +    def test_module_boundaries_reset_both_tiers(self):
 +        base = mock.Mock()
 +        fp4 = mock.Mock()
++        events = []
++        base.step_end.side_effect = lambda: events.append("base.end")
++        fp4.step_end.side_effect = lambda: events.append("fp4.end")
++        base.wake.side_effect = lambda: events.append("base.wake")
++        fp4.wake.side_effect = lambda: events.append("fp4.wake")
 +        with (
 +            mock.patch.object(self.delta, "_BASE_TIER", base),
 +            mock.patch.object(self.delta, "_TIER", fp4),
@@ -796,8 +822,14 @@ index 0000000..4da3005
 +        fp4.routing_step_begin.assert_called_once_with()
 +        base.step_begin.assert_called_once_with()
 +        fp4.step_begin.assert_called_once_with()
++        base.step_end.assert_called_once_with()
++        fp4.step_end.assert_called_once_with()
 +        base.wake.assert_called_once_with()
 +        fp4.wake.assert_called_once_with()
++        self.assertEqual(
++            events,
++            ["base.end", "fp4.end", "base.wake", "fp4.wake"],
++        )
 +
 +    def test_manager_pass_cannot_overlap_forward_window(self):
 +        tier = object.__new__(self.delta.DeltaTier)
@@ -987,10 +1019,64 @@ index 0000000..4da3005
 +            ]
 +            self.assertEqual(len(assignments), 1, name)
 +
-+    def test_current_prefetch_hit_is_repinned_for_replay(self):
++    def test_force_promote_only_repins_when_replay_follows(self):
++        for pin, expected_pins in ((True, {0}), (False, set())):
++            with self.subTest(pin=pin):
++                tier = object.__new__(self.delta.DeltaTier)
++                tier.dev = torch.device("cpu")
++                tier._store = {0: object()}
++                tier.n_layers = 1
++                tier._store_mask_cache = None
++                tier._store_mask_n = -1
++                tier._snap_lock = threading.Lock()
++                tier._lock = threading.Lock()
++                tier._stream = mock.Mock()
++                tier.seen = torch.zeros((1, 4), dtype=torch.uint8)
++                tier.seen[0, 2] = 1
++                tier._seen_host = torch.zeros_like(tier.seen)
++                tier._mirror = torch.full((1, 4), -1, dtype=torch.int32)
++                tier._mirror[0, 2] = 0
++                tier._alloc_owner(1)
++                tier._owner_li[0] = 0
++                tier._owner_ei[0] = 2
++                tier._owner_tick[0] = 3
++                tier._tick = 10
++                tier._step_pins = {0}
++                tier._need = torch.zeros((1, 4), dtype=torch.float32)
++                main = object()
++                event = mock.Mock()
++
++                tier.step_begin()
++                self.assertEqual(tier._step_pins, set())
++                with (
++                    mock.patch.object(
++                        self.delta.torch.cuda, "current_stream", return_value=main
++                    ),
++                    mock.patch.object(
++                        self.delta.torch.cuda,
++                        "stream",
++                        return_value=contextlib.nullcontext(),
++                    ),
++                    mock.patch.object(
++                        self.delta.torch.cuda, "Event", return_value=event
++                    ),
++                ):
++                    self.assertEqual(tier.force_promote(pin=pin), 0)
++
++                self.assertEqual(tier._step_pins, expected_pins)
++                self.assertEqual(tier._owner[0], (0, 2, tier._tick))
++                tier._stream.wait_stream.assert_called_once_with(main)
++                event.synchronize.assert_called_once_with()
++
++    def test_final_no_replay_fetch_does_not_pin_new_slot(self):
++        class Store(dict):
++            def rows_for(self, pairs):
++                self.requested = pairs
++                return [torch.tensor([7.0])]
++
 +        tier = object.__new__(self.delta.DeltaTier)
 +        tier.dev = torch.device("cpu")
-+        tier._store = {0: object()}
++        tier._store = Store({0: object()})
 +        tier.n_layers = 1
 +        tier._store_mask_cache = None
 +        tier._store_mask_n = -1
@@ -1001,34 +1087,158 @@ index 0000000..4da3005
 +        tier.seen[0, 2] = 1
 +        tier._seen_host = torch.zeros_like(tier.seen)
 +        tier._mirror = torch.full((1, 4), -1, dtype=torch.int32)
-+        tier._mirror[0, 2] = 0
++        tier.slot_table = torch.full((1, 4), -1, dtype=torch.int32)
++        tier.pool = torch.zeros((1, 1), dtype=torch.float32)
++        tier.n_slots = 1
++        tier._free = [0]
 +        tier._alloc_owner(1)
-+        tier._owner_li[0] = 0
-+        tier._owner_ei[0] = 2
-+        tier._owner_tick[0] = 3
 +        tier._tick = 10
-+        tier._step_pins = {0}  # draft_prefetch pinned this current-step hit
++        tier._step_pins = set()
++        tier._coupled_fp4 = None
 +        tier._need = torch.zeros((1, 4), dtype=torch.float32)
++        tier._freq = torch.zeros((1, 4), dtype=torch.float32)
++        tier._n_promoted = 0
++        tier._win_promoted = 0
++        tier._kpi_deferred = 0
++        tier._kpi_unfixed = 0
 +        main = object()
 +        event = mock.Mock()
 +
-+        tier.step_begin()
-+        self.assertEqual(tier._step_pins, set())
 +        with (
 +            mock.patch.object(
 +                self.delta.torch.cuda, "current_stream", return_value=main
 +            ),
 +            mock.patch.object(
-+                self.delta.torch.cuda, "stream", return_value=contextlib.nullcontext()
++                self.delta.torch.cuda,
++                "stream",
++                return_value=contextlib.nullcontext(),
 +            ),
 +            mock.patch.object(self.delta.torch.cuda, "Event", return_value=event),
 +        ):
-+            self.assertEqual(tier.force_promote(), 0)
++            self.assertEqual(tier.force_promote(pin=False), 1)
 +
-+        self.assertEqual(tier._step_pins, {0})
-+        self.assertEqual(tier._owner[0], (0, 2, tier._tick))
-+        tier._stream.wait_stream.assert_called_once_with(main)
-+        event.synchronize.assert_called_once_with()
++        self.assertEqual(tier._store.requested, [(0, 2)])
++        self.assertEqual(tier._step_pins, set())
++        self.assertEqual(tier._mirror[0, 2].item(), 0)
++        self.assertEqual(tier.pool[0, 0].item(), 7.0)
++
++    def test_runner_pins_force_promote_only_when_fixed_point_continues(self):
++        tree = ast.parse(RUNNER_PATH.read_text())
++        execute_model = next(
++            node
++            for node in ast.walk(tree)
++            if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
++        )
++        promotions = [
++            node
++            for node in ast.walk(execute_model)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "force_promote"
++        ]
++        self.assertEqual(len(promotions), 4)
++
++        pin_args = []
++        for promotion in promotions:
++            pin_kw = next(
++                keyword for keyword in promotion.keywords if keyword.arg == "pin"
++            )
++            self.assertIsInstance(pin_kw.value, ast.Call)
++            self.assertIsInstance(pin_kw.value.func, ast.Attribute)
++            self.assertIsInstance(pin_kw.value.func.value, ast.Name)
++            self.assertEqual(pin_kw.value.func.value.id, "_w2d")
++            self.assertEqual(pin_kw.value.func.attr, "fp_continue")
++            pin_args.append(pin_kw.value.args[0])
++
++        self.assertEqual(
++            sum(isinstance(arg, ast.Constant) and arg.value == 0 for arg in pin_args),
++            2,
++        )
++        self.assertEqual(
++            sum(isinstance(arg, ast.Name) and arg.id == "_replays" for arg in pin_args),
++            2,
++        )
++
++    def test_spec_guard_covers_ngram_and_native_mtp_k1_without_method_branch(self):
++        runner_tree = ast.parse(RUNNER_PATH.read_text())
++        take_drafts = next(
++            node
++            for node in ast.walk(runner_tree)
++            if isinstance(node, ast.FunctionDef) and node.name == "take_draft_token_ids"
++        )
++        spec_guard = next(
++            node
++            for node in ast.walk(take_drafts)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "spec_suppressed"
++        )
++        schedule_drafts = next(
++            node
++            for node in ast.walk(take_drafts)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "_get_draft_token_ids_cpu"
++        )
++        self.assertLess(spec_guard.lineno, schedule_drafts.lineno)
++        self.assertFalse(
++            any(
++                isinstance(node, ast.Attribute) and node.attr == "method"
++                for node in ast.walk(take_drafts)
++            )
++        )
++
++        config_tree = ast.parse(SPEC_CONFIG_PATH.read_text())
++        aliases = {
++            node.targets[0].id: node
++            for node in ast.walk(config_tree)
++            if isinstance(node, ast.Assign)
++            and len(node.targets) == 1
++            and isinstance(node.targets[0], ast.Name)
++        }
++        mtp_values = {
++            node.value
++            for node in ast.walk(aliases["MTPModelTypes"].value)
++            if isinstance(node, ast.Constant) and isinstance(node.value, str)
++        }
++        spec_values = {
++            node.value
++            for node in ast.walk(aliases["SpeculativeMethod"].value)
++            if isinstance(node, ast.Constant) and isinstance(node.value, str)
++        }
++        spec_names = {
++            node.id
++            for node in ast.walk(aliases["SpeculativeMethod"].value)
++            if isinstance(node, ast.Name)
++        }
++        eagle_names = {
++            node.id
++            for node in ast.walk(aliases["EagleModelTypes"].value)
++            if isinstance(node, ast.Name)
++        }
++        self.assertIn("mtp", mtp_values)
++        self.assertIn("ngram", spec_values)
++        self.assertIn("EagleModelTypes", spec_names)
++        self.assertIn("MTPModelTypes", eagle_names)
++
++        spec_config = next(
++            node
++            for node in ast.walk(config_tree)
++            if isinstance(node, ast.ClassDef) and node.name == "SpeculativeConfig"
++        )
++        token_count = next(
++            node
++            for node in spec_config.body
++            if isinstance(node, ast.AnnAssign)
++            and isinstance(node.target, ast.Name)
++            and node.target.id == "num_speculative_tokens"
++        )
++        self.assertIsInstance(token_count.value, ast.Call)
++        gt = next(
++            keyword for keyword in token_count.value.keywords if keyword.arg == "gt"
++        )
++        self.assertIsInstance(gt.value, ast.Constant)
++        self.assertEqual(gt.value.value, 0)
 +
 +    def test_runner_uses_routing_then_post_forward_pin_boundaries(self):
 +        tree = ast.parse(RUNNER_PATH.read_text())
@@ -4924,10 +5134,10 @@ index 0000000..cf35fde
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000..5c7d49c
+index 0000000..326a655
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1937 @@
+@@ -0,0 +1,1960 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -5262,6 +5472,7 @@ index 0000000..5c7d49c
 +        self._kpi_c_steps = 0
 +        self._kpi_c_replays = 0
 +        self._kpi_unfixed = 0     # experts replay could NOT restore (window)
++        self._kpi_deferred = 0    # slotless warm-up fetches (no reader; window)
 +        self._kpi_2nd = 0         # extra replays for second-order misses
 +        self._kpi_fp_giveup = 0   # steps that accepted second-order residue
 +        self._kpi_fp_resid = 0    # residual missing pairs in those steps
@@ -5769,9 +5980,11 @@ index 0000000..5c7d49c
 +        of GIL time per fired step and starved the forward thread.
 +
 +        `emergency=True` (synchronous runner-thread callers only — never the
-+        background manager) adds a second eviction pass that relaxes the
-+        2-tick coldness bound when the first pass cannot cover k, keeping
-+        the seen-window exclusion. See the pass comments below.
++        background manager) adds two fallback eviction passes when the first
++        pass cannot cover k: pass 2 relaxes the 2-tick coldness bound but
++        keeps the seen-window exclusion; pass 3 also drops the seen window.
++        The seen window is a recency heuristic after the target has drained;
++        step pins and split-FP4 residency coupling remain hard exclusions.
 +
 +        Eviction policy is unchanged: least-valuable slot by _POLICY key
 +        (need / freq / lru), restricted to slots whose owner is not active in
@@ -5798,9 +6011,9 @@ index 0000000..5c7d49c
 +            # sentinel below. Promote to float so a saturated LRU pool can
 +            # exclude in-flight slots instead of raising on the assignment.
 +            key = tk.double()
-+        # Hard exclusions: free markers, owners active in the current seen
-+        # window (their slots may be read by this step's graph/replay), and
-+        # step-pinned slots (touched by any pass of the current step).
++        # Hard exclusions: free markers and step-pinned slots (touched by a
++        # pass that the current step will replay). The seen window is a soft
++        # recency exclusion once the target has drained.
 +        if seen_set is None:
 +            active_seen = self._seen_host[lic, eic].to(torch.bool)
 +        else:
@@ -5809,9 +6022,10 @@ index 0000000..5c7d49c
 +                seen_li, seen_ei = zip(*seen_set)
 +                seen_mask[list(seen_li), list(seen_ei)] = True
 +            active_seen = seen_mask[lic, eic]
-+        blocked = (li < 0) | active_seen
++        hard = li < 0
 +        if self._step_pins:
-+            blocked[list(self._step_pins)] = True
++            hard[list(self._step_pins)] = True
++        blocked = hard | active_seen
 +        # Residency coupling (split-FP4 over the base cache): never evict a
 +        # BASE slot whose expert is mapped in the coupled FP4 tier — the
 +        # split kernel reads its refinement against THESE base codes+scales.
@@ -5821,19 +6035,21 @@ index 0000000..5c7d49c
 +        # and a missed one downgrades that expert to a base miss -> the
 +        # standard fetch+replay restores it.
 +        if self._coupled_fp4 is not None:
-+            blocked |= self._coupled_fp4._mirror[lic, eic] >= 0
++            coupled = self._coupled_fp4._mirror[lic, eic] >= 0
++            hard |= coupled
++            blocked |= coupled
 +        # Pass 1: only >=min_cold-tick-cold victims (never disturbs slots a
 +        # CONCURRENT in-flight graph might still read — the background
 +        # manager's constraint; speculative prefetchers pass a much higher
-+        # bound so they can never churn the hot set). Pass 2 (emergency):
-+        # the synchronous callers (force_promote / ensure_resident, runner
-+        # thread, no forward in flight) relax the coldness bound rather
-+        # than leave a missing expert UNRESTORED — a replay that keeps
-+        # zeroed contributions is a silent quality hit and a nondeterminism
-+        # source, strictly worse than evicting a warm-but-idle slot.
++        # bound so they can never churn the hot set). Passes 2-3 (emergency):
++        # synchronous callers relax first the coldness bound, then the seen
++        # window, rather than leave a missing expert UNRESTORED. MTP verify
++        # can mark nearly the whole pool in one step, so keeping the seen
++        # window hard in pass 3 starves the restore path.
 +        passes = [blocked | ((self._tick - tk) < min_cold)]
 +        if emergency:
 +            passes.append(blocked)
++            passes.append(hard)
 +        taken: set[int] = set()
 +        for ineligible in passes:
 +            need = k - len(out)
@@ -5905,6 +6121,10 @@ index 0000000..5c7d49c
 +            # waiting for the runner. Order future snapshots after the zero.
 +            with torch.cuda.stream(self._stream):
 +                self._stream.wait_stream(main)
++
++    def step_end(self) -> None:
++        """Close the target/replay routing window before managers resume."""
++        self.routing_step_begin()
 +
 +    # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
 +
@@ -6014,7 +6234,7 @@ index 0000000..5c7d49c
 +            self._kpi_prefetched += len(plan)
 +        return len(plan)
 +
-+    def force_promote(self, layers=None, max_promote=None) -> int:
++    def force_promote(self, layers=None, max_promote=None, pin: bool = True) -> int:
 +        """Synchronously pull this step's COLD routed experts up to FP4, for a
 +        confidence-gated re-forward (directive 2 / Step B).
 +
@@ -6035,6 +6255,8 @@ index 0000000..5c7d49c
 +        Args:
 +            layers: optional iterable of layer keys to restrict to (default all).
 +            max_promote: optional cap on experts promoted this call.
++            pin: pin touched slots when another replay will read this step.
++                Pass False for the final fetch when no replay follows.
 +        Returns:
 +            number of experts newly promoted to FP4.
 +        """
@@ -6081,7 +6303,8 @@ index 0000000..5c7d49c
 +            if bool(hit.any()):
 +                hs = slots[hit]
 +                self._owner_tick[hs] = self._tick
-+                self._step_pins.update(hs.tolist())
++                if pin:
++                    self._step_pins.update(hs.tolist())
 +            keep = torch.ones(seen.shape[0], dtype=torch.bool)
 +            if layer_filter is not None:
 +                lf = torch.zeros(self.n_layers, dtype=torch.bool)
@@ -6128,7 +6351,8 @@ index 0000000..5c7d49c
 +            rows = self._store.rows_for([p for p, _ in plan])
 +            for ((li, ei), slot), row in zip(plan, rows):
 +                self._own(slot, li, ei)
-+                self._step_pins.add(slot)
++                if pin:
++                    self._step_pins.add(slot)
 +                with torch.cuda.stream(self._stream):
 +                    self.pool[slot].copy_(row, non_blocking=True)
 +            with torch.cuda.stream(self._stream):
@@ -6142,18 +6366,20 @@ index 0000000..5c7d49c
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +        if len(plan) < len(cand):
-+            # QUALITY KPI: some of this step's missing experts got NO slot
-+            # (free list empty + every victim ineligible: seen-live or <2
-+            # ticks old). The mandatory replay then RE-ZEROES their
-+            # contributions — a silent quality drop even at MISS_TOL=0, and
-+            # (pool-content-dependent) a source of run-to-run greedy
-+            # nondeterminism. The fix is a bigger pool, not a knob.
-+            self._kpi_unfixed += len(cand) - len(plan)
-+            logger.warning_once(
-+                "moe_w2 [%s]: %d missing experts could not be promoted "
-+                "(pool too tight to evict) — replay keeps their zeroed "
-+                "contributions. Raise the pool GiB; occurrences counted "
-+                "in the KPI line.", self._tag, len(cand) - len(plan))
++            if not pin:
++                # No reader follows this call. The next routed step refetches
++                # under its own mandatory pass, so this is a deferred warm-up.
++                self._kpi_deferred += len(cand) - len(plan)
++            else:
++                # A replay will re-read this step, so any slotless candidate
++                # remains a correctness-visible zeroed contribution.
++                self._kpi_unfixed += len(cand) - len(plan)
++                logger.warning(
++                    "moe_w2 [%s]: %d missing experts could not be promoted "
++                    "(pool too tight to evict) — replay keeps their zeroed "
++                    "contributions [pool %d, pinned %d, free %d, wanted %d]",
++                    self._tag, len(cand) - len(plan), self.n_slots,
++                    len(self._step_pins), len(self._free), len(cand))
 +        if _TRACE >= 2:
 +            logger.info("[%s] force-promote %d experts (gate)",
 +                        self._tag, len(plan))
@@ -6340,6 +6566,9 @@ index 0000000..5c7d49c
 +        unfixed = (f"; UNRESTORED experts: {self._kpi_unfixed} "
 +                   "(pool too tight — quality at risk)"
 +                   if self._kpi_unfixed else "")
++        if self._kpi_deferred:
++            unfixed += (f"; deferred warm-ups: {self._kpi_deferred} "
++                        "(benign; no replay followed)")
 +        if self._kpi_2nd:
 +            unfixed += (f"; second-order replays: {self._kpi_2nd}")
 +        if self._kpi_fp_giveup:
@@ -6365,6 +6594,7 @@ index 0000000..5c7d49c
 +            100.0 * self.n_slots / cov_total, unfixed)
 +        self._kpi_steps = self._kpi_miss_pairs = self._kpi_replays = 0
 +        self._kpi_unfixed = 0
++        self._kpi_deferred = 0
 +        self._kpi_2nd = 0
 +        self._kpi_fp_giveup = 0
 +        self._kpi_fp_resid = 0
@@ -6583,7 +6813,10 @@ index 0000000..5c7d49c
 +
 +
 +def finish_forward_step() -> None:
-+    """Open the between-forward manager window and signal one pass."""
++    """Close routing windows, then resume managers between forwards."""
++    for tier in (_BASE_TIER, _TIER):
++        if tier is not None:
++            tier.step_end()
 +    wake_all()
 +
 +# Miss tolerance: a decode step with <= TOL missing routed (layer, expert)
@@ -13274,7 +13507,7 @@ index e25672e..830e99a 100644
              # This case only happens when async scheduling is disabled.
              draft_token_ids = [[-1] * self.num_draft_tokens for _ in self.req_ids]
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index e9b23f1..33def8b 100644
+index e9b23f1..2525302 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -13606,7 +13839,7 @@ index e9b23f1..33def8b 100644
                  skip_compiled=has_encoder_input,
              ),
              record_function_or_nullcontext("gpu_model_runner: forward"),
-@@ -4358,6 +4505,151 @@ class GPUModelRunner(
+@@ -4358,6 +4505,157 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -13662,7 +13895,10 @@ index e9b23f1..33def8b 100644
 +                    else:
 +                        _max_miss = _miss
 +                    if _miss > 0:
-+                        _btier.force_promote(max_promote=None)
++                        _btier.force_promote(
++                            max_promote=None,
++                            pin=_w2d.fp_continue(0, _max_miss),
++                        )
 +                    _btier.kpi_step(_max_miss, _max_miss > _w2d.base_miss_tol())
 +                    # Replay to a FIXED POINT (bounded): the corrected early
 +                    # layers can re-route later layers to experts the first
@@ -13707,7 +13943,10 @@ index e9b23f1..33def8b 100644
 +                        else:
 +                            _max_miss = _miss
 +                        if _miss > 0:
-+                            _btier.force_promote(max_promote=None)
++                            _btier.force_promote(
++                                max_promote=None,
++                                pin=_w2d.fp_continue(_replays, _max_miss),
++                            )
 +                    if _replays:
 +                        _btier.kpi_fp(_replays, _max_miss)
 +            except Exception as e:  # noqa: BLE001 - never crash serving
@@ -13758,7 +13997,7 @@ index e9b23f1..33def8b 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4416,6 +4708,196 @@ class GPUModelRunner(
+@@ -4416,6 +4714,202 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -13804,7 +14043,10 @@ index e9b23f1..33def8b 100644
 +                    # the step's ~top_k*n_layers weighted contributions were
 +                    # zeroed (bounded approximation, delta/gate class).
 +                    if _miss > 0:
-+                        _btier.force_promote(max_promote=None)
++                        _btier.force_promote(
++                            max_promote=None,
++                            pin=_w2d.fp_continue(0, _max_miss),
++                        )
 +                    # KPI: per-step replay rate + missing pairs (windowed
 +                    # INFO line) — the pool-sizing signal.
 +                    _btier.kpi_step(_max_miss, _max_miss > _w2d.base_miss_tol())
@@ -13857,7 +14099,10 @@ index e9b23f1..33def8b 100644
 +                        else:
 +                            _max_miss = _miss
 +                        if _miss > 0:
-+                            _btier.force_promote(max_promote=None)
++                            _btier.force_promote(
++                                max_promote=None,
++                                pin=_w2d.fp_continue(_replays, _max_miss),
++                            )
 +                    if _replays:
 +                        _btier.kpi_fp(_replays, _max_miss)
 +            except Exception as e:  # noqa: BLE001 - never crash serving
@@ -13955,7 +14200,7 @@ index e9b23f1..33def8b 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4437,6 +4919,101 @@ class GPUModelRunner(
+@@ -4437,6 +4931,101 @@ class GPUModelRunner(
  
          return None
  
@@ -14057,7 +14302,7 @@ index e9b23f1..33def8b 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4462,6 +5039,12 @@ class GPUModelRunner(
+@@ -4462,6 +5051,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -14070,7 +14315,7 @@ index e9b23f1..33def8b 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4653,6 +5236,23 @@ class GPUModelRunner(
+@@ -4653,6 +5248,23 @@ class GPUModelRunner(
                  )
                  self.drafter.dummy_run(num_tokens=1)
  
@@ -14094,7 +14339,7 @@ index e9b23f1..33def8b 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4745,13 +5345,35 @@ class GPUModelRunner(
+@@ -4745,13 +5357,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -14135,7 +14380,7 @@ index e9b23f1..33def8b 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4760,16 +5382,33 @@ class GPUModelRunner(
+@@ -4760,16 +5394,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -14173,7 +14418,7 @@ index e9b23f1..33def8b 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4780,18 +5419,157 @@ class GPUModelRunner(
+@@ -4780,18 +5431,157 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -14336,7 +14581,7 @@ index e9b23f1..33def8b 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5260,6 +6038,45 @@ class GPUModelRunner(
+@@ -5260,6 +6050,45 @@ class GPUModelRunner(
                          self.drafter.set_eplb_state(self.eplb_state)
                          eplb_models += 1
  
@@ -14382,7 +14627,7 @@ index e9b23f1..33def8b 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5874,11 +6691,13 @@ class GPUModelRunner(
+@@ -5874,11 +6703,13 @@ class GPUModelRunner(
  
          attn_metadata: PerLayerAttnMetadata | None = None
  
@@ -14401,7 +14646,7 @@ index e9b23f1..33def8b 100644
          )
  
          # Dummy runs have no real slot assignments — fill with -1 so
-@@ -6005,6 +6824,8 @@ class GPUModelRunner(
+@@ -6005,6 +6836,8 @@ class GPUModelRunner(
                      batch_descriptor=batch_desc,
                      ubatch_slices=ubatch_slices_padded,
                      slot_mapping=slot_mappings,
@@ -14410,7 +14655,7 @@ index e9b23f1..33def8b 100644
                  ),
              ):
                  outputs = self.model(
-@@ -6020,10 +6841,15 @@ class GPUModelRunner(
+@@ -6020,10 +6853,15 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -14430,7 +14675,7 @@ index e9b23f1..33def8b 100644
              ):
                  assert isinstance(
                      self.drafter,
-@@ -6926,10 +7752,15 @@ class GPUModelRunner(
+@@ -6926,10 +7764,15 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -14450,7 +14695,7 @@ index e9b23f1..33def8b 100644
          ):
              assert isinstance(
                  self.drafter,
-@@ -6981,9 +7812,14 @@ class GPUModelRunner(
+@@ -6981,9 +7824,14 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.

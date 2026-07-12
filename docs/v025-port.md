@@ -11,8 +11,8 @@ rollback boundary until the v0.25 candidate passes the SM120 hardware canary.
 - Official tag commit: `702f4814fe54fabff350d43cb753ae3e47c0c276`
 - Linux/amd64 base image manifest: `sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97`
 - W2 overlay: `patch/vllm-moet-v0.25.0.patch`
-- Overlay SHA-256: `25ac6fea69d71c1a641b0d6343c01011bca3b481436e29f9f02f8e4c3ce639a4`
-- Overlay scope: 60 files, 13,042 insertions, 133 deletions
+- Overlay SHA-256: `f2989ad13b02f341420d6871abfc8c627d0e57b6b36d678ea99475a3c1fbfd58`
+- Overlay scope: 60 files, 13,287 insertions, 133 deletions
 
 Apply it directly to an official checkout with:
 
@@ -82,6 +82,14 @@ hardware-aware DSpark confidence scheduler.
   extension can abort if a daemon manager still owns Torch tensors during
   Python shutdown. Each tier now has an explicit stop/join boundary and the
   module registers a deduplicated `atexit` shutdown for serving workers.
+- **The v0.24 starvation fix is present in the v0.25 tree.** The source change
+  from `96bc1a406d57557a1d1d4f6f8ed3e7b8272ea51f` was adapted to Model Runner
+  V2: synchronous recovery gets a third eviction pass that may drop the
+  drained step's seen window while retaining step pins and split-FP4 coupling;
+  both routing windows close before tier managers wake; and a final fetch with
+  no following replay does not pin the pool. The scheduling guard remains
+  method-agnostic before draft extraction, covering both n-gram and native MTP
+  with `num_speculative_tokens=1`.
 
 ## Verification completed before image build
 
@@ -89,7 +97,7 @@ The source port passed:
 
 - `git diff --check` against the exact v0.25 tag;
 - Python compilation across every changed Python file;
-- 22 passed / 1 skipped focused W2 memory, padded-route, step-pin, and manager
+- 27 passed / 1 skipped focused W2 memory, padded-route, step-pin, and manager
   shutdown tests;
 - 6 passed CPU DSpark scheduling and live-re-derivation regressions;
 - clean patch application and a committed 60-file lost-line manifest.
@@ -98,6 +106,11 @@ These are source gates only. They do **not** establish CUDA kernel, model-load,
 quality, context, or throughput parity.
 
 ## Bounded SM120 image receipt (2026-07-12)
+
+This receipt belongs to the earlier `25ac6fea...` overlay, not the current
+`f2989ad1...` source candidate. It remains bounded evidence for that image; the
+starvation-corrected overlay has not been built, deployed, or canaried by this
+source-only port.
 
 The digest-pinned recipe built on taro as
 `vllm-moet-sm120:v025-w2candidate-25ac6fea`, local image ID
