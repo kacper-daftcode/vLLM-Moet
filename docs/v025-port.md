@@ -39,6 +39,21 @@ V4 DSpark implementation, Gumbel sampling, and SM120 cooperative-top-k guard.
 The v0.25 overlay therefore drops those redundant hunks instead of shadowing
 upstream.
 
+Exact paths removed from the overlay:
+
+```text
+vllm/model_executor/models/qwen3_dflash.py
+vllm/model_executor/models/registry.py
+vllm/models/deepseek_v4/__init__.py
+vllm/models/deepseek_v4/nvidia/dspark.py
+vllm/models/deepseek_v4/nvidia/model.py
+vllm/transformers_utils/configs/speculators/algos.py
+vllm/v1/worker/gpu/sample/gumbel.py
+vllm/v1/worker/gpu/spec_decode/__init__.py
+vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
+vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
+```
+
 The retained delta is the project-specific W2 stack: 2-bit planes, FP4
 recovery and confidence gate, tiered/NVMe expert stores, persistent pack-cache
 safety, SM120 cubins, NVFP4 KV, pipeline-aware replay, and the optional
