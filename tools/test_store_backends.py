@@ -95,6 +95,10 @@ def main():
     tier = make_tier("t-mmap")
     for li in range(N_LAYERS):
         tier.add_layer_host_planes(li, *parts[li])
+    cold_st = tier._store.stats()
+    assert cold_st["write_cache_drop_calls"] == N_LAYERS, cold_st
+    assert cold_st["write_cache_drop_bytes"] == (
+        N_LAYERS * E * tier._store.stride), cold_st
     check_tier(tier, parts, "mmap-pack cold")
 
     # boot-from-pack: new tier, same dir; add_layer must SKIP (feed garbage
@@ -119,6 +123,10 @@ def main():
     assert isinstance(tier._store, TieredPackStore), type(tier._store)
     for li in range(N_LAYERS):
         tier.add_layer_host_planes(li, *parts[li])
+    cold_st = tier._store.stats()
+    assert cold_st["write_cache_drop_calls"] == N_LAYERS, cold_st
+    assert cold_st["write_cache_drop_bytes"] == (
+        N_LAYERS * E * tier._store.stride), cold_st
     check_tier(tier, parts, "tiered cold")
     st = tier._store.stats()
     assert st["miss_rows"] > 0, st
