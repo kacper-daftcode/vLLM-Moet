@@ -1,6 +1,6 @@
 diff --git a/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 new file mode 100644
-index 0000000000000000000000000000000000000000..df62c57ccd1c840b25176d2980171f823bf0976f
+index 0000000..df62c57
 --- /dev/null
 +++ b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 @@ -0,0 +1,142 @@
@@ -148,7 +148,7 @@ index 0000000000000000000000000000000000000000..df62c57ccd1c840b25176d2980171f82
 +}
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_cgroup_memory.py b/tests/model_executor/layers/quantization/test_moe_w2_cgroup_memory.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..97a0b6a3ce20df5b06d01020a692530f7f642612
+index 0000000..97a0b6a
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_cgroup_memory.py
 @@ -0,0 +1,124 @@
@@ -278,10 +278,10 @@ index 0000000000000000000000000000000000000000..97a0b6a3ce20df5b06d01020a692530f
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_padded_routes.py b/tests/model_executor/layers/quantization/test_moe_w2_padded_routes.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..3b8ae6c46ee523000d782e41b3c14ac429d6f16b
+index 0000000..2b4a328
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_padded_routes.py
-@@ -0,0 +1,361 @@
+@@ -0,0 +1,363 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -464,8 +464,10 @@ index 0000000000000000000000000000000000000000..3b8ae6c46ee523000d782e41b3c14ac4
 +        }
 +        for name in (
 +            "_desc_build_kernel",
++            "_desc_build_kernel_w4s",
 +            "_desc_build_kernel_basecache",
 +            "_desc_build_kernel_base_delta",
++            "_desc_build_kernel_base_delta_split",
 +        ):
 +            function = functions[name]
 +            self.assertIn("pair_live_ptr", [arg.arg for arg in function.args.args])
@@ -645,7 +647,7 @@ index 0000000000000000000000000000000000000000..3b8ae6c46ee523000d782e41b3c14ac4
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..fa3ca4c5b2fb7bca9e4f3803078f01fa32ed8934
+index 0000000..fa3ca4c
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 @@ -0,0 +1,463 @@
@@ -1114,7 +1116,7 @@ index 0000000000000000000000000000000000000000..fa3ca4c5b2fb7bca9e4f3803078f01fa
 +    unittest.main()
 diff --git a/tools/nvfp4_flashinfer_sm120/README.md b/tools/nvfp4_flashinfer_sm120/README.md
 new file mode 100644
-index 0000000000000000000000000000000000000000..a147137db72cd322a170b69e3b05828d366bba73
+index 0000000..a147137
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/README.md
 @@ -0,0 +1,49 @@
@@ -1169,7 +1171,7 @@ index 0000000000000000000000000000000000000000..a147137db72cd322a170b69e3b05828d
 +- Microbench (isolated KV gather, RTX 5090): 1.86× tokens/s vs 656 B.
 diff --git a/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh b/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 new file mode 100644
-index 0000000000000000000000000000000000000000..e27203c56cd05b15873ee10c8f9f6e9d3de04612
+index 0000000..e27203c
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 @@ -0,0 +1,211 @@
@@ -1386,7 +1388,7 @@ index 0000000000000000000000000000000000000000..e27203c56cd05b15873ee10c8f9f6e9d
 +}
 diff --git a/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py b/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..cfa92d32329a54057d93382b10d1927f24b1e8e5
+index 0000000..cfa92d3
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 @@ -0,0 +1,412 @@
@@ -1803,7 +1805,7 @@ index 0000000000000000000000000000000000000000..cfa92d32329a54057d93382b10d1927f
 +print("SYNTAX-OK python")
 +print("PATCH-FLASHINFER-DONE")
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
-index 6da3ec71786128368adab1027c012bcae0885798..c84958ac0b172c45ac9924e4c54dbdf00b825bd0 100644
+index 6da3ec7..c84958a 100644
 --- a/vllm/compilation/breakable_cudagraph.py
 +++ b/vllm/compilation/breakable_cudagraph.py
 @@ -175,10 +175,13 @@ class BreakableCUDAGraphCapture:
@@ -1823,7 +1825,7 @@ index 6da3ec71786128368adab1027c012bcae0885798..c84958ac0b172c45ac9924e4c54dbdf0
          self._capturing = True
  
 diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
-index b63d86199720d077118f2427c52498ab216b24a3..3cad1f058d886dfdeb18c5030507c0bdb1df3c7e 100644
+index b63d861..3cad1f0 100644
 --- a/vllm/compilation/cuda_graph.py
 +++ b/vllm/compilation/cuda_graph.py
 @@ -314,6 +314,10 @@ class CUDAGraphWrapper:
@@ -1838,7 +1840,7 @@ index b63d86199720d077118f2427c52498ab216b24a3..3cad1f058d886dfdeb18c5030507c0bd
                      # `output` is managed by pytorch's cudagraph pool
                      output = self.runnable(*args, **kwargs)
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index de505e122cf6310ccbd33952ea7372381e35b7d1..f0b49e2940bad4db344961d2be8b86fe2a0c2753 100644
+index de505e1..f0b49e2 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
 @@ -54,6 +54,7 @@ MTPModelTypes = Literal[
@@ -2040,7 +2042,7 @@ index de505e122cf6310ccbd33952ea7372381e35b7d1..f0b49e2940bad4db344961d2be8b86fe
          return self.num_speculative_tokens_per_batch_size is not None
  
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index ba7d26c93b235c5cc083cf926be9fbf271ca0256..67d3b5ea262a2813945f659ae91c1512646ca84a 100644
+index ba7d26c..67d3b5e 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -524,6 +524,16 @@ class VllmConfig:
@@ -2150,7 +2152,7 @@ index ba7d26c93b235c5cc083cf926be9fbf271ca0256..67d3b5ea262a2813945f659ae91c1512
                  "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
                  "Attention) backends. Please use a different --kv-cache-dtype "
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 27a85bb3d0e7e292f64340cfdb6988ccf6c74287..4a657cac0be8dcd407854a9f8a4d6b836dee7dc4 100755
+index 27a85bb..4a657ca 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -179,6 +179,17 @@ if TYPE_CHECKING:
@@ -2202,7 +2204,7 @@ index 27a85bb3d0e7e292f64340cfdb6988ccf6c74287..4a657cac0be8dcd407854a9f8a4d6b83
      # JIT all the required kernels before model execution so there is no
      # JIT'ing in the hot-path. However, this warmup increases the engine
 diff --git a/vllm/forward_context.py b/vllm/forward_context.py
-index 5527ec13b0611b783fb20a9e22647dd14a6d5d00..a7cb4f431cd1db9fe27c95bd084236e12f2b500a 100644
+index 5527ec1..a7cb4f4 100644
 --- a/vllm/forward_context.py
 +++ b/vllm/forward_context.py
 @@ -131,6 +131,10 @@ class ForwardContext:
@@ -2259,7 +2261,7 @@ index 5527ec13b0611b783fb20a9e22647dd14a6d5d00..a7cb4f431cd1db9fe27c95bd084236e1
  
      try:
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index 051468ed14c7317256e7f9e31b2dc6ae02d814ae..33902056c8d3114e8f891176890d065b852ed3cb 100644
+index 051468e..3390205 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
 @@ -188,6 +188,7 @@ return curr_o @ W_O
@@ -2316,7 +2318,7 @@ index 051468ed14c7317256e7f9e31b2dc6ae02d814ae..33902056c8d3114e8f891176890d065b
  
          # Enforce that we enough for at least 1 page per request
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 7cdb04cfbeccfc62ee8c97ffb00b108f3257a5e4..64813139b3db63177aeb6efe1eea470f8f01ed33 100644
+index 7cdb04c..6481313 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
 @@ -671,6 +671,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
@@ -2380,7 +2382,7 @@ index 7cdb04cfbeccfc62ee8c97ffb00b108f3257a5e4..64813139b3db63177aeb6efe1eea470f
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index d51a2dd312af9c68756003aab665a9c747875e2d..2fe74cc556cc5377991f900294f974c34c538116 100644
+index d51a2dd..2fe74cc 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1,6 +1,7 @@
@@ -2595,7 +2597,7 @@ index d51a2dd312af9c68756003aab665a9c747875e2d..2fe74cc556cc5377991f900294f974c3
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 1b2a8a74bdcbfc28cfa9aa6dbe7eec18deb64a76..de8314293ed29861de8cade00eb531dd9021ba82 100644
+index 1b2a8a7..de83142 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -617,6 +617,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -2669,7 +2671,7 @@ index 1b2a8a74bdcbfc28cfa9aa6dbe7eec18deb64a76..de8314293ed29861de8cade00eb531dd
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-index 32a2d86899ccf066ec1d37473bb7af3df12a8714..3e83d5a87056b05fea995ab96eba4c9d87879aed 100644
+index 32a2d86..3e83d5a 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 +++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 @@ -1122,6 +1122,11 @@ def deepgemm_post_process_fp8_weight_block(
@@ -2686,10 +2688,10 @@ index 32a2d86899ccf066ec1d37473bb7af3df12a8714..3e83d5a87056b05fea995ab96eba4c9d
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb362c4f58
+index 0000000..cf35fde
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2113 @@
+@@ -0,0 +1,2275 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3052,14 +3054,17 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +    carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
 +    base planes, and with them the GPU-resident scale planes the standalone
 +    delta shares, are host-resident there. Split mode (DELTA_SPLIT): slots
-+    hold 2-bit REFINEMENT planes — half the nibble bytes."""
++    hold 2-bit REFINEMENT planes (half the nibble bytes) and NO scale
++    sections even over the base cache — the split kernel reads scales from
++    the base slot the refinement is residency-coupled to."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    split = moe_w2_delta.split_enabled()
 +    sc13, sc2 = (
 +        (n13k13 // 32, n2k2 // 32)
-+        if moe_w2_delta.base_enabled()
++        if moe_w2_delta.base_enabled() and not split
 +        else (0, 0)
 +    )
-+    div = 4 if moe_w2_delta.split_enabled() else 2
++    div = 4 if split else 2
 +    return moe_w2_delta.get_tier(
 +        n_experts=E,
 +        dev=dev,
@@ -3071,10 +3076,10 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
 +    """Stage a layer's FP4 planes into the tier's pinned host store; over the
 +    base cache the scale planes ride along inside the slot sections (copied
-+    section-by-section — no GPU-side cat temporaries)."""
++    section-by-section — no GPU-side cat temporaries). Split slots carry
++    refinement only — their scales live in the coupled base slot."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-+
-+    if moe_w2_delta.base_enabled():
++    if moe_w2_delta.base_enabled() and not moe_w2_delta.split_enabled():
 +        tier.add_layer_host_sections(layer_key, (fp13, sc13), (fp2, sc2))
 +    else:
 +        tier.add_layer_host_planes(layer_key, fp13, fp2)
@@ -3146,10 +3151,15 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +        if not pack_has_layer("base", key, n_keys, E, c13len + s13len + c2len + s2len):
 +            return False
 +        if moe_w2_delta.enabled():
-+            # over-base FP4 need-pool: its slots carry their own scales
-+            # ([fp4_13|sc13|fp4_2|sc2]) — mirror _fp4_tier_for_build's sizing
-+            fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
-+            if not pack_has_layer("fp4", key, n_keys, E, fslot):
++            # over-base FP4 need-pool: mirror _fp4_tier_for_build's sizing
++            # and get_tier's pack tag (split refinement slots live in a
++            # SEPARATE pack — different geometry, "fp4s")
++            if moe_w2_delta.split_enabled():
++                ftag, fslot = "fp4s", N13 * K13 // 4 + N2 * K2 // 4
++            else:
++                ftag = "fp4"
++                fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
++            if not pack_has_layer(ftag, key, n_keys, E, fslot):
 +                return False
 +    else:
 +        # GPU-resident: the planes cache is the only source that can
@@ -4161,7 +4171,7 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +
 +@triton.jit
 +def _desc_build_kernel_w4s(
-+    eids_ptr, npost_ptr, slot_ptr, d_ptr,
++    eids_ptr, npost_ptr, pair_live_ptr, slot_ptr, d_ptr,
 +    a1b, as1b, c13b, a2b, as2b, c2b,
 +    p13b, s13b, p2b, s2b, poolb,
 +    p13s, s13s, p2s, s2s,
@@ -4182,7 +4192,8 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
 +    slot = tl.load(slot_ptr + e, mask=mask, other=-1).to(tl.int64)
 +    npost = tl.load(npost_ptr).to(tl.int64)
-+    live = p < npost // mblock
++    has_real = tl.load(pair_live_ptr + p, mask=mask, other=0) != 0
++    live = (p < npost // mblock) & has_real
 +    is4 = slot >= 0
 +    m4 = tl.where(live & is4, mblock, 0).to(tl.int64)
 +    base = p.to(tl.int64) * mblock
@@ -4372,6 +4383,112 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +        tl.store(d + 5, m, mask=mask)
 +
 +
++@triton.jit
++def _desc_build_kernel_base_delta_split(
++    eids_ptr,
++    npost_ptr,
++    pair_live_ptr,
++    bslot_ptr,
++    fslot_ptr,
++    miss_ptr,
++    d_ptr,
++    d4s_ptr,
++    a1b,
++    as1b,
++    c13b,
++    a2b,
++    as2b,
++    c2b,
++    bpoolb,
++    bslot_bytes,
++    off_s13,
++    off_c2,
++    off_s2,
++    fpoolb,
++    fslot_bytes,
++    w13r_bytes,
++    a1_rb,
++    as1_rb,
++    c13_rb,
++    a2_rb,
++    as2_rb,
++    c2_rb,
++    n_experts,
++    pairs,
++    cap6,
++    cap8,
++    mblock,
++    BLOCK: tl.constexpr,
++):
++    """Base cache + SPLIT FP4 need-pool: refinement slots are read AGAINST
++    the base pool slot (codes + scales), so a pair routes to the w4s tier
++    only when its expert is resident in BOTH slot tables. FP4-mapped but
++    base-missing counts as a MISS (contributes zero, bumps miss_ptr — the
++    runner's base fetch + replay restores it; the base tier's eviction
++    hard-excludes FP4-mapped experts so this is a transient, not a steady
++    state). w2 tables (d_ptr[0..1], 6-field) serve base-resident pairs not
++    in FP4; w4s tables (d4s_ptr[0..1], 8-field/64 B) carry
++    {a, as, base=bslot codes section, ref=fslot section,
++    bs=bslot scale section, c, m, pad}."""
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    has_real = tl.load(pair_live_ptr + p, mask=mask, other=0) != 0
++    live = (p < npost // mblock) & has_real
++    bhit = bslot >= 0
++    is4 = (fslot >= 0) & bhit  # split serve needs BOTH resident
++    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
++    m4 = tl.where(live & is4, mblock, 0).to(tl.int64)
++    n_miss = tl.sum(tl.where(mask & live & ~bhit, 1, 0))
++    tl.atomic_add(miss_ptr, n_miss)
++    base = p.to(tl.int64) * mblock
++    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
++    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
++    a1 = a1b + base * a1_rb
++    as1 = as1b + base * as1_rb
++    c13 = c13b + base * c13_rb
++    a2 = a2b + base * a2_rb
++    as2 = as2b + base * as2_rb
++    c2 = c2b + base * c2_rb
++    for gi in tl.static_range(2):  # w2 tables (base pool sections)
++        d = d_ptr + gi * cap6 + p * 6
++        if gi == 0:
++            b, s, a, as_, c = bs, bs + off_s13, a1, as1, c13
++        else:
++            b, s, a, as_, c = bs + off_c2, bs + off_s2, a2, as2, c2
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, b, mask=mask)
++        tl.store(d + 3, s, mask=mask)
++        tl.store(d + 4, c, mask=mask)
++        tl.store(d + 5, m2, mask=mask)
++    for gi in tl.static_range(2):  # w4s tables (base + refinement)
++        d = d4s_ptr + gi * cap8 + p * 8
++        if gi == 0:
++            bb, rr, ss, a, as_, c = bs, fs, bs + off_s13, a1, as1, c13
++        else:
++            bb, rr, ss, a, as_, c = (
++                bs + off_c2,
++                fs + w13r_bytes,
++                bs + off_s2,
++                a2,
++                as2,
++                c2,
++            )
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, bb, mask=mask)
++        tl.store(d + 3, rr, mask=mask)
++        tl.store(d + 4, ss, mask=mask)
++        tl.store(d + 5, c, mask=mask)
++        tl.store(d + 6, m4, mask=mask)
++        tl.store(d + 7, tl.zeros_like(m4), mask=mask)
++
++
 +def _launch(tier: str, K: int, desc: torch.Tensor, n_rows: int, pairs: int, stream):
 +    fn = _fns[(tier, K)]
 +    args = [
@@ -4542,7 +4659,48 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +            btier.miss_count.zero_()
 +        slot_row = btier.slot_table[layer_key]
 +        use_fp4 = tier is not None and not bulk_prefill
-+        if use_fp4:
++        use_w4s_base = use_fp4 and moe_w2_delta.split_enabled()
++        use_w4s = use_w4s_base
++        if use_w4s_base:
++            fslot_row = tier.slot_table[layer_key]
++            d4s = ws["desc4s"]
++            _desc_build_kernel_base_delta_split[(triton.cdiv(pairs, 256),)](
++                expert_blocks,
++                num_post,
++                pair_live,
++                slot_row,
++                fslot_row,
++                btier.miss_count,
++                d,
++                d4s,
++                a1_base.data_ptr(),
++                ws["as1"].data_ptr(),
++                ws["c13"].data_ptr(),
++                a2_base.data_ptr(),
++                ws["as2"].data_ptr(),
++                ws["c2"].data_ptr(),
++                btier.pool.data_ptr(),
++                btier.slot_bytes,
++                st["off_s13"],
++                st["off_c2"],
++                st["off_s2"],
++                tier.pool.data_ptr(),
++                tier.slot_bytes,
++                tier.w13_bytes,
++                st["K13"],
++                (st["K13"] // 128) * 4,
++                4 * st["K2"],
++                st["K2"],
++                (st["K2"] // 128) * 4,
++                2 * st["K13"],
++                st["E"],
++                pairs,
++                cap * 6,
++                d4s.shape[1] * 8,
++                mblock,
++                BLOCK=256,
++            )
++        elif use_fp4:
 +            fslot_row = tier.slot_table[layer_key]
 +            _desc_build_kernel_base_delta[(triton.cdiv(pairs, 256),)](
 +                expert_blocks,
@@ -4615,10 +4773,12 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +        # never write their c13/c2 rows, but those workspace rows hold STALE
 +        # values from a previous forward — zeroing the WEIGHT (not the rows)
 +        # makes the miss contribution an exact 0 for free. Graph-safe (pure
-+        # tensor ops on captured buffers). FP4-resident pairs are NOT misses.
++        # tensor ops on captured buffers). FP4-resident pairs are NOT misses
++        # — except under split, where serving needs the BASE slot too (an
++        # FP4-mapped/base-missing pair contributed zero and must replay).
 +        e_pair = expert_blocks.to(torch.long).clamp_(0, st["E"] - 1)
 +        resident = slot_row[e_pair] >= 0
-+        if use_fp4:
++        if use_fp4 and not use_w4s_base:
 +            resident |= fslot_row[e_pair] >= 0
 +        miss_rows = resident.repeat_interleave(mblock)[:slots]
 +        if not use_fp4:
@@ -4690,6 +4850,7 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +            _desc_build_kernel_w4s[(triton.cdiv(pairs, 256),)](
 +                expert_blocks,
 +                num_post,
++                pair_live,
 +                slot_row,
 +                d4s,
 +                a1_base.data_ptr(),
@@ -4732,6 +4893,9 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +    if use_afrag:
 +        _afrag_repack(ws["a1"], ws["a1f"], pairs, st["K13"])
 +    _launch(w2tier, st["K13"], d[0], st["N13"], pairs, stream)
++    # split-FP4 dispatch: both residency modes fill ws["desc4s"] (classic:
++    # _desc_build_kernel_w4s against resident planes; base cache:
++    # _desc_build_kernel_base_delta_split against the coupled base slots)
 +    if tier is not None and not bulk_prefill:
 +        if use_w4s:
 +            _launch(
@@ -4805,10 +4969,10 @@ index 0000000000000000000000000000000000000000..49078128b2dc2d9c4e573a5433355bdb
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb252545c51890
+index 0000000..f9b12c8
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1859 @@
+@@ -0,0 +1,1899 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -5151,6 +5315,11 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +        # to serve pass-k+1 (their seen marks are zeroed after each
 +        # snapshot) and ping-pong past the replay cap.
 +        self._step_pins: set[int] = set()
++        # Residency coupling (BASE tier only, split-FP4 over the base
++        # cache): the coexisting FP4 tier whose refinement slots read THIS
++        # tier's base slots — its mapped experts are eviction-blocked here.
++        # Set by get_tier() when the need-pool is created in split mode.
++        self._coupled_fp4 = None
 +        # Draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1, base tier only):
 +        # route_log = in-graph [n_layers, T_cap, K_cap] routing log written
 +        # by the forward glue; _aff = token->experts affinity table folded
@@ -5662,6 +5831,16 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +        blocked = (li < 0) | active_seen
 +        if self._step_pins:
 +            blocked[list(self._step_pins)] = True
++        # Residency coupling (split-FP4 over the base cache): never evict a
++        # BASE slot whose expert is mapped in the coupled FP4 tier — the
++        # split kernel reads its refinement against THESE base codes+scales.
++        # The read is lockless (the other tier's host mirror, mutated under
++        # ITS lock); a torn value is benign: dispatch requires residency in
++        # BOTH slot tables, so a stale exclusion only delays one eviction
++        # and a missed one downgrades that expert to a base miss -> the
++        # standard fetch+replay restores it.
++        if self._coupled_fp4 is not None:
++            blocked |= self._coupled_fp4._mirror[lic, eic] >= 0
 +        # Pass 1: only >=min_cold-tick-cold victims (never disturbs slots a
 +        # CONCURRENT in-flight graph might still read — the background
 +        # manager's constraint; speculative prefetchers pass a much higher
@@ -6529,27 +6708,25 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +
 +# SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT=1, default off): the delta tier stores
 +# 2-bit REFINEMENT planes instead of full e2m1 nibble planes and dispatches
-+# moe_w4s_mm, which reads them alongside the GPU-RESIDENT 2-bit base planes
-+# (nested codebook; see moe_w2_planes.nibbles_to_refinement) — half the
-+# pool bytes per expert = 2x FP4 coverage at equal VRAM, at ~+16-23%
-+# kernel-time on the FP4-served pairs (decode ALU; read bytes unchanged).
-+# Requires the base planes resident on GPU, so it is INERT over the base
-+# cache (the base slot could be evicted under the refinement's feet;
-+# residency coupling is future work).
++# moe_w4s_mm, which reads them alongside the 2-bit base (nested codebook;
++# see moe_w2_planes.nibbles_to_refinement) — half the pool bytes per expert
++# (over the base cache: less — the refinement slot also drops the private
++# scale sections, the base slot's serve both GEMMs) = 2x+ FP4 coverage at
++# equal VRAM, at ~+16-23% kernel-time on the FP4-served pairs (decode ALU;
++# read bytes unchanged).
++#
++# GPU-resident-base configs read the resident planes directly. Over the
++# BASE CACHE the base codes+scales come from the base tier's pool slot, so
++# split serving is RESIDENCY-COUPLED: the desc kernel routes a pair to w4s
++# only when the expert is resident in BOTH slot tables (FP4-mapped but
++# base-missing counts as a miss -> the standard fetch+replay restores it),
++# and the base tier's eviction hard-excludes experts mapped in the FP4
++# tier (_coupled_fp4) so a mapped refinement never outlives its base row.
 +_SPLIT = os.getenv("VLLM_MOE_W2_DELTA_SPLIT", "0") == "1"
 +
 +
 +def split_enabled() -> bool:
-+    if not _SPLIT:
-+        return False
-+    if base_enabled():
-+        logger.warning_once(
-+            "VLLM_MOE_W2_DELTA_SPLIT=1 is unsupported over the base cache "
-+            "(VLLM_MOE_W2_BASE_CACHE_GB>0) — the resident 2-bit base the "
-+            "split kernel refines does not exist there. Flag ignored; the "
-+            "FP4 tier serves full nibble planes via moe_w4_mm.")
-+        return False
-+    return True
++    return _SPLIT
 +
 +
 +def enabled() -> bool:
@@ -6564,6 +6741,25 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +
 +def base_enabled() -> bool:
 +    return _BASE_GB > 0
++
++
++def _arm_split_coupling() -> None:
++    """Couple split-FP4 refinement residency to the base tier.
++
++    Fresh requant builds create the FP4 tier before ``_finish_layer`` creates
++    the base tier, while pack-hit restores create them in the opposite order.
++    Invoke this after either singleton lookup so coupling cannot depend on
++    which path constructed its tier first.
++    """
++    if not split_enabled() or _BASE_TIER is None or _TIER is None:
++        return
++    if _BASE_TIER._coupled_fp4 is _TIER:
++        return
++    _BASE_TIER._coupled_fp4 = _TIER
++    logger.info(
++        "moe_w2 delta: split-FP4 residency coupling armed "
++        "(base evictions exclude FP4-mapped experts)"
++    )
 +
 +
 +def spec_suppressed() -> bool:
@@ -6629,6 +6825,7 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +                    _BASE_TIER.n_slots, _BASE_TIER.slot_bytes / 2**20,
 +                    _BASE_TIER.n_slots * _BASE_TIER.slot_bytes / 2**30,
 +                    cov, n_layers * n_experts)
++    _arm_split_coupling()
 +    return _BASE_TIER
 +
 +
@@ -6653,11 +6850,17 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +        policy = None
 +        if base_enabled():
 +            policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
++        # Split refinement slots have a DIFFERENT geometry than full-FP4
++        # slots; a distinct pack tag ("fp4s") keeps the two modes' pack
++        # files apart — a shared pack dir otherwise ping-pong-rebuilds one
++        # file under the other config's feet (the page-cache store reads
++        # it live at serve time -> garbage FP4 rows on BOTH; measured).
++        fp4_tag = "fp4s" if split_enabled() else "fp4"
 +        _TIER = DeltaTier(
 +            n_layers, n_experts, dev or torch.device("cuda"),
 +            w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
 +            w2_bytes=W2_BYTES if w2_bytes is None else w2_bytes,
-+            policy=policy, tag="fp4" if base_enabled() else "delta",
++            policy=policy, tag=fp4_tag if base_enabled() else "delta",
 +            host_pinned=not base_enabled())
 +        # Start the background manager as soon as the tier exists. It idles until
 +        # experts are actually routed (seen empty -> early return) and only
@@ -6667,10 +6870,11 @@ index 0000000000000000000000000000000000000000..b3372c0a13d5a5444cb55cb14cfb2525
 +        # "start on the last layer built" trigger never ran and the tier sat
 +        # inactive (pool allocated but no promotions).
 +        _TIER.start()
++    _arm_split_coupling()
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8891cf5fd16fbc63b113e415f01a806835156a7e
+index 0000000..8891cf5
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 @@ -0,0 +1,182 @@
@@ -6858,7 +7062,7 @@ index 0000000000000000000000000000000000000000..8891cf5fd16fbc63b113e415f01a8068
 +                fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..6e1c3ea63fd8222f06cf50d42bc3bf914288fbac
+index 0000000..6e1c3ea
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 @@ -0,0 +1,260 @@
@@ -7124,7 +7328,7 @@ index 0000000000000000000000000000000000000000..6e1c3ea63fd8222f06cf50d42bc3bf91
 +            f"(top-{_PILOT_K}, n={tot[1]})")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..634454b8d06d651814193baf9e5a1fec815a39f5
+index 0000000..634454b
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 @@ -0,0 +1,286 @@
@@ -7416,7 +7620,7 @@ index 0000000000000000000000000000000000000000..634454b8d06d651814193baf9e5a1fec
 +    return vals * s
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..9bffa48fa7ca77211fc19c701e6b50ac08f1ce8a
+index 0000000..9bffa48
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 @@ -0,0 +1,259 @@
@@ -7681,7 +7885,7 @@ index 0000000000000000000000000000000000000000..9bffa48fa7ca77211fc19c701e6b50ac
 +        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..a64cb58e781227e9d8907cbac98a6d12ccb28696
+index 0000000..a64cb58
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 @@ -0,0 +1,1405 @@
@@ -9092,7 +9296,7 @@ index 0000000000000000000000000000000000000000..a64cb58e781227e9d8907cbac98a6d12
 +    return store
 diff --git a/vllm/model_executor/layers/quantization/utils/prefill_timers.py b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..fd83f500b398b2d54e783d85eb31a49f53a363f9
+index 0000000..fd83f50
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 @@ -0,0 +1,53 @@
@@ -9151,7 +9355,7 @@ index 0000000000000000000000000000000000000000..fd83f500b398b2d54e783d85eb31a49f
 +                name, _total_ms[name], _count[name])
 diff --git a/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py b/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..adf4754deed8619bb1105fe59a165d5cee3054ff
+index 0000000..adf4754
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
 @@ -0,0 +1,238 @@
@@ -9394,7 +9598,7 @@ index 0000000000000000000000000000000000000000..adf4754deed8619bb1105fe59a165d5c
 +    torch.zeros(1, device="cuda")
 +    return _ensure_ready()
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index fe2b268cde66c440694ea18310c4c7d2b5920cc5..d56825ef832ae9e99e6ddb4158d8ecf09d2aa862 100644
+index fe2b268..d56825e 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -340,6 +340,9 @@ def sparse_attn_indexer(
@@ -9408,7 +9612,7 @@ index fe2b268cde66c440694ea18310c4c7d2b5920cc5..d56825ef832ae9e99e6ddb4158d8ecf0
          use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
              512,
 diff --git a/vllm/model_executor/model_loader/__init__.py b/vllm/model_executor/model_loader/__init__.py
-index 1ae78b77c0490d238ca9339b0ad73a25820763ad..254ce7f26105059e4fd0eb0bd7fbe2941428c621 100644
+index 1ae78b7..254ce7f 100644
 --- a/vllm/model_executor/model_loader/__init__.py
 +++ b/vllm/model_executor/model_loader/__init__.py
 @@ -122,6 +122,15 @@ def register_model_loader(load_format: str):
@@ -9428,7 +9632,7 @@ index 1ae78b77c0490d238ca9339b0ad73a25820763ad..254ce7f26105059e4fd0eb0bd7fbe294
          raise ValueError(f"Load format `{load_format}` is not supported")
      return _LOAD_FORMAT_TO_MODEL_LOADER[load_format](load_config)
 diff --git a/vllm/model_executor/model_loader/default_loader.py b/vllm/model_executor/model_loader/default_loader.py
-index 3ea76f4d9b3a43cb71337de80a04416f4ee70561..b2c329e26ed870128e3f2256c5d697f3165b51f1 100644
+index 3ea76f4..b2c329e 100644
 --- a/vllm/model_executor/model_loader/default_loader.py
 +++ b/vllm/model_executor/model_loader/default_loader.py
 @@ -253,6 +253,25 @@ class DefaultModelLoader(BaseModelLoader):
@@ -9515,7 +9719,7 @@ index 3ea76f4d9b3a43cb71337de80a04416f4ee70561..b2c329e26ed870128e3f2256c5d697f3
          self.counter_after_loading_weights = time.perf_counter()
          logger.info_once(
 diff --git a/vllm/model_executor/model_loader/weight_utils.py b/vllm/model_executor/model_loader/weight_utils.py
-index 47c6c02be6aba67b08a709a6b4a2d35945095141..6737f5dfe2b767e035643fab7949589ce1f4501a 100644
+index 47c6c02..6737f5d 100644
 --- a/vllm/model_executor/model_loader/weight_utils.py
 +++ b/vllm/model_executor/model_loader/weight_utils.py
 @@ -837,6 +837,15 @@ def safetensors_weights_iterator(
@@ -9713,7 +9917,7 @@ index 47c6c02be6aba67b08a709a6b4a2d35945095141..6737f5dfe2b767e035643fab7949589c
          result = load_file(st_file, device="cpu")
          return result
 diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
-index 88f33ac021b72ea72e24900bbaeefd0445101dea..546f92265c2f0a2558a1c3af4e82074047a04cfc 100644
+index 88f33ac..546f922 100644
 --- a/vllm/model_executor/models/deepseek_mtp.py
 +++ b/vllm/model_executor/models/deepseek_mtp.py
 @@ -35,6 +35,7 @@ from .deepseek_v2 import (
@@ -9741,7 +9945,7 @@ index 88f33ac021b72ea72e24900bbaeefd0445101dea..546f92265c2f0a2558a1c3af4e820740
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
-index 820260f795cdc80e105cc695ce604cf7a564063e..6340e22f33d0a473157b207eeb96aee3f45bbb71 100644
+index 820260f..6340e22 100644
 --- a/vllm/model_executor/models/qwen3_dflash.py
 +++ b/vllm/model_executor/models/qwen3_dflash.py
 @@ -345,7 +345,7 @@ class DFlashQwen3Model(nn.Module):
@@ -9787,7 +9991,7 @@ index 820260f795cdc80e105cc695ce604cf7a564063e..6340e22f33d0a473157b207eeb96aee3
          self.model.precompute_and_store_context_kv(
 diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b387bae3d90f07dfc81a59152bac278a48cff7d3
+index 0000000..b387bae
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_dspark.py
 @@ -0,0 +1,220 @@
@@ -10012,7 +10216,7 @@ index 0000000000000000000000000000000000000000..b387bae3d90f07dfc81a59152bac278a
 +        loader.load_weights(model_weights.items())
 +        self.model._build_fused_kv_buffers()
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index a18d54acdc0385ba8eb5e2ce873e3a0c0350aec5..92e3bede8bf058589dc5071e50da17a51741ac49 100644
+index a18d54a..92e3bed 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
 @@ -604,6 +604,8 @@ _SPECULATIVE_DECODING_MODELS = {
@@ -10025,7 +10229,7 @@ index a18d54acdc0385ba8eb5e2ce873e3a0c0350aec5..92e3bede8bf058589dc5071e50da17a5
      "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
      "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
 diff --git a/vllm/models/deepseek_v4/__init__.py b/vllm/models/deepseek_v4/__init__.py
-index 44e486db773d8a9ef4f512baf8f43d0554f3a3f0..d03eba3d414ed5ceb03a28caa21b886038f1da4c 100644
+index 44e486d..d03eba3 100644
 --- a/vllm/models/deepseek_v4/__init__.py
 +++ b/vllm/models/deepseek_v4/__init__.py
 @@ -17,14 +17,23 @@ from .quant_config import DeepseekV4FP8Config
@@ -10054,7 +10258,7 @@ index 44e486db773d8a9ef4f512baf8f43d0554f3a3f0..d03eba3d414ed5ceb03a28caa21b8860
      "DeepseekV4ForCausalLM",
 diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..be4a87b323feac8f428417f1ce41c0bd81c5144b
+index 0000000..be4a87b
 --- /dev/null
 +++ b/vllm/models/deepseek_v4/nvidia/dspark.py
 @@ -0,0 +1,488 @@
@@ -10547,7 +10751,7 @@ index 0000000000000000000000000000000000000000..be4a87b323feac8f428417f1ce41c0bd
 +            return f"model.{rest}"
 +        return f"model.layers.{stage}.{rest}"
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index aa60ad34ce3272d97df47d90a954afa846953c63..fa6da8cbee27fc0811c5a4c05066675b1eff9e10 100644
+index aa60ad3..fa6da8c 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -10633,7 +10837,7 @@ index aa60ad34ce3272d97df47d90a954afa846953c63..fa6da8cbee27fc0811c5a4c05066675b
  
      # Default mapper assumes the original FP4-expert checkpoint layout.
 diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
-index 64715deae99bf67e8112058d52f1d85bafbff3ae..8c456a69a6a84dfbbf8fd13983db88b2fc64fd59 100644
+index 64715de..8c456a6 100644
 --- a/vllm/models/deepseek_v4/nvidia/mtp.py
 +++ b/vllm/models/deepseek_v4/nvidia/mtp.py
 @@ -40,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -10659,7 +10863,7 @@ index 64715deae99bf67e8112058d52f1d85bafbff3ae..8c456a69a6a84dfbbf8fd13983db88b2
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-index 18e3b10562bdb125b3caca0aefae35990665dd5e..d53669202a05130e9f695fcae7111e5ebbf9b410 100644
+index 18e3b10..d536692 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 @@ -15,13 +15,16 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -10682,7 +10886,7 @@ index 18e3b10562bdb125b3caca0aefae35990665dd5e..d53669202a05130e9f695fcae7111e5e
  
  
 diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
-index 0dc3ccce08926be476d47a2677295f5398da0df1..fb75a278c734fc968a750525bbffb295b229770c 100644
+index 0dc3ccc..fb75a27 100644
 --- a/vllm/transformers_utils/configs/speculators/algos.py
 +++ b/vllm/transformers_utils/configs/speculators/algos.py
 @@ -118,3 +118,47 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
@@ -10734,7 +10938,7 @@ index 0dc3ccce08926be476d47a2677295f5398da0df1..fb75a278c734fc968a750525bbffb295
 +        if config_dict.get(key) is not None:
 +            pre_trained_config[key] = config_dict[key]
 diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
-index 80319003da599df3d7b132a44f1c1508a8f8b4a7..40193a3a6b3df51dd63bc8abf85df7d6820dd893 100755
+index 8031900..40193a3 100755
 --- a/vllm/v1/attention/backends/flashinfer.py
 +++ b/vllm/v1/attention/backends/flashinfer.py
 @@ -408,7 +408,9 @@ class FlashInferBackend(AttentionBackend):
@@ -10750,7 +10954,7 @@ index 80319003da599df3d7b132a44f1c1508a8f8b4a7..40193a3a6b3df51dd63bc8abf85df7d6
              return torch.float8_e5m2
 diff --git a/vllm/v1/attention/backends/mla/cubit_sparse_mla.py b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..16d22c7cde94920a65076db084f9dfc66f30a25e
+index 0000000..16d22c7
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 @@ -0,0 +1,1171 @@
@@ -11926,7 +12130,7 @@ index 0000000000000000000000000000000000000000..16d22c7cde94920a65076db084f9dfc6
 +                    tcap, (T + tcap - 1) // tcap, int(capturing), _pfc_launches)
 +    return True
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
-index 2a944d0618b0d8dc3336764ec30e9fb6d2455a48..d4807a5f74631440410b96108326132f526afb29 100644
+index 2a944d0..d4807a5 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 @@ -148,6 +148,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
@@ -11957,7 +12161,7 @@ index 2a944d0618b0d8dc3336764ec30e9fb6d2455a48..d4807a5f74631440410b96108326132f
              # fp8_ds_mla packed layout: 512 NoPE + 16 scales + 128 RoPE.
              return (num_blocks, block_size, 656)
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
-index d802f568836a0eade0a614cdcc5fe3d98d1480d2..d192d3aa306ebc9f0a224115aa7024c32ca88834 100644
+index d802f56..d192d3a 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 @@ -62,10 +62,10 @@ class FlashInferMLASparseSM120Impl(SparseMLAAttentionImpl[FlashInferMLASparseMet
@@ -12021,7 +12225,7 @@ index d802f568836a0eade0a614cdcc5fe3d98d1480d2..d192d3aa306ebc9f0a224115aa7024c3
          q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
 diff --git a/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c37d3729e05b71d35947c128a35ffd6eb586a662
+index 0000000..c37d372
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 @@ -0,0 +1,53 @@
@@ -12080,7 +12284,7 @@ index 0000000000000000000000000000000000000000..c37d3729e05b71d35947c128a35ffd6e
 +                                         slot_mapping)
 diff --git a/vllm/v1/attention/backends/mla/sparse_mla_env.py b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..93161417775ab67008e5a0262d2609d24117c0d9
+index 0000000..9316141
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 @@ -0,0 +1,216 @@
@@ -12301,7 +12505,7 @@ index 0000000000000000000000000000000000000000..93161417775ab67008e5a0262d2609d2
 +    except ValueError:
 +        return 8192
 diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
-index df23f34378e2563ade25d606d15ca42fedba20be..962c098f854e12f029ef95eca9f229b67c8bc892 100644
+index df23f34..962c098 100644
 --- a/vllm/v1/attention/backends/mla/sparse_swa.py
 +++ b/vllm/v1/attention/backends/mla/sparse_swa.py
 @@ -306,16 +306,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
@@ -12509,7 +12713,7 @@ index df23f34378e2563ade25d606d15ca42fedba20be..962c098f854e12f029ef95eca9f229b6
 +            mask=offset < index_width,
 +        )
 diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
-index cf4338fb180d4fd426b5cd7b2211d2ab43589de5..f0577501e984c0926c77c2a0c97f7cc7a4ef0c32 100644
+index cf4338f..f057750 100644
 --- a/vllm/v1/attention/ops/merge_attn_states.py
 +++ b/vllm/v1/attention/ops/merge_attn_states.py
 @@ -46,6 +46,19 @@ def merge_attn_states(
@@ -12533,7 +12737,7 @@ index cf4338fb180d4fd426b5cd7b2211d2ab43589de5..f0577501e984c0926c77c2a0c97f7cc7
      # does not support FP8 dtype for inputs, fallback to use Triton kernel.
      # However, when output_scale is provided, the inputs are still BF16/FP16
 diff --git a/vllm/v1/attention/ops/triton_decode_attention.py b/vllm/v1/attention/ops/triton_decode_attention.py
-index dbe3c5705de9dc4d53b9af1c968834dac38ceddb..f12d719fba7e3744302c21da7d9b55529a67f4eb 100644
+index dbe3c57..f12d719 100644
 --- a/vllm/v1/attention/ops/triton_decode_attention.py
 +++ b/vllm/v1/attention/ops/triton_decode_attention.py
 @@ -530,6 +530,13 @@ def _decode_grouped_att_m_fwd(
@@ -12551,7 +12755,7 @@ index dbe3c5705de9dc4d53b9af1c968834dac38ceddb..f12d719fba7e3744302c21da7d9b5552
      _fwd_grouped_kernel_stage1[grid](
          q,
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 90d93a110cc0a46e89ddd096f93f995996959de8..418f33346d2e37d74bf72a001f2d6f6de2de963a 100644
+index 90d93a1..418f333 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -57,7 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -12611,7 +12815,7 @@ index 90d93a110cc0a46e89ddd096f93f995996959de8..418f33346d2e37d74bf72a001f2d6f6d
          self,
          spec_decoding_stats: SpecDecodingStats | None,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index f97f697dedcaaafa03bcb6d0c616d2f02ef4a9a9..df3827905c964d522912ce0331dd4305b5884a17 100644
+index f97f697..df38279 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -147,6 +147,43 @@ class EngineCore:
@@ -12670,7 +12874,7 @@ index f97f697dedcaaafa03bcb6d0c616d2f02ef4a9a9..df3827905c964d522912ce0331dd4305
          self.check_for_draft_tokens = (
              self.use_spec_decode or vllm_config.model_config.is_diffusion
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
-index 5a2a5c5e298dd7f072a541b6d58015479811e670..33c628e8e17b9c4c21c4f571e9bdcf74d482b2f6 100644
+index 5a2a5c5..33c628e 100644
 --- a/vllm/v1/kv_cache_interface.py
 +++ b/vllm/v1/kv_cache_interface.py
 @@ -382,6 +382,10 @@ class MLAAttentionSpec(FullAttentionSpec):
@@ -12685,7 +12889,7 @@ index 5a2a5c5e298dd7f072a541b6d58015479811e670..33c628e8e17b9c4c21c4f571e9bdcf74
              if self.model_version == "deepseek_v4":
                  # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
 diff --git a/vllm/v1/spec_decode/dynamic/utils.py b/vllm/v1/spec_decode/dynamic/utils.py
-index de869b19a72808e652f91f848d83d2edfd67ef36..348eaf2e9a1df7d3177a21a74d09e73d149eca2a 100644
+index de869b1..348eaf2 100644
 --- a/vllm/v1/spec_decode/dynamic/utils.py
 +++ b/vllm/v1/spec_decode/dynamic/utils.py
 @@ -1,8 +1,16 @@
@@ -12823,7 +13027,7 @@ index de869b19a72808e652f91f848d83d2edfd67ef36..348eaf2e9a1df7d3177a21a74d09e73d
 +            vllm_num_speculative_tokens=self._num_spec_tokens,
 +        )
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index dad1777b47e274f063230a81dfa84be5e577c8c7..358acf464c6e9f2156af679ece733caa9f86e406 100644
+index dad1777..358acf4 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
 @@ -109,6 +109,13 @@ def get_uniform_token_count(
@@ -12953,7 +13157,7 @@ index dad1777b47e274f063230a81dfa84be5e577c8c7..358acf464c6e9f2156af679ece733caa
          self.hidden_states: torch.Tensor | None = None
          self.aux_hidden_states: list[torch.Tensor] = []
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
-index 6b750fe7ebf5d1a1f2b7fbc50aa65e02172324ac..167ad685116df78960dd12a0cd4f48784e0ffbaf 100644
+index 6b750fe..167ad68 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
 +++ b/vllm/v1/worker/gpu/input_batch.py
 @@ -93,6 +93,11 @@ class InputBatch:
@@ -13029,7 +13233,7 @@ index 6b750fe7ebf5d1a1f2b7fbc50aa65e02172324ac..167ad685116df78960dd12a0cd4f4878
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2ddc5629c1a33185a42ea15c4b80571c4a2e..894e258bf8ad188477c046987801c5a8c6f36ef8 100644
+index 30ca2dd..894e258 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -47,6 +47,7 @@ from vllm.tasks import SupportedTask
@@ -13345,7 +13549,7 @@ index 30ca2ddc5629c1a33185a42ea15c4b80571c4a2e..894e258bf8ad188477c046987801c5a8
  
          # Post-step KV connector related operations.
 diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
-index fab53fef7ee8461786e1ff2c0cb54941c57658a2..7bacdbc51df0f8747bd1d683c2e8154f2ed6605e 100644
+index fab53fe..7bacdbc 100644
 --- a/vllm/v1/worker/gpu/sample/gumbel.py
 +++ b/vllm/v1/worker/gpu/sample/gumbel.py
 @@ -213,6 +213,11 @@ def gumbel_sample(
@@ -13361,7 +13565,7 @@ index fab53fef7ee8461786e1ff2c0cb54941c57658a2..7bacdbc51df0f8747bd1d683c2e8154f
      BLOCK_SIZE = 1024
      num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
 diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
-index 09153dd20f2c7a128dd668e589ce3d8bf3c75477..c70f169f7be652ffd510e63219f26f31fe1b34ff 100644
+index 09153dd..c70f169 100644
 --- a/vllm/v1/worker/gpu/spec_decode/__init__.py
 +++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
 @@ -14,6 +14,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
@@ -13378,7 +13582,7 @@ index 09153dd20f2c7a128dd668e589ce3d8bf3c75477..c70f169f7be652ffd510e63219f26f31
          from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
              Gemma4Speculator,
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 1bd130838a1a6b260a3aaec8b6b989c818a2c025..9014fc0e7f550a2867533e7b6494a314705b02c3 100644
+index 1bd1308..9014fc0 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -29,6 +29,8 @@ logger = init_logger(__name__)
@@ -13728,7 +13932,7 @@ index 1bd130838a1a6b260a3aaec8b6b989c818a2c025..9014fc0e7f550a2867533e7b6494a314
      )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..208f01a7cb5ee04c88d276fec2082cd4e830884b
+index 0000000..208f01a
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
 @@ -0,0 +1,2 @@
@@ -13736,7 +13940,7 @@ index 0000000000000000000000000000000000000000..208f01a7cb5ee04c88d276fec2082cd4
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..28a3417558b89b1a5003b5df3a88fcf598b67c65
+index 0000000..28a3417
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
 @@ -0,0 +1,373 @@
@@ -14115,7 +14319,7 @@ index 0000000000000000000000000000000000000000..28a3417558b89b1a5003b5df3a88fcf5
 +        self._prev_sched_l = length
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..88841d5f4194124067927ca50a2aaa3f27adc33e
+index 0000000..88841d5
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -0,0 +1,302 @@
@@ -14423,7 +14627,7 @@ index 0000000000000000000000000000000000000000..88841d5f4194124067927ca50a2aaa3f
 +        self._sample_sequential(num_reqs, head_hidden)
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b5f2a540aa628aa2fd94643196b14a290868b005
+index 0000000..b5f2a54
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 @@ -0,0 +1,76 @@
@@ -14504,7 +14708,7 @@ index 0000000000000000000000000000000000000000..b5f2a540aa628aa2fd94643196b14a29
 +
 +    return draft_model
 diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
-index 360f64921e179bab4dc59362f9df8957984673cd..66d0ba8b43c3143fcaabf2f4046f56e4bfa371bc 100644
+index 360f649..66d0ba8 100644
 --- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
 @@ -44,6 +44,15 @@ def get_eagle3_aux_layers_from_config(
@@ -14524,7 +14728,7 @@ index 360f64921e179bab4dc59362f9df8957984673cd..66d0ba8b43c3143fcaabf2f4046f56e4
          return tuple(layer_ids)
      return None
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
-index 3868604d3ae28dc5fd498960dd7bb9886ea71c7e..5e7cadc6867063d4572914fac269ec0907203980 100644
+index 3868604..5e7cadc 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 +++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 @@ -100,12 +100,22 @@ class RejectionSampler:
@@ -14551,7 +14755,7 @@ index 3868604d3ae28dc5fd498960dd7bb9886ea71c7e..5e7cadc6867063d4572914fac269ec09
          processed_logits = self.sampler.apply_sampling_params(
              logits,
 diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
-index 4ab45b2ae27a7eb9dff0c9b60efd862a648473cc..35a89634ee9ad08eda5a59593d3904f3df0de800 100644
+index 4ab45b2..35a8963 100644
 --- a/vllm/v1/worker/gpu/spec_decode/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/utils.py
 @@ -16,35 +16,58 @@ class DraftTokensHandler:
@@ -14652,7 +14856,7 @@ index 4ab45b2ae27a7eb9dff0c9b60efd862a648473cc..35a89634ee9ad08eda5a59593d3904f3
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823d9fd4cec8f63f08bc41abc67958825c..909ce6359f64b2c064b819d382cae9c84bc27d60 100644
+index 74938a8..909ce63 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -15847,7 +16051,7 @@ index 74938a823d9fd4cec8f63f08bc41abc67958825c..909ce6359f64b2c064b819d382cae9c8
              assert isinstance(
                  self.drafter,
 diff --git a/vllm/v1/worker/gpu_ubatch_wrapper.py b/vllm/v1/worker/gpu_ubatch_wrapper.py
-index 657fc826734543ef3dfe3ccc3ef81e43851a91aa..9dfdb209644d4052aeb2ccc7ba53e0d0d480ca8b 100644
+index 657fc82..9dfdb20 100644
 --- a/vllm/v1/worker/gpu_ubatch_wrapper.py
 +++ b/vllm/v1/worker/gpu_ubatch_wrapper.py
 @@ -278,6 +278,9 @@ class UBatchWrapper:
@@ -15918,7 +16122,7 @@ index 657fc826734543ef3dfe3ccc3ef81e43851a91aa..9dfdb209644d4052aeb2ccc7ba53e0d0
                  positions=positions,
                  intermediate_tensors=intermediate_tensors,
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a313545f7a0ff5f5b5fe38bf62acc428eb1..d8fa6bb4b392e1a1c14b90377a85070895c43998 100644
+index 5e266a3..d8fa6bb 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -616,6 +616,31 @@ class Worker(WorkerBase):
