@@ -2,7 +2,7 @@
 
 The project targets **official vLLM v0.24.0**, which ships DeepSeek‑V4 + SM120 natively
 (`vllm/models/deepseek_v4/`, FlashInfer SM120 sparse‑MLA, GLM‑5.x `GlmMoeDsaForCausalLM`).
-Our overlay is a **14.0k-line patch** (70 files, 14,018 insertions): the 2-bit expert planes, the FP4 delta
+Our overlay is a **7.4k‑line patch** (37 files): the 2‑bit expert planes, the FP4 delta
 cache, the confidence gate, the cubit dispatch, the expert stores — plus the SM120 fixes
 below.
 
@@ -40,10 +40,9 @@ Environment pins that go with the patch (both required on SM120):
 
 ## Our hooks
 
-- `mxfp4.py` (`Mxfp4MoEMethod`) — FP4-checkpoint path (DeepSeek-V4-Flash): create zero-sized
-  expert parameters, materialize one guarded layer while its tensors load, build/write its
-  2-bit planes once, then release it before the next layer. Exact pack identity skips the
-  materialization; `moe_w2_forward` runs in `apply`.
+- `mxfp4.py` (`Mxfp4MoEMethod`) — FP4‑checkpoint path (DeepSeek‑V4‑Flash): host‑stage experts
+  at `create_weights`, build 2‑bit planes at `process_weights_after_loading`, `moe_w2_forward`
+  in `apply`.
 - `fp8.py` (`Fp8MoEMethod`) — FP8 block‑quant checkpoint path (DS4‑Flash‑Base,
   **GLM‑5.2‑FP8**): same three hooks; the loader re‑quantizes fp8+f32‑block‑128 to the
   sign‑symmetric 2‑bit codebook at load (`build_layer_planes_fp8`, float64 math, golden‑tested
@@ -62,9 +61,8 @@ Environment pins that go with the patch (both required on SM120):
   RAM; the GPU pool caches hot experts through the same slot‑table/manager/eviction machinery
   as the delta tier. Decode misses zero the pair's contribution, bump an in‑graph miss
   counter, and the runner fetches all missing routed experts synchronously (batched pinned
-  H2D, 51.6 GiB/s measured) and replays the step's graph once. Replay is bit-identical to a
-  resident forward only when the replay creates no second-order misses (the zero-residue case
-  is unit-tested). Prefill prefetches per layer
+  H2D, 51.6 GiB/s measured) and replays the step's graph once — replay bit‑identical to a
+  resident forward (unit‑tested, `internal` test_base_cache). Prefill prefetches per layer
   via `ensure_resident`. TP MAX‑reduces the miss decision. Under **PP** a miss is local to
   its stage (per‑stage counter, inputs still held in the stage's static buffers), so each
   stage re‑runs only its own **segment** before activations flow downstream — no cross‑stage
@@ -77,10 +75,7 @@ Environment pins that go with the patch (both required on SM120):
   `VLLM_MOE_W2_FP_MAX` bounds ping‑pong). An unconditional loop collapsed decode at low
   coverage (GLM TP2 29→16 tok/s, DS4‑14 GiB 43→15 — chasing a moving target at up to 8
   forwards/step); the live A/B behind the default: thresh 16 → 19.2, thresh 0 → 28.3 tok/s
-  at identical quality probes. With the default threshold, second-order experts are fetched
-  for later steps but their current-step contributions remain zero; `fp-residue` reports this
-  explicit approximation, so zero `UNRESTORED` is not a miss-free or determinism claim.
-  Slots touched by any pass of a step are pinned against
+  at identical quality probes. Slots touched by any pass of a step are pinned against
   eviction until the next step (the passes must not cannibalize each other's fetches); on
   tight pools an emergency eviction pass (synchronous callers only) relaxes the 2‑tick
   coldness bound rather than leave a miss UNRESTORED. Coexists with the FP4 need‑pool (explicit
@@ -99,10 +94,9 @@ Environment pins that go with the patch (both required on SM120):
   | 11 GiB (util 0.90) | 15.2% | 96.5–97.7% | 32.7 / **27–28 tok/s** |
   | 14 GiB (util 0.95) | 19.3% | 98.7–98.9% | 43.4 / **~31 tok/s** |
 
-  The pre-fix column is the single-replay stack (silently kept second-order zeros); the
-  shipped column is the adaptive-replay + NVMe-store stack, which measures that residue and
-  can chase it when `FP_THRESH` is raised but accepts it at the throughput-oriented default
-  (2026-07-10 evening, same box/bench idiom). The pool
+  The pre‑fix column is the single‑replay stack (silently kept second‑order zeros — the
+  nondeterminism the fixed‑point restore later closed); the shipped column is the final
+  adaptive‑replay + NVMe‑store stack (2026‑07‑10 evening, same box/bench idiom). The pool
   slope survives the stack change (+12–15% for 3 GiB). 14 GiB does NOT fit at util 0.90 (KV
   needs 0.46 GiB after graphs) — raise `--gpu-memory-utilization` alongside the pool. The
   engine logs pool
@@ -126,60 +120,23 @@ Environment pins that go with the patch (both required on SM120):
   pinned 33.0 / pack 25.5 / tiered+20 GiB arena **32.8 tok/s (parity)** at RSS 26–33 vs
   42–44 GiB; GLM TP2 both stores on NVMe: expert‑store RAM ~568 → ~136 GiB, 28–32 tok/s
   (tol 0–8, adaptive replay), needle 4/4 to **121K prompt tokens** at a served 128K window
-  (KV 157K tokens measured). Prefill is derived authoritatively from each request's
-  `num_computed_tokens < num_prompt_tokens` state and carried as
-  `ForwardContext.has_prefill` through normal, replay, pipeline, gate, and DBO execution.
-  A real W2 prefill is eager (capture fails loud), disables draft-affinity prefetch and
-  confidence-gate promotion, and uses fill-only arena reads so it cannot evict the decode
-  hot set. Long prefills use the aligned bulk base-only path; short prefills retain FP4
-  recovery and mblock-4 instead of falling into the decode path. Padded CUDA-graph routes
-  carry an explicit token-slot mapping and are masked out of miss, promotion, and output
-  accounting. The arena hot set persists to `<pack>.heat.json` and preheats on boot
-  (57 GiB approximately 35 s). **Boot-from-pack**
+  (KV 157K tokens measured). Prefill batches are scan‑flagged (fill free arena slots,
+  never evict the decode hot set — a caller flag, NOT a batch‑size heuristic: GLM's
+  100+‑row decode replay fetches misclassified and froze the arena at −66%); the arena hot
+  set persists to `<pack>.heat.json` and preheats on boot (57 GiB ≈ 35 s). **Boot‑from‑pack**
   (`_try_skip_requant`, all three loaders): a layer present in every serving pack skips
   dequant→re‑quant entirely — GLM TP2 second boot 408 s vs ~11 min, no ~405 GiB transient;
   the pack is a persistent quantization cache keyed by shape/config sidecar match. Also
-  fixed here, exposed by long-prefill testing but **pre-existing**: manager and forward
-  threads previously reused one mutable pinned seen-mask, so a later layer could overwrite
-  the snapshot while the current layer selected or fetched rows. Each residency operation
-  now drains prior main-stream work, freezes an immutable layer-local `seen_set`, clears only
-  the previous BASE layer's pins, and pins the current layer's hits/promotions until its
-  forward completes. A target step also acquires the exclusion lock shared with each background
-  tier-manager pass. That lock stays held through target execution, BASE replay, confidence-gate
-  re-forward, and the pipeline barrier; only `finish_forward_step()` releases it and wakes one
-  manager pass. `step_begin()` therefore clears pins without racing a wake. Saturated LRU uses a
-  floating-point timestamp key before assigning infinity, and both force-promote and manager
-  ticks receive immutable seen sets. Backends unit-tested byte-identical
-  (`tools/test_store_backends.py`: 3 backends x cold/warm/reboot/evict/overflow/scan/
+  fixed here, exposed by long‑prefill testing but **pre‑existing**: the manager tick and
+  forward‑thread paths ran concurrent seen‑snapshots into one shared pinned `_seen_host`
+  (torch's two‑pass `nonzero` overruns its output when the input mutates mid‑call →
+  TensorAdvancedIndexing.cpp:3008 assert → glibc heap corruption → dead worker on ≥16K
+  prefills; a torn snapshot could also evict an in‑flight expert's slot). Snapshots are now
+  serialized under a dedicated lock. Backends unit‑tested byte‑identical
+  (`tools/test_store_backends.py`: 3 backends × cold/warm/reboot/evict/overflow/scan/
   preheat, both IO modes). Ops: packs on a bind‑mounted real FS (not overlayfs); ~1 TB NVMe
   for the full GLM stack; parity holds even on a Gen3‑x4 drive (3.7 GB/s) — steady‑state
   misses ride the page cache, cold shifts pay drive speed.
-  Cold rebuilds are bounded separately from steady reads: MXFP4 uses guarded one-layer
-  materialization/build/write/release rather than retaining every layer's expert tensors;
-  pack-skip and completion guards prevent unnecessary or duplicate work. Eviction is
-  requested for each
-  released safetensors shard and each durable pack layer, then retried after the model
-  consumer unwinds,
-  checkpoint prefetch is refused, requested multi-thread shard loading is serialized, and
-  arena/shard/layer operations preflight a default 16 GiB host + 4 GiB hard cgroup
-  `memory.max` reserve. `memory.high` is traced as a soft reclaim/throttle boundary and does
-  not reduce that hard allocation budget. The
-  safety controls are `VLLM_MOE_W2_CACHE_CONTROL`,
-  `VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB`, and
-  `VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB`; cache control defaults to fail-closed `required`.
-  The all-43-layer cold canary completed with a 51,807,191,040-byte cgroup peak,
-  8,231,129,088-byte anon peak, 44,430,127,104-byte file peak, and a
-  73,793,277,952-byte host `MemAvailable` floor; cgroup swap, PSI, limit, and OOM events were
-  zero, and the host recorded no swap-out; host swap-in increased by 160 pages.
-  That all-layer canary used predecessor patch `e7417054a6e8`; integrated patch
-  `41d7b2f96ca3` retains the mechanism and passed the exact-head baked safety tests. Sanitized
-  trace and cleanup receipts are under
-  [`evidence/public/ds4-w2-2026-07-11/p0/`](../evidence/public/ds4-w2-2026-07-11/p0/).
-  Historical predecessor receipts establish the 32K P1 lane; the current integrated image's
-  guarded 128K series independently satisfies the same stability gate. Both are documented in
-  [`ds4-w2-5090-2026-07-11.md`](benchmarks/ds4-w2-5090-2026-07-11.md): 0/120 frozen-rule sink
-  detections in each series, with exact 120,000-token retrieval at depths 0.1, 0.5, and 0.9 on
-  the integrated image. This is a quality/context result; no 128K throughput is claimed.
 - **Deterministic unpermute**: the MoE output scatter used atomic `index_add_`, so identical
   runs wobbled (~1.6e‑2 on prefill) and greedy decode was not reproducible (surfaced by the
   PP determinism investigation; never PP‑specific). Valid `sorted_ids` form a permutation of

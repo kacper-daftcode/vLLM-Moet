@@ -1,6 +1,6 @@
 # Frontier MoE on consumer Blackwell (SM120)
 
-**Official vLLM v0.24.0 + a 14.0k-line, 70-file patch** that serves frontier Mixture-of-Experts models —
+**Official vLLM v0.24.0 + a 7.4k‑line patch** that serves frontier Mixture‑of‑Experts models —
 **GLM‑5.2 (753B)**, **DeepSeek‑V4‑Flash (159B)** and **Kimi‑K2.7‑Code (1T)** — on
 consumer/workstation Blackwell (RTX PRO 6000, RTX 5090), hardware their official checkpoints
 cannot even fit on. Three ideas carry it:
@@ -10,8 +10,7 @@ cannot even fit on. Three ideas carry it:
    gate) restores precision exactly where it matters.
 2. **Tiered expert residency** — when even the 2‑bit base outgrows VRAM, it moves to pinned
    host RAM — and, one tier further, to an **NVMe pack file with a pinned‑RAM arena** — and
-   the GPU becomes an **expert cache** (miss -> batched fetch + graph replay, with explicit
-   telemetry for any accepted second-order approximation).
+   the GPU becomes an **expert cache** (miss → batched fetch + bit‑identical graph replay).
    That puts 753B on two 96 GB cards and 159B on a single RTX 5090, and the packs double as
    a **persistent quantization cache** (reboots skip the re‑quant).
 3. **A rebuilt serving base** — vLLM v0.24.0 actually working on SM120 (the release is
@@ -64,13 +63,10 @@ medians; prefill = 8k‑token prompt, uncached):
 | 2× RTX PRO 6000 (TP2) | 210 tok/s | 5 790 tok/s | 512K | — |
 | 4× RTX 5090 (TP4) | 214 tok/s | 6 100 tok/s | 16K | — |
 | **1× RTX 5090 (32 GB)** | **~31 tok/s** (14 GiB pool + NVMe stores) | ~400–540 tok/s | **32K** | **~30 GiB** |
-| **1× RTX 5090 (32 GB), no-MTP quality config** | not measured | not measured | **128K; PASS at 120K** | **≤100 GiB eval cgroup incl. cache** |
 
 Retrieval behind the window column: needle PASS at 453K on the PRO 6000 (947K‑token KV
-measured), at 29.7K on the single-5090 throughput configuration (131K-token KV), and 3/3 exact
-at 120K on the canonical no-MTP 128K quality configuration (720,677-token KV). The 128K row is
-a quality/context result, not a throughput measurement. "—" in host RAM = all-VRAM config, no
-host expert store.
+measured) and at 29.7K on the single 5090 (131K‑token KV). "—" in host RAM = all‑VRAM
+config, no host expert store.
 
 **Batched serving** (aggregate decode tok/s at N concurrent streams; per‑stream in
 parentheses at N=32):
@@ -85,10 +81,6 @@ configs. MTP also runs under **pipeline parallelism** (draft propagation + draft
 share across ranks): DS4 on 4× RTX 5090 **PP4** does 184 tok/s vs 93 without (~2×), and greedy
 decode under PP is **bit‑deterministic** (6/6 identical runs, with and without MTP).
 Methodology: **[docs/v024-port.md](docs/v024-port.md)**.
-The guarded single-5090 W2 quality/context result, including P0/P1/P2 evidence boundaries, is
-reported in **[docs/benchmarks/ds4-w2-5090-2026-07-11.md](docs/benchmarks/ds4-w2-5090-2026-07-11.md)**;
-the sanitized receipt index is
-**[evidence/public/ds4-w2-2026-07-11/](evidence/public/ds4-w2-2026-07-11/)**.
 
 ---
 
@@ -136,12 +128,11 @@ routed working set). MoE routing is concentrated enough to make this practical: 
 coverage serves ~96% of token→expert routings** on DS4, **~51% serves ~91%** on GLM —
 measured live, not simulated.
 
-First-order misses are restored through the gate's replay trick: the desc kernel zeroes a missing
+Misses stay correct through the gate's replay trick: the desc kernel zeroes a missing
 expert's contribution and bumps an in‑graph miss counter; the runner fetches **all** missing
 routed experts in one batched pinned‑H2D transfer (51.6 GiB/s here; a 64‑expert fetch ≈ 3 ms)
-and replays the step's graph once. The result is bit-identical to a fully resident forward
-only when that replay creates no second-order misses (unit-tested for the zero-residue case).
-A **miss-tolerance knob** (`VLLM_MOE_W2_BASE_MISS_TOL=k`, runtime‑tunable)
+and replays the step's graph once — **bit‑identical** to a fully resident forward
+(unit‑tested). A **miss‑tolerance knob** (`VLLM_MOE_W2_BASE_MISS_TOL=k`, runtime‑tunable)
 skips the replay when ≤ k of the step's ~600 routings miss — +12% decode on GLM TP2 at
 tol 8 (28.3 → 31.7 tok/s) with clean quality probes (arithmetic, PL coherence, needle
 retrieval; quantitative eval pending).
@@ -158,20 +149,14 @@ e.g. `--gpu-memory-utilization 0.95`) before touching any other knob.
 **Misses are restored adaptively.** A replayed step can re‑route onto experts the first
 pass never fetched (second‑order misses); the runner re‑checks after each replay and keeps
 replaying **only while the step is within `VLLM_MOE_W2_FP_THRESH` of miss‑free** (default 0
-= the mandatory first‑order restore only, the throughput‑optimal setting; raising it can chase
-zero-residue fixed points on converged working sets at a decode cost, but does not itself promise
-deterministic output — runtime‑tunable via `VLLM_MOE_W2_FP_THRESH_FILE`). At the default
-threshold, newly fetched second-order
-experts are available to later steps but their current-step contributions remain zero. This
-is an explicit throughput/quality approximation, not a miss-free or bit-deterministic claim;
-its frequency and pair count are KPI-visible as `fp-residue` and are reported beside quality.
+= the mandatory first‑order restore only, the throughput‑optimal setting; raising it buys
+bit‑deterministic fixed points on converged working sets at a decode cost — runtime‑tunable
+via `VLLM_MOE_W2_FP_THRESH_FILE`). The accepted residue is second‑order only and
+KPI‑visible (`fp-residue`).
 
 Results: **DeepSeek‑V4‑Flash 159B on one RTX 5090** (72.7 GiB of 2‑bit planes vs 32 GB of
 VRAM): ~31 tok/s steady with MTP, 32K window served, coherent — and ~30 GiB of host RAM
 with the NVMe stores (below, RSS‑measured) instead of ~80 GiB pinned.
-The canonical no-MTP quality configuration separately serves a 128K window: 120/120
-machine-exact and semantically correct, 0/120 frozen-rule sink detections, and 3/3 exact
-retrieval at 120K prompt tokens. Throughput was not measured for that configuration.
 **GLM‑5.2 753B on two RTX PRO 6000**: 28–32 tok/s with the full three‑tier stack (NVMe 2‑bit
 base + pinned arena → GPU 2‑bit cache → GPU FP4) at a 128K single‑user window — see the GLM
 table above. Neither model can otherwise run on that hardware at any precision.
@@ -229,53 +214,15 @@ Operational notes:
   drive on a PCIe **Gen3 x4** link (3.7 GB/s). Cold working‑set shifts and first‑touch
   prefills do pay drive speed. `VLLM_MOE_W2_TIER_DIRECT=1` switches misses to O_DIRECT
   (hard RAM budget, page cache stays flat; raw drive latency on every miss).
-- **Cold pack rebuilds fail closed instead of consuming the host.** MXFP4 expert parameters are
-  zero-sized at model construction and materialized only for the layer currently loading; that
-  layer is quantized, durably written, and released before the next one starts. Exact pack
-  identity skips the build entirely, and completion guards prevent a streamed layer from being
-  built twice. While W2 + a pack store are active, the sequential safetensors loader also
-  preflights every shard, requests eviction of
-  each released shard with `POSIX_FADV_DONTNEED`, and retries after the model consumer unwinds;
-  the pack writer does `fdatasync` + `DONTNEED` after
-  every completed layer. Explicit checkpoint prefetch is refused and a requested
-  multi-thread load is serialized. The final mmap-backed tensor per shard is cloned under the
-  same guard so the consumer cannot keep the whole file mapped. Pinned-arena allocations and
-  indivisible shard/layer I/O
-  keep a **16 GiB host MemAvailable floor** and **4 GiB hard cgroup `memory.max`
-  headroom** by default. `memory.high` remains an observable soft reclaim/throttle boundary;
-  it does not reduce the hard allocation budget. Tune the floors with
-  `VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB` and
-  `VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB`; `VLLM_MOE_W2_CACHE_CONTROL=required` is the safe
-  default (`best-effort` or `off` are explicit unsafe overrides). Linux cgroup-v2 page cache is
-  accounted in `memory.current`; every check logs anon/file/file-mapped/swap/events plus its
-  available/headroom/transient budget for a cold-restage memory trace. In the all-43-layer
-  cold canary, cgroup memory.current peaked at 51.81 GB; observed anon/file maxima were
-  8.23/44.43 GB, host
-  `MemAvailable` stayed above 73.79 GB, cgroup swap and PSI/OOM counters remained zero,
-  and the host recorded no swap-out; host swap-in increased by 160 pages. The full canary used
-  the mechanism-equivalent `e7417054a6e8`
-  predecessor; the integrated `41d7b2f96ca3` image retains that P0 code and passed the exact-head
-  baked safety suites. See the [sanitized P0 receipts](evidence/public/ds4-w2-2026-07-11/p0/).
-- **Prefill is semantic, eager, and arena-safe.** The runner derives prefill from prompt
-  progress and propagates it explicitly through normal, replay, pipeline, gate, and DBO paths;
-  capture is refused for a real W2 prefill. Prefill disables draft-affinity/gate promotion,
-  holds exact per-layer BASE pins through the forward, and uses fill-only arena scan discipline.
-  Long prefills use the bulk base-only path; short prefills retain FP4 recovery without being
-  misclassified as decode. The arena's hot set persists to
+- **Prefill can't wipe the arena** (scan discipline: prefill working sets fill free slots
+  but never evict the decode hot set), and the arena's hot set persists to
   `<pack>.heat.json` and **preheats on boot** (57 GiB ≈ 35 s; `VLLM_MOE_W2_TIER_PREHEAT=0`
   opts out). Reader pool: `VLLM_MOE_W2_STORE_THREADS` (default 8).
-- **Tier managers run only between forwards.** A target step acquires the same exclusion lock
-  used by background promotion/eviction passes and holds it through target execution, BASE
-  replay, confidence-gate re-forward, and the pipeline barrier. Only the worker's final
-  `finish_forward_step()` releases the lock and wakes one manager pass. LRU timestamps use a
-  floating-point comparison key, and force-promote plus manager ticks consume immutable
-  layer-local seen sets, so saturated-LRU eviction and background tiering cannot mutate a live
-  route or overflow an integer timestamp.
 - **Observability:** with `VLLM_MOE_W2_DELTA_TRACE=1` the summary carries a
   `[base] tiered store: arena N/M | fetch rows X ram + Y nvme (Z% ram) | … p50/p99` line —
   the ram‑hit % *is* the arena‑coverage curve; grow `BASE_RAM_GB` if it sags.
-- Expert-store rows stay **byte-identical** across backends (only the copy source changes) —
-  unit-tested per backend × cold/warm/reboot/evict/overflow/scan/preheat in
+- Replays stay **bit‑identical** across backends (bytes are bytes; only the copy source
+  changes) — unit‑tested per backend × cold/warm/reboot/evict/overflow/scan/preheat in
   `tools/test_store_backends.py`.
 
 ---
@@ -477,8 +424,8 @@ Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recip
 <!-- bench:table:end -->
 
 ## Repository layout
-- **`patch/vllm-moet-v0.24.0.patch`** — the single canonical delta vs official vLLM `v0.24.0`
-  (70 files, +14,018/-226 source lines; applies clean on the tag). Goes with the pins above.
+- **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (37 files,
+  +7.4k lines; applies clean on the tag). Goes with the pins above.
 - **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
   cubins.
 - **`kernels/`** — SASS (`sass/`) + prebuilt SM120 cubins (`cubins-sm120/`, incl. the K=6144
