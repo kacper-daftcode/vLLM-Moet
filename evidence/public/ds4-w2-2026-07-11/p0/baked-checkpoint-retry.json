@@ -1,7 +1,7 @@
 {
   "cgroup": {
-    "anon": 517885952,
-    "current": 556552192,
+    "anon": 543322112,
+    "current": 582164480,
     "events": {
       "high": 0,
       "low": 0,
@@ -11,12 +11,12 @@
       "oom_kill": 0,
       "sock_throttled": 0
     },
-    "file": 180224,
-    "file_mapped": 49152,
+    "file": 536576,
+    "file_mapped": 0,
     "high_available": null,
     "known": true,
     "limited": true,
-    "max_available": 1590931456,
+    "max_available": 1565319168,
     "swap_current": 0,
     "swap_limit": 0,
     "version": 2
@@ -25,9 +25,9 @@
   "file_bytes": 536871000,
   "probe": "checkpoint-next-shard-retry",
   "provenance": {
-    "captured_at": "2026-07-11T23:38:50.564872+00:00",
-    "image": "vllm-moet-sm120:v024-w2p1-55d30bb9cf9b",
-    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
+    "captured_at": "2026-07-12T00:31:40.272365+00:00",
+    "image": "vllm-moet-sm120:v024-w2int-4708c9d41b50",
+    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
     "kernel": "7.0.0-14-generic"
   },
   "resident_after_live_mapping_dontneed": 536870912,

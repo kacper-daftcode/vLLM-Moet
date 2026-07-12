@@ -2,7 +2,7 @@
 
 The project targets **official vLLM v0.24.0**, which ships DeepSeek‑V4 + SM120 natively
 (`vllm/models/deepseek_v4/`, FlashInfer SM120 sparse‑MLA, GLM‑5.x `GlmMoeDsaForCausalLM`).
-Our overlay is a **13.5k-line patch** (70 files): the 2-bit expert planes, the FP4 delta
+Our overlay is a **13.8k-line patch** (70 files): the 2-bit expert planes, the FP4 delta
 cache, the confidence gate, the cubit dispatch, the expert stores — plus the SM120 fixes
 below.
 
@@ -144,8 +144,12 @@ Environment pins that go with the patch (both required on SM120):
   the snapshot while the current layer selected or fetched rows. Each residency operation
   now drains prior main-stream work, freezes an immutable layer-local `seen_set`, clears only
   the previous BASE layer's pins, and pins the current layer's hits/promotions until its
-  forward completes. Target-step boundaries reset routing state without discarding those
-  pins; the post-target replay boundary clears both tiers. Backends unit-tested byte-identical
+  forward completes. A target step also acquires the exclusion lock shared with each background
+  tier-manager pass. That lock stays held through target execution, BASE replay, confidence-gate
+  re-forward, and the pipeline barrier; only `finish_forward_step()` releases it and wakes one
+  manager pass. `step_begin()` therefore clears pins without racing a wake. Saturated LRU uses a
+  floating-point timestamp key before assigning infinity, and both force-promote and manager
+  ticks receive immutable seen sets. Backends unit-tested byte-identical
   (`tools/test_store_backends.py`: 3 backends x cold/warm/reboot/evict/overflow/scan/
   preheat, both IO modes). Ops: packs on a bind‑mounted real FS (not overlayfs); ~1 TB NVMe
   for the full GLM stack; parity holds even on a Gen3‑x4 drive (3.7 GB/s) — steady‑state
@@ -167,14 +171,15 @@ Environment pins that go with the patch (both required on SM120):
   8,231,129,088-byte anon peak, 44,430,127,104-byte file peak, and a
   73,793,277,952-byte host `MemAvailable` floor; cgroup swap, PSI, limit, and OOM events were
   zero, and the host recorded no swap-out; host swap-in increased by 160 pages.
-  That all-layer canary used predecessor patch `e7417054a6e8`; canonical patch
-  `55d30bb9cf9b` retains the mechanism and passed the exact-head baked safety tests. Sanitized
+  That all-layer canary used predecessor patch `e7417054a6e8`; integrated patch
+  `4708c9d41b50` retains the mechanism and passed the exact-head baked safety tests. Sanitized
   trace and cleanup receipts are under
   [`evidence/public/ds4-w2-2026-07-11/p0/`](../evidence/public/ds4-w2-2026-07-11/p0/).
-  The same canonical image's guarded single-5090 P1/P2 result is documented in
+  Historical predecessor receipts establish the 32K P1 lane; the current integrated image's
+  guarded 128K series independently satisfies the same stability gate. Both are documented in
   [`ds4-w2-5090-2026-07-11.md`](benchmarks/ds4-w2-5090-2026-07-11.md): 0/120 frozen-rule sink
-  detections at both 32K and 128K, with exact 120,000-token retrieval at depths 0.1, 0.5, and
-  0.9. This is a quality/context result; no 128K throughput is claimed.
+  detections in each series, with exact 120,000-token retrieval at depths 0.1, 0.5, and 0.9 on
+  the integrated image. This is a quality/context result; no 128K throughput is claimed.
 - **Deterministic unpermute**: the MoE output scatter used atomic `index_add_`, so identical
   runs wobbled (~1.6e‑2 on prefill) and greedy decode was not reproducible (surfaced by the
   PP determinism investigation; never PP‑specific). Valid `sorted_ids` form a permutation of

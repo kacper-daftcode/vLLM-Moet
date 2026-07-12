@@ -1,13 +1,13 @@
 {
-  "schema_version": "ds4-w2-eval-v1",
-  "run_label": "p2-final-55d30bb9-nomtp-128k-s44",
-  "status": "complete",
-  "started_at_utc": "2026-07-11T23:02:57.249700Z",
-  "completed_at_utc": "2026-07-11T23:10:26.471315Z",
-  "inputs": {
-    "expected_count": 40,
-    "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
+  "artifacts": {
+    "manifest": "seed44.manifest.json",
+    "raw_jsonl": "seed44.raw.jsonl",
+    "raw_sha256": "c16f3fc4f4acff0d8cb2f4fa4085be7899cf07c0fe0f268877acd87d30e2e969",
+    "warmup_jsonl": "seed44.warmup.jsonl",
+    "warmup_sha256": "0b6306a4000501a734e00b6f08cda33b201a5701cc4095a1d367de827ac92c01"
   },
+  "completed_at_utc": "2026-07-12T01:00:25.913635Z",
+  "error": null,
   "eval": {
     "max_tokens": 700,
     "order": "reasoning-coding-interleaved-fixed",
@@ -25,58 +25,17 @@
     },
     "python": "3.11.15 (main, Apr  7 2026, 20:41:15) [Clang 22.1.1 ]"
   },
-  "prewarm": {
-    "cases": 10,
-    "enabled": true,
-    "max_tokens": 150,
-    "receipts_sha256": "e6ad6a23b4498825a0e8ad2ad1c5cbc4bcddabadcdd6b586120675ab10f2fdec",
-    "retry_count": 0,
-    "seed": 20260711,
-    "status": "passed",
-    "suite_version": "ds4-w2-prewarm-v4",
-    "temperature": 0.0,
-    "top_p": 1.0,
-    "receipts_sha256_scope": "published_sanitized_jsonl"
-  },
-  "server": {
-    "served_model": "deepseek-v4-flash-w2",
-    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
-    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
-    "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
-    "runtime": {
-      "base_cache_gb": 8,
-      "delta_gb": 6,
-      "delta_policy": "lru",
-      "gate_tau": 0.75,
-      "gpu_memory_utilization": 0.95,
-      "kv_cache_dtype": "fp8",
-      "max_model_len": 131072,
-      "speculative_tokens": 0
-    },
-    "w2_environment": {
-      "VLLM_MOE_W2": "1",
-      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
-      "VLLM_MOE_W2_CACHE_CONTROL": "required",
-      "VLLM_MOE_W2_DELTA_GB": "6",
-      "VLLM_MOE_W2_DELTA_POLICY": "lru",
-      "VLLM_MOE_W2_DELTA_TRACE": "1",
-      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
-      "VLLM_MOE_W2_GATE": "1",
-      "VLLM_MOE_W2_GATE_TAU": "0.75",
-      "VLLM_MOE_W2_KPI_EVERY": "64",
-      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
-      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24",
-      "VLLM_MOE_W2_POOL_HEAT": "0",
-      "VLLM_MOE_W2_PREFETCH": "0"
-    }
+  "inputs": {
+    "expected_count": 40,
+    "items_path": "/private/tmp/codex-w2-restage-safety-20260711/tools/ds4_eval/items.json",
+    "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
   },
   "pool_gate": {
     "baseline_snapshot": null,
     "checks": [
       {
         "metric": "fp4_tick",
-        "observed": 89665,
+        "observed": 28856,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -90,7 +49,7 @@
       },
       {
         "metric": "fp4_total_evicted",
-        "observed": 176189,
+        "observed": 88014,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -126,23 +85,23 @@
     "policy_sha256": "1afb9b0d96d05c9d7a374dff88c94c76a3e854c8d046fb8ef1783275ad3f5630",
     "post_eval": {
       "baseline_snapshot": {
-        "base_cumulative_replay_pct": 98.4,
-        "base_cumulative_steps": 6784,
+        "base_cumulative_replay_pct": 98.3,
+        "base_cumulative_steps": 6336,
         "base_fp_residue_steps": 58,
-        "base_replay_pct": 92.2,
+        "base_replay_pct": 90.6,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-11T23:03:26.551430Z",
+        "captured_at_utc": "2026-07-12T00:53:56.998354Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 20.2,
+        "fp4_expert_hit_pct": 19.6,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 89665,
-        "fp4_token_hit_pct": 26.5,
-        "fp4_total_evicted": 176189,
-        "fp4_total_promoted": 176670,
-        "fp4_window_evicted": 104,
-        "fp4_window_promoted": 104,
+        "fp4_tick": 28856,
+        "fp4_token_hit_pct": 26.6,
+        "fp4_total_evicted": 88014,
+        "fp4_total_promoted": 88495,
+        "fp4_window_evicted": 672,
+        "fp4_window_promoted": 672,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
@@ -150,7 +109,7 @@
       "checks": [
         {
           "metric": "fp4_tick",
-          "observed": 115235,
+          "observed": 31864,
           "operator": ">=",
           "passed": true,
           "threshold": 1
@@ -164,14 +123,14 @@
         },
         {
           "metric": "fp4_total_evicted",
-          "observed": 251909,
+          "observed": 129585,
           "operator": ">=",
           "passed": true,
           "threshold": 1
         },
         {
           "metric": "fp4_total_evicted_delta",
-          "observed": 75720,
+          "observed": 41571,
           "operator": ">=",
           "passed": true,
           "threshold": 16
@@ -203,68 +162,110 @@
         "min_gate_steps": null
       },
       "snapshot": {
-        "base_cumulative_replay_pct": 98.5,
-        "base_cumulative_steps": 9856,
+        "base_cumulative_replay_pct": 98.4,
+        "base_cumulative_steps": 9280,
         "base_fp_residue_steps": 63,
         "base_replay_pct": 98.4,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-11T23:10:26.468488Z",
+        "captured_at_utc": "2026-07-12T01:00:25.911469Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 35.4,
+        "fp4_expert_hit_pct": 21.5,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 115235,
-        "fp4_token_hit_pct": 35.7,
-        "fp4_total_evicted": 251909,
-        "fp4_total_promoted": 252390,
-        "fp4_window_evicted": 128,
-        "fp4_window_promoted": 171,
+        "fp4_tick": 31864,
+        "fp4_token_hit_pct": 22.7,
+        "fp4_total_evicted": 129585,
+        "fp4_total_promoted": 130066,
+        "fp4_window_evicted": 749,
+        "fp4_window_promoted": 749,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
       }
     },
     "snapshot": {
-      "base_cumulative_replay_pct": 98.4,
-      "base_cumulative_steps": 6784,
+      "base_cumulative_replay_pct": 98.3,
+      "base_cumulative_steps": 6336,
       "base_fp_residue_steps": 58,
-      "base_replay_pct": 92.2,
+      "base_replay_pct": 90.6,
       "base_replay_steps": 64,
       "base_unrestored_experts": 0,
-      "captured_at_utc": "2026-07-11T23:03:26.551430Z",
+      "captured_at_utc": "2026-07-12T00:53:56.998354Z",
       "fp4_cached": 481,
-      "fp4_expert_hit_pct": 20.2,
+      "fp4_expert_hit_pct": 19.6,
       "fp4_occupancy": 1.0,
       "fp4_slots": 481,
-      "fp4_tick": 89665,
-      "fp4_token_hit_pct": 26.5,
-      "fp4_total_evicted": 176189,
-      "fp4_total_promoted": 176670,
-      "fp4_window_evicted": 104,
-      "fp4_window_promoted": 104,
+      "fp4_tick": 28856,
+      "fp4_token_hit_pct": 26.6,
+      "fp4_total_evicted": 88014,
+      "fp4_total_promoted": 88495,
+      "fp4_window_evicted": 672,
+      "fp4_window_promoted": 672,
       "gate_fire_rate": null,
       "gate_fired": null,
       "gate_steps": null
     },
     "status": "passed"
   },
-  "summary": {
-    "clean": 39,
-    "coding_clean": 20,
-    "lenient": 39,
-    "n": 40,
-    "reasoning_clean": 19,
-    "sinks": 0
+  "prewarm": {
+    "cases": 10,
+    "enabled": true,
+    "max_tokens": 150,
+    "receipts_sha256": "0b6306a4000501a734e00b6f08cda33b201a5701cc4095a1d367de827ac92c01",
+    "retry_count": 0,
+    "seed": 20260711,
+    "status": "passed",
+    "suite_version": "ds4-w2-prewarm-v4",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "receipts_sha256_scope": "published_sanitized_jsonl"
   },
   "quality_comparable": true,
-  "error": null,
-  "artifacts": {
-    "manifest": "seed44.manifest.json",
-    "raw_jsonl": "seed44.raw.jsonl",
-    "raw_sha256": "68852959dc946873252fcd29fcfca29ae6cdce196ff3d9d03a6d3f3d81784909",
-    "warmup_jsonl": "seed44.warmup.jsonl",
-    "warmup_sha256": "e6ad6a23b4498825a0e8ad2ad1c5cbc4bcddabadcdd6b586120675ab10f2fdec"
+  "run_label": "p2-integration-4708c9d-128k-s44",
+  "schema_version": "ds4-w2-eval-v1",
+  "server": {
+    "served_model": "deepseek-v4-flash-w2",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
+    "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "runtime": {
+      "max_model_len": 131072,
+      "base_cache_gb": 8,
+      "delta_gb": 6,
+      "delta_policy": "lru",
+      "gate_tau": 0.75,
+      "kv_cache_dtype": "fp8",
+      "speculative_tokens": 0,
+      "gpu_memory_utilization": 0.95
+    },
+    "w2_environment": {
+      "VLLM_MOE_W2": "1",
+      "VLLM_MOE_W2_GATE_TAU": "0.75",
+      "VLLM_MOE_W2_DELTA_TRACE": "1",
+      "VLLM_MOE_W2_DELTA_POLICY": "lru",
+      "VLLM_MOE_W2_POOL_HEAT": "0",
+      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
+      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
+      "VLLM_MOE_W2_DELTA_GB": "6",
+      "VLLM_MOE_W2_GATE": "1",
+      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
+      "VLLM_MOE_W2_CACHE_CONTROL": "required",
+      "VLLM_MOE_W2_PREFETCH": "0",
+      "VLLM_MOE_W2_KPI_EVERY": "64",
+      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
+    }
+  },
+  "started_at_utc": "2026-07-12T00:53:30.255201Z",
+  "status": "complete",
+  "summary": {
+    "clean": 40,
+    "coding_clean": 20,
+    "lenient": 40,
+    "n": 40,
+    "reasoning_clean": 20,
+    "sinks": 0
   },
   "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and response IDs are retained only in private source receipts. The public run label is descriptive."
 }

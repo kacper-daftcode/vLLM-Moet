@@ -1,18 +1,18 @@
 {
-  "schema_version": "ds4-w2-context-composite-v1",
-  "run_label": "p2-final-128k-context-120k-exact-composite",
+  "schema_version": "ds4-w2-context-composite-v2",
+  "run_label": "p2-integrated-128k-context-120k-zero-tolerance-composite",
   "status": "complete",
   "context_validated": true,
   "exact_prompt_contract": true,
-  "started_at_utc": "2026-07-11T23:10:50.529737Z",
-  "completed_at_utc": "2026-07-11T23:36:48Z",
+  "started_at_utc": "2026-07-12T01:03:06.509177Z",
+  "completed_at_utc": "2026-07-12T01:16:23.167087Z",
   "server": {
-    "schema_version": "ds4-w2-public-server-v1",
+    "schema_version": "ds4-w2-public-server-v2",
     "served_model": "deepseek-v4-flash-w2",
     "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
-    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
-    "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
+    "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
     "runtime": {
       "max_model_len": 131072,
       "base_cache_gb": 8,
@@ -54,6 +54,7 @@
     "generator_version": "deterministic-word-haystack-v1",
     "model": "deepseek-v4-flash-w2",
     "max_tokens": 256,
+    "prompt_token_tolerance": 0,
     "expected_runtime": {
       "max_model_len": 131072,
       "kv_cache_dtype": "fp8",
@@ -84,22 +85,25 @@
       "context_probe_py": "07b76343c5007ae98e84de22cb34931a440243e9a923d480aebc02e0d2664312",
       "harness_py": "62240f57a4b27d4bc10aa7083fd32542a21797aea1d1aaac586cc827e4fe0e25"
     },
-    "selection_rule": "Use original exact receipts for depths 0.1 and 0.5 and the zero-tolerance corrective receipt for depth 0.9."
+    "selection_rule": "Use only fresh tolerance-zero receipts after calibration-only seed qualification; depths 0.1/0.5 share one manifest and depth 0.9 uses a second manifest."
   },
-  "calibration_correction": {
-    "excluded_original_depth": 0.9,
-    "excluded_observed_prompt_tokens": 119999,
-    "excluded_reason": "One token short of the exact contract despite being accepted by the generic +/-64-token harness tolerance.",
-    "corrective_seed": 20260712,
-    "corrective_prompt_token_tolerance": 0,
-    "corrective_observed_prompt_tokens": 120000
+  "calibration_selection": {
+    "failed_closed_attempts_before_inference": 1,
+    "failed_depth": 0.1,
+    "closest_observed_prompt_tokens": 120001,
+    "chat_requests_contributed": 0,
+    "qualified_manifest_seeds": [
+      20260714,
+      20260711
+    ],
+    "interpretation": "The rejected calibration emitted no model answer and contributes no retrieval row. Candidate seeds were checked with /tokenize only; the three published receipts are fresh, zero-tolerance inference requests."
   },
   "summary": {
     "accepted": 3,
     "of": 3,
     "min_observed_prompt_tokens": 120000,
     "max_observed_prompt_tokens": 120000,
-    "receipts_sha256": "7c388419da6f45b45e81e6a91676dc0092f12c834f9fb990c811c329a76fae0f",
+    "receipts_sha256": "b44a9fc08d72c050f0a264629758d016e6f933452617d44959a196b70fb8b367",
     "receipts_sha256_scope": "published_sanitized_composite_jsonl"
   },
   "artifacts": {

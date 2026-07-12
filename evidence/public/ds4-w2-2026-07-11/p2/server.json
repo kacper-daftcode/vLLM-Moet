@@ -1,10 +1,10 @@
 {
-  "schema_version": "ds4-w2-public-server-v1",
+  "schema_version": "ds4-w2-public-server-v2",
   "served_model": "deepseek-v4-flash-w2",
   "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-  "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
-  "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
-  "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+  "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+  "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
+  "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
   "runtime": {
     "max_model_len": 131072,
     "base_cache_gb": 8,

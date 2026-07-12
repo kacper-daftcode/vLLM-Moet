@@ -1,5 +1,6 @@
 {
-  "schema_version": "ds4-w2-p2-public-quality-aggregate-v1",
+  "schema_version": "ds4-w2-p2-public-quality-aggregate-v2",
+  "artifact_role": "canonical integrated 128K series; also satisfies the P1 three-seed stability gate",
   "runtime": {
     "max_model_len": 131072,
     "max_num_seqs": 1,
@@ -26,7 +27,7 @@
     "per_seed": [
       {
         "seed": 42,
-        "machine_exact": 39,
+        "machine_exact": 40,
         "semantic_equivalent": 40,
         "responses": 40,
         "sinks": 0,
@@ -42,7 +43,7 @@
       },
       {
         "seed": 44,
-        "machine_exact": 39,
+        "machine_exact": 40,
         "semantic_equivalent": 40,
         "responses": 40,
         "sinks": 0,
@@ -50,11 +51,11 @@
       }
     ],
     "combined": {
-      "machine_exact": 117,
+      "machine_exact": 119,
       "semantic_equivalent": 120,
       "responses": 120,
       "coding_machine_exact": 60,
-      "reasoning_machine_exact": 57,
+      "reasoning_machine_exact": 59,
       "sinks": 0,
       "errors": 0,
       "non_200_responses": 0,
@@ -63,15 +64,13 @@
     "latex_normalization_caveat": {
       "item": "r17",
       "affected_seeds": [
-        42,
-        43,
-        44
+        43
       ],
       "expected": "3/8",
       "returned_final": "\\(\\frac{3}{8}\\)",
       "machine_exact": false,
       "sink": false,
-      "interpretation": "Each returned value is mathematically equivalent to 3/8, but the frozen scorer does not normalize this LaTeX wrapper. The public machine score remains 117/120; 120/120 is reported separately as semantic equivalence."
+      "interpretation": "The returned value is mathematically equivalent to 3/8, but the frozen scorer does not normalize this LaTeX wrapper. The public machine score remains 119/120; 120/120 is reported separately as semantic equivalence."
     }
   },
   "receipt_derived_latency_seconds": {
@@ -79,62 +78,62 @@
     "per_seed": [
       {
         "seed": 42,
-        "sum": 454.275,
-        "mean": 11.356875,
-        "median": 10.277,
-        "p95": 18.384,
-        "max": 42.095
+        "max": 32.405,
+        "mean": 9.90055,
+        "median": 9.1425,
+        "p95": 14.6,
+        "sum": 396.022
       },
       {
         "seed": 43,
-        "sum": 433.745,
-        "mean": 10.843625,
-        "median": 9.77,
-        "p95": 19.918,
-        "max": 28.456
+        "max": 25.672,
+        "mean": 10.042975,
+        "median": 8.6005,
+        "p95": 16.786,
+        "sum": 401.719
       },
       {
         "seed": 44,
-        "sum": 419.339,
-        "mean": 10.483475,
-        "median": 9.402,
-        "p95": 15.39,
-        "max": 34.28
+        "max": 20.121,
+        "mean": 9.716249999999999,
+        "median": 8.8335,
+        "p95": 17.105,
+        "sum": 388.65
       }
     ],
     "combined": {
-      "sum": 1307.359,
-      "mean": 10.894658333333334,
-      "median": 9.751,
-      "p95": 19.918,
-      "max": 42.095
+      "sum": 1186.391,
+      "mean": 9.886591666666666,
+      "median": 8.968,
+      "p95": 16.786,
+      "max": 32.405
     }
   },
   "pool_activity_during_scoring": {
     "per_seed": [
       {
         "seed": 42,
-        "evictions": 82756,
+        "evictions": 43178,
         "post_latest_64_replay_percent": 98.4,
         "post_latest_64_residue_steps": 63,
         "post_unrestored_experts": 0
       },
       {
         "seed": 43,
-        "evictions": 79730,
+        "evictions": 42756,
         "post_latest_64_replay_percent": 98.4,
         "post_latest_64_residue_steps": 63,
         "post_unrestored_experts": 0
       },
       {
         "seed": 44,
-        "evictions": 75720,
+        "evictions": 41571,
         "post_latest_64_replay_percent": 98.4,
         "post_latest_64_residue_steps": 63,
         "post_unrestored_experts": 0
       }
     ],
-    "combined_evictions": 238206,
+    "combined_evictions": 127505,
     "all_pre_and_post_gates_passed": true,
     "policy_boundary": "The quality policy required full FP4 occupancy, live churn, and zero unrestored experts. Replay rate and second-order residue were retained in the manifests but were not rejection thresholds."
   },

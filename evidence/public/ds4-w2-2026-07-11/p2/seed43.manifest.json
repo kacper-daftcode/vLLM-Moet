@@ -1,13 +1,13 @@
 {
-  "schema_version": "ds4-w2-eval-v1",
-  "run_label": "p2-final-55d30bb9-nomtp-128k-s43",
-  "status": "complete",
-  "started_at_utc": "2026-07-11T22:54:55.351668Z",
-  "completed_at_utc": "2026-07-11T23:02:38.520960Z",
-  "inputs": {
-    "expected_count": 40,
-    "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
+  "artifacts": {
+    "manifest": "seed43.manifest.json",
+    "raw_jsonl": "seed43.raw.jsonl",
+    "raw_sha256": "fd71e9d534e7f44170b3ffc7ef2669ef4258b8d861fd9daa60900c0f7415a117",
+    "warmup_jsonl": "seed43.warmup.jsonl",
+    "warmup_sha256": "0dacc560ea7dcec7cd37082f31bfc171db4888fd556879bc9ce8bc7a80ad360f"
   },
+  "completed_at_utc": "2026-07-12T00:52:52.462505Z",
+  "error": null,
   "eval": {
     "max_tokens": 700,
     "order": "reasoning-coding-interleaved-fixed",
@@ -25,58 +25,17 @@
     },
     "python": "3.11.15 (main, Apr  7 2026, 20:41:15) [Clang 22.1.1 ]"
   },
-  "prewarm": {
-    "cases": 10,
-    "enabled": true,
-    "max_tokens": 150,
-    "receipts_sha256": "c2203cad828d75779da96428e0dc2cba6e2706001943bd44d89a4f2cf59b5c3d",
-    "retry_count": 0,
-    "seed": 20260711,
-    "status": "passed",
-    "suite_version": "ds4-w2-prewarm-v4",
-    "temperature": 0.0,
-    "top_p": 1.0,
-    "receipts_sha256_scope": "published_sanitized_jsonl"
-  },
-  "server": {
-    "served_model": "deepseek-v4-flash-w2",
-    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
-    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
-    "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
-    "runtime": {
-      "base_cache_gb": 8,
-      "delta_gb": 6,
-      "delta_policy": "lru",
-      "gate_tau": 0.75,
-      "gpu_memory_utilization": 0.95,
-      "kv_cache_dtype": "fp8",
-      "max_model_len": 131072,
-      "speculative_tokens": 0
-    },
-    "w2_environment": {
-      "VLLM_MOE_W2": "1",
-      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
-      "VLLM_MOE_W2_CACHE_CONTROL": "required",
-      "VLLM_MOE_W2_DELTA_GB": "6",
-      "VLLM_MOE_W2_DELTA_POLICY": "lru",
-      "VLLM_MOE_W2_DELTA_TRACE": "1",
-      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
-      "VLLM_MOE_W2_GATE": "1",
-      "VLLM_MOE_W2_GATE_TAU": "0.75",
-      "VLLM_MOE_W2_KPI_EVERY": "64",
-      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
-      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24",
-      "VLLM_MOE_W2_POOL_HEAT": "0",
-      "VLLM_MOE_W2_PREFETCH": "0"
-    }
+  "inputs": {
+    "expected_count": 40,
+    "items_path": "/private/tmp/codex-w2-restage-safety-20260711/tools/ds4_eval/items.json",
+    "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
   },
   "pool_gate": {
     "baseline_snapshot": null,
     "checks": [
       {
         "metric": "fp4_tick",
-        "observed": 58480,
+        "observed": 25477,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -90,7 +49,7 @@
       },
       {
         "metric": "fp4_total_evicted",
-        "observed": 91906,
+        "observed": 44298,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -126,23 +85,23 @@
     "policy_sha256": "1afb9b0d96d05c9d7a374dff88c94c76a3e854c8d046fb8ef1783275ad3f5630",
     "post_eval": {
       "baseline_snapshot": {
-        "base_cumulative_replay_pct": 98.4,
-        "base_cumulative_steps": 3456,
-        "base_fp_residue_steps": 58,
-        "base_replay_pct": 90.6,
+        "base_cumulative_replay_pct": 98.2,
+        "base_cumulative_steps": 3136,
+        "base_fp_residue_steps": 59,
+        "base_replay_pct": 92.2,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-11T22:55:24.423822Z",
+        "captured_at_utc": "2026-07-12T00:46:10.553892Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 16.6,
+        "fp4_expert_hit_pct": 20.3,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 58480,
-        "fp4_token_hit_pct": 19.8,
-        "fp4_total_evicted": 91906,
-        "fp4_total_promoted": 92387,
-        "fp4_window_evicted": 248,
-        "fp4_window_promoted": 248,
+        "fp4_tick": 25477,
+        "fp4_token_hit_pct": 26.3,
+        "fp4_total_evicted": 44298,
+        "fp4_total_promoted": 44779,
+        "fp4_window_evicted": 611,
+        "fp4_window_promoted": 611,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
@@ -150,7 +109,7 @@
       "checks": [
         {
           "metric": "fp4_tick",
-          "observed": 84593,
+          "observed": 28613,
           "operator": ">=",
           "passed": true,
           "threshold": 1
@@ -164,14 +123,14 @@
         },
         {
           "metric": "fp4_total_evicted",
-          "observed": 171636,
+          "observed": 87054,
           "operator": ">=",
           "passed": true,
           "threshold": 1
         },
         {
           "metric": "fp4_total_evicted_delta",
-          "observed": 79730,
+          "observed": 42756,
           "operator": ">=",
           "passed": true,
           "threshold": 16
@@ -203,52 +162,103 @@
         "min_gate_steps": null
       },
       "snapshot": {
-        "base_cumulative_replay_pct": 98.5,
-        "base_cumulative_steps": 6656,
+        "base_cumulative_replay_pct": 98.4,
+        "base_cumulative_steps": 6208,
         "base_fp_residue_steps": 63,
         "base_replay_pct": 98.4,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-11T23:02:38.518732Z",
+        "captured_at_utc": "2026-07-12T00:52:52.461309Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 35.4,
+        "fp4_expert_hit_pct": 23.1,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 84593,
-        "fp4_token_hit_pct": 35.8,
-        "fp4_total_evicted": 171636,
-        "fp4_total_promoted": 172117,
-        "fp4_window_evicted": 185,
-        "fp4_window_promoted": 185,
+        "fp4_tick": 28613,
+        "fp4_token_hit_pct": 24.3,
+        "fp4_total_evicted": 87054,
+        "fp4_total_promoted": 87535,
+        "fp4_window_evicted": 823,
+        "fp4_window_promoted": 823,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
       }
     },
     "snapshot": {
-      "base_cumulative_replay_pct": 98.4,
-      "base_cumulative_steps": 3456,
-      "base_fp_residue_steps": 58,
-      "base_replay_pct": 90.6,
+      "base_cumulative_replay_pct": 98.2,
+      "base_cumulative_steps": 3136,
+      "base_fp_residue_steps": 59,
+      "base_replay_pct": 92.2,
       "base_replay_steps": 64,
       "base_unrestored_experts": 0,
-      "captured_at_utc": "2026-07-11T22:55:24.423822Z",
+      "captured_at_utc": "2026-07-12T00:46:10.553892Z",
       "fp4_cached": 481,
-      "fp4_expert_hit_pct": 16.6,
+      "fp4_expert_hit_pct": 20.3,
       "fp4_occupancy": 1.0,
       "fp4_slots": 481,
-      "fp4_tick": 58480,
-      "fp4_token_hit_pct": 19.8,
-      "fp4_total_evicted": 91906,
-      "fp4_total_promoted": 92387,
-      "fp4_window_evicted": 248,
-      "fp4_window_promoted": 248,
+      "fp4_tick": 25477,
+      "fp4_token_hit_pct": 26.3,
+      "fp4_total_evicted": 44298,
+      "fp4_total_promoted": 44779,
+      "fp4_window_evicted": 611,
+      "fp4_window_promoted": 611,
       "gate_fire_rate": null,
       "gate_fired": null,
       "gate_steps": null
     },
     "status": "passed"
   },
+  "prewarm": {
+    "cases": 10,
+    "enabled": true,
+    "max_tokens": 150,
+    "receipts_sha256": "0dacc560ea7dcec7cd37082f31bfc171db4888fd556879bc9ce8bc7a80ad360f",
+    "retry_count": 0,
+    "seed": 20260711,
+    "status": "passed",
+    "suite_version": "ds4-w2-prewarm-v4",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "receipts_sha256_scope": "published_sanitized_jsonl"
+  },
+  "quality_comparable": true,
+  "run_label": "p2-integration-4708c9d-128k-s43",
+  "schema_version": "ds4-w2-eval-v1",
+  "server": {
+    "served_model": "deepseek-v4-flash-w2",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
+    "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "runtime": {
+      "max_model_len": 131072,
+      "base_cache_gb": 8,
+      "delta_gb": 6,
+      "delta_policy": "lru",
+      "gate_tau": 0.75,
+      "kv_cache_dtype": "fp8",
+      "speculative_tokens": 0,
+      "gpu_memory_utilization": 0.95
+    },
+    "w2_environment": {
+      "VLLM_MOE_W2": "1",
+      "VLLM_MOE_W2_GATE_TAU": "0.75",
+      "VLLM_MOE_W2_DELTA_TRACE": "1",
+      "VLLM_MOE_W2_DELTA_POLICY": "lru",
+      "VLLM_MOE_W2_POOL_HEAT": "0",
+      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
+      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
+      "VLLM_MOE_W2_DELTA_GB": "6",
+      "VLLM_MOE_W2_GATE": "1",
+      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
+      "VLLM_MOE_W2_CACHE_CONTROL": "required",
+      "VLLM_MOE_W2_PREFETCH": "0",
+      "VLLM_MOE_W2_KPI_EVERY": "64",
+      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
+    }
+  },
+  "started_at_utc": "2026-07-12T00:45:44.601100Z",
+  "status": "complete",
   "summary": {
     "clean": 39,
     "coding_clean": 20,
@@ -256,15 +266,6 @@
     "n": 40,
     "reasoning_clean": 19,
     "sinks": 0
-  },
-  "quality_comparable": true,
-  "error": null,
-  "artifacts": {
-    "manifest": "seed43.manifest.json",
-    "raw_jsonl": "seed43.raw.jsonl",
-    "raw_sha256": "a64a157189d695eceea7be48230f2599c8f98fe93693373a6a6a679d89a8ce31",
-    "warmup_jsonl": "seed43.warmup.jsonl",
-    "warmup_sha256": "c2203cad828d75779da96428e0dc2cba6e2706001943bd44d89a4f2cf59b5c3d"
   },
   "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and response IDs are retained only in private source receipts. The public run label is descriptive."
 }
