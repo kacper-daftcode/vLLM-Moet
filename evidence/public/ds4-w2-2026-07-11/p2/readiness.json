@@ -1,0 +1,42 @@
+{
+  "schema_version": "ds4-w2-p2-public-readiness-v1",
+  "result": "pass",
+  "ready_at_utc": "2026-07-11T22:45:21Z",
+  "sustained_health_hold_seconds": 34,
+  "runtime": {
+    "max_model_len": 131072,
+    "max_num_seqs": 1,
+    "kv_cache_dtype": "fp8",
+    "speculative_tokens": 0
+  },
+  "capacity": {
+    "model_loading_memory_gib": 22.87,
+    "available_kv_cache_memory_gib": 4.8,
+    "gpu_kv_cache_tokens": 720386,
+    "reported_maximum_concurrency_at_full_window": 5.5
+  },
+  "watchdog_start_to_ready": {
+    "samples": 182,
+    "elapsed_seconds": 184.3,
+    "host_mem_available_min_bytes": 111033548800,
+    "host_swap_free_min_bytes": 8589918208,
+    "cgroup_memory_current_max_bytes": 8543817728,
+    "cgroup_memory_peak_bytes": 8693653504,
+    "cgroup_memory_max_bytes": 107374182400,
+    "cgroup_memory_high_bytes": 103079215104,
+    "cgroup_swap_current_max_bytes": 0,
+    "memory_high_event_delta": 0,
+    "memory_max_event_delta": 0,
+    "oom_event_delta": 0,
+    "oom_kill_event_delta": 0,
+    "host_swap_in_pages_delta": 0,
+    "host_swap_out_pages_delta": 0,
+    "host_oom_kill_delta": 0
+  },
+  "artifact_identity": {
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab"
+  },
+  "sanitization_note": "Topology-specific and private runtime provenance identifiers are intentionally omitted."
+}

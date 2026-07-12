@@ -1,0 +1,110 @@
+{
+  "schema_version": "ds4-w2-context-composite-v1",
+  "run_label": "p2-final-128k-context-120k-exact-composite",
+  "status": "complete",
+  "context_validated": true,
+  "exact_prompt_contract": true,
+  "started_at_utc": "2026-07-11T23:10:50.529737Z",
+  "completed_at_utc": "2026-07-11T23:36:48Z",
+  "server": {
+    "schema_version": "ds4-w2-public-server-v1",
+    "served_model": "deepseek-v4-flash-w2",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
+    "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+    "runtime": {
+      "max_model_len": 131072,
+      "base_cache_gb": 8,
+      "delta_gb": 6,
+      "delta_policy": "lru",
+      "gate_tau": 0.75,
+      "kv_cache_dtype": "fp8",
+      "speculative_tokens": 0,
+      "gpu_memory_utilization": 0.95
+    },
+    "w2_environment": {
+      "VLLM_MOE_W2": "1",
+      "VLLM_MOE_W2_GATE_TAU": "0.75",
+      "VLLM_MOE_W2_DELTA_TRACE": "1",
+      "VLLM_MOE_W2_DELTA_POLICY": "lru",
+      "VLLM_MOE_W2_POOL_HEAT": "0",
+      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
+      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
+      "VLLM_MOE_W2_DELTA_GB": "6",
+      "VLLM_MOE_W2_GATE": "1",
+      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
+      "VLLM_MOE_W2_CACHE_CONTROL": "required",
+      "VLLM_MOE_W2_PREFETCH": "0",
+      "VLLM_MOE_W2_KPI_EVERY": "64",
+      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
+    },
+    "runtime_shape": {
+      "max_num_seqs": 1,
+      "speculative_config_present": false
+    },
+    "capacity": {
+      "available_kv_cache_memory_gib": 4.8,
+      "gpu_kv_cache_tokens": 720386,
+      "reported_maximum_concurrency_at_full_window": 5.5
+    },
+    "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and endpoint details are retained only in private source receipts."
+  },
+  "probe": {
+    "generator_version": "deterministic-word-haystack-v1",
+    "model": "deepseek-v4-flash-w2",
+    "max_tokens": 256,
+    "expected_runtime": {
+      "max_model_len": 131072,
+      "kv_cache_dtype": "fp8",
+      "base_cache_gb": 8,
+      "delta_gb": 6,
+      "delta_policy": "lru",
+      "gate_tau": 0.75,
+      "speculative_tokens": 0,
+      "max_num_seqs": 1
+    },
+    "cases": [
+      {
+        "target_prompt_tokens": 120000,
+        "depth": 0.1
+      },
+      {
+        "target_prompt_tokens": 120000,
+        "depth": 0.5
+      },
+      {
+        "target_prompt_tokens": 120000,
+        "depth": 0.9
+      }
+    ]
+  },
+  "harness": {
+    "files": {
+      "context_probe_py": "07b76343c5007ae98e84de22cb34931a440243e9a923d480aebc02e0d2664312",
+      "harness_py": "62240f57a4b27d4bc10aa7083fd32542a21797aea1d1aaac586cc827e4fe0e25"
+    },
+    "selection_rule": "Use original exact receipts for depths 0.1 and 0.5 and the zero-tolerance corrective receipt for depth 0.9."
+  },
+  "calibration_correction": {
+    "excluded_original_depth": 0.9,
+    "excluded_observed_prompt_tokens": 119999,
+    "excluded_reason": "One token short of the exact contract despite being accepted by the generic +/-64-token harness tolerance.",
+    "corrective_seed": 20260712,
+    "corrective_prompt_token_tolerance": 0,
+    "corrective_observed_prompt_tokens": 120000
+  },
+  "summary": {
+    "accepted": 3,
+    "of": 3,
+    "min_observed_prompt_tokens": 120000,
+    "max_observed_prompt_tokens": 120000,
+    "receipts_sha256": "7c388419da6f45b45e81e6a91676dc0092f12c834f9fb990c811c329a76fae0f",
+    "receipts_sha256_scope": "published_sanitized_composite_jsonl"
+  },
+  "artifacts": {
+    "manifest": "context-120k.manifest.json",
+    "receipts_jsonl": "context-120k.receipts.jsonl"
+  },
+  "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, endpoint details, and response IDs are retained only in private source receipts. The public run label is descriptive."
+}

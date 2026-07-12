@@ -1,0 +1,27 @@
+{
+  "schema_version": "ds4-w2-p2-public-cleanup-v1",
+  "result": "pass",
+  "stop_handshake_accepted": true,
+  "controller_cleanup_exit_code": 0,
+  "cleanup_completed_at_utc": "2026-07-11T23:37:32Z",
+  "watchdog_done_marker_present": true,
+  "abort_receipt_present": false,
+  "evaluation_container_absent_after": true,
+  "production_pack_fingerprint_unchanged": true,
+  "immutable_seed_pack_fingerprint_unchanged": true,
+  "stopped_services_expected_count": 2,
+  "stopped_services_active_after_count": 2,
+  "controller_health_waits_succeeded": true,
+  "post_cleanup_followup_health_http": [
+    200,
+    200
+  ],
+  "generated_store_removed_after_evidence_sync": true,
+  "generated_store_removed_bytes": 230317622095,
+  "controller_log": {
+    "line_count": 32,
+    "byte_count": 2738,
+    "sha256": "0d8a89c10e36dedaf7c846a4dcb39078630d499eebfa448dabda481d0f742033"
+  },
+  "verification_note": "The final container-inspect receipt was captured before stop. Post-stop absence is established by the guarded controller's successful remove-and-reinspect path and zero cleanup exit code. Immediate post-restart curls initially saw connection refusal; the controller health waits succeeded, and the listed 200 responses are a later follow-up verification. Topology-specific identifiers remain private."
+}

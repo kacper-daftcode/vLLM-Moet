@@ -1,0 +1,40 @@
+{
+  "schema_version": "vllm-moet-exact-image-verification-v1",
+  "official_vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+  "wrapper_core_commit": "c2b30a0b1f12f366a31378ed9f2e8f2420e0235c",
+  "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+  "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
+  "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+  "applied_tree": {
+    "files_changed": 70,
+    "insertions": 13506,
+    "deletions": 226,
+    "apply_check": "pass",
+    "source_diff_whitespace_check": "pass"
+  },
+  "baked_source_sha256": {
+    "vllm/forward_context.py": "b3b5d84c16e0f5c886186cc06fcd65e1aa577ee6e58c2746ecea4c599f778ec7",
+    "vllm/v1/worker/gpu_model_runner.py": "63a08d992701cfca677de0e35eab2bc00e97a4514ae6d69858d544460d35be3f",
+    "vllm/v1/worker/gpu_ubatch_wrapper.py": "cc9526d859ccecdeb69b42140c92ba13c6fb80a8091734ab518a819c322dd1e7c",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py": "f11039af14494380875aa4fdd8ba42fa9235205b5062a708d530032494ac1b55",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_delta.py": "1c5aade4c613cce96f45da56b361d4178f5403c18ad8d696ec9c1b20a5266265"
+  },
+  "canonical_synthetic_safety_probes": {
+    "checkpoint_residency_sha256": "bfe459e9540de65dba362b20f47ea790b9ec62d1ca118d9f637ba0a17a737486",
+    "checkpoint_next_shard_retry_sha256": "f158316cbe033e4f3423137423bf560117b5eca1964aa1a954500afaf1e18844",
+    "constrained_pack_build_sha256": "d3b400c74d588c4eb880c9ae7150dd8d0d9043a88e572f9ee7f440e7c3ddba1d",
+    "image_identity_match": true
+  },
+  "tests": {
+    "focused_cgroup_padded_route_step_pin": "18 passed, 1 CUDA-only skip on the local tree",
+    "exact_image_padded_route": "7 passed with CUDA graph replay",
+    "exact_image_store_safety": "37 passed",
+    "exact_image_mxfp4_stream_safety": "10 passed",
+    "exact_image_gpu_store_backends": "all pinned, mmap, reboot, tiered, eviction, overflow, scan, and preheat checks passed",
+    "evaluation_and_context_harness": "36 passed",
+    "ruff": "pass",
+    "format": "pass",
+    "benchmark_lint": "0 errors, 0 warnings",
+    "benchmark_render_check": "up to date"
+  }
+}

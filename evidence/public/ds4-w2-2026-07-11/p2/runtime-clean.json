@@ -1,0 +1,146 @@
+{
+  "schema_version": "ds4-w2-p2-public-runtime-clean-v1",
+  "log_snapshot": {
+    "scope": "complete container log through the zero-tolerance corrective 120K context case and last pre-stop health check; the controller log separately proves stop and cleanup",
+    "line_count": 23900,
+    "byte_count": 5221581,
+    "sha256": "78257f44df8091ccd443df47d13fb519b0920e06f8313bf0d322434219da4041"
+  },
+  "exact_pattern_scan": {
+    "replay_skipped": 0,
+    "gate_skipped": 0,
+    "draft_prefetch_skipped": 0,
+    "unrestored_experts": 0,
+    "pool_too_tight": 0,
+    "pool_too_small": 0,
+    "fixed_point_replay_hit_maximum": 0,
+    "error_severity": 0,
+    "traceback": 0,
+    "actionable_or_nonzero_oom": 0,
+    "abort": 0,
+    "timeout": 0
+  },
+  "http_response_scan": {
+    "health_200": 3742,
+    "chat_200": 154,
+    "tokenize_200": 87,
+    "non_200": 0
+  },
+  "wording_caveats": {
+    "cgroup_event_records": {
+      "matching_lines": 230,
+      "all_values_zero": true,
+      "interpretation": "These container-log records are startup/cache-control snapshots with zero high, max, OOM, and OOM-kill values. The separate watchdog trace later records nonzero soft memory.high events and is authoritative for the full lane."
+    },
+    "generic_skipped": {
+      "matching_lines": 45,
+      "persistent_quantization_staging_notices": 2,
+      "per_layer_boot_from_pack_requant_notices": 43,
+      "replay_or_gate_skips": 0
+    },
+    "startup_and_shape_warnings": {
+      "uppercase_warning_lines": 25,
+      "deprecated_model_option": 1,
+      "custom_or_build_environment_keys": 16,
+      "compile_pipeline_disabled_notices": 4,
+      "generation_config_override": 1,
+      "inference_shape_jit_notices": 3,
+      "serving_correctness_or_safety_failures": 0
+    }
+  },
+  "base_kpi_windows": {
+    "window_count": 162,
+    "steps_per_window": 64,
+    "windows_with_fp_residue": 161,
+    "windows_with_unrestored_experts": 0,
+    "replay_percent": {
+      "min": 0.0,
+      "max": 100.0,
+      "mean": 94.0
+    },
+    "average_missing_pairs_per_step": {
+      "min": 0.0,
+      "max": 100.2,
+      "mean": 80.527
+    },
+    "fp_residue_steps": {
+      "min": 0,
+      "max": 64,
+      "mean": 60.167
+    },
+    "nonzero_residue_steps": {
+      "min": 1,
+      "max": 64,
+      "mean": 60.54,
+      "total": 9747
+    },
+    "reported_average_residual_pairs": {
+      "min": 0,
+      "max": 91,
+      "mean_of_window_reports": 27.895
+    },
+    "final_window": {
+      "replay_percent": 0.0,
+      "cumulative_replay_percent": 94.0,
+      "cumulative_steps": 10368,
+      "fp_residue_steps": 0,
+      "average_residual_pairs": 0,
+      "base_pool_slots": 1213,
+      "base_expert_coverage_percent": 11.0
+    }
+  },
+  "selected_context_receipts": {
+    "exact_120k_cases": 3,
+    "accepted_residue_steps_total": 33,
+    "depth_0_1_residue_steps": 10,
+    "depth_0_5_residue_steps": 10,
+    "depth_0_9_corrective_residue_steps": 13,
+    "interpretation": "Exact retrieval passed despite accepted second-order residue. The corrective case ended with a later zero-residue KPI window; this does not retroactively make every forward miss-free."
+  },
+  "memory_watchdog": {
+    "samples": 3210,
+    "elapsed_seconds": 3280.1,
+    "trace_byte_count": 813616,
+    "trace_sha256": "be775646f81954f2d7bdc5214f842998c90ee0934581234a6626343b8ae5125d",
+    "host_mem_available_min_bytes": 108113108992,
+    "host_mem_available_max_bytes": 118115373056,
+    "host_mem_available_final_bytes": 110259212288,
+    "host_floor_headroom_min_bytes": 82343305216,
+    "host_swap_free_min_bytes": 8589918208,
+    "cgroup_memory_current_max_bytes": 103080333312,
+    "cgroup_memory_peak_bytes": 103082561536,
+    "cgroup_anon_max_bytes": 3807731712,
+    "cgroup_file_max_bytes": 99544764416,
+    "cgroup_file_mapped_max_bytes": 4109488128,
+    "cgroup_hard_max_bytes": 107374182400,
+    "cgroup_hard_headroom_min_bytes": 4293849088,
+    "cgroup_peak_based_hard_headroom_bytes": 4291620864,
+    "cgroup_soft_high_bytes": 103079215104,
+    "cgroup_soft_high_headroom_min_bytes": -1118208,
+    "cgroup_peak_above_soft_high_bytes": 3346432,
+    "samples_above_soft_high": 28,
+    "soft_high_event_delta": 156123,
+    "cgroup_swap_current_max_bytes": 0,
+    "hard_max_event_delta": 0,
+    "oom_event_delta": 0,
+    "oom_kill_event_delta": 0,
+    "host_swap_in_pages_delta": 0,
+    "host_swap_out_pages_delta": 0,
+    "host_oom_kill_delta": 0,
+    "psi_full_avg10_max": 0.62,
+    "psi_nonzero_samples": 122,
+    "host_wide_reclaim_counters": {
+      "pgscan_delta": 884446923,
+      "pgsteal_delta": 884428863,
+      "major_fault_delta": 91763,
+      "attribution_note": "These counters are host-wide and are not exclusively attributable to the evaluation cgroup."
+    },
+    "interpretation": "The 128K quality/context lane retained more than 4.29 GB of hard cgroup headroom with no swap, hard-limit, or OOM event. File-cache growth crossed the soft memory.high boundary and produced observable reclaim and pressure; those events are intentionally not reported as zero."
+  },
+  "kpi_semantics": {
+    "window_boundary": "Residue and replay fields describe the latest 64-step KPI window, not cumulative correctness.",
+    "residue_boundary": "Residue records second-order misses exposed after mandatory first-order fetch and replay. Under the default continuation threshold, those experts are available to later steps while their current-step contribution remains zero.",
+    "unrestored_boundary": "Zero unrestored experts establishes fetch/store liveness. It does not establish a miss-free forward, bit-identical logits, or identical token streams across boots."
+  },
+  "sanitization_note": "Topology-specific and private runtime provenance identifiers are intentionally omitted."
+}
