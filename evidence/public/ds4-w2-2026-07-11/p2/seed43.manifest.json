@@ -2,11 +2,11 @@
   "artifacts": {
     "manifest": "seed43.manifest.json",
     "raw_jsonl": "seed43.raw.jsonl",
-    "raw_sha256": "fd71e9d534e7f44170b3ffc7ef2669ef4258b8d861fd9daa60900c0f7415a117",
+    "raw_sha256": "12ebd8458751bbea4d7683794a5c9e7c447784a93d2fae7dce275d59f242f5fc",
     "warmup_jsonl": "seed43.warmup.jsonl",
-    "warmup_sha256": "0dacc560ea7dcec7cd37082f31bfc171db4888fd556879bc9ce8bc7a80ad360f"
+    "warmup_sha256": "c89b523c53ee899193e829eaa1b58c06cf992f1ffb587433f293221cbe9ec86d"
   },
-  "completed_at_utc": "2026-07-12T00:52:52.462505Z",
+  "completed_at_utc": "2026-07-12T02:16:49.677911Z",
   "error": null,
   "eval": {
     "max_tokens": 700,
@@ -18,6 +18,41 @@
     "top_p": 0.95
   },
   "harness": {
+    "argv": [
+      "tools/ds4_eval/eval_rig.py",
+      "--items",
+      "tools/ds4_eval/items.json",
+      "--server-provenance",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/server.json",
+      "--pool-gate-policy",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/pool-gate-policy-quality.json",
+      "--pool-command-json",
+      "private pool-log command omitted",
+      "--output-dir",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/quality-seed43",
+      "--run-label",
+      "p2-integration-41d7b2f-128k-r1-s43",
+      "--url",
+      "private evaluation endpoint omitted",
+      "--model",
+      "deepseek-v4-flash-w2",
+      "--mode",
+      "warm",
+      "--eval-seed",
+      "43",
+      "--eval-temperature",
+      "0.6",
+      "--eval-top-p",
+      "0.95",
+      "--eval-max-tokens",
+      "700",
+      "--eval-timeout",
+      "300",
+      "--expected-count",
+      "40",
+      "--pool-kpi-timeout",
+      "30"
+    ],
     "files": {
       "eval_rig.py": "1d338ab4b1279238c5b0f7ce0e91694b16ac1883da428fd2a59cd17030ced11b",
       "harness.py": "62240f57a4b27d4bc10aa7083fd32542a21797aea1d1aaac586cc827e4fe0e25",
@@ -27,7 +62,7 @@
   },
   "inputs": {
     "expected_count": 40,
-    "items_path": "/private/tmp/codex-w2-restage-safety-20260711/tools/ds4_eval/items.json",
+    "items_path": "tools/ds4_eval/items.json",
     "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
   },
   "pool_gate": {
@@ -35,7 +70,7 @@
     "checks": [
       {
         "metric": "fp4_tick",
-        "observed": 25477,
+        "observed": 53216,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -49,7 +84,7 @@
       },
       {
         "metric": "fp4_total_evicted",
-        "observed": 44298,
+        "observed": 44765,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -91,17 +126,17 @@
         "base_replay_pct": 92.2,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-12T00:46:10.553892Z",
+        "captured_at_utc": "2026-07-12T02:10:03.262261Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 20.3,
+        "fp4_expert_hit_pct": 24.9,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 25477,
-        "fp4_token_hit_pct": 26.3,
-        "fp4_total_evicted": 44298,
-        "fp4_total_promoted": 44779,
-        "fp4_window_evicted": 611,
-        "fp4_window_promoted": 611,
+        "fp4_tick": 53216,
+        "fp4_token_hit_pct": 30.6,
+        "fp4_total_evicted": 44765,
+        "fp4_total_promoted": 45246,
+        "fp4_window_evicted": 816,
+        "fp4_window_promoted": 816,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
@@ -109,7 +144,7 @@
       "checks": [
         {
           "metric": "fp4_tick",
-          "observed": 28613,
+          "observed": 56288,
           "operator": ">=",
           "passed": true,
           "threshold": 1
@@ -123,14 +158,14 @@
         },
         {
           "metric": "fp4_total_evicted",
-          "observed": 87054,
+          "observed": 87883,
           "operator": ">=",
           "passed": true,
           "threshold": 1
         },
         {
           "metric": "fp4_total_evicted_delta",
-          "observed": 42756,
+          "observed": 43118,
           "operator": ">=",
           "passed": true,
           "threshold": 16
@@ -165,20 +200,20 @@
         "base_cumulative_replay_pct": 98.4,
         "base_cumulative_steps": 6208,
         "base_fp_residue_steps": 63,
-        "base_replay_pct": 98.4,
+        "base_replay_pct": 100.0,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-12T00:52:52.461309Z",
+        "captured_at_utc": "2026-07-12T02:16:49.676796Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 23.1,
+        "fp4_expert_hit_pct": 19.9,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 28613,
-        "fp4_token_hit_pct": 24.3,
-        "fp4_total_evicted": 87054,
-        "fp4_total_promoted": 87535,
-        "fp4_window_evicted": 823,
-        "fp4_window_promoted": 823,
+        "fp4_tick": 56288,
+        "fp4_token_hit_pct": 21.2,
+        "fp4_total_evicted": 87883,
+        "fp4_total_promoted": 88364,
+        "fp4_window_evicted": 693,
+        "fp4_window_promoted": 693,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
@@ -191,17 +226,17 @@
       "base_replay_pct": 92.2,
       "base_replay_steps": 64,
       "base_unrestored_experts": 0,
-      "captured_at_utc": "2026-07-12T00:46:10.553892Z",
+      "captured_at_utc": "2026-07-12T02:10:03.262261Z",
       "fp4_cached": 481,
-      "fp4_expert_hit_pct": 20.3,
+      "fp4_expert_hit_pct": 24.9,
       "fp4_occupancy": 1.0,
       "fp4_slots": 481,
-      "fp4_tick": 25477,
-      "fp4_token_hit_pct": 26.3,
-      "fp4_total_evicted": 44298,
-      "fp4_total_promoted": 44779,
-      "fp4_window_evicted": 611,
-      "fp4_window_promoted": 611,
+      "fp4_tick": 53216,
+      "fp4_token_hit_pct": 30.6,
+      "fp4_total_evicted": 44765,
+      "fp4_total_promoted": 45246,
+      "fp4_window_evicted": 816,
+      "fp4_window_promoted": 816,
       "gate_fire_rate": null,
       "gate_fired": null,
       "gate_steps": null
@@ -212,7 +247,7 @@
     "cases": 10,
     "enabled": true,
     "max_tokens": 150,
-    "receipts_sha256": "0dacc560ea7dcec7cd37082f31bfc171db4888fd556879bc9ce8bc7a80ad360f",
+    "receipts_sha256": "c89b523c53ee899193e829eaa1b58c06cf992f1ffb587433f293221cbe9ec86d",
     "retry_count": 0,
     "seed": 20260711,
     "status": "passed",
@@ -222,14 +257,14 @@
     "receipts_sha256_scope": "published_sanitized_jsonl"
   },
   "quality_comparable": true,
-  "run_label": "p2-integration-4708c9d-128k-s43",
+  "run_label": "p2-integration-41d7b2f-128k-r1-s43",
   "schema_version": "ds4-w2-eval-v1",
   "server": {
     "served_model": "deepseek-v4-flash-w2",
     "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
-    "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+    "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
     "runtime": {
       "max_model_len": 131072,
       "base_cache_gb": 8,
@@ -257,14 +292,14 @@
       "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
     }
   },
-  "started_at_utc": "2026-07-12T00:45:44.601100Z",
+  "started_at_utc": "2026-07-12T02:09:34.034009Z",
   "status": "complete",
   "summary": {
-    "clean": 39,
+    "clean": 40,
     "coding_clean": 20,
-    "lenient": 39,
+    "lenient": 40,
     "n": 40,
-    "reasoning_clean": 19,
+    "reasoning_clean": 20,
     "sinks": 0
   },
   "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and response IDs are retained only in private source receipts. The public run label is descriptive."

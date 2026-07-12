@@ -77,12 +77,11 @@ The guarded single-RTX-5090 application of this protocol is recorded in
 receipts under [`evidence/public/ds4-w2-2026-07-11/`](../evidence/public/ds4-w2-2026-07-11/).
 The historical predecessor P1 series at 32K produced 119/120 machine-exact and 120/120
 semantically correct answers with 0/120 frozen-rule sink detections. The current integrated
-artifact's independent P2 series at 128K also produced 119/120 machine-exact, 120/120
-semantically correct, and 0/120 sink detections, thereby satisfying the P1 stability gate at the
-larger window. In each series, the sole machine mismatch was the equivalent `3/8` LaTeX wrapper.
-P2 then passed exact 120,000-token needles at depths 0.1, 0.5, and 0.9. Calibration-only seed
-selection happened before inference; the public composite contains only fresh zero-tolerance
-receipts whose tokenizer and response-usage counts both equal 120,000.
+artifact's independent P2 series at 128K improved to 120/120 machine-exact and semantically
+correct, with 0/120 sink detections, thereby satisfying the P1 stability gate at the larger
+window. P2 then passed exact 120,000-token needles at depths 0.1, 0.5, and 0.9. Each case was
+calibrated with tokenizer-only requests before its sole inference; the public composite contains
+only fresh zero-tolerance receipts whose tokenizer and response-usage counts both equal 120,000.
 
 ## Bits‑vs‑quality ablation (same stack, only the expert codes change)
 | codebook | bits | MTP acc. length | draft accept % | arithmetic | coherence |

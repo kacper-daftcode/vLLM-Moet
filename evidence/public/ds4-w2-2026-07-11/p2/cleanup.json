@@ -3,7 +3,7 @@
   "result": "pass",
   "stop_handshake_accepted": true,
   "controller_cleanup_exit_code": 0,
-  "cleanup_completed_at_utc": "2026-07-12T01:17:22Z",
+  "cleanup_completed_at_utc": "2026-07-12T02:38:15Z",
   "watchdog_done_marker_present": true,
   "abort_receipt_present": false,
   "evaluation_container_absent_after": true,
@@ -17,11 +17,13 @@
     200
   ],
   "generated_store_removed_after_evidence_sync": true,
-  "generated_store_removed_bytes": 230317622095,
+  "generated_store_removed_bytes": 230317622135,
+  "generated_store_metadata_delta_bytes_from_predecessor": 40,
+  "generated_store_metadata_change": "Both pack manifests add fp4_split=false; payload pack sizes are unchanged.",
   "controller_log": {
-    "line_count": 31,
-    "byte_count": 2646,
-    "sha256": "88352089aec1e381ee18d9189099427f3970c2c79a2a09975c0f586c7a8d1b7a"
+    "line_count": 69,
+    "byte_count": 6104,
+    "sha256": "c1f97c6ae43ab3c735d1990d0cc215e694e49f53dc6a7c3de36789599cc4a927"
   },
   "verification_note": "The final container-inspect receipt was captured before stop. Post-stop absence is established by the guarded controller successful remove-and-reinspect path and zero cleanup exit code. Immediate post-restart curls initially saw connection refusal; the controller health waits completed, and the listed 200 responses are a later follow-up verification. Topology-specific identifiers remain private."
 }

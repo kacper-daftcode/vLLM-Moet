@@ -1,6 +1,6 @@
 # Frontier MoE on consumer Blackwell (SM120)
 
-**Official vLLM v0.24.0 + a 13.8k-line, 70-file patch** that serves frontier Mixture-of-Experts models —
+**Official vLLM v0.24.0 + a 14.0k-line, 70-file patch** that serves frontier Mixture-of-Experts models —
 **GLM‑5.2 (753B)**, **DeepSeek‑V4‑Flash (159B)** and **Kimi‑K2.7‑Code (1T)** — on
 consumer/workstation Blackwell (RTX PRO 6000, RTX 5090), hardware their official checkpoints
 cannot even fit on. Three ideas carry it:
@@ -68,7 +68,7 @@ medians; prefill = 8k‑token prompt, uncached):
 
 Retrieval behind the window column: needle PASS at 453K on the PRO 6000 (947K‑token KV
 measured), at 29.7K on the single-5090 throughput configuration (131K-token KV), and 3/3 exact
-at 120K on the canonical no-MTP 128K quality configuration (720,386-token KV). The 128K row is
+at 120K on the canonical no-MTP 128K quality configuration (720,677-token KV). The 128K row is
 a quality/context result, not a throughput measurement. "—" in host RAM = all-VRAM config, no
 host expert store.
 
@@ -169,8 +169,8 @@ its frequency and pair count are KPI-visible as `fp-residue` and are reported be
 Results: **DeepSeek‑V4‑Flash 159B on one RTX 5090** (72.7 GiB of 2‑bit planes vs 32 GB of
 VRAM): ~31 tok/s steady with MTP, 32K window served, coherent — and ~30 GiB of host RAM
 with the NVMe stores (below, RSS‑measured) instead of ~80 GiB pinned.
-The canonical no-MTP quality configuration separately serves a 128K window: 119/120
-machine-exact, 120/120 semantically correct, 0/120 frozen-rule sink detections, and 3/3 exact
+The canonical no-MTP quality configuration separately serves a 128K window: 120/120
+machine-exact and semantically correct, 0/120 frozen-rule sink detections, and 3/3 exact
 retrieval at 120K prompt tokens. Throughput was not measured for that configuration.
 **GLM‑5.2 753B on two RTX PRO 6000**: 28–32 tok/s with the full three‑tier stack (NVMe 2‑bit
 base + pinned arena → GPU 2‑bit cache → GPU FP4) at a 128K single‑user window — see the GLM
@@ -254,7 +254,7 @@ Operational notes:
   `MemAvailable` stayed above 73.79 GB, cgroup swap and PSI/OOM counters remained zero,
   and the host recorded no swap-out; host swap-in increased by 160 pages. The full canary used
   the mechanism-equivalent `e7417054a6e8`
-  predecessor; the integrated `4708c9d41b50` image retains that P0 code and passed the exact-head
+  predecessor; the integrated `41d7b2f96ca3` image retains that P0 code and passed the exact-head
   baked safety suites. See the [sanitized P0 receipts](evidence/public/ds4-w2-2026-07-11/p0/).
 - **Prefill is semantic, eager, and arena-safe.** The runner derives prefill from prompt
   progress and propagates it explicitly through normal, replay, pipeline, gate, and DBO paths;
@@ -478,7 +478,7 @@ Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recip
 
 ## Repository layout
 - **`patch/vllm-moet-v0.24.0.patch`** — the single canonical delta vs official vLLM `v0.24.0`
-  (70 files, +13.8k/-226 source lines; applies clean on the tag). Goes with the pins above.
+  (70 files, +14,018/-226 source lines; applies clean on the tag). Goes with the pins above.
 - **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
   cubins.
 - **`kernels/`** — SASS (`sass/`) + prebuilt SM120 cubins (`cubins-sm120/`, incl. the K=6144

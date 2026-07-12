@@ -2,11 +2,11 @@
   "artifacts": {
     "manifest": "seed44.manifest.json",
     "raw_jsonl": "seed44.raw.jsonl",
-    "raw_sha256": "c16f3fc4f4acff0d8cb2f4fa4085be7899cf07c0fe0f268877acd87d30e2e969",
+    "raw_sha256": "d188e788324b3d47a8a81112e7c1e185e1297e703c78df6f30d19b5c0dae7600",
     "warmup_jsonl": "seed44.warmup.jsonl",
-    "warmup_sha256": "0b6306a4000501a734e00b6f08cda33b201a5701cc4095a1d367de827ac92c01"
+    "warmup_sha256": "e1485a5efec3960924b722834bd04d87112bf32ad1a98373a9981455412d08ba"
   },
-  "completed_at_utc": "2026-07-12T01:00:25.913635Z",
+  "completed_at_utc": "2026-07-12T02:24:12.827395Z",
   "error": null,
   "eval": {
     "max_tokens": 700,
@@ -18,6 +18,41 @@
     "top_p": 0.95
   },
   "harness": {
+    "argv": [
+      "tools/ds4_eval/eval_rig.py",
+      "--items",
+      "tools/ds4_eval/items.json",
+      "--server-provenance",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/server.json",
+      "--pool-gate-policy",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/pool-gate-policy-quality.json",
+      "--pool-command-json",
+      "private pool-log command omitted",
+      "--output-dir",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/quality-seed44",
+      "--run-label",
+      "p2-integration-41d7b2f-128k-r1-s44",
+      "--url",
+      "private evaluation endpoint omitted",
+      "--model",
+      "deepseek-v4-flash-w2",
+      "--mode",
+      "warm",
+      "--eval-seed",
+      "44",
+      "--eval-temperature",
+      "0.6",
+      "--eval-top-p",
+      "0.95",
+      "--eval-max-tokens",
+      "700",
+      "--eval-timeout",
+      "300",
+      "--expected-count",
+      "40",
+      "--pool-kpi-timeout",
+      "30"
+    ],
     "files": {
       "eval_rig.py": "1d338ab4b1279238c5b0f7ce0e91694b16ac1883da428fd2a59cd17030ced11b",
       "harness.py": "62240f57a4b27d4bc10aa7083fd32542a21797aea1d1aaac586cc827e4fe0e25",
@@ -27,7 +62,7 @@
   },
   "inputs": {
     "expected_count": 40,
-    "items_path": "/private/tmp/codex-w2-restage-safety-20260711/tools/ds4_eval/items.json",
+    "items_path": "tools/ds4_eval/items.json",
     "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
   },
   "pool_gate": {
@@ -35,7 +70,7 @@
     "checks": [
       {
         "metric": "fp4_tick",
-        "observed": 28856,
+        "observed": 56478,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -49,7 +84,7 @@
       },
       {
         "metric": "fp4_total_evicted",
-        "observed": 88014,
+        "observed": 89056,
         "operator": ">=",
         "passed": true,
         "threshold": 1
@@ -91,17 +126,17 @@
         "base_replay_pct": 90.6,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-12T00:53:56.998354Z",
+        "captured_at_utc": "2026-07-12T02:17:35.262453Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 19.6,
+        "fp4_expert_hit_pct": 19.5,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 28856,
-        "fp4_token_hit_pct": 26.6,
-        "fp4_total_evicted": 88014,
-        "fp4_total_promoted": 88495,
-        "fp4_window_evicted": 672,
-        "fp4_window_promoted": 672,
+        "fp4_tick": 56478,
+        "fp4_token_hit_pct": 26.2,
+        "fp4_total_evicted": 89056,
+        "fp4_total_promoted": 89537,
+        "fp4_window_evicted": 621,
+        "fp4_window_promoted": 621,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
@@ -109,7 +144,7 @@
       "checks": [
         {
           "metric": "fp4_tick",
-          "observed": 31864,
+          "observed": 59550,
           "operator": ">=",
           "passed": true,
           "threshold": 1
@@ -123,14 +158,14 @@
         },
         {
           "metric": "fp4_total_evicted",
-          "observed": 129585,
+          "observed": 133525,
           "operator": ">=",
           "passed": true,
           "threshold": 1
         },
         {
           "metric": "fp4_total_evicted_delta",
-          "observed": 41571,
+          "observed": 44469,
           "operator": ">=",
           "passed": true,
           "threshold": 16
@@ -168,17 +203,17 @@
         "base_replay_pct": 98.4,
         "base_replay_steps": 64,
         "base_unrestored_experts": 0,
-        "captured_at_utc": "2026-07-12T01:00:25.911469Z",
+        "captured_at_utc": "2026-07-12T02:24:12.825830Z",
         "fp4_cached": 481,
-        "fp4_expert_hit_pct": 21.5,
+        "fp4_expert_hit_pct": 22.7,
         "fp4_occupancy": 1.0,
         "fp4_slots": 481,
-        "fp4_tick": 31864,
-        "fp4_token_hit_pct": 22.7,
-        "fp4_total_evicted": 129585,
-        "fp4_total_promoted": 130066,
-        "fp4_window_evicted": 749,
-        "fp4_window_promoted": 749,
+        "fp4_tick": 59550,
+        "fp4_token_hit_pct": 23.1,
+        "fp4_total_evicted": 133525,
+        "fp4_total_promoted": 134006,
+        "fp4_window_evicted": 814,
+        "fp4_window_promoted": 814,
         "gate_fire_rate": null,
         "gate_fired": null,
         "gate_steps": null
@@ -191,17 +226,17 @@
       "base_replay_pct": 90.6,
       "base_replay_steps": 64,
       "base_unrestored_experts": 0,
-      "captured_at_utc": "2026-07-12T00:53:56.998354Z",
+      "captured_at_utc": "2026-07-12T02:17:35.262453Z",
       "fp4_cached": 481,
-      "fp4_expert_hit_pct": 19.6,
+      "fp4_expert_hit_pct": 19.5,
       "fp4_occupancy": 1.0,
       "fp4_slots": 481,
-      "fp4_tick": 28856,
-      "fp4_token_hit_pct": 26.6,
-      "fp4_total_evicted": 88014,
-      "fp4_total_promoted": 88495,
-      "fp4_window_evicted": 672,
-      "fp4_window_promoted": 672,
+      "fp4_tick": 56478,
+      "fp4_token_hit_pct": 26.2,
+      "fp4_total_evicted": 89056,
+      "fp4_total_promoted": 89537,
+      "fp4_window_evicted": 621,
+      "fp4_window_promoted": 621,
       "gate_fire_rate": null,
       "gate_fired": null,
       "gate_steps": null
@@ -212,7 +247,7 @@
     "cases": 10,
     "enabled": true,
     "max_tokens": 150,
-    "receipts_sha256": "0b6306a4000501a734e00b6f08cda33b201a5701cc4095a1d367de827ac92c01",
+    "receipts_sha256": "e1485a5efec3960924b722834bd04d87112bf32ad1a98373a9981455412d08ba",
     "retry_count": 0,
     "seed": 20260711,
     "status": "passed",
@@ -222,14 +257,14 @@
     "receipts_sha256_scope": "published_sanitized_jsonl"
   },
   "quality_comparable": true,
-  "run_label": "p2-integration-4708c9d-128k-s44",
+  "run_label": "p2-integration-41d7b2f-128k-r1-s44",
   "schema_version": "ds4-w2-eval-v1",
   "server": {
     "served_model": "deepseek-v4-flash-w2",
     "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
-    "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+    "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
     "runtime": {
       "max_model_len": 131072,
       "base_cache_gb": 8,
@@ -257,12 +292,12 @@
       "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
     }
   },
-  "started_at_utc": "2026-07-12T00:53:30.255201Z",
+  "started_at_utc": "2026-07-12T02:17:08.691100Z",
   "status": "complete",
   "summary": {
     "clean": 40,
     "coding_clean": 20,
-    "lenient": 40,
+    "lenient": 39,
     "n": 40,
     "reasoning_clean": 20,
     "sinks": 0

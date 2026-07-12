@@ -10,7 +10,7 @@ boundaries are in [`docs/benchmarks/ds4-w2-5090-2026-07-11.md`](../../../docs/be
 |---|---|
 | P0 all-layer cold canary | mechanism-equivalent predecessor `e7417054a6e8`; measured memory belongs only to this canary |
 | Historical P1 32K receipts | patch `55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7`; image `sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab` |
-| Canonical integrated P2 and exact-head verification | official vLLM `ee0da84ab9e04ac7610e28580af62c365e898389`; patch `4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5`; image `sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934`; wrapper `fe67421c56d94daa8b33434fe94c4a6fd8281ebf` |
+| Canonical integrated P2 and exact-head verification | official vLLM `ee0da84ab9e04ac7610e28580af62c365e898389`; patch `41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d`; image `sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9`; wrapper `5e69228e1e8e6f7345ae96657ab33b50e5805be7` |
 
 [`exact-image-verification.json`](exact-image-verification.json) records the clean-apply shape,
 baked source hashes, exact-image test matrix, and integrated-image synthetic safety-probe hashes.
@@ -44,15 +44,14 @@ records fingerprint preservation, service restoration, and disposable-store remo
 
 The P2 receipts bind to the canonical integrated artifact above. Its three-seed 128K series also
 satisfies the P1 stability requirement. [`p2/quality-aggregate.json`](p2/quality-aggregate.json)
-reports 119/120 machine-exact,
-120/120 semantically correct, and 0/120 frozen-rule sink detections at a 131,072-token window.
-The sole machine mismatch is seed 43 item `r17`, the mathematically equivalent `3/8` LaTeX wrapper.
+reports 120/120 machine-exact and semantically correct, with 0/120 frozen-rule sink detections at
+a 131,072-token window.
 
 [`p2/context-120k.manifest.json`](p2/context-120k.manifest.json) and
 [`p2/context-120k.receipts.jsonl`](p2/context-120k.receipts.jsonl) contain the admitted exact
 120,000-token receipts at depths 0.1, 0.5, and 0.9. All three published receipts use zero token
-tolerance. One initial calibration failed closed at 120,001 before inference and contributes no
-chat response; calibration-only seed qualification selected fresh exact-hit receipts.
+tolerance. Each case calibrated to exactly 120,000 tokens with tokenizer-only requests before its
+sole inference; no rejected calibration contributed a chat response in this run.
 Readiness, complete runtime/memory, and guarded cleanup are recorded in
 [`p2/readiness.json`](p2/readiness.json), [`p2/runtime-clean.json`](p2/runtime-clean.json), and
 [`p2/cleanup.json`](p2/cleanup.json).

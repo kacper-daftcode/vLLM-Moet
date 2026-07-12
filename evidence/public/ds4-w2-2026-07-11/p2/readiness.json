@@ -1,7 +1,7 @@
 {
   "schema_version": "ds4-w2-p2-public-readiness-v2",
   "result": "pass",
-  "ready_at_utc": "2026-07-12T00:36:46Z",
+  "ready_at_utc": "2026-07-12T02:01:04Z",
   "sustained_health_hold_seconds": 30,
   "runtime": {
     "max_model_len": 131072,
@@ -12,16 +12,16 @@
   "capacity": {
     "model_loading_memory_gib": 22.87,
     "available_kv_cache_memory_gib": 4.8,
-    "gpu_kv_cache_tokens": 720386,
+    "gpu_kv_cache_tokens": 720677,
     "reported_maximum_concurrency_at_full_window": 5.5
   },
   "watchdog_start_to_ready": {
-    "samples": 149,
-    "elapsed_seconds": 150.0,
-    "host_mem_available_min_bytes": 112834666496,
+    "samples": 337,
+    "elapsed_seconds": 343.6,
+    "host_mem_available_min_bytes": 104107237376,
     "host_swap_free_min_bytes": 8589918208,
-    "cgroup_memory_current_max_bytes": 8667557888,
-    "cgroup_memory_peak_bytes": 8726413312,
+    "cgroup_memory_current_max_bytes": 22381260800,
+    "cgroup_memory_peak_bytes": 22381522944,
     "cgroup_memory_max_bytes": 107374182400,
     "cgroup_memory_high_bytes": 103079215104,
     "cgroup_swap_current_max_bytes": 0,
@@ -35,9 +35,9 @@
   },
   "artifact_identity": {
     "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
-    "wrapper_head_commit": "fe67421c56d94daa8b33434fe94c4a6fd8281ebf"
+    "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+    "wrapper_head_commit": "5e69228e1e8e6f7345ae96657ab33b50e5805be7"
   },
   "sanitization_note": "Topology-specific and private runtime provenance identifiers are intentionally omitted."
 }

@@ -35,7 +35,7 @@
       },
       {
         "seed": 43,
-        "machine_exact": 39,
+        "machine_exact": 40,
         "semantic_equivalent": 40,
         "responses": 40,
         "sinks": 0,
@@ -51,26 +51,27 @@
       }
     ],
     "combined": {
-      "machine_exact": 119,
+      "machine_exact": 120,
       "semantic_equivalent": 120,
       "responses": 120,
       "coding_machine_exact": 60,
-      "reasoning_machine_exact": 59,
+      "reasoning_machine_exact": 60,
       "sinks": 0,
       "errors": 0,
       "non_200_responses": 0,
       "non_stop_finishes": 0
     },
-    "latex_normalization_caveat": {
-      "item": "r17",
+    "scoring_note": {
+      "item": "c18",
       "affected_seeds": [
-        43
+        44
       ],
-      "expected": "3/8",
-      "returned_final": "\\(\\frac{3}{8}\\)",
-      "machine_exact": false,
+      "expected": "(2, 5)",
+      "returned_final": "(2,5)",
+      "machine_exact": true,
+      "legacy_lenient_flag": false,
       "sink": false,
-      "interpretation": "The returned value is mathematically equivalent to 3/8, but the frozen scorer does not normalize this LaTeX wrapper. The public machine score remains 119/120; 120/120 is reported separately as semantic equivalence."
+      "interpretation": "The frozen exact scorer normalizes tuple whitespace; the legacy lenient flag does not. The machine-exact count remains 120/120."
     }
   },
   "receipt_derived_latency_seconds": {
@@ -78,62 +79,62 @@
     "per_seed": [
       {
         "seed": 42,
-        "max": 32.405,
-        "mean": 9.90055,
-        "median": 9.1425,
-        "p95": 14.6,
-        "sum": 396.022
+        "max": 34.588,
+        "mean": 9.90535,
+        "median": 9.0635,
+        "p95": 14.294,
+        "sum": 396.214
       },
       {
         "seed": 43,
-        "max": 25.672,
-        "mean": 10.042975,
-        "median": 8.6005,
-        "p95": 16.786,
-        "sum": 401.719
+        "max": 25.879,
+        "mean": 10.155899999999999,
+        "median": 8.9265,
+        "p95": 16.053,
+        "sum": 406.236
       },
       {
         "seed": 44,
-        "max": 20.121,
-        "mean": 9.716249999999999,
-        "median": 8.8335,
-        "p95": 17.105,
-        "sum": 388.65
+        "max": 18.092,
+        "mean": 9.9346,
+        "median": 9.092,
+        "p95": 15.988,
+        "sum": 397.384
       }
     ],
     "combined": {
-      "sum": 1186.391,
-      "mean": 9.886591666666666,
-      "median": 8.968,
-      "p95": 16.786,
-      "max": 32.405
+      "sum": 1199.834,
+      "mean": 9.998616666666667,
+      "median": 8.971,
+      "p95": 16.053,
+      "max": 34.588
     }
   },
   "pool_activity_during_scoring": {
     "per_seed": [
       {
         "seed": 42,
-        "evictions": 43178,
+        "evictions": 42760,
         "post_latest_64_replay_percent": 98.4,
         "post_latest_64_residue_steps": 63,
         "post_unrestored_experts": 0
       },
       {
         "seed": 43,
-        "evictions": 42756,
-        "post_latest_64_replay_percent": 98.4,
+        "evictions": 43118,
+        "post_latest_64_replay_percent": 100.0,
         "post_latest_64_residue_steps": 63,
         "post_unrestored_experts": 0
       },
       {
         "seed": 44,
-        "evictions": 41571,
+        "evictions": 44469,
         "post_latest_64_replay_percent": 98.4,
         "post_latest_64_residue_steps": 63,
         "post_unrestored_experts": 0
       }
     ],
-    "combined_evictions": 127505,
+    "combined_evictions": 130347,
     "all_pre_and_post_gates_passed": true,
     "policy_boundary": "The quality policy required full FP4 occupancy, live churn, and zero unrestored experts. Replay rate and second-order residue were retained in the manifests but were not rejection thresholds."
   },

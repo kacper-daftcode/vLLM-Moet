@@ -4,15 +4,15 @@
   "status": "complete",
   "context_validated": true,
   "exact_prompt_contract": true,
-  "started_at_utc": "2026-07-12T01:03:06.509177Z",
-  "completed_at_utc": "2026-07-12T01:16:23.167087Z",
+  "started_at_utc": "2026-07-12T02:24:47.144372Z",
+  "completed_at_utc": "2026-07-12T02:37:38.949660Z",
   "server": {
     "schema_version": "ds4-w2-public-server-v2",
     "served_model": "deepseek-v4-flash-w2",
     "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-    "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-    "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
-    "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+    "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+    "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
     "runtime": {
       "max_model_len": 131072,
       "base_cache_gb": 8,
@@ -45,7 +45,7 @@
     },
     "capacity": {
       "available_kv_cache_memory_gib": 4.8,
-      "gpu_kv_cache_tokens": 720386,
+      "gpu_kv_cache_tokens": 720677,
       "reported_maximum_concurrency_at_full_window": 5.5
     },
     "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and endpoint details are retained only in private source receipts."
@@ -88,22 +88,25 @@
     "selection_rule": "Use only fresh tolerance-zero receipts after calibration-only seed qualification; depths 0.1/0.5 share one manifest and depth 0.9 uses a second manifest."
   },
   "calibration_selection": {
-    "failed_closed_attempts_before_inference": 1,
-    "failed_depth": 0.1,
-    "closest_observed_prompt_tokens": 120001,
-    "chat_requests_contributed": 0,
+    "failed_closed_attempts_before_inference": 0,
+    "chat_requests_contributed_by_rejected_calibrations": 0,
     "qualified_manifest_seeds": [
       20260714,
       20260711
     ],
-    "interpretation": "The rejected calibration emitted no model answer and contributes no retrieval row. Candidate seeds were checked with /tokenize only; the three published receipts are fresh, zero-tolerance inference requests."
+    "per_case_seeds": [
+      20260714,
+      20260715,
+      20260711
+    ],
+    "interpretation": "Each published case calibrated to exactly 120000 tokens via /tokenize before its sole chat request; no failed calibration issued a model answer in this run."
   },
   "summary": {
     "accepted": 3,
     "of": 3,
     "min_observed_prompt_tokens": 120000,
     "max_observed_prompt_tokens": 120000,
-    "receipts_sha256": "b44a9fc08d72c050f0a264629758d016e6f933452617d44959a196b70fb8b367",
+    "receipts_sha256": "67c2a1f834b9a6ce54d4ea4f2ce98a51c5257bfb8a78cf9a3917bbab52ea1db7",
     "receipts_sha256_scope": "published_sanitized_composite_jsonl"
   },
   "artifacts": {

@@ -1,15 +1,15 @@
 {
   "schema_version": "vllm-moet-exact-image-verification-v2",
   "official_vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-  "integrated_origin_main_commit": "6ed0d1abb55e218b6aa6354e6b06169d5da652b9",
-  "wrapper_head_commit": "fe67421c56d94daa8b33434fe94c4a6fd8281ebf",
-  "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-  "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
-  "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-  "image_wrapper_commit_label": "fe67421c56d94daa8b33434fe94c4a6fd8281ebf",
+  "integrated_origin_main_commit": "7d2429c109b625f23ed7926eb4e80f5d8d80f2e5",
+  "wrapper_head_commit": "5e69228e1e8e6f7345ae96657ab33b50e5805be7",
+  "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+  "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+  "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+  "image_wrapper_commit_label": "5e69228e1e8e6f7345ae96657ab33b50e5805be7",
   "applied_tree": {
     "files_changed": 70,
-    "insertions": 13815,
+    "insertions": 14018,
     "deletions": 226,
     "apply_check": "pass",
     "source_diff_whitespace_check": "pass",
@@ -20,14 +20,15 @@
     "vllm/v1/worker/gpu_model_runner.py": "63a08d992701cfca677de0e35eab2bc00e97a4514ae6d69858d544460d35be3f",
     "vllm/v1/worker/gpu_ubatch_wrapper.py": "cc9526d859ccecdeb69b42140c92ba13c6fb80a8091734ab518a819c322dd1e7",
     "vllm/v1/worker/gpu_worker.py": "76331291a8cd98236a17d85ffced0a4ed2d749da7e68f163e5ffb3df922faca5",
-    "vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py": "f11039af14494380875aa4fdd8ba42fa9235205b5062a708d530032494ac1b55",
-    "vllm/model_executor/layers/quantization/utils/moe_w2_delta.py": "044cb275bad4a9f4c30f2c78a5c967bb982822824209f29a3acda6fe0a3b0595",
-    "vllm/model_executor/layers/quantization/utils/moe_w2_gate.py": "d035e371fd93a7840733ecb3c9b2b89675a5448efac0da834fd5628c1052691b"
+    "vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py": "446ca01535ffdf5b0c96921f456ab22c406edab92df6379f07100c6af7757a97",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_delta.py": "5810322e7b7c94d531c3482cd26f4400fbb0551bc9c9b0e04031a90a2fe0a3f8",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_gate.py": "d035e371fd93a7840733ecb3c9b2b89675a5448efac0da834fd5628c1052691b",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_planes.py": "3555b5561063ca000be91fabaf3e65a8da4b56e6c75e93c46611aa82c66e5a56"
   },
   "canonical_synthetic_safety_probes": {
-    "checkpoint_residency_sha256": "d28aee973077f93bc39bb3c6561a1e273bd91c616bbf6675c41c1e1d63004c1b",
-    "checkpoint_next_shard_retry_sha256": "a2740c46760eae8db301625268f2944115a53ad70ef4e4711d30bbc7198cdd0e",
-    "constrained_pack_build_sha256": "0e07c41f9adf6f8a35bcf82407d85e4c744541b4b3bb7e6e4c6fba0c19713d72",
+    "checkpoint_residency_sha256": "2d831aab1d09291e118f84d4801cede44f6e46645e33fec33cc5f404d48914c8",
+    "checkpoint_next_shard_retry_sha256": "1a8588c770313d9995a53e4eedebb4825f70c709e85f68fcaa45031ec95c1dda",
+    "constrained_pack_build_sha256": "f5f0ca3e92ef0802b96d5b683584bfafcc875cd0ac7fc2d85962affdd0614e77",
     "image_identity_match": true
   },
   "tests": {
@@ -35,11 +36,14 @@
     "exact_image_store_safety": "37 passed",
     "exact_image_mxfp4_stream_safety": "10 passed",
     "exact_image_gpu_store_backends": "all pinned, mmap, reboot, tiered, eviction, overflow, scan, and preheat checks passed",
+    "exact_image_forward_matrix": "base 2-bit, full-FP4 delta, and split-FP4 refinement passed at E=32 before fixture-only formatting and at E=8 after formatting beside live production",
+    "split_fp4_base_cache_boundary": "VLLM_MOE_W2_DELTA_SPLIT=1 is rejected when VLLM_MOE_W2_BASE_CACHE_GB=8; the serving lane remains on full-nibble FP4 delta planes",
+    "live_gpu_contention_boundary": "one post-format E=32 rerun exhausted free VRAM while production occupied 25.37 GiB; the reduced E=8 rerun covered the same three numerical paths and passed",
     "evaluation_and_context_harness": "39 passed, 17 subtests passed",
-    "guarded_128k_quality": "119/120 machine-exact, 120/120 semantically correct, 0/120 sinks; all retry-free prewarms and pre/post pool gates passed",
+    "guarded_128k_quality": "120/120 machine-exact, 120/120 semantically correct, 0/120 sinks; all retry-free prewarms and pre/post pool gates passed",
     "guarded_120k_context": "3/3 exact at zero prompt-token tolerance",
-    "ruff": "pass",
-    "format": "pass",
+    "ruff": "changed W2 harness and targeted project files pass; broad upstream helper lint is outside this receipt",
+    "format": "changed W2 harness and targeted project files pass",
     "benchmark_lint": "0 errors, 0 warnings",
     "benchmark_render_check": "up to date"
   }

@@ -2,7 +2,7 @@
 
 The project targets **official vLLM v0.24.0**, which ships DeepSeek‑V4 + SM120 natively
 (`vllm/models/deepseek_v4/`, FlashInfer SM120 sparse‑MLA, GLM‑5.x `GlmMoeDsaForCausalLM`).
-Our overlay is a **13.8k-line patch** (70 files): the 2-bit expert planes, the FP4 delta
+Our overlay is a **14.0k-line patch** (70 files, 14,018 insertions): the 2-bit expert planes, the FP4 delta
 cache, the confidence gate, the cubit dispatch, the expert stores — plus the SM120 fixes
 below.
 
@@ -172,7 +172,7 @@ Environment pins that go with the patch (both required on SM120):
   73,793,277,952-byte host `MemAvailable` floor; cgroup swap, PSI, limit, and OOM events were
   zero, and the host recorded no swap-out; host swap-in increased by 160 pages.
   That all-layer canary used predecessor patch `e7417054a6e8`; integrated patch
-  `4708c9d41b50` retains the mechanism and passed the exact-head baked safety tests. Sanitized
+  `41d7b2f96ca3` retains the mechanism and passed the exact-head baked safety tests. Sanitized
   trace and cleanup receipts are under
   [`evidence/public/ds4-w2-2026-07-11/p0/`](../evidence/public/ds4-w2-2026-07-11/p0/).
   Historical predecessor receipts establish the 32K P1 lane; the current integrated image's

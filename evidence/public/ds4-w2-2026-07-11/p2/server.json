@@ -2,9 +2,9 @@
   "schema_version": "ds4-w2-public-server-v2",
   "served_model": "deepseek-v4-flash-w2",
   "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
-  "source_patch_sha256": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
-  "image_id": "sha256:18c02398e4760ac3a9572a30dbc6597883886568820104e86a7b8631dfc64934",
-  "image_source_patch_label": "4708c9d41b505ce875eeb5a06c75d3589db0401d70bc5ff6fa176f39be4089f5",
+  "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+  "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+  "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
   "runtime": {
     "max_model_len": 131072,
     "base_cache_gb": 8,
@@ -37,7 +37,7 @@
   },
   "capacity": {
     "available_kv_cache_memory_gib": 4.8,
-    "gpu_kv_cache_tokens": 720386,
+    "gpu_kv_cache_tokens": 720677,
     "reported_maximum_concurrency_at_full_window": 5.5
   },
   "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and endpoint details are retained only in private source receipts."
