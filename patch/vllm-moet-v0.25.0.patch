@@ -647,10 +647,10 @@ index 0000000..2b4a328
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 new file mode 100644
-index 0000000..711fb77
+index 0000000..4da3005
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
-@@ -0,0 +1,464 @@
+@@ -0,0 +1,492 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -823,6 +823,34 @@ index 0000000..711fb77
 +        self.assertFalse(tier._forward_paused)
 +        self.assertTrue(tier._wake_driven)
 +        tier._wake.set.assert_called_once_with()
++
++    def test_stop_joins_idle_manager_and_releases_forward_pause(self):
++        tier = object.__new__(self.delta.DeltaTier)
++        tier._stop = False
++        tier._wake = threading.Event()
++        tier._forward_lock = threading.Lock()
++        tier._forward_lock.acquire()
++        tier._forward_paused = True
++        tier._thread = threading.Thread(target=tier._wake.wait, daemon=True)
++        tier._thread.start()
++
++        tier.stop()
++
++        self.assertTrue(tier._stop)
++        self.assertFalse(tier._forward_paused)
++        self.assertIsNone(tier._thread)
++        self.assertTrue(tier._forward_lock.acquire(blocking=False))
++        tier._forward_lock.release()
++
++    def test_shutdown_all_stops_each_unique_tier_once(self):
++        tier = mock.Mock()
++        with (
++            mock.patch.object(self.delta, "_BASE_TIER", tier),
++            mock.patch.object(self.delta, "_TIER", tier),
++        ):
++            self.delta.shutdown_all()
++
++        tier.stop.assert_called_once_with()
 +
 +    def test_ensure_resident_drains_then_uses_exact_layer_snapshot(self):
 +        tree = ast.parse(DELTA_PATH.read_text())
@@ -4896,10 +4924,10 @@ index 0000000..cf35fde
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000..f9b12c8
+index 0000000..5c7d49c
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1899 @@
+@@ -0,0 +1,1937 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -4930,6 +4958,7 @@ index 0000000..f9b12c8
 +cold slots keeps pool rewrites away from in-flight reads.
 +"""
 +
++import atexit
 +import os
 +import threading
 +import time
@@ -5404,6 +5433,29 @@ index 0000000..f9b12c8
 +                                        name="moe-w2-delta")
 +        self._thread.start()
 +
++    def stop(self) -> None:
++        """Stop and join the manager before Torch/Python module teardown.
++
++        Python 3.12 + the v0.25 stable-libtorch extension can abort at process
++        exit if a daemon manager is still copying tensors while pybind and
++        Torch interpreter state are being destroyed. Serving workers normally
++        live until process exit, so an atexit-driven explicit join is the only
++        reliable ownership boundary.
++        """
++        self._stop = True
++        if self._forward_paused:
++            self._forward_paused = False
++            self._forward_lock.release()
++        self._wake.set()
++        thread = self._thread
++        if thread is None or thread is threading.current_thread():
++            return
++        thread.join(timeout=max(_FALLBACK_S, _TICK_S) + 2.0)
++        if thread.is_alive():
++            logger.warning("moe_w2 delta manager did not stop before timeout")
++        else:
++            self._thread = None
++
 +    # ---- manager loop ----------------------------------------------------
 +
 +    def _loop(self):
@@ -5422,6 +5474,8 @@ index 0000000..f9b12c8
 +                # runner): keep the legacy fixed-period poll.
 +                self._wake.wait(timeout=_TICK_S)
 +            self._wake.clear()
++            if self._stop:
++                break
 +            # A target/replay sequence holds this lock. If the next target
 +            # starts before an event-driven pass does, the pass waits; if the
 +            # pass already started, the target waits for it to finish.
@@ -6705,6 +6759,18 @@ index 0000000..f9b12c8
 +    t = _TIER
 +    if t is not None:
 +        t.wake()
++
++
++def shutdown_all() -> None:
++    """Join every distinct tier manager while Torch is still fully alive."""
++    stopped: set[int] = set()
++    for tier in (_BASE_TIER, _TIER):
++        if tier is not None and id(tier) not in stopped:
++            stopped.add(id(tier))
++            tier.stop()
++
++
++atexit.register(shutdown_all)
 +
 +
 +def get_base_tier(n_layers: int, n_experts: int, dev,

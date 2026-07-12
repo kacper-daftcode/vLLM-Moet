@@ -11,8 +11,8 @@ rollback boundary until the v0.25 candidate passes the SM120 hardware canary.
 - Official tag commit: `702f4814fe54fabff350d43cb753ae3e47c0c276`
 - Linux/amd64 base image manifest: `sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97`
 - W2 overlay: `patch/vllm-moet-v0.25.0.patch`
-- Overlay SHA-256: `9ebd246059592ce2966f63854785f4c98f7c75f4f00d940a351902207a8e0072`
-- Overlay scope: 60 files, 12,976 insertions, 133 deletions
+- Overlay SHA-256: `25ac6fea69d71c1a641b0d6343c01011bca3b481436e29f9f02f8e4c3ce639a4`
+- Overlay scope: 60 files, 13,042 insertions, 133 deletions
 
 Apply it directly to an official checkout with:
 
@@ -78,6 +78,10 @@ hardware-aware DSpark confidence scheduler.
 - **The DSpark extensions remain optional.** v0.25 supplies the core DSpark
   engine; the overlay adds per-request confidence widths, profiled cost tables,
   online calibration, hysteresis, and live dynamic-SD re-derivation.
+- **Tier managers stop before interpreter teardown.** The v0.25 stable-libtorch
+  extension can abort if a daemon manager still owns Torch tensors during
+  Python shutdown. Each tier now has an explicit stop/join boundary and the
+  module registers a deduplicated `atexit` shutdown for serving workers.
 
 ## Verification completed before image build
 
@@ -85,7 +89,8 @@ The source port passed:
 
 - `git diff --check` against the exact v0.25 tag;
 - Python compilation across every changed Python file;
-- 20 passed / 1 skipped focused W2 memory, padded-route, and step-pin tests;
+- 22 passed / 1 skipped focused W2 memory, padded-route, step-pin, and manager
+  shutdown tests;
 - 6 passed CPU DSpark scheduling and live-re-derivation regressions;
 - clean patch application and a committed 60-file lost-line manifest.
 
