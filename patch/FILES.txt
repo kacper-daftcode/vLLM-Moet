@@ -4,6 +4,9 @@
 # patch but not in the vllm fork branch the patch is generated from —
 # merge it into the branch first; do not ship the regeneration.
 csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
+tests/model_executor/layers/quantization/test_moe_w2_cgroup_memory.py
+tests/model_executor/layers/quantization/test_moe_w2_padded_routes.py
+tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 tools/nvfp4_flashinfer_sm120/README.md
 tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
@@ -12,6 +15,7 @@ vllm/compilation/cuda_graph.py
 vllm/config/speculative.py
 vllm/config/vllm.py
 vllm/envs.py
+vllm/forward_context.py
 vllm/model_executor/layers/attention/mla_attention.py
 vllm/model_executor/layers/quantization/fp8.py
 vllm/model_executor/layers/quantization/modelopt.py
@@ -27,6 +31,9 @@ vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 vllm/model_executor/layers/quantization/utils/prefill_timers.py
 vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
 vllm/model_executor/layers/sparse_attn_indexer.py
+vllm/model_executor/model_loader/__init__.py
+vllm/model_executor/model_loader/default_loader.py
+vllm/model_executor/model_loader/weight_utils.py
 vllm/model_executor/models/deepseek_mtp.py
 vllm/model_executor/models/qwen3_dflash.py
 vllm/model_executor/models/qwen3_dspark.py
