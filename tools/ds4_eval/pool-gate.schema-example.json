@@ -1,0 +1,8 @@
+{
+  "max_base_fp_residue_steps": 0,
+  "max_base_unrestored_experts": 0,
+  "min_fp4_occupancy": 1.0,
+  "min_fp4_tick": 1,
+  "min_fp4_total_evicted": 1,
+  "min_fp4_total_evicted_delta": 16
+}
