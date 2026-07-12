@@ -1,0 +1,44 @@
+{
+  "schema_version": "ds4-w2-public-server-v2",
+  "served_model": "deepseek-v4-flash-w2",
+  "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+  "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+  "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+  "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+  "runtime": {
+    "max_model_len": 131072,
+    "base_cache_gb": 8,
+    "delta_gb": 6,
+    "delta_policy": "lru",
+    "gate_tau": 0.75,
+    "kv_cache_dtype": "fp8",
+    "speculative_tokens": 0,
+    "gpu_memory_utilization": 0.95
+  },
+  "w2_environment": {
+    "VLLM_MOE_W2": "1",
+    "VLLM_MOE_W2_GATE_TAU": "0.75",
+    "VLLM_MOE_W2_DELTA_TRACE": "1",
+    "VLLM_MOE_W2_DELTA_POLICY": "lru",
+    "VLLM_MOE_W2_POOL_HEAT": "0",
+    "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
+    "VLLM_MOE_W2_BASE_CACHE_GB": "8",
+    "VLLM_MOE_W2_DELTA_GB": "6",
+    "VLLM_MOE_W2_GATE": "1",
+    "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
+    "VLLM_MOE_W2_CACHE_CONTROL": "required",
+    "VLLM_MOE_W2_PREFETCH": "0",
+    "VLLM_MOE_W2_KPI_EVERY": "64",
+    "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
+  },
+  "runtime_shape": {
+    "max_num_seqs": 1,
+    "speculative_config_present": false
+  },
+  "capacity": {
+    "available_kv_cache_memory_gib": 4.8,
+    "gpu_kv_cache_tokens": 720677,
+    "reported_maximum_concurrency_at_full_window": 5.5
+  },
+  "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and endpoint details are retained only in private source receipts."
+}
