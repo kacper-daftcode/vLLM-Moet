@@ -645,10 +645,10 @@ index 0000000000000000000000000000000000000000..3b8ae6c46ee523000d782e41b3c14ac4
 +    unittest.main()
 diff --git a/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..725f9782e998a31e4814f3f1bbca368bdefc7004
+index 0000000000000000000000000000000000000000..fa3ca4c5b2fb7bca9e4f3803078f01fa32ed8934
 --- /dev/null
 +++ b/tests/model_executor/layers/quantization/test_moe_w2_step_pins.py
-@@ -0,0 +1,380 @@
+@@ -0,0 +1,463 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -667,7 +667,9 @@ index 0000000000000000000000000000000000000000..725f9782e998a31e4814f3f1bbca368b
 +
 +ROOT = Path(__file__).resolve().parents[4]
 +DELTA_PATH = ROOT / "vllm/model_executor/layers/quantization/utils/moe_w2_delta.py"
++GATE_PATH = ROOT / "vllm/model_executor/layers/quantization/utils/moe_w2_gate.py"
 +RUNNER_PATH = ROOT / "vllm/v1/worker/gpu_model_runner.py"
++WORKER_PATH = ROOT / "vllm/v1/worker/gpu_worker.py"
 +
 +
 +def _load_delta_module():
@@ -783,11 +785,41 @@ index 0000000000000000000000000000000000000000..725f9782e998a31e4814f3f1bbca368b
 +        ):
 +            self.delta.begin_target_step()
 +            self.delta.begin_replay_step()
++            self.delta.finish_forward_step()
 +
++        base.pause_for_forward.assert_called_once_with()
++        fp4.pause_for_forward.assert_called_once_with()
 +        base.routing_step_begin.assert_called_once_with()
 +        fp4.routing_step_begin.assert_called_once_with()
 +        base.step_begin.assert_called_once_with()
 +        fp4.step_begin.assert_called_once_with()
++        base.wake.assert_called_once_with()
++        fp4.wake.assert_called_once_with()
++
++    def test_manager_pass_cannot_overlap_forward_window(self):
++        tier = object.__new__(self.delta.DeltaTier)
++        tier._forward_lock = threading.Lock()
++        tier._forward_paused = False
++        tier._wake = mock.Mock()
++        tier._wake_driven = False
++
++        tier.pause_for_forward()
++        entered = threading.Event()
++
++        def manager_pass():
++            with tier._forward_lock:
++                entered.set()
++
++        thread = threading.Thread(target=manager_pass)
++        thread.start()
++        self.assertFalse(entered.wait(0.05))
++        tier.wake()
++        self.assertTrue(entered.wait(1.0))
++        thread.join(timeout=1.0)
++        self.assertFalse(thread.is_alive())
++        self.assertFalse(tier._forward_paused)
++        self.assertTrue(tier._wake_driven)
++        tier._wake.set.assert_called_once_with()
 +
 +    def test_ensure_resident_drains_then_uses_exact_layer_snapshot(self):
 +        tree = ast.parse(DELTA_PATH.read_text())
@@ -1025,6 +1057,57 @@ index 0000000000000000000000000000000000000000..725f9782e998a31e4814f3f1bbca368b
 +            and node.func.attr == "step_begin"
 +        ]
 +        self.assertEqual(direct_tier_resets, [])
++
++    def test_worker_releases_manager_only_after_gate_barrier(self):
++        tree = ast.parse(WORKER_PATH.read_text())
++        execute_model = next(
++            node
++            for node in ast.walk(tree)
++            if isinstance(node, ast.FunctionDef) and node.name == "execute_model"
++        )
++        finishes = [
++            node
++            for node in ast.walk(execute_model)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "_finish_w2_manager_step"
++        ]
++        barriers = [
++            node
++            for node in ast.walk(execute_model)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "_gate_pp_barrier"
++        ]
++        self.assertEqual(len(finishes), 2)
++        self.assertEqual(len(barriers), 2)
++        finally_finishes = [
++            node
++            for node in ast.walk(execute_model)
++            if isinstance(node, ast.Try)
++            and any(finish in ast.walk(node) for finish in finishes)
++            and any(
++                finish in ast.walk(final)
++                for final in node.finalbody
++                for finish in finishes
++            )
++        ]
++        self.assertEqual(len(finally_finishes), 2)
++
++        gate_tree = ast.parse(GATE_PATH.read_text())
++        should_reforward = next(
++            node
++            for node in ast.walk(gate_tree)
++            if isinstance(node, ast.FunctionDef) and node.name == "should_reforward"
++        )
++        unsafe_wakes = [
++            node
++            for node in ast.walk(should_reforward)
++            if isinstance(node, ast.Call)
++            and isinstance(node.func, ast.Attribute)
++            and node.func.attr == "wake_all"
++        ]
++        self.assertEqual(unsafe_wakes, [])
 +
 +
 +if __name__ == "__main__":
@@ -4582,10 +4665,10 @@ index 0000000000000000000000000000000000000000..70752eda28b1c63a9ef28f26cae1b9df
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c7802dc5280e
+index 0000000000000000000000000000000000000000..9140e34dd96f431e99a5ed5a1ad5994169a71a8c
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1812 @@
+@@ -0,0 +1,1835 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -4602,13 +4685,13 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +    (w13 8.4 MiB + w2 4.2 MiB packed back-to-back per slot);
 +  - slot table: int32 [layers, 256] on GPU (-1 = base tier), read by the
 +    desc-build kernel inside CUDA graphs;
-+  - manager thread: consumes the forward's last-seen expert flags
++  - manager thread: between forwards, consumes the last-seen expert flags
 +    (event-synced D2H), promotes seen-but-uncached experts (H2D on a side
 +    stream, capped per pass), evicts only experts cold for >= 2 passes.
-+    Passes are EVENT-DRIVEN: the runner signals step boundaries (wake_all
-+    via step_begin / the gate decision) and the manager runs at most one
-+    pass per signal, rate-limited by VLLM_MOE_W2_DELTA_TICK_MS; a wall
-+    clock timeout only provides liveness for configs that never signal.
++    Passes are EVENT-DRIVEN: the worker opens a manager window after each
++    completed forward and closes it before the next one. The manager runs at
++    most one pass per signal, rate-limited by VLLM_MOE_W2_DELTA_TICK_MS; a
++    wall-clock timeout only provides liveness for configs that never signal.
 +
 +Consistency model (deliberate): the table update is racy versus graph
 +replay — the worst case is one step reading the OLD tier for an expert,
@@ -4879,6 +4962,12 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +        self._tick = 0
 +        self._stop = False
 +        self._thread = None
++        # Manager passes may rewrite pool slots that CUDA graphs read without
++        # taking the Python tier lock. Keep the whole pass outside the forward
++        # window: pause_for_forward() acquires this lock before a target starts;
++        # wake() releases it only after every fixed-point/gate replay finishes.
++        self._forward_lock = threading.Lock()
++        self._forward_paused = False
 +        # Step-boundary wakeup (wake()/wake_all()): coalescing event; the
 +        # _wake_driven latch flips the loop from legacy polling to pure
 +        # event cadence the moment the first signal arrives.
@@ -5097,21 +5186,39 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +                # runner): keep the legacy fixed-period poll.
 +                self._wake.wait(timeout=_TICK_S)
 +            self._wake.clear()
-+            gap = _TICK_S - (time.monotonic() - last)
-+            if gap > 0:
-+                time.sleep(gap)
-+            last = time.monotonic()
-+            try:
-+                torch.cuda.set_device(self.dev)
-+                self._tick_once()
-+            except Exception as e:  # noqa: BLE001 - never kill serving
-+                logger.warning("delta tick failed: %s", e)
-+                time.sleep(1.0)
++            # A target/replay sequence holds this lock. If the next target
++            # starts before an event-driven pass does, the pass waits; if the
++            # pass already started, the target waits for it to finish.
++            with self._forward_lock:
++                gap = _TICK_S - (time.monotonic() - last)
++                if gap > 0:
++                    time.sleep(gap)
++                last = time.monotonic()
++                try:
++                    torch.cuda.set_device(self.dev)
++                    self._tick_once()
++                except Exception as e:  # noqa: BLE001 - never kill serving
++                    logger.warning("delta tick failed: %s", e)
++                    time.sleep(1.0)
++
++    def pause_for_forward(self) -> None:
++        """Block until any manager pass finishes, then exclude new passes.
++
++        Called on the runner thread before routing marks are cleared and a new
++        target forward starts. Idempotence keeps a failed prior forward safe:
++        the next call remains paused until a later worker completion releases
++        the window.
++        """
++        if self._forward_paused:
++            return
++        self._forward_lock.acquire()
++        self._forward_paused = True
 +
 +    def wake(self):
-+        """Step-boundary signal (runner thread): run one manager pass as
-+        soon as the rate limiter allows. Lock-free and coalescing — a burst
-+        of calls between two passes collapses into one."""
++        """Finish the forward window and signal one manager pass."""
++        if self._forward_paused:
++            self._forward_paused = False
++            self._forward_lock.release()
 +        self._wake_driven = True
 +        self._wake.set()
 +
@@ -5484,14 +5591,10 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +        """Open a new step's pin scope (runner: before the first miss read;
 +        prefill: before the first ensure_resident). Slots touched after this call are
 +        pinned against eviction until the next step_begin — the fixed-point
-+        replay's passes must never cannibalize each other's fetches.
-+
-+        Doubles as the manager's step-boundary signal: every live tier
-+        (base AND fp4) gets one pass per step instead of a free-running
-+        poll."""
++        replay's passes must never cannibalize each other's fetches. The worker
++        signals the manager only after every replay has completed."""
 +        with self._lock:
 +            self._step_pins.clear()
-+        wake_all()
 +
 +    def routing_step_begin(self) -> None:
 +        """Discard routing marks left by warmup or the previous target step."""
@@ -6165,9 +6268,10 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +
 +
 +def begin_target_step() -> None:
-+    """Clear stale routing marks for both tiers before the target forward."""
++    """Exclude manager rewrites, then clear stale marks before the target."""
 +    for tier in (_BASE_TIER, _TIER):
 +        if tier is not None:
++            tier.pause_for_forward()
 +            tier.routing_step_begin()
 +
 +
@@ -6176,6 +6280,11 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +    for tier in (_BASE_TIER, _TIER):
 +        if tier is not None:
 +            tier.step_begin()
++
++
++def finish_forward_step() -> None:
++    """Open the between-forward manager window and signal one pass."""
++    wake_all()
 +
 +# Miss tolerance: a decode step with <= TOL missing routed (layer, expert)
 +# pairs keeps its logits (the missing pairs contributed zero) instead of
@@ -6302,10 +6411,7 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +
 +
 +def wake_all() -> None:
-+    """Step-boundary broadcast: nudge every live tier's manager (base +
-+    fp4/delta) to run one pass. Called once per decode step from
-+    step_begin (base-cache configs) and the gate decision (delta-only
-+    configs); lock-free, coalescing, safe before tiers exist."""
++    """Post-forward broadcast: release and nudge each live tier manager."""
 +    t = _BASE_TIER
 +    if t is not None:
 +        t.wake()
@@ -6400,10 +6506,10 @@ index 0000000000000000000000000000000000000000..4a596f0f7888569bb2d7b6602c05c780
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..fcf18c48439ab321a129f5bfd9fd52e23695b135
+index 0000000000000000000000000000000000000000..8891cf5fd16fbc63b113e415f01a806835156a7e
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,182 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -6536,12 +6642,6 @@ index 0000000000000000000000000000000000000000..fcf18c48439ab321a129f5bfd9fd52e2
 +    """
 +    global _n_steps, _n_fired
 +    _n_steps += 1
-+    # Step-boundary signal for the tier managers: this is the one gate call
-+    # guaranteed once per decode step, so delta-only configs (no base tier,
-+    # hence no runner step_begin) still get event-driven manager passes
-+    # instead of the legacy free-running poll.
-+    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
-+    moe_w2_delta.wake_all()
 +    if logits is None or logits.numel() == 0:
 +        return False
 +    if logits.dim() == 1:
@@ -15615,7 +15715,7 @@ index 657fc826734543ef3dfe3ccc3ef81e43851a91aa..9dfdb209644d4052aeb2ccc7ba53e0d0
                  positions=positions,
                  intermediate_tensors=intermediate_tensors,
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a313545f7a0ff5f5b5fe38bf62acc428eb1..75eb17b841fc385b191a2c34177fbf0232ab8c34 100644
+index 5e266a313545f7a0ff5f5b5fe38bf62acc428eb1..d8fa6bb4b392e1a1c14b90377a85070895c43998 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -616,6 +616,31 @@ class Worker(WorkerBase):
@@ -15667,16 +15767,19 @@ index 5e266a313545f7a0ff5f5b5fe38bf62acc428eb1..75eb17b841fc385b191a2c34177fbf02
      def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          return self.model_runner.get_supported_tasks()
  
-@@ -905,6 +940,8 @@ class Worker(WorkerBase):
+@@ -905,6 +940,11 @@ class Worker(WorkerBase):
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
 +                # Last PP rank: re-decide at FP4 (full pipeline) before sampling.
-+                self._gate_pp_barrier(forward_pass)
++                try:
++                    self._gate_pp_barrier(forward_pass)
++                finally:
++                    self._finish_w2_manager_step(forward_pass)
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -914,15 +951,69 @@ class Worker(WorkerBase):
+@@ -914,15 +954,80 @@ class Worker(WorkerBase):
              and not get_pp_group().is_last_rank
          )
  
@@ -15704,9 +15807,20 @@ index 5e266a313545f7a0ff5f5b5fe38bf62acc428eb1..75eb17b841fc385b191a2c34177fbf02
  
 +        # Non-last PP rank: participate in the gate barrier + (if fired) re-run
 +        # this stage at FP4 for the full-pipeline re-decide.
-+        self._gate_pp_barrier(forward_pass)
++        try:
++            self._gate_pp_barrier(forward_pass)
++        finally:
++            self._finish_w2_manager_step(forward_pass)
          return None
  
++    def _finish_w2_manager_step(self, forward_pass: bool) -> None:
++        """Release tier managers only after every target/replay has drained."""
++        if not forward_pass or os.getenv("VLLM_MOE_W2", "0") != "1":
++            return
++        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++
++        moe_w2_delta.finish_forward_step()
++
 +    def _gate_pp_barrier(self, forward_pass: bool) -> None:
 +        """Confidence-gate full re-forward under PP (opt-in, VLLM_MOE_W2_GATE).
 +
