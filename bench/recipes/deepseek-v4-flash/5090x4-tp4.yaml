@@ -1,7 +1,7 @@
 id: deepseek-v4-flash/5090x4-tp4
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "4x RTX 5090 TP4 - cheapest contract-clean quality config (32k)"
+summary: "4x RTX 5090 TP4 - native-parity quality at 184 tok/s (32k)"
 
 requires:
   gpus: 4
@@ -21,6 +21,11 @@ env:
   VLLM_MOE_W2: "1"
   VLLM_MOE_W2_DELTA_GB: "4.5"
   VLLM_MOE_W2_GATE: "1"
+  # tau 1.0 = quality mode, measured 2026-07-13: GSM8K-200 97.0%
+  # (194/200) - EXACT native parity, flips 1<->1 - at 183.6 tok/s.
+  # Drop to the 0.60 default for +6% decode (96.0%, n.s.). Legal
+  # because the pool clears the fire floor (1536 >= 1346 slots).
+  VLLM_MOE_W2_GATE_TAU: "1.0"
 
 serve_args:
   - --trust-remote-code
