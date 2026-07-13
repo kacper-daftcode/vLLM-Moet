@@ -1,27 +1,33 @@
 id: deepseek-v4-flash/5090x1-basecache
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "1x RTX 5090 (32 GB) - host-resident 2-bit base, GPU as expert cache"
+summary: "1x RTX 5090 (32 GB) - host-resident 2-bit base + gated FP4 need-pool"
 
 requires:
   gpus: 1
   vram_gb: 32
   host_ram_gb: 96
 
-context: 8192
+context: 32768
 load_timeout_s: 3600
 
+# Quality-validated 2026-07-13 (GSM8K-200 95.0%, needle 32k PASS, ~17 tok/s):
+# base 14 GiB is the STARVATION FLOOR for MTP-2 x 2 seqs (11 GiB corrupted
+# math - the boot guard now refuses it); gate tau 0.60 (code default) with a
+# small NON-SPLIT FP4 need-pool (bit-faithful nibbles; split's mag-0 merge
+# is lossy - see internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md).
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_BASE_CACHE_GB: "11"
-  VLLM_MOE_W2_DELTA_GB: "0"
+  VLLM_MOE_W2_BASE_CACHE_GB: "14"
+  VLLM_MOE_W2_DELTA_GB: "1"
+  VLLM_MOE_W2_GATE: "1"
 
 serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 8192
-  - --gpu-memory-utilization 0.90
+  - --max-model-len 32768
+  - --gpu-memory-utilization 0.95
   - --max-num-batched-tokens 1024
   - --max-num-seqs 2
   - --tokenizer-mode deepseek_v4
@@ -46,4 +52,6 @@ tuning:
   axes:
     - kind: env
       name: VLLM_MOE_W2_BASE_CACHE_GB
-      values: ["11", "14"]
+      # 11 removed: below the per-step working-set floor (MTP-2 x 2 seqs)
+      # - silent quality corruption, now refused by the boot guard.
+      values: ["14", "16"]

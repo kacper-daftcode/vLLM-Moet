@@ -3376,10 +3376,10 @@ index 000000000..43bad76a2
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..471f6a3b8
+index 000000000..922edaed1
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1876 @@
+@@ -0,0 +1,1946 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -5139,6 +5139,76 @@ index 000000000..471f6a3b8
 +    return _BASE_GB > 0
 +
 +
++def check_pool_floor(top_k: int, n_spec: int, max_num_seqs: int) -> None:
++    """Boot-time guard: refuse to serve when a pool is sized below its
++    WORKING-SET floor (VLLM_MOE_W2_FORCE_POOL=1 downgrades to a warning).
++
++    BASE cache: a pool smaller than the per-step routed working set cannot
++    hold a step's experts even with perfect eviction — the emergency path
++    then leaves routed experts ZEROED (silent quality corruption; measured
++    on DS4+MTP2: 11 GiB pool -> corrupted math, 14 GiB -> clean). Floor:
++        pairs = moe_layers x top_k x (1 + n_spec) x sqrt(min(seqs, 4))
++    (sqrt: concurrent decodes overlap heavily on hot experts). HARD floor
++    1.15x pairs (below the measured-bad anchor stays below it), comfort
++    1.40x (the measured-good anchor stays above it).
++
++    FP4 need-pool (gate): pool < one step's routed set means a fire can
++    NEVER cover its own step (partial upgrades regardless of
++    GATE_MAX_PROMOTE) — degraded recovery, not corruption: WARN only.
++    """
++    import math
++    force = os.getenv("VLLM_MOE_W2_FORCE_POOL", "0") == "1"
++    seq_f = math.sqrt(float(min(max(max_num_seqs, 1), 4)))
++    t = _BASE_TIER
++    if t is not None and len(t._store) > 0:
++        pairs = int(len(t._store) * top_k * (1 + n_spec) * seq_f)
++        hard = int(1.15 * pairs)
++        comfort = int(1.40 * pairs)
++        gib = t.n_slots * t.slot_bytes / 2**30
++        need_gib = hard * t.slot_bytes / 2**30
++        if t.n_slots < hard:
++            msg = (
++                f"moe_w2 BASE cache pool is BELOW the working-set floor: "
++                f"{t.n_slots} slots ({gib:.1f} GiB) < {hard} required "
++                f"(~{need_gib:.1f} GiB) for {len(t._store)} MoE layers x "
++                f"top-{top_k} x (1+{n_spec} spec) x {max_num_seqs} seqs. "
++                f"Steps will keep ZEROED expert contributions (silent "
++                f"quality corruption). Raise VLLM_MOE_W2_BASE_CACHE_GB, "
++                f"reduce num_speculative_tokens/max_num_seqs, or set "
++                f"VLLM_MOE_W2_FORCE_POOL=1 to serve anyway.")
++            if not force:
++                raise ValueError(msg)
++            logger.warning("%s (FORCED past the check)", msg)
++        elif t.n_slots < comfort:
++            logger.warning(
++                "moe_w2 BASE cache pool is tight: %d slots (%.1f GiB) < "
++                "comfort %d for this step working set — expect UNRESTORED "
++                "bursts at prefill->decode transitions (watch the KPI "
++                "line).", t.n_slots, gib, comfort)
++        else:
++            logger.info(
++                "moe_w2 BASE cache pool floor check OK: %d slots (%.1f "
++                "GiB) >= comfort %d (step working set %d pairs).",
++                t.n_slots, gib, comfort, pairs)
++    d = _TIER
++    if d is not None and gate_armed() and len(d._store) > 0:
++        step_set = int(len(d._store) * top_k * (1 + n_spec))
++        if d.n_slots < step_set:
++            logger.warning(
++                "moe_w2 FP4 need-pool (%d slots) is smaller than one "
++                "step's routed set (~%d pairs): gate fires can only "
++                "PARTIALLY upgrade their own step regardless of "
++                "GATE_MAX_PROMOTE. Quality recovery is degraded (not "
++                "corrupted). For clean fires raise VLLM_MOE_W2_DELTA_GB "
++                "to >= %.1f GiB.", d.n_slots, step_set,
++                step_set * d.slot_bytes / 2**30)
++
++
++def gate_armed() -> bool:
++    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
++    return moe_w2_gate.enabled()
++
++
 +def spec_suppressed() -> bool:
 +    """Spec-guard latch (VLLM_MOE_W2_SPEC_GUARD): True while the base pool
 +    is too cold for speculation to pay — the runner then skips scheduling
@@ -5258,10 +5328,10 @@ index 000000000..471f6a3b8
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 000000000..fcf18c484
+index 000000000..6c46f55aa
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,188 @@
+@@ -0,0 +1,196 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -5298,16 +5368,24 @@ index 000000000..fcf18c484
 +                           0.70-0.80 for more recall once a functional eval confirms
 +                           the FP4 upgrades are correct; lower to 0.50 if marginal.
 +  VLLM_MOE_W2_GATE_MAX_PROMOTE  cap experts force-promoted per fired step
-+                                (default 64; 0 = unlimited). The cap bounds
-+                                the fire cost: each promote is a synchronous
-+                                H2D plane copy, and deep/wide models route
-+                                600+ (layer, expert) pairs per step (GLM-5.2:
-+                                unlimited fires measured 200-1400 promotes =
-+                                up to ~6 GiB H2D and a 56->3 tok/s collapse;
-+                                64 caps it at ~0.3 GiB). Most-needed experts
-+                                are promoted first, and promotions persist,
-+                                so repeated fires still converge to FP4
-+                                coverage of the hard set.
++                                (default 0 = UNLIMITED). A cap below one
++                                step's routed set silently breaks the
++                                fire's contract: the replay re-decides the
++                                token with most of its routing still 2-bit
++                                (measured on DS4: cap 64 vs ~350-pair
++                                steps made accuracy/token-length WORSE as
++                                tau rose — partial upgrades churn the pool
++                                without cleaning any step). There is no
++                                model-independent "harmless" value, so the
++                                default is off; promotions are only the
++                                step's COLD routed experts (steady state:
++                                tens) and per-fire H2D is bounded by the
++                                pool size. Set a cap (e.g. 64-128) only
++                                for latency-sensitive serving on configs
++                                with large slots (non-split) AND a large
++                                pool — the GLM-5.2 case where unlimited
++                                fires measured 200-1400 promotes = ~6 GiB
++                                H2D and a 56->3 tok/s collapse.
 +  VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
 +"""
 +
@@ -5323,7 +5401,7 @@ index 000000000..fcf18c484
 +_SIGNAL = os.getenv("VLLM_MOE_W2_GATE_SIGNAL", "max_prob")
 +_DEFAULT_TAU = {"max_prob": 0.60, "margin": 1.5}
 +_TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.60))))
-+_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "64"))
++_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
 +_TRACE = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
 +# Measurement mode: on a fired step, COUNT routed experts (delta._need) instead of
 +# promoting/re-forwarding -> study whether 2-bit difficulty concentrates on few
@@ -12978,7 +13056,7 @@ index 4ab45b2ae..35a89634e 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..87114b894 100644
+index 74938a823..3eb452778 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -13905,7 +13983,41 @@ index 74938a823..87114b894 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5969,7 +6707,8 @@ class GPUModelRunner(
+@@ -5257,6 +5995,33 @@ class GPUModelRunner(
+             format_gib(self.model_memory_usage),
+             time_after_load - time_before_load,
+         )
++        # moe_w2 pool-floor guard: refuse to serve a base-cache pool sized
++        # below its per-step working set (silent quality corruption:
++        # routed experts keep zeroed contributions). Runs here because the
++        # plane builder has registered every MoE layer by end-of-load and
++        # the spec/scheduler configs are final. VLLM_MOE_W2_FORCE_POOL=1
++        # downgrades the failure to a warning.
++        if moe_w2_gate is not None and not load_dummy_weights:
++            try:
++                from vllm.model_executor.layers.quantization.utils import (
++                    moe_w2_delta as _w2d_floor)
++                if _w2d_floor._BASE_TIER is not None or _w2d_floor._TIER is not None:
++                    _n_spec = 0
++                    if self.speculative_config is not None:
++                        _n_spec = int(getattr(
++                            self.speculative_config,
++                            "num_speculative_tokens", 0) or 0)
++                    _topk = int(getattr(
++                        self.model_config.hf_text_config,
++                        "num_experts_per_tok", 0) or 0)
++                    if _topk > 0:
++                        _w2d_floor.check_pool_floor(
++                            _topk, _n_spec,
++                            int(self.scheduler_config.max_num_seqs))
++            except ValueError:
++                raise
++            except Exception as e:  # noqa: BLE001 - guard must not break boot
++                logger.warning("moe_w2 pool-floor check skipped: %s", e)
+         if not load_dummy_weights:
+             prepare_communication_buffer_for_model(self.model)
+             if (drafter := getattr(self, "drafter", None)) and (
+@@ -5969,7 +6734,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -13915,7 +14027,7 @@ index 74938a823..87114b894 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7614,9 @@ class GPUModelRunner(
+@@ -6875,8 +7641,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -13927,7 +14039,7 @@ index 74938a823..87114b894 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7669,8 @@ class GPUModelRunner(
+@@ -6929,7 +7696,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
