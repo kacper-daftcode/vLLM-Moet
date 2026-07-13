@@ -9,10 +9,18 @@ rollback boundary until the v0.25 candidate passes the SM120 hardware canary.
 
 - Official tag: `v0.25.0`
 - Official tag commit: `702f4814fe54fabff350d43cb753ae3e47c0c276`
+- Production fork: `https://github.com/OmarB97/vllm`
+- Production branch: `moet-v0.25.0`
+- Production source commit: `6023898a814230ea839107ad82ca0141b71062b6`
 - Linux/amd64 base image manifest: `sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97`
 - W2 overlay: `patch/vllm-moet-v0.25.0.patch`
 - Overlay SHA-256: `ea1e8462008e8d3530e8938483a4f8974258196acc6a0bbcc4124bc4a719ed5d`
 - Overlay scope: 61 files, 13,342 insertions, 134 deletions
+
+The production fork branch and the exact source SHA recorded in
+`patch/SOURCE-v025.txt` are the rollout authority. Pull requests to another
+fork or to official upstream are welcome follow-up contributions, but their
+review or merge state never gates this production overlay.
 
 Apply it directly to an official checkout with:
 

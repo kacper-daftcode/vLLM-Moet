@@ -16,7 +16,9 @@ on:
       - "docs/v025-port.md"
       - "docs/benchmarks/**"
       - "patch/**"
+      - "tests/test_check_patch_files.py"
       - "tools/check_patch_files.py"
+      - ".gitattributes"
       - ".github/workflows/bench-lint.yml"
 
 jobs:
@@ -28,7 +30,16 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install pyyaml
-      - name: Patch file lists match both frozen release overlays
+      - name: Clone the production v0.25 source lineage
+        run: |
+          git clone --filter=blob:none --single-branch --branch moet-v0.25.0 https://github.com/OmarB97/vllm.git .vllm-source-v025
+          git -C .vllm-source-v025 remote rename origin fork
+          git -C .vllm-source-v025 fetch --force fork refs/tags/v0.25.0:refs/tags/v0.25.0
+      - name: Patch guard regressions
+        run: python3 -m unittest discover -s tests -p "test_check_patch_files.py"
+      - name: Patch manifests and production source bindings match
+        env:
+          VLLM_MOET_FORK: ${{ github.workspace }}/.vllm-source-v025
         run: |
           python3 tools/check_patch_files.py
           python3 tools/check_patch_files.py --version 0.25.0

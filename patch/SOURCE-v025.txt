@@ -1,0 +1,6 @@
+# The production vllm fork-branch commit patch/vllm-moet-v0.25.0.patch was generated
+# from (branch moet-v0.25.0, diffed against the v0.25.0 tag).
+# Written by tools/check_patch_files.py --update and source-verified whenever a
+# matching clone is supplied (strict releases require one in CI). Regenerations
+# only move this FORWARD - see AGENTS.md. Never edit by hand.
+6023898a814230ea839107ad82ca0141b71062b6

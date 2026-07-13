@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Guard generated distribution patches against lost work.
 
-Each release overlay has a committed file manifest. The v0.24 ship lineage
-also records the exact source-branch commit and byte-verifies the patch when
-the fork clone is available. The v0.25 candidate is a frozen overlay, so its
-``--update`` mode refreshes only the manifest; it never rewrites the patch.
+Each release overlay has a committed file manifest. Shipping lineages also
+record the exact production-fork commit and verify that the patch is the
+normalized diff from the release tag. A strict release fails closed when its
+source clone, branch, tag, or pushed source commit is unavailable.
 
 Usage: python3 tools/check_patch_files.py [--version 0.24.0|0.25.0] [--update]
 """
@@ -32,10 +32,17 @@ RELEASES = {
     "0.25.0": {
         "patch": "vllm-moet-v0.25.0.patch",
         "manifest": "FILES-v025.txt",
-        "source": None,
-        "branch": None,
+        "source": "SOURCE-v025.txt",
+        "branch": "moet-v0.25.0",
         "base_tag": "v0.25.0",
-        "fork_candidates": [],
+        "base_sha": "702f4814fe54fabff350d43cb753ae3e47c0c276",
+        "fork_candidates": [
+            "/workspace/vllm-v0.25.0",
+            "/root/workspace/vllm-v0.25.0",
+        ],
+        "require_source": True,
+        "require_pushed_source": True,
+        "normalize_blank_context": True,
     },
 }
 
@@ -73,11 +80,11 @@ def manifest_header(version: str, release: dict) -> str:
 
 def source_header(release: dict) -> str:
     return f"""\
-# The vllm fork-branch commit patch/{release['patch']} was generated
+# The production vllm fork-branch commit patch/{release['patch']} was generated
 # from (branch {release['branch']}, diffed against the {release['base_tag']} tag).
-# Written by tools/check_patch_files.py --update, byte-verified wherever a fork
-# clone is available (dev boxes; CI has none). Regenerations only move this
-# FORWARD along the branch - see AGENTS.md. Never edit by hand.
+# Written by tools/check_patch_files.py --update and source-verified whenever a
+# matching clone is supplied (strict releases require one in CI). Regenerations
+# only move this FORWARD - see AGENTS.md. Never edit by hand.
 """
 
 
@@ -119,7 +126,25 @@ def read_source(source_path: str) -> str | None:
 
 
 def normalized(diff: bytes) -> list[bytes]:
-    return [b"index" if _INDEX_RE.match(line) else line for line in diff.split(b"\n")]
+    """Normalize representation-only differences in generated patches."""
+    result = []
+    for line in diff.split(b"\n"):
+        if _INDEX_RE.match(line):
+            line = b"index"
+        elif line == b" ":
+            # Git emits an empty context line as one prefix space. Generated
+            # distribution patches strip that marker so the patch artifact
+            # itself remains whitespace-clean. Both forms apply identically.
+            line = b""
+        result.append(line)
+    return result
+
+
+def canonical_patch(diff: bytes, release: dict) -> bytes:
+    """Return the committed representation for a generated source diff."""
+    if not release.get("normalize_blank_context"):
+        return diff
+    return b"\n".join(b"" if line == b" " else line for line in diff.split(b"\n"))
 
 
 def find_fork(release: dict) -> str | None:
@@ -184,23 +209,113 @@ def check_source(
         )
         return 1
     if fork is None:
+        if release.get("require_source"):
+            print(
+                f"SOURCE VERIFICATION REQUIRED: no production-fork clone with "
+                f"branch {release['branch']} is available; set VLLM_MOET_FORK "
+                f"and retry ({source_name} records {sha[:12]})"
+            )
+            return 1
         print(
             f"patch source: no fork clone here - byte-verify skipped "
             f"({source_name} records {sha[:12]})"
         )
         return 0
+
+    base_tag = release["base_tag"]
+    base_result = git(
+        fork, "rev-parse", "--verify", base_tag + "^{commit}", check=False
+    )
+    if base_result.returncode != 0:
+        print(
+            f"patch source: base tag {base_tag} is unavailable in {fork} - "
+            "fetch the official release tag and retry"
+        )
+        return 1
+    base_sha = base_result.stdout.decode().strip()
+    expected_base = release.get("base_sha")
+    if expected_base and base_sha != expected_base:
+        print(
+            f"patch source: {base_tag} resolves to {base_sha}, expected "
+            f"{expected_base}; refusing a moved or counterfeit release base"
+        )
+        return 1
+
     if git(fork, "cat-file", "-e", sha + "^{commit}", check=False).returncode != 0:
         print(
             f"patch source: recorded commit {sha[:12]} is unknown in the fork "
             f"clone at {fork} - fetch the fork remotes and retry"
         )
         return 1
+
+    branch = release["branch"]
+    if (
+        git(fork, "rev-parse", "--verify", branch, check=False).returncode != 0
+        or git(
+            fork,
+            "merge-base",
+            "--is-ancestor",
+            sha,
+            branch,
+            check=False,
+        ).returncode
+        != 0
+    ):
+        print(
+            f"patch source: recorded commit {sha[:12]} is not reachable from "
+            f"the production branch {branch} in {fork}"
+        )
+        return 1
+    if (
+        git(
+            fork,
+            "merge-base",
+            "--is-ancestor",
+            base_tag,
+            sha,
+            check=False,
+        ).returncode
+        != 0
+    ):
+        print(
+            f"patch source: recorded commit {sha[:12]} does not descend from "
+            f"the bound release base {base_tag} ({base_sha[:12]})"
+        )
+        return 1
+
+    if release.get("require_pushed_source"):
+        remote_ref = "refs/remotes/fork/" + branch
+        if (
+            git(
+                fork,
+                "rev-parse",
+                "--verify",
+                remote_ref,
+                check=False,
+            ).returncode
+            != 0
+            or git(
+                fork,
+                "merge-base",
+                "--is-ancestor",
+                sha,
+                remote_ref,
+                check=False,
+            ).returncode
+            != 0
+        ):
+            print(
+                f"PATCH SOURCE IS NOT PUBLISHED: {sha[:12]} is not reachable "
+                f"from fork/{branch}; push the production source branch first"
+            )
+            return 1
+
     regenerated = git(fork, "diff", release["base_tag"], sha).stdout
     with open(patch_path, "rb") as patch_file:
         committed = patch_file.read()
     if normalized(regenerated) == normalized(committed):
         print(
-            f"patch source OK: byte-identical to `git diff "
+            f"patch source OK: normalized-identical to `git diff "
             f"{release['base_tag']} {sha[:12]}` in {fork}"
         )
         return 0
@@ -242,9 +357,12 @@ def update_sourced_release(version: str, release: dict, fork: str | None) -> int
     assert source_path is not None
 
     remote_ref = "refs/remotes/fork/" + release["branch"]
-    if (
+    remote_ref_exists = (
         git(fork, "rev-parse", "--verify", "--quiet", remote_ref, check=False).returncode
         == 0
+    )
+    if (
+        remote_ref_exists
         and git(
             fork,
             "merge-base",
@@ -262,6 +380,56 @@ def update_sourced_release(version: str, release: dict, fork: str | None) -> int
         )
 
     new_sha = git(fork, "rev-parse", release["branch"]).stdout.decode().strip()
+    if release.get("require_pushed_source"):
+        if not remote_ref_exists:
+            sys.exit(
+                f"refusing: required remote branch fork/{release['branch']} "
+                "does not exist; publish the production source first"
+            )
+        remote_sha = git(fork, "rev-parse", remote_ref).stdout.decode().strip()
+        if remote_sha != new_sha:
+            sys.exit(
+                f"refusing: local {release['branch']} is {new_sha[:12]} but "
+                f"fork/{release['branch']} is {remote_sha[:12]}; source must "
+                "be pushed exactly before distribution regeneration"
+            )
+
+    expected_base = release.get("base_sha")
+    if expected_base:
+        base_result = git(
+            fork,
+            "rev-parse",
+            "--verify",
+            release["base_tag"] + "^{commit}",
+            check=False,
+        )
+        if base_result.returncode != 0:
+            sys.exit(
+                f"refusing: required base tag {release['base_tag']} is missing; "
+                "fetch the official release tag and retry"
+            )
+        actual_base = base_result.stdout.decode().strip()
+        if actual_base != expected_base:
+            sys.exit(
+                f"refusing: {release['base_tag']} resolves to {actual_base}, "
+                f"expected {expected_base}"
+            )
+    if (
+        git(
+            fork,
+            "merge-base",
+            "--is-ancestor",
+            release["base_tag"],
+            new_sha,
+            check=False,
+        ).returncode
+        != 0
+    ):
+        sys.exit(
+            f"refusing: {new_sha[:12]} does not descend from "
+            f"{release['base_tag']}"
+        )
+
     old_sha = read_source(source_path)
     if old_sha and old_sha != new_sha:
         if git(fork, "cat-file", "-e", old_sha + "^{commit}", check=False).returncode:
@@ -292,7 +460,10 @@ def update_sourced_release(version: str, release: dict, fork: str | None) -> int
         git(ROOT, "diff", "--quiet", "--", relative_patch, check=False).returncode
         != 0
     )
-    diff = git(fork, "diff", release["base_tag"], new_sha).stdout
+    diff = canonical_patch(
+        git(fork, "diff", release["base_tag"], new_sha).stdout,
+        release,
+    )
     if b"diff --git" not in diff:
         sys.exit(
             f"refusing: `git diff {release['base_tag']} {release['branch']}` "
