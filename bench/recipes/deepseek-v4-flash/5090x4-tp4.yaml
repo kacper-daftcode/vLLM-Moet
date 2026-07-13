@@ -11,12 +11,12 @@ context: 16384
 load_timeout_s: 2400
 
 # 2026-07-13: gate ON (tau 0.60 = code default), NON-SPLIT pool 3 GiB/rank
-# (~960 slots >= the per-step routed set at TP4 -> clean fires). Split is
+# (~1280 slots >= the fire floor 792x sqrt(2 seqs) ~ 1120 at TP4). Split is
 # quality-banned (internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md). Not yet
 # quality-benched on this topology - GSM8K/needle pending free 5090s.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "3"
+  VLLM_MOE_W2_DELTA_GB: "4"
   VLLM_MOE_W2_GATE: "1"
 
 serve_args:

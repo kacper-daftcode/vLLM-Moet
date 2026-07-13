@@ -27,6 +27,14 @@ env:
   # 94.5% / +110%% tokens vs 96.5%/95.0%% with cap 64. Remove the
   # cap only on configs with pool >= the step routed union.
   VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
+  # DEGRADED gate mode, explicit consent: the pool is below the
+  # FIRE FLOOR (one step's routed union), so the boot guard would
+  # refuse to serve. Fires upgrade incrementally (cap 64); tau->1
+  # does NOT converge to native on this card. Measured quality at
+  # this operating point: GSM8K-200 96.5% (1xPRO6000) / 95.0%
+  # (1x5090), both p=1 vs native. The split capacity fix (2x
+  # slots/GiB) is the path out of degraded mode on these cards.
+  VLLM_MOE_W2_FORCE_POOL: "1"
 
 serve_args:
   - --trust-remote-code

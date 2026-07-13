@@ -53,6 +53,14 @@ tuning:
   constraints: ["arithmetic.score>=3", "coherence.pass"]
   axes:
     - kind: env
+      name: VLLM_MOE_W2_TOPP
+      values: ["0", "0.7"]
+      restart: true
+    - kind: env
+      name: VLLM_MOE_W2_DELTA_SPLIT
+      values: ["0", "1"]
+      restart: true
+    - kind: env
       name: VLLM_MOE_W2_GATE_TAU
       values: ["0.50", "0.60", "0.75"]
       restart: false
