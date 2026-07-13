@@ -1,22 +1,24 @@
 id: deepseek-v4-flash/5090x4-tp4
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "4x RTX 5090 TP4 - consumer-card throughput"
+summary: "4x RTX 5090 TP4 - cheapest contract-clean quality config (32k)"
 
 requires:
   gpus: 4
   vram_gb: 32
 
-context: 16384
+context: 32768
 load_timeout_s: 2400
 
 # 2026-07-13: gate ON (tau 0.60 = code default), NON-SPLIT pool 3 GiB/rank
-# (~1280 slots >= the fire floor 792x sqrt(2 seqs) ~ 1120 at TP4). Split is
+# (1122 slots >= the fire floor ~1120 at 2 seqs; per-rank TP4 slots are
+# 4x smaller, making this the CHEAPEST hardware class that clears the
+# fire-floor hardstop -> uncapped fires + high tau are legal). Split is
 # quality-banned (internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md). Not yet
 # quality-benched on this topology - GSM8K/needle pending free 5090s.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "4"
+  VLLM_MOE_W2_DELTA_GB: "3.5"
   VLLM_MOE_W2_GATE: "1"
 
 serve_args:
@@ -25,10 +27,10 @@ serve_args:
   - --disable-custom-all-reduce
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 16384
+  - --max-model-len 32768
   - --gpu-memory-utilization 0.95
   - --max-num-batched-tokens 1024
-  - --max-num-seqs 4
+  - --max-num-seqs 2
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
   - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
