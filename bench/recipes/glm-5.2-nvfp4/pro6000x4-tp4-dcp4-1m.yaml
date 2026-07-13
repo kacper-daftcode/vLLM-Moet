@@ -1,0 +1,80 @@
+id: glm-5.2-nvfp4/pro6000x4-tp4-dcp4-1m
+model: GLM-5.2-NVFP4
+served_name: glm-5.2
+summary: "4x RTX PRO 6000 TP4+DCP4 - GPU-resident 1M window (nvfp4 KV sharded 4-way) + FP4 delta (auto) + gate tau=0.60, MTP k=5, a2a DCP combine"
+
+requires:
+  gpus: 4
+  vram_gb: 96
+  host_ram_gb: 160
+
+context: 1048576
+load_timeout_s: 3600
+
+# MTP acceptance is depth-FLAT on real context (2.94 code / 2.0 prose task,
+# 8K-891K). Do not "measure" acceptance-vs-depth over random-word filler:
+# junk context sends greedy output into loop attractors whose draftability
+# is a lottery (see docs/benchmarks/mtp-acceptance-depth-2026-07-13.md).
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "auto"
+  VLLM_MOE_W2_DELTA_RESERVE_GB: "3"
+  VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_GATE_TAU: "0.60"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 4
+  # DCP4: nvfp4 KV interleaved across the TP ranks (30.7 -> 7.7 KB/tok/rank),
+  # so the full 1M window is GPU-resident with a healthy FP4 pool left over.
+  # The DSA indexer scores its local shard and merges top-2048 group-wide;
+  # attention LSE-merges partial outputs (PYNCCL collectives only).
+  - --decode-context-parallel-size 4
+  # a2a combine: one packed all_to_all (out+fp32 LSE in 2 bf16 lanes) replaces
+  # AG-LSE + RS-out per attention layer (-78 collectives/step, +1.1 steps/s
+  # measured 2026-07-13; exact LSE-weighted reduction, top-k merge untouched).
+  # Greedy outputs can tie-break differently vs ag_rs (different reduction
+  # order) - same class of noise as DCP1-vs-DCP4.
+  - --dcp-comm-backend a2a
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype nvfp4
+  - --block-size 256
+  - --max-model-len 1048576
+  # 8.5 GiB/rank ~= 1.2M tokens of nvfp4 KV under DCP4.
+  - --kv-cache-memory-bytes 9126805504
+  - --gpu-memory-utilization 0.93
+  - --max-num-batched-tokens 2048
+  - --max-num-seqs 2
+  - --no-scheduler-reserve-full-isl
+  - --tool-call-parser glm47
+  - --reasoning-parser glm45
+  # k=5: acceptance 4.7-5.9 on code/easy prompts more than repays the +39%
+  # step cost (5 sequential drafter forwards); k=7 LOSES on code (acceptance
+  # saturates ~4.9, the 2 extra drafts are dead weight). Acceptance is
+  # depth-flat on real context (docs/benchmarks/mtp-acceptance-depth-*.md).
+  - --speculative-config {"method":"mtp","num_speculative_tokens":5}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 4
+
+suite_params:
+  decode:
+    runs: 7
+  batch_decode:
+    concurrency: [1, 2]
+  needle:
+    sizes_words: [91000, 371000, 742000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=3", "coherence.pass", "needle.all_pass"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_GATE_TAU
+      values: ["0.60", "0.75"]
+      restart: false
+      file_env: VLLM_MOE_W2_GATE_TAU_FILE

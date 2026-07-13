@@ -2,8 +2,10 @@
 """needle_probe with a reasoning budget: PASS when the secret appears in the
 final answer (after </think>) or anywhere in the content when finish=stop.
 
-Usage: needle_full.py <port> <n_words> [depth]  (served model name: glm-5.2)"""
+Usage: needle_full.py <port> <n_words> [depth] [model]
+(model: 4th arg > NEEDLE_MODEL env > auto-detect from /v1/models)"""
 import json
+import os
 import random
 import sys
 import time
@@ -25,8 +27,17 @@ ctx = " ".join(filler[:at]) + "\n\n" + needle + "\n\n" + " ".join(filler[at:])
 user = (ctx + "\n\nQuestion: What is the vault passphrase? "
         "Reply with ONLY the passphrase, nothing else.")
 
+MODEL = (sys.argv[4] if len(sys.argv) > 4 else "") or os.environ.get(
+    "NEEDLE_MODEL", "")
+if not MODEL:
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{PORT}/v1/models", timeout=30) as mr:
+            MODEL = json.loads(mr.read())["data"][0]["id"]
+    except Exception:
+        MODEL = "glm-5.2"      # old hardcoded default
 body = json.dumps({
-    "model": "glm-5.2",
+    "model": MODEL,
     "messages": [{"role": "user", "content": user}],
     "max_tokens": 2000, "temperature": 0,
 }).encode()

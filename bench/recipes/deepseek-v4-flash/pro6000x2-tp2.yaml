@@ -1,18 +1,25 @@
 id: deepseek-v4-flash/pro6000x2-tp2
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "2x RTX PRO 6000 TP2 - throughput"
+summary: "2x RTX PRO 6000 TP2 - quality-first, 128k window"
 
 requires:
   gpus: 2
   vram_gb: 96
 
-context: 24576
+context: 131072
 load_timeout_s: 2400
 
+# Quality-validated 2026-07-13: GSM8K-200 97.5% vs native-FP8 97.0%
+# (paired McNemar p=1, flips 0<->1), needle @121k tokens PASS. Resident
+# 2-bit planes (~36.4 GiB/rank) + NON-SPLIT FP4 need-pool 12 GiB/rank
+# (~1900 slots >= the per-step routed set -> gate fires upgrade their
+# whole step; split is quality-banned: internal/SPLIT_FP4_ZERO_LOSS_*).
+# Gate tau 0.60 and unlimited MAX_PROMOTE are the code defaults.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "auto"
+  VLLM_MOE_W2_DELTA_GB: "12"
+  VLLM_MOE_W2_GATE: "1"
 
 serve_args:
   - --trust-remote-code
@@ -20,10 +27,10 @@ serve_args:
   - --disable-custom-all-reduce
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 24576
-  - --gpu-memory-utilization 0.95
-  - --max-num-batched-tokens 1024
-  - --max-num-seqs 4
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.92
+  - --max-num-batched-tokens 4096
+  - --max-num-seqs 2
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
   - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
@@ -31,6 +38,6 @@ serve_args:
 
 suite_params:
   batch_decode:
-    concurrency: [1, 4]
+    concurrency: [1, 2]
   needle:
-    sizes_words: [8000, 20000]
+    sizes_words: [8000, 90000]

@@ -1,27 +1,35 @@
 id: deepseek-v4-flash/pro6000x1-24k
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "1x RTX PRO 6000 - throughput (24K ctx, FP4 delta auto, MTP k=2)"
+summary: "1x RTX PRO 6000 - quality 128k single-stream (~150 tok/s)"
 
 requires:
   gpus: 1
   vram_gb: 96
 
-context: 24576
+context: 131072
 load_timeout_s: 2400
 
+# Quality-validated 2026-07-13: GSM8K-200 96.5% vs native 97.0% (McNemar
+# p=1), needle @121k PASS, 149 tok/s single-stream. Resident planes eat
+# 72.7 GiB, so the last ~5 GiB split between the FP4 need-pool and KV:
+# NON-SPLIT 1.5 GiB pool + one 128k stream at util 0.97 (0.95 leaves
+# only 1.04 GiB KV and the boot fails; MTP scratch has a ~1.7 GiB fixed
+# floor). Two streams need dropping the window to 64k. Gate tau 0.60 =
+# code default.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "auto"
+  VLLM_MOE_W2_DELTA_GB: "1.5"
+  VLLM_MOE_W2_GATE: "1"
 
 serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 24576
-  - --gpu-memory-utilization 0.95
-  - --max-num-batched-tokens 1024
-  - --max-num-seqs 4
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.97
+  - --max-num-batched-tokens 4096
+  - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
   - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
@@ -29,9 +37,9 @@ serve_args:
 
 suite_params:
   batch_decode:
-    concurrency: [1, 4]
+    concurrency: [1]
   needle:
-    sizes_words: [8000, 20000]
+    sizes_words: [8000, 90000]
     depth: 0.5
 
 tuning:
@@ -40,4 +48,4 @@ tuning:
   axes:
     - kind: env
       name: VLLM_MOE_W2_DELTA_GB
-      values: ["auto", "1", "0"]
+      values: ["1.5", "1", "0"]
