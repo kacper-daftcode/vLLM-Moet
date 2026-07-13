@@ -21,6 +21,12 @@ env:
   VLLM_MOE_W2_BASE_CACHE_GB: "14"
   VLLM_MOE_W2_DELTA_GB: "1"
   VLLM_MOE_W2_GATE: "1"
+  # pool below the FIRE FLOOR (one step's routed union ~10 GiB
+  # non-split at TP1): fires cannot cover their own step, so the
+  # only sound mode is INCREMENTAL promotion - uncapped measured
+  # 94.5% / +110%% tokens vs 96.5%/95.0%% with cap 64. Remove the
+  # cap only on configs with pool >= the step routed union.
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
 
 serve_args:
   - --trust-remote-code
