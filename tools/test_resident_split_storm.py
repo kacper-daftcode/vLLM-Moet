@@ -244,6 +244,49 @@ for r in range(ROUNDS):
               f"evicted={tier._n_evicted} mapped={len(mapped)} "
               f"verified={verified_slots} fails={fails}", flush=True)
 
+# ---- admission control: uncapped fire przy pelnej puli nie moze
+# obnizyc wartosci puli (need ofiary > need kandydata => odmowa)
+tier.step_begin()
+with tier._lock:
+    floor_before = float(tier._need[tier._owner_li.clamp(min=0),
+                                    tier._owner_ei.clamp(min=0)].min())
+# wysoki need dla rezydentow, potem ogien z zimnymi kandydatami (need=1)
+with tier._lock:
+    for s_ in range(tier.n_slots):
+        li_, ei_ = int(tier._owner_li[s_]), int(tier._owner_ei[s_])
+        if li_ >= 0:
+            tier._need[li_, ei_] += 50.0
+cold = [e for e in range(E) if int(tier._mirror[0, e]) < 0][:24]
+ids_adm = torch.tensor([cold[:TOPK]], dtype=torch.int32,
+                       device=dev).repeat(T, 1)
+moe_w2_cubit._moe_w2_forward(x, torch.rand(T, TOPK, device=dev) * 0.5,
+                             ids_adm, 0)
+torch.cuda.synchronize()
+# 1) FIRE CONTRACT: force_promote jest bezwarunkowe — odpalony step
+# dostaje wszystkie swoje routed-cold sloty mimo wysokiego need
+# rezydentow (ofiary ograniczone pinami/seen do nie-tego-stepu).
+before_map = int((tier._mirror[0] >= 0).sum())
+tier.force_promote(max_promote=None)
+routed_now = set(ids_adm.flatten().tolist())
+unmapped = [e for e in routed_now if int(tier._mirror[0, e]) < 0]
+print(f"fire contract: routed-cold zmapowane po ogniu: "
+      f"{len(routed_now) - len(unmapped)}/{len(routed_now)} "
+      f"-> {'OK' if not unmapped else 'FAIL ' + str(unmapped[:5])}")
+if unmapped:
+    fails += 1
+# 2) admission_keys (sciezka lazy/manager): jawne klucze nizsze niz
+# floor puli => zero ewikcji
+with tier._lock:
+    ev_before = tier._n_evicted
+    got_slots = tier._take_slots_batch(8, emergency=True,
+                                       admission_keys=[0.1] * 8)
+    denied = tier._n_evicted == ev_before and not got_slots
+print(f"admission(lazy): niskie klucze vs high-need pool: "
+      f"slots={len(got_slots)}, evictions={tier._n_evicted - ev_before} "
+      f"-> {'OK' if denied else 'FAIL'}")
+if not denied:
+    fails += 1
+
 print(f"DONE rounds={ROUNDS} promoted={tier._n_promoted} "
       f"evicted={tier._n_evicted} slot-verifications={verified_slots} "
       f"fails={fails}")
