@@ -11,14 +11,15 @@ context: 32768
 load_timeout_s: 2400
 
 # 2026-07-13: gate ON (tau 0.60 = code default), NON-SPLIT pool 3 GiB/rank
-# (1122 slots >= the fire floor ~1120 at 2 seqs; per-rank TP4 slots are
-# 4x smaller, making this the CHEAPEST hardware class that clears the
-# fire-floor hardstop -> uncapped fires + high tau are legal). Split is
+# (1444 slots >= the fire floor 1346 at 1 seq x FP-growth 1.7; 2 seqs
+# would need 8.4 GiB - beyond this card. Per-rank TP4 slots are 4x
+# smaller, making this the cheapest class that clears the fire-floor
+# hardstop -> uncapped fires + high tau are legal). Split is
 # quality-banned (internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md). Not yet
 # quality-benched on this topology - GSM8K/needle pending free 5090s.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "3.5"
+  VLLM_MOE_W2_DELTA_GB: "4.5"
   VLLM_MOE_W2_GATE: "1"
 
 serve_args:
@@ -30,7 +31,7 @@ serve_args:
   - --max-model-len 32768
   - --gpu-memory-utilization 0.95
   - --max-num-batched-tokens 1024
-  - --max-num-seqs 2
+  - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
   - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}

@@ -10,15 +10,17 @@ requires:
 context: 131072
 load_timeout_s: 2400
 
-# Quality-validated 2026-07-13: GSM8K-200 97.5% vs native-FP8 97.0%
+# Quality-validated 2026-07-13: GPQA Diamond 72.2% (24 GiB); GSM8K-200
+# 97.5% vs native-FP8 97.0% (measured at 12 GiB, tau-insensitive)
 # (paired McNemar p=1, flips 0<->1), needle @121k tokens PASS. Resident
 # 2-bit planes (~36.4 GiB/rank) + NON-SPLIT FP4 need-pool 12 GiB/rank
-# (~1900 slots >= the per-step routed set -> gate fires upgrade their
-# whole step; split is quality-banned: internal/SPLIT_FP4_ZERO_LOSS_*).
+# (4096 slots >= the FIRE FLOOR 2692 at 2 seqs x FP-loop growth 1.7 —
+# measured: 12 GiB pinned 2048/2048 + 542 denied on GPQA C=2, 66-68%
+# vs 72.2% here; split is quality-banned: internal/SPLIT_FP4_ZERO_*).
 # Gate tau 0.60 and unlimited MAX_PROMOTE are the code defaults.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "12"
+  VLLM_MOE_W2_DELTA_GB: "24"
   VLLM_MOE_W2_GATE: "1"
 
 serve_args:
