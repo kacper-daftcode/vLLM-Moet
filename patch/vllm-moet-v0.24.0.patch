@@ -1,6 +1,6 @@
 diff --git a/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 new file mode 100644
-index 0000000..df62c57
+index 000000000..df62c57cc
 --- /dev/null
 +++ b/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
 @@ -0,0 +1,142 @@
@@ -148,7 +148,7 @@ index 0000000..df62c57
 +}
 diff --git a/tools/nvfp4_flashinfer_sm120/README.md b/tools/nvfp4_flashinfer_sm120/README.md
 new file mode 100644
-index 0000000..a147137
+index 000000000..a147137db
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/README.md
 @@ -0,0 +1,49 @@
@@ -203,7 +203,7 @@ index 0000000..a147137
 +- Microbench (isolated KV gather, RTX 5090): 1.86× tokens/s vs 656 B.
 diff --git a/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh b/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 new file mode 100644
-index 0000000..e27203c
+index 000000000..e27203c56
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 @@ -0,0 +1,211 @@
@@ -420,7 +420,7 @@ index 0000000..e27203c
 +}
 diff --git a/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py b/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 new file mode 100644
-index 0000000..cfa92d3
+index 000000000..cfa92d323
 --- /dev/null
 +++ b/tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 @@ -0,0 +1,412 @@
@@ -837,7 +837,7 @@ index 0000000..cfa92d3
 +print("SYNTAX-OK python")
 +print("PATCH-FLASHINFER-DONE")
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
-index 6da3ec7..c84958a 100644
+index 6da3ec717..c84958ac0 100644
 --- a/vllm/compilation/breakable_cudagraph.py
 +++ b/vllm/compilation/breakable_cudagraph.py
 @@ -175,10 +175,13 @@ class BreakableCUDAGraphCapture:
@@ -857,7 +857,7 @@ index 6da3ec7..c84958a 100644
          self._capturing = True
  
 diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
-index b63d861..3cad1f0 100644
+index b63d86199..3cad1f058 100644
 --- a/vllm/compilation/cuda_graph.py
 +++ b/vllm/compilation/cuda_graph.py
 @@ -314,6 +314,10 @@ class CUDAGraphWrapper:
@@ -872,7 +872,7 @@ index b63d861..3cad1f0 100644
                      # `output` is managed by pytorch's cudagraph pool
                      output = self.runnable(*args, **kwargs)
 diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
-index de505e1..f0b49e2 100644
+index de505e122..f0b49e294 100644
 --- a/vllm/config/speculative.py
 +++ b/vllm/config/speculative.py
 @@ -54,6 +54,7 @@ MTPModelTypes = Literal[
@@ -1074,7 +1074,7 @@ index de505e1..f0b49e2 100644
          return self.num_speculative_tokens_per_batch_size is not None
  
 diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
-index ba7d26c..67d3b5e 100644
+index ba7d26c93..67d3b5ea2 100644
 --- a/vllm/config/vllm.py
 +++ b/vllm/config/vllm.py
 @@ -524,6 +524,16 @@ class VllmConfig:
@@ -1184,7 +1184,7 @@ index ba7d26c..67d3b5e 100644
                  "nvfp4 KV cache is not supported with MLA (Multi-head Latent "
                  "Attention) backends. Please use a different --kv-cache-dtype "
 diff --git a/vllm/envs.py b/vllm/envs.py
-index 27a85bb..88f310c 100755
+index 27a85bb3d..88f310c4f 100755
 --- a/vllm/envs.py
 +++ b/vllm/envs.py
 @@ -179,6 +179,9 @@ if TYPE_CHECKING:
@@ -1215,7 +1215,7 @@ index 27a85bb..88f310c 100755
      # JIT all the required kernels before model execution so there is no
      # JIT'ing in the hot-path. However, this warmup increases the engine
 diff --git a/vllm/model_executor/layers/attention/mla_attention.py b/vllm/model_executor/layers/attention/mla_attention.py
-index 051468e..9e5cc3d 100644
+index 051468ed1..9e5cc3dad 100644
 --- a/vllm/model_executor/layers/attention/mla_attention.py
 +++ b/vllm/model_executor/layers/attention/mla_attention.py
 @@ -188,6 +188,7 @@ return curr_o @ W_O
@@ -1311,7 +1311,7 @@ index 051468e..9e5cc3d 100644
  
          # Enforce that we enough for at least 1 page per request
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 7cdb04c..6481313 100644
+index 7cdb04cfb..64813139b 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
 @@ -671,6 +671,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
@@ -1375,7 +1375,7 @@ index 7cdb04c..6481313 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/modelopt.py b/vllm/model_executor/layers/quantization/modelopt.py
-index d51a2dd..2fe74cc 100644
+index d51a2dd31..2fe74cc55 100644
 --- a/vllm/model_executor/layers/quantization/modelopt.py
 +++ b/vllm/model_executor/layers/quantization/modelopt.py
 @@ -1,6 +1,7 @@
@@ -1590,7 +1590,7 @@ index d51a2dd..2fe74cc 100644
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 1b2a8a7..3afdb16 100644
+index 1b2a8a74b..3afdb16fd 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
 @@ -617,6 +617,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
@@ -1651,7 +1651,7 @@ index 1b2a8a7..3afdb16 100644
          assert self.moe_kernel is not None
          return self.moe_kernel.apply(
 diff --git a/vllm/model_executor/layers/quantization/utils/fp8_utils.py b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
-index 32a2d86..3e83d5a 100644
+index 32a2d8689..3e83d5a87 100644
 --- a/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 +++ b/vllm/model_executor/layers/quantization/utils/fp8_utils.py
 @@ -1122,6 +1122,11 @@ def deepgemm_post_process_fp8_weight_block(
@@ -1668,10 +1668,10 @@ index 32a2d86..3e83d5a 100644
              mn=r,
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 0000000..43bad76
+index 000000000..371d388ed
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,1702 @@
+@@ -0,0 +1,1718 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -1890,7 +1890,7 @@ index 0000000..43bad76
 +        torch.zeros(1, device="cuda")
 +        cu = _driver()
 +        for tier, kern in (("w2", b"moe_w2_mm"), ("w4", b"moe_w4_mm"),
-+                           ("w4s", b"moe_w4s_mm"),
++                           ("w4q", b"moe_w4q_mm"),
 +                           ("w2mc2", b"moe_w2_mm"), ("w2mc4", b"moe_w2_mm")):
 +            # GEMM contraction K: gate-up needs K=hidden (4096 DS4-Flash,
 +            # 6144 GLM-5.x, 7168 Kimi-K2.x); down needs K=I/TP (2048 @ TP1,
@@ -1950,7 +1950,7 @@ index 0000000..43bad76
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    need = [("w2", K13), ("w2", K2), ("w2mc4", K13), ("w2mc4", K2)]
 +    if need_w4:
-+        w4tier = "w4s" if moe_w2_delta.split_enabled() else "w4"
++        w4tier = "w4q" if moe_w2_delta.split_enabled() else "w4"
 +        need += [(w4tier, K13), (w4tier, K2)]
 +    missing = [f"{t}_k{k}" for t, k in need if (t, k) not in _fns]
 +    assert not missing, (
@@ -1964,17 +1964,21 @@ index 0000000..43bad76
 +    carry their OWN block-32 scale sections ([fp4_13|sc13|fp4_2|sc2]) — the
 +    base planes, and with them the GPU-resident scale planes the standalone
 +    delta shares, are host-resident there. Split mode (DELTA_SPLIT): slots
-+    hold 2-bit REFINEMENT planes (half the nibble bytes) and NO scale
-+    sections even over the base cache — the split kernel reads scales from
++    hold RADIX-5 quintal planes (2.5 bits/elem, bit-exact e2m1 — see
++    moe_w2_planes.pack_quintal_fragment_major) and NO scale sections even
++    over the base cache — the quintal kernel reads class/sign/scales from
 +    the base slot the refinement is residency-coupled to."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    split = moe_w2_delta.split_enabled()
 +    sc13, sc2 = ((n13k13 // 32, n2k2 // 32)
 +                 if moe_w2_delta.base_enabled() and not split else (0, 0))
-+    div = 4 if split else 2
++    if split:
++        return moe_w2_delta.get_tier(n_experts=E, dev=dev,
++                                     w13_bytes=n13k13 * 5 // 16,
++                                     w2_bytes=n2k2 * 5 // 16)
 +    return moe_w2_delta.get_tier(n_experts=E, dev=dev,
-+                                 w13_bytes=n13k13 // div + sc13,
-+                                 w2_bytes=n2k2 // div + sc2)
++                                 w13_bytes=n13k13 // 2 + sc13,
++                                 w2_bytes=n2k2 // 2 + sc2)
 +
 +
 +def _stage_fp4_host(tier, layer_key: int, fp13, sc13, fp2, sc2) -> None:
@@ -1991,14 +1995,22 @@ index 0000000..43bad76
 +
 +def _pack_fp4_plane(nib):
 +    """One expert's FP4-tier plane row from its e2m1 nibbles: the full
-+    fragment-major nibble plane (moe_w4_mm), or — split mode — the 2-bit
-+    REFINEMENT plane (moe_w4s_mm reads it alongside the resident base)."""
++    fragment-major nibble plane (moe_w4_mm), or — split mode — the radix-5
++    QUINTAL plane (moe_w4q_mm reads it alongside the resident base;
++    bit-exact e2m1 at 2.5 bits/elem)."""
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
-+        nibbles_to_refinement, pack_fp4_fragment_major)
++        pack_fp4_fragment_major, pack_quintal_fragment_major)
 +    if moe_w2_delta.split_enabled():
-+        return pack_fragment_major(nibbles_to_refinement(nib))
++        return pack_quintal_fragment_major(nib)
 +    return pack_fp4_fragment_major(nib)
++
++
++def _fp4_plane_nbytes(n: int, k: int) -> int:
++    """Per-expert FP4-tier plane bytes for one [n, k] matrix: nibbles
++    (n*k/2) or the split quintal plane (n*k*5/16)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    return n * k * 5 // 16 if moe_w2_delta.split_enabled() else n * k // 2
 +
 +
 +# Loader-level skip (the planes-cache/pack "v1.5 follow-up"): layers the
@@ -2056,10 +2068,11 @@ index 0000000..43bad76
 +            return False
 +        if moe_w2_delta.enabled():
 +            # over-base FP4 need-pool: mirror _fp4_tier_for_build's sizing
-+            # and get_tier's pack tag (split refinement slots live in a
-+            # SEPARATE pack — different geometry, "fp4s")
++            # and get_tier's pack tag (split quintal slots live in a
++            # SEPARATE pack — different geometry, "fp4q")
 +            if moe_w2_delta.split_enabled():
-+                ftag, fslot = "fp4s", N13 * K13 // 4 + N2 * K2 // 4
++                ftag = "fp4q"
++                fslot = N13 * K13 * 5 // 16 + N2 * K2 * 5 // 16
 +            else:
 +                ftag = "fp4"
 +                fslot = (N13 * K13 // 2 + s13len) + (N2 * K2 // 2 + s2len)
@@ -2307,10 +2320,11 @@ index 0000000..43bad76
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
-+        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
-+        _div = 4 if moe_w2_delta.split_enabled() else 2
-+        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
-+        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
++        # full nibble planes (w4) or quintal planes (w4q, split)
++        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
++                           dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
++                          dtype=torch.uint8, device=dev)
 +
 +    chunk = 32
 +    for e0 in range(0, E, chunk):
@@ -2384,10 +2398,11 @@ index 0000000..43bad76
 +    tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
 +    fp13 = fp2 = None
 +    if tier is not None:
-+        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
-+        _div = 4 if moe_w2_delta.split_enabled() else 2
-+        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
-+        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
++        # full nibble planes (w4) or quintal planes (w4q, split)
++        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
++                           dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
++                          dtype=torch.uint8, device=dev)
 +
 +    # fp8 experts are 4x the bytes of the mxfp4 path and the requant makes f32
 +    # temporaries -> smaller H2D chunks, per-expert quantize.
@@ -2541,10 +2556,11 @@ index 0000000..43bad76
 +
 +    fp13 = fp2 = None
 +    if tier is not None:
-+        # full nibble planes (w4) or 2-bit refinement planes (w4s, split)
-+        _div = 4 if moe_w2_delta.split_enabled() else 2
-+        fp13 = torch.empty(E, N13 * K13 // _div, dtype=torch.uint8, device=dev)
-+        fp2 = torch.empty(E, N2 * K2 // _div, dtype=torch.uint8, device=dev)
++        # full nibble planes (w4) or quintal planes (w4q, split)
++        fp13 = torch.empty(E, _fp4_plane_nbytes(N13, K13),
++                           dtype=torch.uint8, device=dev)
++        fp2 = torch.empty(E, _fp4_plane_nbytes(N2, K2),
++                          dtype=torch.uint8, device=dev)
 +
 +    # f64 temporaries are 16x the packed nibbles -> small H2D chunks,
 +    # per-expert quantize (mirrors the fp8 loader).
@@ -2698,7 +2714,7 @@ index 0000000..43bad76
 +                           device=dev),
 +            desc=torch.empty(4, slots // _BLOCK, 6, dtype=torch.int64,
 +                             device=dev),
-+            # split-FP4 (moe_w4s_mm) desc tables: 8 u64 per pair, 64 B ABI
++            # split-FP4 (moe_w4q_mm) desc tables: 8 u64 per pair, 64 B ABI
 +            desc4s=torch.empty(2, slots // _BLOCK, 8, dtype=torch.int64,
 +                               device=dev),
 +            # -1 slot row for the tier-less desc path; sized to the MODEL's
@@ -2822,12 +2838,12 @@ index 0000000..43bad76
 +    n_experts, pairs, cap8, mblock,
 +    BLOCK: tl.constexpr,
 +):
-+    """Split-FP4 desc tables (moe_w4s_mm, 8 x u64 per pair, 64 B ABI):
++    """Split-FP4 desc tables (moe_w4q_mm, 8 x u64 per pair, 64 B ABI):
 +    {a, as, base, ref, bs, c, m_rows, pad}. `base`/`bs` point at the
 +    RESIDENT 2-bit plane / scale rows (exactly the w2 tier's pointers);
-+    `ref` at the delta slot's refinement sections ([ref13 | ref2],
-+    w13r_bytes = ref13 section size). Written alongside the main kernel's
-+    w2 tables; pairs not FP4-resident get m=0 (w4s early-EXITs)."""
++    `ref` at the delta slot's quintal sections ([q13 | q2], w13r_bytes =
++    q13 section size). Written alongside the main kernel's w2 tables;
++    pairs not FP4-resident get m=0 (w4q early-EXITs)."""
 +    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
 +    mask = p < pairs
 +    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
@@ -2983,14 +2999,14 @@ index 0000000..43bad76
 +    n_experts, pairs, cap6, cap8, mblock,
 +    BLOCK: tl.constexpr,
 +):
-+    """Base cache + SPLIT FP4 need-pool: refinement slots are read AGAINST
-+    the base pool slot (codes + scales), so a pair routes to the w4s tier
++    """Base cache + SPLIT FP4 need-pool: quintal slots are read AGAINST
++    the base pool slot (codes + scales), so a pair routes to the w4q tier
 +    only when its expert is resident in BOTH slot tables. FP4-mapped but
 +    base-missing counts as a MISS (contributes zero, bumps miss_ptr — the
 +    runner's base fetch + replay restores it; the base tier's eviction
 +    hard-excludes FP4-mapped experts so this is a transient, not a steady
 +    state). w2 tables (d_ptr[0..1], 6-field) serve base-resident pairs not
-+    in FP4; w4s tables (d4s_ptr[0..1], 8-field/64 B) carry
++    in FP4; w4q tables (d4s_ptr[0..1], 8-field/64 B) carry
 +    {a, as, base=bslot codes section, ref=fslot section,
 +    bs=bslot scale section, c, m, pad}."""
 +    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -3270,8 +3286,8 @@ index 0000000..43bad76
 +            (st["K2"] // 128) * 4, 2 * st["K13"],
 +            st["E"], pairs, cap * 6, mblock, BLOCK=256)
 +        if tier is not None and not prefill and moe_w2_delta.split_enabled():
-+            # split-FP4: the extra 8-field tables for moe_w4s_mm (base/bs =
-+            # the resident plane rows, ref = the slot's refinement sections)
++            # split-FP4: the extra 8-field tables for moe_w4q_mm (base/bs =
++            # the resident plane rows, ref = the slot's quintal sections)
 +            d4s = ws["desc4s"]
 +            _desc_build_kernel_w4s[(triton.cdiv(pairs, 256),)](
 +                expert_blocks, num_post, slot_row, d4s,
@@ -3307,7 +3323,7 @@ index 0000000..43bad76
 +               and moe_w2_delta.split_enabled())
 +    if tier is not None and not prefill:
 +        if use_w4s:
-+            _launch("w4s", st["K13"], ws["desc4s"][0], st["N13"], pairs,
++            _launch("w4q", st["K13"], ws["desc4s"][0], st["N13"], pairs,
 +                    stream)
 +        else:
 +            _launch("w4", st["K13"], d[2], st["N13"], pairs, stream)
@@ -3320,7 +3336,7 @@ index 0000000..43bad76
 +    _launch(w2tier, st["K2"], d[1], st["N2"], pairs, stream)
 +    if tier is not None and not prefill:
 +        if use_w4s:
-+            _launch("w4s", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
++            _launch("w4q", st["K2"], ws["desc4s"][1], st["N2"], pairs, stream)
 +        else:
 +            _launch("w4", st["K2"], d[3], st["N2"], pairs, stream)
 +
@@ -3376,10 +3392,10 @@ index 0000000..43bad76
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 0000000..922edae
+index 000000000..b03228171
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,1946 @@
+@@ -0,0 +1,2025 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -4164,7 +4180,8 @@ index 0000000..922edae
 +            return 0
 +
 +    def _take_slots_batch(self, k: int, emergency: bool = False,
-+                          min_cold: int = 2) -> list[int]:
++                          min_cold: int = 2,
++                          admission_keys=None) -> list[int]:
 +        """Take up to k slots (lock held by caller): free list first, then ONE
 +        vectorized eviction pass over all slots. Replaces the old per-slot
 +        python scan per promotion — O(n_slots) per TAKEN slot — which at GLM
@@ -4189,12 +4206,23 @@ index 0000000..922edae
 +        the call sites always passed a set built from exactly that) and cold
 +        >= 2 ticks, so in-flight graph reads never hit a rewritten slot.
 +        Victims are unmapped here (graphs stop dispatching w4 before bytes
-+        change); the caller reserves _owner for each returned slot."""
++        change); the caller reserves _owner for each returned slot.
++
++        `admission_keys` (opportunistic tiers ONLY — the FP4 need-pool,
++        never the base cache): per-candidate priority values aligned with
++        the caller's candidate order (descending). Free slots are granted
++        unconditionally; an EVICTION is granted only while the candidate's
++        priority EXCEEDS the victim's key — pool value never decreases.
++        Without this, an uncapped gate fire at a full pool bulk-evicted
++        the accumulated high-need core for once-routed candidates
++        (wholesale churn; the old MAX_PROMOTE cap merely masked it)."""
 +        out: list[int] = []
 +        while self._free and len(out) < k:
 +            out.append(self._free.pop())
 +        k_evict = k - len(out)
 +        if k_evict <= 0:
++            return out
++        if admission_keys is not None and len(out) >= len(admission_keys):
 +            return out
 +        li, ei = self._owner_li, self._owner_ei
 +        tk = self._owner_tick
@@ -4269,8 +4297,19 @@ index 0000000..922edae
 +            take = min(need, int((~mask).sum()))
 +            if take <= 0:
 +                continue
-+            victims = torch.topk(kk, take, largest=False).indices.tolist()
-+            for s in victims:
++            victims = torch.topk(kk, take, largest=False)
++            vidx = victims.indices.tolist()
++            vkey = victims.values.tolist()
++            for s, vk in zip(vidx, vkey):
++                if admission_keys is not None:
++                    # value-monotone admission: the slot granted next serves
++                    # candidate #len(out) (callers zip candidates with the
++                    # returned slots in order). Victims come cheapest-first
++                    # and candidate priorities descend, so the first losing
++                    # pairing ends the whole take (later pairs only worse).
++                    if len(out) >= len(admission_keys) or \
++                            not (admission_keys[len(out)] > vk):
++                        return out
 +                vli = int(self._owner_li[s])
 +                vei = int(self._owner_ei[s])
 +                self.slot_table[vli, vei] = -1
@@ -4558,6 +4597,20 @@ index 0000000..922edae
 +            # emergency=True: this is the synchronous runner-thread path with
 +            # no forward in flight — leaving a miss UNRESTORED is worse than
 +            # evicting a warm-but-idle slot (see _take_slots_batch).
++            # NO admission control here — the FIRE CONTRACT forbids it
++            # (2026-07-13): the gate fired because THIS token is uncertain
++            # and the imminent replay must see the step's routed set
++            # upgraded. Step pins + the seen window already restrict
++            # victims to experts NOT routed in this step, so unconditional
++            # promotion cannot corrupt the fired step; a "bad" eviction
++            # only costs future re-promotions (speed). At high tau this
++            # converges to native regardless of eviction policy — an
++            # admission veto breaks exactly that limit (the uncertain
++            # token would keep its 2-bit expert forever). Standing
++            # coverage for NON-fired steps is a POOL SIZE knob, not a
++            # promotion-policy knob. (admission_keys plumbing remains in
++            # _take_slots_batch for lazy/manager promotions, which carry
++            # no fire contract.)
 +            slots = self._take_slots_batch(len(cand), emergency=True)
 +            plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
 +            if not plan:
@@ -4583,7 +4636,13 @@ index 0000000..922edae
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +        if len(plan) < len(cand):
-+            if not pin:
++            if self._policy == "need":
++                # Opportunistic tier: the shortfall is admission control
++                # doing its job (candidates below the pool's value floor
++                # stay 2-bit — correct, just not upgraded). Not a quality
++                # event; visible via the deferred KPI.
++                self._kpi_deferred += len(cand) - len(plan)
++            elif not pin:
 +                # No reader follows this call in the current step (see the
 +                # pin doc): a slotless candidate is a DEFERRED warm-up
 +                # fetch, not a quality event — the next step that routes it
@@ -5103,21 +5162,25 @@ index 0000000..922edae
 +_GB_EXPLICIT = "VLLM_MOE_W2_DELTA_GB" in os.environ
 +
 +# SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT=1, default off): the delta tier stores
-+# 2-bit REFINEMENT planes instead of full e2m1 nibble planes and dispatches
-+# moe_w4s_mm, which reads them alongside the 2-bit base (nested codebook;
-+# see moe_w2_planes.nibbles_to_refinement) — half the pool bytes per expert
-+# (over the base cache: less — the refinement slot also drops the private
-+# scale sections, the base slot's serve both GEMMs) = 2x+ FP4 coverage at
-+# equal VRAM, at ~+16-23% kernel-time on the FP4-served pairs (decode ALU;
-+# read bytes unchanged).
++# RADIX-5 QUINTAL planes (2.5 bits/elem) instead of full e2m1 nibble planes
++# and dispatches moe_w4q_mm, which reads them alongside the 2-bit base and
++# reconstructs e2m1 BIT-EXACTLY — all 16 nibbles, zeros included (see
++# moe_w2_planes.pack_quintal_fragment_major; the historical 2-bit
++# refinement merged mag 0 into 0.5 and measurably decayed GSM8K with pool
++# coverage — internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md). 5/8 of the
++# nibble bytes per expert — 1.6x experts/GiB
++# (over the base cache: 1.7x — the quintal slot also drops the private
++# scale sections, the base slot's serve both GEMMs) at ~+11/6/6% kernel
++# time vs moe_w4s at K=4096/2048/512 (decode ALU; slot read bytes 10 B vs
++# 8 B per lane-k64).
 +#
 +# GPU-resident-base configs read the resident planes directly. Over the
 +# BASE CACHE the base codes+scales come from the base tier's pool slot, so
-+# split serving is RESIDENCY-COUPLED: the desc kernel routes a pair to w4s
++# split serving is RESIDENCY-COUPLED: the desc kernel routes a pair to w4q
 +# only when the expert is resident in BOTH slot tables (FP4-mapped but
 +# base-missing counts as a miss -> the standard fetch+replay restores it),
 +# and the base tier's eviction hard-excludes experts mapped in the FP4
-+# tier (_coupled_fp4) so a mapped refinement never outlives its base row.
++# tier (_coupled_fp4) so a mapped quintal row never outlives its base row.
 +_SPLIT = os.getenv("VLLM_MOE_W2_DELTA_SPLIT", "0") == "1"
 +
 +
@@ -5192,16 +5255,47 @@ index 0000000..922edae
 +                t.n_slots, gib, comfort, pairs)
 +    d = _TIER
 +    if d is not None and gate_armed() and len(d._store) > 0:
-+        step_set = int(len(d._store) * top_k * (1 + n_spec))
-+        if d.n_slots < step_set:
-+            logger.warning(
-+                "moe_w2 FP4 need-pool (%d slots) is smaller than one "
-+                "step's routed set (~%d pairs): gate fires can only "
-+                "PARTIALLY upgrade their own step regardless of "
-+                "GATE_MAX_PROMOTE. Quality recovery is degraded (not "
-+                "corrupted). For clean fires raise VLLM_MOE_W2_DELTA_GB "
-+                "to >= %.1f GiB.", d.n_slots, step_set,
-+                step_set * d.slot_bytes / 2**30)
++        # FIRE FLOOR (hard): the fire contract - "this step was uncertain,
++        # re-decide it with its routed set upgraded" - requires the pool to
++        # hold the step's routed union ACROSS ALL of the fire's fixed-point
++        # iterations (pins persist through the step, so every pass's hits
++        # and fetches stay unevictable while later passes promote the
++        # re-routed remainder). Components:
++        #   - one seq's union: moe_layers x top_k x (1 + n_spec);
++        #   - seqs: LINEAR (worst case: independent prompts share nothing —
++        #     measured on GPQA C=2: demand 2590 slots vs sqrt-scaled
++        #     estimate 1899, pool 2048 fully pinned + 542 denied);
++        #   - fixed-point growth: each extra replay re-routes onto new
++        #     experts; measured ~0.32 x union per iteration on GPQA ->
++        #     factor 1 + 0.35 x (GATE_FP_MAX - 1).
++        # Below the floor a fire can only partially upgrade the very token
++        # it exists to fix, and tau->1 does NOT converge: structurally
++        # broken, not merely slow (measured: sub-floor pools 94.5% /
++        # +110% token inflation vs 96.5-97.5% above; 12 GiB at C=2 GPQA
++        # 66.2-67.7% vs 72.2% for a floor-satisfying 24 GiB).
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_gate)
++        fp_growth = 1.0 + 0.35 * max(moe_w2_gate.fire_fp_max() - 1, 0)
++        fire_floor = int(len(d._store) * top_k * (1 + n_spec)
++                         * min(max(max_num_seqs, 1), 4) * fp_growth)
++        if d.n_slots < fire_floor:
++            msg = (
++                f"moe_w2 FP4 need-pool is BELOW the FIRE FLOOR: "
++                f"{d.n_slots} slots < {fire_floor} required for the "
++                f"fire's full fixed-point union ({len(d._store)} MoE "
++                f"layers x top-{top_k} x (1+{n_spec} spec) x "
++                f"{max_num_seqs} seqs x {fp_growth:.2f} FP-growth) = "
++                f"~{fire_floor * d.slot_bytes / 2**30:.1f} GiB. A gate "
++                f"fire cannot cover the step it is meant to fix - the "
++                f"gate contract is structurally broken at ANY tau. Raise "
++                f"VLLM_MOE_W2_DELTA_GB, reduce num_speculative_tokens / "
++                f"max_num_seqs / VLLM_MOE_W2_GATE_FP_MAX, disable the "
++                f"gate, or set VLLM_MOE_W2_FORCE_POOL=1 to serve anyway "
++                f"in DEGRADED mode (incremental promotion via "
++                f"GATE_MAX_PROMOTE).")
++            if not force:
++                raise ValueError(msg)
++            logger.warning("%s (FORCED past the check)", msg)
 +
 +
 +def gate_armed() -> bool:
@@ -5299,12 +5393,13 @@ index 0000000..922edae
 +        policy = None
 +        if base_enabled():
 +            policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
-+        # Split refinement slots have a DIFFERENT geometry than full-FP4
-+        # slots; a distinct pack tag ("fp4s") keeps the two modes' pack
-+        # files apart — a shared pack dir otherwise ping-pong-rebuilds one
-+        # file under the other config's feet (the page-cache store reads
-+        # it live at serve time -> garbage FP4 rows on BOTH; measured).
-+        fp4_tag = "fp4s" if split_enabled() else "fp4"
++        # Split quintal slots have a DIFFERENT geometry than full-FP4
++        # slots; a distinct pack tag ("fp4q"; the superseded 2-bit
++        # refinement used "fp4s") keeps the modes' pack files apart — a
++        # shared pack dir otherwise ping-pong-rebuilds one file under the
++        # other config's feet (the page-cache store reads it live at
++        # serve time -> garbage FP4 rows on BOTH; measured).
++        fp4_tag = "fp4q" if split_enabled() else "fp4"
 +        _TIER = DeltaTier(
 +            n_layers, n_experts, dev or torch.device("cuda"),
 +            w13_bytes=W13_BYTES if w13_bytes is None else w13_bytes,
@@ -5328,10 +5423,10 @@ index 0000000..922edae
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 0000000..6c46f55
+index 000000000..c00bd7b28
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,221 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -5368,25 +5463,39 @@ index 0000000..6c46f55
 +                           0.70-0.80 for more recall once a functional eval confirms
 +                           the FP4 upgrades are correct; lower to 0.50 if marginal.
 +  VLLM_MOE_W2_GATE_MAX_PROMOTE  cap experts force-promoted per fired step
-+                                (default 0 = UNLIMITED). A cap below one
-+                                step's routed set silently breaks the
-+                                fire's contract: the replay re-decides the
-+                                token with most of its routing still 2-bit
-+                                (measured on DS4: cap 64 vs ~350-pair
-+                                steps made accuracy/token-length WORSE as
-+                                tau rose — partial upgrades churn the pool
-+                                without cleaning any step). There is no
-+                                model-independent "harmless" value, so the
-+                                default is off; promotions are only the
-+                                step's COLD routed experts (steady state:
-+                                tens) and per-fire H2D is bounded by the
-+                                pool size. Set a cap (e.g. 64-128) only
-+                                for latency-sensitive serving on configs
-+                                with large slots (non-split) AND a large
-+                                pool — the GLM-5.2 case where unlimited
-+                                fires measured 200-1400 promotes = ~6 GiB
-+                                H2D and a 56->3 tok/s collapse.
++                                (default 64; 0 = unlimited). The cap is a
++                                STABILIZER, not just a latency bound —
++                                measured both ways on DS4 (2026-07-13):
++                                - uncapped, LONG-form generation (GPQA
++                                  Diamond, drifting working sets): pool
++                                  churns wholesale on every fire and the
++                                  FP4 set mutates mid-answer — 60.6% vs
++                                  70.2% capped (McNemar p=0.002); small
++                                  pools also blow up short-form token
++                                  length (+110% on an 85-slot pool).
++                                - capped 64, SHORT-form (GSM8K): capped
++                                  and uncapped tie at big pools (97.0 vs
++                                  97.5, n.s.); capped never measured
++                                  worse than uncapped end-to-end.
++                                Incremental promotion + need-ranking
++                                accumulates the true hard core across
++                                fires; promotions persist. Raise/0 only
++                                for short-form serving with a pool >= the
++                                per-step routed set, where fires then
++                                cover their whole step (and see the
++                                GLM-5.2 collapse note: unlimited fires
++                                measured 200-1400 promotes = ~6 GiB H2D
++                                per fire = 56->3 tok/s).
 +  VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
++  VLLM_MOE_W2_GATE_FP_MAX  max promote->replay iterations per fired step
++                           (default 3). A single replay is only FIRST-order:
++                           upgraded early layers re-route later layers onto
++                           still-cold experts inside the replay, which then
++                           decide the token at 2-bit (measured on GPQA:
++                           tau=1.00 66.2% vs 72.2% when a big pool hid the
++                           residue; GSM8K showed no gap - stable routing).
++                           The loop iterates until no rank promotes; steady
++                           state costs nothing (first check promotes 0).
 +"""
 +
 +import os
@@ -5401,7 +5510,18 @@ index 0000000..6c46f55
 +_SIGNAL = os.getenv("VLLM_MOE_W2_GATE_SIGNAL", "max_prob")
 +_DEFAULT_TAU = {"max_prob": 0.60, "margin": 1.5}
 +_TAU = float(os.getenv("VLLM_MOE_W2_GATE_TAU", str(_DEFAULT_TAU.get(_SIGNAL, 0.60))))
++# Default 0 = UNLIMITED. The cap is a pure PERF knob (bounds a fire's H2D
++# tail); quality-wise it must be neutral. Configs whose pool cannot hold
++# one step's routed union are refused at boot (the FIRE FLOOR hardstop in
++# moe_w2_delta.check_pool_floor); FORCE_POOL=1 configs run degraded and
++# should set an explicit cap.
 +_MAX_PROMOTE = int(os.getenv("VLLM_MOE_W2_GATE_MAX_PROMOTE", "0"))
++_FIRE_FP_MAX = max(int(os.getenv("VLLM_MOE_W2_GATE_FP_MAX", "3")), 1)
++
++
++def fire_fp_max() -> int:
++    """Bound on promote->replay iterations per fired step (see header)."""
++    return _FIRE_FP_MAX
 +_TRACE = os.getenv("VLLM_MOE_W2_GATE_TRACE", "0") == "1"
 +# Measurement mode: on a fired step, COUNT routed experts (delta._need) instead of
 +# promoting/re-forwarding -> study whether 2-bit difficulty concentrates on few
@@ -5530,7 +5650,7 @@ index 0000000..6c46f55
 +                fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 new file mode 100644
-index 0000000..f5de680
+index 000000000..f5de680cf
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 @@ -0,0 +1,256 @@
@@ -5792,10 +5912,10 @@ index 0000000..f5de680
 +            f"(top-{_PILOT_K}, n={tot[1]})")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 0000000..634454b
+index 000000000..b061273a2
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,369 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
@@ -5828,7 +5948,13 @@ index 0000000..634454b
 +import torch
 +
 +# e2m1 nibble -> 2-bit code (tensor-sym {-4,-1,1,4}), validated against
-+# tools/repack_expert_bits.py in tools/test_moe_w2_planes.py
++# tools/repack_expert_bits.py in tools/test_moe_w2_planes.py.
++# The classification is proximity: mags {0,.5,1,1.5,2} -> +-1 (small),
++# {3,4,6} -> +-4 (big). Re-classifying mag 2 into the big class (the
++# "variant A" bijection candidate for the split-FP4 zero loss) was
++# MEASURED AND REJECTED 2026-07-13: base rel-RMS +35% (DS4) / +29% (GLM),
++# cold-tier needle 32k FAIL with degeneration loops — see
++# internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md.
 +_NIBBLE_TO_CODE = torch.tensor(
 +    [2, 2, 2, 2, 2, 3, 3, 3,   # +0,.5,1,1.5,2,3,4,6
 +     1, 1, 1, 1, 1, 0, 0, 0],  # -0,-.5,-1,-1.5,-2,-3,-4,-6
@@ -5837,15 +5963,13 @@ index 0000000..634454b
 +# 2-bit code -> e2m1 nibble of the reconstructed level (for golden tests)
 +_CODE_TO_NIBBLE = torch.tensor([0xE, 0xA, 0x2, 0x6], dtype=torch.uint8)
 +
-+# --- split-FP4 refinement (moe_w4s_mm) -------------------------------------
-+# e2m1 magnitude index -> 2-bit refinement code within the base-code class.
-+# Small classes (codes +-1, mags {0,.5,1,1.5,2}) have 5 members for 4 codes:
-+# magnitude 0 MERGES into 0.5 (measured least-mass adjacent pair on real GLM
-+# packs, 3.6% of elements; unit err 0.5 where the 2-bit base gives them 1.0).
-+# Big classes (codes +-4, mags {3,4,6}) fit with a spare code. The kernel's
-+# decode pools are pool_S={.5,1,1.5,2} and pool_B={3,4,6,6} indexed by ref;
-+# sign comes from the base code. Nesting invariant (code is a pure function
-+# of the nibble) holds pack-wide: kernels/gen/moe_w4s_nesting_study.py.
++# --- split-FP4 refinement, LEGACY 2-bit (moe_w4s_mm) ------------------------
++# SUPERSEDED by the radix-5 quintal planes below (moe_w4q_mm): the 2-bit
++# refinement has 4 states for the small class's 5 magnitudes, so mag 0
++# MERGES into 0.5 — every zero weight serves as +-0.5 x 2^(scale-127).
++# Chosen on GLM packs (3.6% zeros); on DS4 zeros are 11.6% of elements and
++# the merge measurably decays GSM8K with FP4-pool coverage. Kept only for
++# the historical kernel's tests; serving dispatches moe_w4q_mm.
 +_MAG_TO_REF = torch.tensor([0, 0, 1, 2, 3, 0, 1, 2], dtype=torch.uint8)
 +# ref -> reconstructed |value|, per class (golden tests / references)
 +_REF_TO_VAL_SMALL = torch.tensor([0.5, 1.0, 1.5, 2.0])
@@ -5853,14 +5977,16 @@ index 0000000..634454b
 +
 +
 +def nibbles_to_refinement(nib: torch.Tensor) -> torch.Tensor:
-+    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for moe_w4s_mm
-+    (the base 2-bit plane supplies class+sign; see _MAG_TO_REF above)."""
++    """e2m1 nibbles (u8, 0..15) -> 2-bit refinement codes for the LEGACY
++    moe_w4s_mm (mag-0 merge included; superseded by the quintal planes)."""
 +    return _MAG_TO_REF.to(nib.device)[(nib & 7).long()]
 +
 +
 +def split_fp4_dequant(nib: torch.Tensor) -> torch.Tensor:
-+    """Values the SPLIT decode reconstructs from e2m1 nibbles (mag 0 -> 0.5
-+    merge included) — the reference for split-path golden tests."""
++    """Values the LEGACY 2-bit SPLIT decode reconstructs from e2m1 nibbles
++    (mag 0 -> 0.5 merge included) — the reference for moe_w4s golden tests.
++    The quintal path (moe_w4q_mm) reconstructs TRUE e2m1 — its reference
++    is quintal_dequant below."""
 +    dev = nib.device
 +    mag = (nib & 7).long()
 +    code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
@@ -5869,6 +5995,83 @@ index 0000000..634454b
 +    val = torch.where(big, _REF_TO_VAL_BIG.to(dev)[ref],
 +                      _REF_TO_VAL_SMALL.to(dev)[ref])
 +    return torch.where(code <= 1, -val, val)
++
++
++# --- split-FP4 refinement, RADIX-5 quintal planes (moe_w4q_mm) --------------
++# BIT-EXACT split at 2.5 bits/elem: the decoder reconstructs the e2m1
++# magnitude INDEX — the base code narrows it to the small ({0,.5,1,1.5,2})
++# or big ({3,4,6}) class, so a base-5 digit per element covers both, and
++# 4 digits pack into one 10-bit word per QMMA quad (5^4 = 625 <= 1024).
++# Kernel decode: magic /5 ((x*0x334)>>12, exact for x<1024, brute-forced
++# in gen_moe_w4q.py) -> selector = digit + 5*is_big(base) = mag idx ->
++# one PRMT over the FULL e2m1 magnitude pool {0,.5,1,1.5 | 2,3,4,6}; sign
++# from the base code. All 16 nibbles reconstruct exactly (zeros included).
++# Slot = 5/8 of the non-split nibble plane -> 1.6x experts/GiB (1.7x over
++# the base cache, where non-split slots also carry scale sections).
++_QUINTAL_POW = torch.tensor([1, 5, 25, 125], dtype=torch.int64)
++
++
++def nibbles_to_quintal_digits(nib: torch.Tensor) -> torch.Tensor:
++    """e2m1 nibbles (u8, 0..15) -> base-5 digits (i64, 0..4): the e2m1
++    magnitude index within the element's base-code class (small: mag idx
++    0..4; big: mag idx - 5 in 0..2)."""
++    mag = (nib & 7).long()
++    code = _NIBBLE_TO_CODE.to(nib.device)[nib.long()]
++    big = (code == 0) | (code == 3)
++    return torch.where(big, mag - 5, mag)
++
++
++def pack_quintal_fragment_major(nib: torch.Tensor) -> torch.Tensor:
++    """[N, K] u8 e2m1 nibbles -> quintal FP4 plane [N*K*5/16] u8.
++
++    moe_w4q_mm layout, per (nb, kb64) block (320 B): a 32-lane x 8 B "P8"
++    section (record bits 0..64) then a 32-lane x 2 B "P2" section (bits
++    64..80). A lane's 80-bit record = 8 words x 10 bits, little-endian;
++    word w = base-5 pack (d0 + 5 d1 + 25 d2 + 125 d3) of the 4 elements
++    of the w2-layout plane byte w (same [nb,kb,g,t,tile,k32,half,k4]
++    permutation as pack_fragment_major)."""
++    N, K = nib.shape
++    assert N % 16 == 0 and K % 64 == 0
++    d = nibbles_to_quintal_digits(nib)
++    d = d.view(N // 16, 2, 8, K // 64, 2, 2, 4, 4)
++    d = d.permute(0, 3, 2, 6, 1, 4, 5, 7).contiguous().view(-1, 8, 4)
++    words = (d * _QUINTAL_POW.to(d.device)).sum(-1)          # [lanes, 8]
++    # 8 x 10-bit words -> 5 x u16 shorts of the 80-bit LE stream
++    shorts = torch.zeros(words.shape[0], 5, dtype=torch.int64,
++                         device=d.device)
++    for w in range(8):
++        b = 10 * w
++        s, off = b // 16, b % 16
++        shorts[:, s] |= words[:, w] << off
++        if off > 6:
++            shorts[:, s + 1] |= words[:, w] >> (16 - off)
++    shorts &= 0xFFFF
++    by = torch.stack([shorts & 0xFF, shorts >> 8], dim=-1).view(-1, 10)
++    by = by.view(-1, 32, 10).to(torch.uint8)                 # [blk, lane, 10]
++    return torch.cat([by[:, :, :8].reshape(-1, 256),
++                      by[:, :, 8:].reshape(-1, 64)], dim=1).flatten()
++
++
++def quintal_fp4_plane_bytes(n: int, k: int) -> int:
++    """Slot bytes of one [n, k] quintal plane (2.5 bits/elem)."""
++    assert (n * k) % 16 == 0
++    return n * k * 5 // 16
++
++
++def quintal_dequant(nib: torch.Tensor) -> torch.Tensor:
++    """Values the QUINTAL decode reconstructs from e2m1 nibbles — true
++    e2m1, merge-free (the golden reference for moe_w4q tests; equality
++    with the E2M1 table IS the bit-exactness criterion)."""
++    dev = nib.device
++    digit = nibbles_to_quintal_digits(nib)
++    code = _NIBBLE_TO_CODE.to(dev)[nib.long()]
++    big = (code == 0) | (code == 3)
++    mag_idx = torch.where(big, digit + 5, digit)             # decode side
++    mags = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
++                        device=dev)
++    val = mags[mag_idx]
++    return torch.where(code <= 1, -val, val)
++
 +
 +# 2-bit code -> e4m3 byte (the kernel's PRMT LUT): -4,-1,1,4
 +PRMT_LUT_WORD = 0x4838B8C8
@@ -6084,10 +6287,10 @@ index 0000000..634454b
 +    return vals * s
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 new file mode 100644
-index 0000000..752f88d
+index 000000000..684cd1283
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
-@@ -0,0 +1,226 @@
+@@ -0,0 +1,231 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Disk cache for built 2-bit expert planes (+ optional FP4 delta planes).
@@ -6179,9 +6382,11 @@ index 0000000..752f88d
 +        world=world,
 +        rank=rank,
 +        zero_mode=os.getenv("VLLM_MOE_W2_ZERO_MODE", "auto"),
-+        # split-FP4 stores 2-bit refinement planes in fp13/fp2 (half the
-+        # bytes) — a cache built in the other mode must MISS wholesale
-+        fp4_split=moe_w2_delta.split_enabled(),
++        # split-FP4 stores radix-5 quintal planes in fp13/fp2 (5/8 of the
++        # nibble bytes) — a cache built in another mode must MISS
++        # wholesale. "w4q" also invalidates caches of the superseded
++        # 2-bit-refinement split (stored fp4_split=True).
++        fp4_split="w4q" if moe_w2_delta.split_enabled() else False,
 +    )
 +
 +
@@ -6201,9 +6406,12 @@ index 0000000..752f88d
 +        "sc2": E * N2 * K2 // 32,
 +    }
 +    if want_fp4:
-+        div = 4 if moe_w2_delta.split_enabled() else 2
-+        exp["fp13"] = E * N13 * K13 // div
-+        exp["fp2"] = E * N2 * K2 // div
++        if moe_w2_delta.split_enabled():
++            exp["fp13"] = E * N13 * K13 * 5 // 16
++            exp["fp2"] = E * N2 * K2 * 5 // 16
++        else:
++            exp["fp13"] = E * N13 * K13 // 2
++            exp["fp2"] = E * N2 * K2 // 2
 +    return exp
 +
 +
@@ -6316,7 +6524,7 @@ index 0000000..752f88d
 +        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 0000000..c0b9374
+index 000000000..c0b937425
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 @@ -0,0 +1,656 @@
@@ -6978,7 +7186,7 @@ index 0000000..c0b9374
 +    return store
 diff --git a/vllm/model_executor/layers/quantization/utils/prefill_timers.py b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 new file mode 100644
-index 0000000..fd83f50
+index 000000000..fd83f500b
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 @@ -0,0 +1,53 @@
@@ -7037,7 +7245,7 @@ index 0000000..fd83f50
 +                name, _total_ms[name], _count[name])
 diff --git a/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py b/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
 new file mode 100644
-index 0000000..adf4754
+index 000000000..adf4754de
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/skinny_fp8_cubit.py
 @@ -0,0 +1,238 @@
@@ -7280,7 +7488,7 @@ index 0000000..adf4754
 +    torch.zeros(1, device="cuda")
 +    return _ensure_ready()
 diff --git a/vllm/model_executor/layers/sparse_attn_indexer.py b/vllm/model_executor/layers/sparse_attn_indexer.py
-index fe2b268..28cbf14 100644
+index fe2b268cd..28cbf1458 100644
 --- a/vllm/model_executor/layers/sparse_attn_indexer.py
 +++ b/vllm/model_executor/layers/sparse_attn_indexer.py
 @@ -2,6 +2,8 @@
@@ -7578,7 +7786,7 @@ index fe2b268..28cbf14 100644
              "AMD sparse_attn_indexer expects a single FP8 q_quant tensor"
          )
 diff --git a/vllm/model_executor/models/deepseek_mtp.py b/vllm/model_executor/models/deepseek_mtp.py
-index 88f33ac..546f922 100644
+index 88f33ac02..546f92265 100644
 --- a/vllm/model_executor/models/deepseek_mtp.py
 +++ b/vllm/model_executor/models/deepseek_mtp.py
 @@ -35,6 +35,7 @@ from .deepseek_v2 import (
@@ -7606,7 +7814,7 @@ index 88f33ac..546f922 100644
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
-index 820260f..6340e22 100644
+index 820260f79..6340e22f3 100644
 --- a/vllm/model_executor/models/qwen3_dflash.py
 +++ b/vllm/model_executor/models/qwen3_dflash.py
 @@ -345,7 +345,7 @@ class DFlashQwen3Model(nn.Module):
@@ -7652,7 +7860,7 @@ index 820260f..6340e22 100644
          self.model.precompute_and_store_context_kv(
 diff --git a/vllm/model_executor/models/qwen3_dspark.py b/vllm/model_executor/models/qwen3_dspark.py
 new file mode 100644
-index 0000000..b387bae
+index 000000000..b387bae3d
 --- /dev/null
 +++ b/vllm/model_executor/models/qwen3_dspark.py
 @@ -0,0 +1,220 @@
@@ -7877,7 +8085,7 @@ index 0000000..b387bae
 +        loader.load_weights(model_weights.items())
 +        self.model._build_fused_kv_buffers()
 diff --git a/vllm/model_executor/models/registry.py b/vllm/model_executor/models/registry.py
-index a18d54a..92e3bed 100644
+index a18d54acd..92e3bede8 100644
 --- a/vllm/model_executor/models/registry.py
 +++ b/vllm/model_executor/models/registry.py
 @@ -604,6 +604,8 @@ _SPECULATIVE_DECODING_MODELS = {
@@ -7890,7 +8098,7 @@ index a18d54a..92e3bed 100644
      "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
      "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
 diff --git a/vllm/models/deepseek_v4/__init__.py b/vllm/models/deepseek_v4/__init__.py
-index 44e486d..d03eba3 100644
+index 44e486db7..d03eba3d4 100644
 --- a/vllm/models/deepseek_v4/__init__.py
 +++ b/vllm/models/deepseek_v4/__init__.py
 @@ -17,14 +17,23 @@ from .quant_config import DeepseekV4FP8Config
@@ -7919,7 +8127,7 @@ index 44e486d..d03eba3 100644
      "DeepseekV4ForCausalLM",
 diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
 new file mode 100644
-index 0000000..be4a87b
+index 000000000..be4a87b32
 --- /dev/null
 +++ b/vllm/models/deepseek_v4/nvidia/dspark.py
 @@ -0,0 +1,488 @@
@@ -8412,7 +8620,7 @@ index 0000000..be4a87b
 +            return f"model.{rest}"
 +        return f"model.layers.{stage}.{rest}"
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index aa60ad3..fa6da8c 100644
+index aa60ad34c..fa6da8cbe 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
 @@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -8498,7 +8706,7 @@ index aa60ad3..fa6da8c 100644
  
      # Default mapper assumes the original FP4-expert checkpoint layout.
 diff --git a/vllm/models/deepseek_v4/nvidia/mtp.py b/vllm/models/deepseek_v4/nvidia/mtp.py
-index 64715de..8c456a6 100644
+index 64715deae..8c456a69a 100644
 --- a/vllm/models/deepseek_v4/nvidia/mtp.py
 +++ b/vllm/models/deepseek_v4/nvidia/mtp.py
 @@ -40,6 +40,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -8524,7 +8732,7 @@ index 64715de..8c456a6 100644
          super().__init__()
          self.config = vllm_config.model_config.hf_config
 diff --git a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
-index 18e3b10..d536692 100644
+index 18e3b1056..d53669202 100644
 --- a/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 +++ b/vllm/models/deepseek_v4/nvidia/ops/o_proj.py
 @@ -15,13 +15,16 @@ def compute_fp8_einsum_recipe() -> tuple[tuple[int, int, int], bool]:
@@ -8547,7 +8755,7 @@ index 18e3b10..d536692 100644
  
  
 diff --git a/vllm/transformers_utils/configs/speculators/algos.py b/vllm/transformers_utils/configs/speculators/algos.py
-index 0dc3ccc..fb75a27 100644
+index 0dc3ccce0..fb75a278c 100644
 --- a/vllm/transformers_utils/configs/speculators/algos.py
 +++ b/vllm/transformers_utils/configs/speculators/algos.py
 @@ -118,3 +118,47 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
@@ -8599,7 +8807,7 @@ index 0dc3ccc..fb75a27 100644
 +        if config_dict.get(key) is not None:
 +            pre_trained_config[key] = config_dict[key]
 diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
-index 8031900..40193a3 100755
+index 80319003d..40193a3a6 100755
 --- a/vllm/v1/attention/backends/flashinfer.py
 +++ b/vllm/v1/attention/backends/flashinfer.py
 @@ -408,7 +408,9 @@ class FlashInferBackend(AttentionBackend):
@@ -8615,7 +8823,7 @@ index 8031900..40193a3 100755
              return torch.float8_e5m2
 diff --git a/vllm/v1/attention/backends/mla/cubit_sparse_mla.py b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 new file mode 100644
-index 0000000..16d22c7
+index 000000000..16d22c7cd
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/cubit_sparse_mla.py
 @@ -0,0 +1,1171 @@
@@ -9791,7 +9999,7 @@ index 0000000..16d22c7
 +                    tcap, (T + tcap - 1) // tcap, int(capturing), _pfc_launches)
 +    return True
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
-index 2a944d0..d4807a5 100644
+index 2a944d061..d4807a5f7 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py
 @@ -148,6 +148,7 @@ class FlashInferMLASparseSM120Backend(_FlashInferMLASparseBackendBase):
@@ -9822,7 +10030,7 @@ index 2a944d0..d4807a5 100644
              # fp8_ds_mla packed layout: 512 NoPE + 16 scales + 128 RoPE.
              return (num_blocks, block_size, 656)
 diff --git a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
-index d802f56..37dabd5 100644
+index d802f5688..37dabd57d 100644
 --- a/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 +++ b/vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py
 @@ -32,6 +32,13 @@ def _kv_scale_format_for_model(model_type: str | None) -> str:
@@ -9977,7 +10185,7 @@ index d802f56..37dabd5 100644
 +            return out, lse
          return out.squeeze(1), None
 diff --git a/vllm/v1/attention/backends/mla/indexer.py b/vllm/v1/attention/backends/mla/indexer.py
-index 0bc7ca7..ae31f01 100644
+index 0bc7ca7aa..ae31f0175 100644
 --- a/vllm/v1/attention/backends/mla/indexer.py
 +++ b/vllm/v1/attention/backends/mla/indexer.py
 @@ -26,6 +26,10 @@ from vllm.v1.attention.backends.mla.compressor_utils import get_compressed_slot_
@@ -10211,7 +10419,7 @@ index 0bc7ca7..ae31f01 100644
              seq_start + seq_len_per_token,
 diff --git a/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 new file mode 100644
-index 0000000..c37d372
+index 000000000..c37d3729e
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/nvfp4_ds_mla_cache.py
 @@ -0,0 +1,53 @@
@@ -10270,7 +10478,7 @@ index 0000000..c37d372
 +                                         slot_mapping)
 diff --git a/vllm/v1/attention/backends/mla/sparse_mla_env.py b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 new file mode 100644
-index 0000000..9316141
+index 000000000..931614177
 --- /dev/null
 +++ b/vllm/v1/attention/backends/mla/sparse_mla_env.py
 @@ -0,0 +1,216 @@
@@ -10491,7 +10699,7 @@ index 0000000..9316141
 +    except ValueError:
 +        return 8192
 diff --git a/vllm/v1/attention/backends/mla/sparse_swa.py b/vllm/v1/attention/backends/mla/sparse_swa.py
-index df23f34..962c098 100644
+index df23f3437..962c098f8 100644
 --- a/vllm/v1/attention/backends/mla/sparse_swa.py
 +++ b/vllm/v1/attention/backends/mla/sparse_swa.py
 @@ -306,16 +306,19 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
@@ -10699,7 +10907,7 @@ index df23f34..962c098 100644
 +            mask=offset < index_width,
 +        )
 diff --git a/vllm/v1/attention/backends/mla/sparse_utils.py b/vllm/v1/attention/backends/mla/sparse_utils.py
-index e4bd0cf..ca49969 100644
+index e4bd0cf42..ca4996968 100644
 --- a/vllm/v1/attention/backends/mla/sparse_utils.py
 +++ b/vllm/v1/attention/backends/mla/sparse_utils.py
 @@ -23,6 +23,12 @@ def _convert_req_index_to_global_index_kernel(
@@ -10762,7 +10970,7 @@ index e4bd0cf..ca49969 100644
          bt_stride1,
 diff --git a/vllm/v1/attention/ops/dcp_sparse_topk.py b/vllm/v1/attention/ops/dcp_sparse_topk.py
 new file mode 100644
-index 0000000..8a93910
+index 000000000..8a93910d6
 --- /dev/null
 +++ b/vllm/v1/attention/ops/dcp_sparse_topk.py
 @@ -0,0 +1,146 @@
@@ -10913,7 +11121,7 @@ index 0000000..8a93910
 +    merged.masked_fill_(top_scores == float("-inf"), -1)
 +    return merged
 diff --git a/vllm/v1/attention/ops/merge_attn_states.py b/vllm/v1/attention/ops/merge_attn_states.py
-index cf4338f..f057750 100644
+index cf4338fb1..f0577501e 100644
 --- a/vllm/v1/attention/ops/merge_attn_states.py
 +++ b/vllm/v1/attention/ops/merge_attn_states.py
 @@ -46,6 +46,19 @@ def merge_attn_states(
@@ -10937,7 +11145,7 @@ index cf4338f..f057750 100644
      # does not support FP8 dtype for inputs, fallback to use Triton kernel.
      # However, when output_scale is provided, the inputs are still BF16/FP16
 diff --git a/vllm/v1/attention/ops/triton_decode_attention.py b/vllm/v1/attention/ops/triton_decode_attention.py
-index dbe3c57..f12d719 100644
+index dbe3c5705..f12d719fb 100644
 --- a/vllm/v1/attention/ops/triton_decode_attention.py
 +++ b/vllm/v1/attention/ops/triton_decode_attention.py
 @@ -530,6 +530,13 @@ def _decode_grouped_att_m_fwd(
@@ -10955,7 +11163,7 @@ index dbe3c57..f12d719 100644
      _fwd_grouped_kernel_stage1[grid](
          q,
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 90d93a1..418f333 100644
+index 90d93a110..418f33346 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -57,7 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -11015,7 +11223,7 @@ index 90d93a1..418f333 100644
          self,
          spec_decoding_stats: SpecDecodingStats | None,
 diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
-index f97f697..df38279 100644
+index f97f697de..df3827905 100644
 --- a/vllm/v1/engine/core.py
 +++ b/vllm/v1/engine/core.py
 @@ -147,6 +147,43 @@ class EngineCore:
@@ -11074,7 +11282,7 @@ index f97f697..df38279 100644
          self.check_for_draft_tokens = (
              self.use_spec_decode or vllm_config.model_config.is_diffusion
 diff --git a/vllm/v1/kv_cache_interface.py b/vllm/v1/kv_cache_interface.py
-index 5a2a5c5..33c628e 100644
+index 5a2a5c5e2..33c628e8e 100644
 --- a/vllm/v1/kv_cache_interface.py
 +++ b/vllm/v1/kv_cache_interface.py
 @@ -382,6 +382,10 @@ class MLAAttentionSpec(FullAttentionSpec):
@@ -11089,7 +11297,7 @@ index 5a2a5c5..33c628e 100644
              if self.model_version == "deepseek_v4":
                  # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
 diff --git a/vllm/v1/spec_decode/dynamic/utils.py b/vllm/v1/spec_decode/dynamic/utils.py
-index de869b1..348eaf2 100644
+index de869b19a..348eaf2e9 100644
 --- a/vllm/v1/spec_decode/dynamic/utils.py
 +++ b/vllm/v1/spec_decode/dynamic/utils.py
 @@ -1,8 +1,16 @@
@@ -11227,7 +11435,7 @@ index de869b1..348eaf2 100644
 +            vllm_num_speculative_tokens=self._num_spec_tokens,
 +        )
 diff --git a/vllm/v1/worker/gpu/cudagraph_utils.py b/vllm/v1/worker/gpu/cudagraph_utils.py
-index dad1777..358acf4 100644
+index dad1777b4..358acf464 100644
 --- a/vllm/v1/worker/gpu/cudagraph_utils.py
 +++ b/vllm/v1/worker/gpu/cudagraph_utils.py
 @@ -109,6 +109,13 @@ def get_uniform_token_count(
@@ -11357,7 +11565,7 @@ index dad1777..358acf4 100644
          self.hidden_states: torch.Tensor | None = None
          self.aux_hidden_states: list[torch.Tensor] = []
 diff --git a/vllm/v1/worker/gpu/input_batch.py b/vllm/v1/worker/gpu/input_batch.py
-index 6b750fe..167ad68 100644
+index 6b750fe7e..167ad6851 100644
 --- a/vllm/v1/worker/gpu/input_batch.py
 +++ b/vllm/v1/worker/gpu/input_batch.py
 @@ -93,6 +93,11 @@ class InputBatch:
@@ -11433,7 +11641,7 @@ index 6b750fe..167ad68 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2dd..894e258 100644
+index 30ca2ddc5..894e258bf 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -47,6 +47,7 @@ from vllm.tasks import SupportedTask
@@ -11749,7 +11957,7 @@ index 30ca2dd..894e258 100644
  
          # Post-step KV connector related operations.
 diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
-index fab53fe..7bacdbc 100644
+index fab53fef7..7bacdbc51 100644
 --- a/vllm/v1/worker/gpu/sample/gumbel.py
 +++ b/vllm/v1/worker/gpu/sample/gumbel.py
 @@ -213,6 +213,11 @@ def gumbel_sample(
@@ -11765,7 +11973,7 @@ index fab53fe..7bacdbc 100644
      BLOCK_SIZE = 1024
      num_blocks = triton.cdiv(vocab_size, BLOCK_SIZE)
 diff --git a/vllm/v1/worker/gpu/spec_decode/__init__.py b/vllm/v1/worker/gpu/spec_decode/__init__.py
-index 09153dd..c70f169 100644
+index 09153dd20..c70f169f7 100644
 --- a/vllm/v1/worker/gpu/spec_decode/__init__.py
 +++ b/vllm/v1/worker/gpu/spec_decode/__init__.py
 @@ -14,6 +14,12 @@ def init_speculator(vllm_config: VllmConfig, device: torch.device):
@@ -11782,7 +11990,7 @@ index 09153dd..c70f169 100644
          from vllm.v1.worker.gpu.spec_decode.gemma4.speculator import (
              Gemma4Speculator,
 diff --git a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
-index 1bd1308..06a4e44 100644
+index 1bd130838..9014fc0e7 100644
 --- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 +++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
 @@ -29,6 +29,8 @@ logger = init_logger(__name__)
@@ -11836,7 +12044,7 @@ index 1bd1308..06a4e44 100644
          )
  
      def load_draft_model(
-@@ -126,18 +130,46 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -126,18 +130,39 @@ class DFlashSpeculator(DraftModelSpeculator):
      ) -> None:
          super().set_attn(model_state, kv_cache_config, block_tables)
  
@@ -11848,20 +12056,12 @@ index 1bd1308..06a4e44 100644
 -            "a single kv-cache group."
 -        )
 -        self.draft_kv_cache_group_id = draft_groups[0]
--        self.draft_block_size = self.block_tables.block_sizes[
 +        self.draft_kv_cache_group_ids = [
 +            gid for gid, g in enumerate(self.attn_groups) if g
 +        ]
 +        assert self.draft_kv_cache_group_ids, "No draft attention groups found."
 +        self.draft_kv_cache_group_id = self.draft_kv_cache_group_ids[0]
-+        # KERNEL block size, not the manager block size: input_block_tables
-+        # rows hold kernel-page ids (manager blocks are expanded by
-+        # blocks_per_kv_block), so all slot math in the prepare kernel must
-+        # use the same unit. With --block-size 256 over a 64-token FlashInfer
-+        # page the two differ by 4x and the context K/V would land in pages
-+        # the draft attention never reads (measured: all-zero context, all
-+        # draft positions collapse to one prediction, acceptance 0).
-+        self.draft_block_size = self.block_tables.kernel_block_sizes[
+         self.draft_block_size = self.block_tables.block_sizes[
              self.draft_kv_cache_group_id
          ]
  
@@ -11892,7 +12092,7 @@ index 1bd1308..06a4e44 100644
      @torch.inference_mode()
      def _run_model(
          self,
-@@ -183,9 +215,11 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -183,9 +208,11 @@ class DFlashSpeculator(DraftModelSpeculator):
  
          num_sample = num_reqs * self.num_speculative_steps
          sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
@@ -11905,7 +12105,7 @@ index 1bd1308..06a4e44 100644
              self.sample_idx_mapping[:num_sample],
              self.temperature,
              self.seeds,
-@@ -244,6 +278,9 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -244,6 +271,9 @@ class DFlashSpeculator(DraftModelSpeculator):
          is_profile: bool = False,
      ) -> torch.Tensor:
          num_reqs = input_batch.num_reqs
@@ -11915,7 +12115,7 @@ index 1bd1308..06a4e44 100644
          num_target_tokens = input_batch.num_tokens
          num_query_tokens = num_reqs * self.num_query_per_req
          max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
-@@ -291,42 +328,56 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -291,42 +321,56 @@ class DFlashSpeculator(DraftModelSpeculator):
          # The query slot mapping is written into the shared BlockTables slot_mappings.
          # That buffer's address is what the captured CUDA graph reads from at replay.
          assert self.draft_kv_cache_group_id >= 0
@@ -11959,7 +12159,7 @@ index 1bd1308..06a4e44 100644
 +                last_sampled,
 +                next_prefill_tokens,
 +                self.block_tables.input_block_tables[gid],
-+                self.block_tables.kernel_block_sizes[gid],
++                self.block_tables.block_sizes[gid],
 +                self.parallel_drafting_token_id,
 +                self.num_query_per_req,
 +                self.num_speculative_steps,
@@ -11999,7 +12199,7 @@ index 1bd1308..06a4e44 100644
          # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
          batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
              self.query_cudagraph_manager,
-@@ -367,6 +418,26 @@ class DFlashSpeculator(DraftModelSpeculator):
+@@ -367,6 +411,26 @@ class DFlashSpeculator(DraftModelSpeculator):
                  cudagraph_runtime_mode=batch_desc.cg_mode,
              )
  
@@ -12026,7 +12226,7 @@ index 1bd1308..06a4e44 100644
          return self.draft_tokens[:num_reqs]
  
  
-@@ -391,6 +462,7 @@ def _prepare_dflash_inputs_kernel(
+@@ -391,6 +455,7 @@ def _prepare_dflash_inputs_kernel(
      next_prefill_tokens_ptr,
      num_sampled_ptr,
      num_rejected_ptr,
@@ -12034,7 +12234,7 @@ index 1bd1308..06a4e44 100644
      # Block table for slot mapping lookup.
      block_table_ptr,
      block_table_stride,
-@@ -401,8 +473,11 @@ def _prepare_dflash_inputs_kernel(
+@@ -401,8 +466,11 @@ def _prepare_dflash_inputs_kernel(
      num_speculative_steps,
      max_num_reqs,
      max_num_tokens,
@@ -12046,7 +12246,7 @@ index 1bd1308..06a4e44 100644
  ):
      req_idx = tl.program_id(0)
      block_idx = tl.program_id(1)
-@@ -412,9 +487,17 @@ def _prepare_dflash_inputs_kernel(
+@@ -412,9 +480,17 @@ def _prepare_dflash_inputs_kernel(
      ctx_start = tl.load(target_query_start_loc_ptr + req_idx)
      ctx_end = tl.load(target_query_start_loc_ptr + req_idx + 1)
      num_ctx = ctx_end - ctx_start
@@ -12065,7 +12265,7 @@ index 1bd1308..06a4e44 100644
  
      num_sampled = tl.load(num_sampled_ptr + req_idx)
      if num_sampled > 0:
-@@ -444,6 +527,17 @@ def _prepare_dflash_inputs_kernel(
+@@ -444,6 +520,17 @@ def _prepare_dflash_inputs_kernel(
      ctx_slot = ctx_block_id * block_size + (ctx_pos % block_size)
      tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
      tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
@@ -12083,7 +12283,7 @@ index 1bd1308..06a4e44 100644
  
      # --- Query positions / input_ids / slots ---
      query_pos = last_valid_pos + 1 + query_off
-@@ -461,14 +555,21 @@ def _prepare_dflash_inputs_kernel(
+@@ -461,14 +548,21 @@ def _prepare_dflash_inputs_kernel(
      q_slot = q_block_id * block_size + (query_pos % block_size)
  
      tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
@@ -12110,7 +12310,7 @@ index 1bd1308..06a4e44 100644
      tl.store(out_sample_idx_mapping_ptr + sample_idx, req_state_idx, mask=is_sample)
  
      if block_idx == 0:
-@@ -533,6 +634,8 @@ def prepare_dflash_inputs(
+@@ -533,6 +627,8 @@ def prepare_dflash_inputs(
      num_speculative_steps: int,
      max_num_reqs: int,
      max_num_tokens: int,
@@ -12119,7 +12319,7 @@ index 1bd1308..06a4e44 100644
  ) -> None:
      num_reqs = input_batch.num_reqs
      assert num_reqs > 0
-@@ -560,6 +663,7 @@ def prepare_dflash_inputs(
+@@ -560,6 +656,7 @@ def prepare_dflash_inputs(
          next_prefill_tokens,
          num_sampled,
          num_rejected,
@@ -12127,7 +12327,7 @@ index 1bd1308..06a4e44 100644
          block_table,
          block_table.stride(0),
          parallel_drafting_token_id,
-@@ -568,6 +672,10 @@ def prepare_dflash_inputs(
+@@ -568,6 +665,10 @@ def prepare_dflash_inputs(
          num_speculative_steps,
          max_num_reqs,
          max_num_tokens,
@@ -12140,7 +12340,7 @@ index 1bd1308..06a4e44 100644
      )
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
 new file mode 100644
-index 0000000..208f01a
+index 000000000..208f01a7c
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/__init__.py
 @@ -0,0 +1,2 @@
@@ -12148,7 +12348,7 @@ index 0000000..208f01a
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
 new file mode 100644
-index 0000000..28a3417
+index 000000000..28a341755
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py
 @@ -0,0 +1,373 @@
@@ -12527,7 +12727,7 @@ index 0000000..28a3417
 +        self._prev_sched_l = length
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 new file mode 100644
-index 0000000..88841d5
+index 000000000..88841d5f4
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 @@ -0,0 +1,302 @@
@@ -12835,7 +13035,7 @@ index 0000000..88841d5
 +        self._sample_sequential(num_reqs, head_hidden)
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 new file mode 100644
-index 0000000..b5f2a54
+index 000000000..b5f2a540a
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 @@ -0,0 +1,76 @@
@@ -12916,7 +13116,7 @@ index 0000000..b5f2a54
 +
 +    return draft_model
 diff --git a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
-index 360f649..66d0ba8 100644
+index 360f64921..66d0ba8b4 100644
 --- a/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/eagle/eagle3_utils.py
 @@ -44,6 +44,15 @@ def get_eagle3_aux_layers_from_config(
@@ -12936,7 +13136,7 @@ index 360f649..66d0ba8 100644
          return tuple(layer_ids)
      return None
 diff --git a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
-index 3868604..5e7cadc 100644
+index 3868604d3..5e7cadc68 100644
 --- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 +++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
 @@ -100,12 +100,22 @@ class RejectionSampler:
@@ -12963,7 +13163,7 @@ index 3868604..5e7cadc 100644
          processed_logits = self.sampler.apply_sampling_params(
              logits,
 diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
-index 4ab45b2..35a8963 100644
+index 4ab45b2ae..35a89634e 100644
 --- a/vllm/v1/worker/gpu/spec_decode/utils.py
 +++ b/vllm/v1/worker/gpu/spec_decode/utils.py
 @@ -16,35 +16,58 @@ class DraftTokensHandler:
@@ -13064,7 +13264,7 @@ index 4ab45b2..35a8963 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a8..3eb4527 100644
+index 74938a823..2535bd199 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -13357,7 +13557,7 @@ index 74938a8..3eb4527 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4598,219 @@ class GPUModelRunner(
+@@ -4395,6 +4598,238 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -13518,13 +13718,32 @@ index 74938a8..3eb4527 100644
 +
 +                    fire = _or_tp(fire)
 +                    if fire:
-+                        # Promote this rank's COLD routed experts (per-rank
-+                        # shard side effect, never a per-rank replay gate).
-+                        n_promoted = moe_w2_gate.force_promote_step()
-+                        # Replay only if SOME rank upgraded a cold expert ->
-+                        # the result can actually change; if everything routed
-+                        # was already FP4 the replay is wasted HBM bandwidth.
-+                        if _or_tp(n_promoted > 0) and moe_w2_gate.reforward_enabled():
++                        # FIXED-POINT fire (2026-07-13): a single replay is
++                        # only FIRST-order — upgraded early layers re-route
++                        # later layers onto still-cold experts INSIDE the
++                        # replay, and those decide the token at 2-bit
++                        # (measured on GPQA: tau=1.00 scored 66.2% vs 72.2%
++                        # for a pool big enough to hide the residue behind
++                        # standing coverage; GSM8K, with stable routing,
++                        # showed no gap). Iterate promote->replay until no
++                        # rank promotes (routed set fully upgraded) or the
++                        # bound trips — restoring tau->1 convergence to the
++                        # mxfp4 ceiling regardless of pool size (above the
++                        # fire floor).
++                        _gate_iters = 0
++                        while _gate_iters < moe_w2_gate.fire_fp_max():
++                            # Promote this rank's COLD routed experts
++                            # (per-rank shard side effect, never a per-rank
++                            # replay gate).
++                            n_promoted = moe_w2_gate.force_promote_step()
++                            # Replay only if SOME rank upgraded a cold
++                            # expert -> the result can actually change; if
++                            # everything routed was already FP4 the replay
++                            # is wasted HBM bandwidth.
++                            if not (_or_tp(n_promoted > 0)
++                                    and moe_w2_gate.reforward_enabled()):
++                                break
++                            _gate_iters += 1
 +                            with set_forward_context(
 +                                attn_metadata,
 +                                self.vllm_config,
@@ -13577,7 +13796,7 @@ index 74938a8..3eb4527 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4832,95 @@ class GPUModelRunner(
+@@ -4416,6 +4851,95 @@ class GPUModelRunner(
  
          return None
  
@@ -13673,7 +13892,7 @@ index 74938a8..3eb4527 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +4946,12 @@ class GPUModelRunner(
+@@ -4441,6 +4965,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -13686,7 +13905,7 @@ index 74938a8..3eb4527 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5116,23 @@ class GPUModelRunner(
+@@ -4605,6 +5135,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -13710,7 +13929,7 @@ index 74938a8..3eb4527 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5224,35 @@ class GPUModelRunner(
+@@ -4696,13 +5243,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -13751,7 +13970,7 @@ index 74938a8..3eb4527 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5261,33 @@ class GPUModelRunner(
+@@ -4711,16 +5280,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -13789,7 +14008,7 @@ index 74938a8..3eb4527 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5298,155 @@ class GPUModelRunner(
+@@ -4731,18 +5317,155 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -13950,7 +14169,7 @@ index 74938a8..3eb4527 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +5913,40 @@ class GPUModelRunner(
+@@ -5209,6 +5932,40 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -13991,7 +14210,7 @@ index 74938a8..3eb4527 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +5995,33 @@ class GPUModelRunner(
+@@ -5257,6 +6014,33 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
@@ -14025,7 +14244,7 @@ index 74938a8..3eb4527 100644
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +6734,8 @@ class GPUModelRunner(
+@@ -5969,7 +6753,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -14035,7 +14254,7 @@ index 74938a8..3eb4527 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7641,9 @@ class GPUModelRunner(
+@@ -6875,8 +7660,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -14047,7 +14266,7 @@ index 74938a8..3eb4527 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7696,8 @@ class GPUModelRunner(
+@@ -6929,7 +7715,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
@@ -14058,7 +14277,7 @@ index 74938a8..3eb4527 100644
              or self.speculative_config.uses_extract_hidden_states()
          ):
 diff --git a/vllm/v1/worker/gpu_ubatch_wrapper.py b/vllm/v1/worker/gpu_ubatch_wrapper.py
-index 657fc82..dee74ff 100644
+index 657fc8267..dee74ffb4 100644
 --- a/vllm/v1/worker/gpu_ubatch_wrapper.py
 +++ b/vllm/v1/worker/gpu_ubatch_wrapper.py
 @@ -278,6 +278,9 @@ class UBatchWrapper:
@@ -14072,7 +14291,7 @@ index 657fc82..dee74ff 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a3..75eb17b 100644
+index 5e266a313..75eb17b84 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -616,6 +616,31 @@ class Worker(WorkerBase):
