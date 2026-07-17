@@ -6548,10 +6548,10 @@ index 000000000..efbe5068f
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 000000000..dfc3b271a
+index 000000000..c990ac33f
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,296 @@
+@@ -0,0 +1,309 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -6818,9 +6818,20 @@ index 000000000..dfc3b271a
 +    return fire
 +
 +
-+def force_promote_step(layers=None) -> int:
++def step_promote_budget():
++    """The per-STEP promotion budget for a fired step (None = unlimited).
++    The runner threads it through the fixed-point loop so GATE_MAX_PROMOTE
++    caps the STEP as documented, not each promote->replay pass."""
++    return _MAX_PROMOTE if _MAX_PROMOTE > 0 else None
++
++
++def force_promote_step(layers=None, max_promote="default") -> int:
 +    """Pull this step's COLD routed experts up to FP4 via the delta tier.
 +    Returns the number promoted (0 if the tier is absent / nothing cold).
++
++    `max_promote`: remaining budget for THIS call ("default" = the full
++    GATE_MAX_PROMOTE — legacy per-call semantics for callers outside the
++    runner's FP loop; None = unlimited; 0 short-circuits to no promotion).
 +
 +    MEASUREMENT mode (VLLM_MOE_W2_GATE_CAPTURE=1): instead of promoting, only
 +    COUNT this low-confidence step's routed experts (tier.mark_need_only) and
@@ -6834,7 +6845,9 @@ index 000000000..dfc3b271a
 +    if _CAPTURE:
 +        tier.mark_need_only(layers=layers)
 +        return 0
-+    cap = _MAX_PROMOTE if _MAX_PROMOTE > 0 else None
++    cap = step_promote_budget() if max_promote == "default" else max_promote
++    if cap is not None and cap <= 0:
++        return 0
 +    n = tier.force_promote(layers=layers, max_promote=cap)
 +    if n > 0:
 +        _n_reforwarded += 1
@@ -14257,7 +14270,7 @@ index 4ab45b2ae..35a89634e 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..10fe4cdba 100644
+index 74938a823..5e1be0437 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -14550,7 +14563,7 @@ index 74938a823..10fe4cdba 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4598,239 @@ class GPUModelRunner(
+@@ -4395,6 +4598,253 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -14725,15 +14738,29 @@ index 74938a823..10fe4cdba 100644
 +                        # mxfp4 ceiling regardless of pool size (above the
 +                        # fire floor).
 +                        _gate_iters = 0
++                        _step_budget = moe_w2_gate.step_promote_budget()
 +                        while _gate_iters < moe_w2_gate.fire_fp_max():
 +                            # Promote this rank's COLD routed experts
 +                            # (per-rank shard side effect, never a per-rank
-+                            # replay gate).
-+                            n_promoted = moe_w2_gate.force_promote_step()
++                            # replay gate). GATE_MAX_PROMOTE is a per-STEP
++                            # budget shared across the FP passes — the
++                            # per-CALL reading multiplied the cap by the
++                            # loop count (measured on a 204-slot pool:
++                            # 64+64+48 promotions in ONE step = the whole
++                            # pool cycled per fire, [pinned 204, free 0]
++                            # refusals, 12% pool hit-rate = pure churn).
++                            n_promoted = moe_w2_gate.force_promote_step(
++                                max_promote=_step_budget)
++                            if _step_budget is not None:
++                                _step_budget = max(
++                                    _step_budget - n_promoted, 0)
 +                            # Replay only if SOME rank upgraded a cold
 +                            # expert -> the result can actually change; if
 +                            # everything routed was already FP4 the replay
-+                            # is wasted HBM bandwidth.
++                            # is wasted HBM bandwidth. A refused/exhausted
++                            # promotion pass (n=0 with budget left, or
++                            # budget 0) ends the loop the same way — extra
++                            # replays cannot change the result either.
 +                            if not (_or_tp(n_promoted > 0)
 +                                    and moe_w2_gate.reforward_enabled()):
 +                                break
@@ -14790,7 +14817,7 @@ index 74938a823..10fe4cdba 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4852,95 @@ class GPUModelRunner(
+@@ -4416,6 +4866,95 @@ class GPUModelRunner(
  
          return None
  
@@ -14886,7 +14913,7 @@ index 74938a823..10fe4cdba 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +4966,12 @@ class GPUModelRunner(
+@@ -4441,6 +4980,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -14899,7 +14926,7 @@ index 74938a823..10fe4cdba 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5136,23 @@ class GPUModelRunner(
+@@ -4605,6 +5150,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -14923,7 +14950,7 @@ index 74938a823..10fe4cdba 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5244,35 @@ class GPUModelRunner(
+@@ -4696,13 +5258,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -14964,7 +14991,7 @@ index 74938a823..10fe4cdba 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5281,33 @@ class GPUModelRunner(
+@@ -4711,16 +5295,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -15002,7 +15029,7 @@ index 74938a823..10fe4cdba 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5318,155 @@ class GPUModelRunner(
+@@ -4731,18 +5332,155 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -15163,7 +15190,7 @@ index 74938a823..10fe4cdba 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +5933,40 @@ class GPUModelRunner(
+@@ -5209,6 +5947,40 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -15204,7 +15231,7 @@ index 74938a823..10fe4cdba 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +6015,33 @@ class GPUModelRunner(
+@@ -5257,6 +6029,33 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
@@ -15238,7 +15265,7 @@ index 74938a823..10fe4cdba 100644
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +6754,8 @@ class GPUModelRunner(
+@@ -5969,7 +6768,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -15248,7 +15275,7 @@ index 74938a823..10fe4cdba 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7661,9 @@ class GPUModelRunner(
+@@ -6875,8 +7675,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -15260,7 +15287,7 @@ index 74938a823..10fe4cdba 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7716,8 @@ class GPUModelRunner(
+@@ -6929,7 +7730,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
