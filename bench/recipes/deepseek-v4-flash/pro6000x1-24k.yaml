@@ -13,7 +13,7 @@ load_timeout_s: 2400
 # Quality-validated 2026-07-13: GSM8K-200 96.5% vs native 97.0% (McNemar
 # p=1), needle @121k PASS, 149 tok/s single-stream. Resident planes eat
 # 72.7 GiB, so the last ~5 GiB split between the FP4 need-pool and KV:
-# NON-SPLIT 1.5 GiB pool + one 128k stream at util 0.97 (0.95 leaves
+# SPLIT-capable 1.5 GiB pool + one 128k stream at util 0.97 (0.95 leaves
 # only 1.04 GiB KV and the boot fails; MTP scratch has a ~1.7 GiB fixed
 # floor). Two streams need dropping the window to 64k. Gate tau 0.60 =
 # code default.
@@ -35,6 +35,17 @@ env:
   # (1x5090), both p=1 vs native. The split capacity fix (2x
   # slots/GiB) is the path out of degraded mode on these cards.
   VLLM_MOE_W2_FORCE_POOL: "1"
+  # S4 verify-row masking: skip gate fires on MTP verify rows the sampler
+  # cannot reach. A/B on THIS config (2026-07-17): 95.0%/133tok/105.4
+  # tok/s -> 97.0%/127/111.1 - better on all three axes.
+  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
+  # prefill-FP4 ensure: the guarantee needs only one layer's chunk
+  # working set (~120-180 split slots at batched<=256), which this pool
+  # holds. Measured (2026-07-17): tokens 127->119-121 at 97.0-97.5%
+  # GSM8K, ~102 tok/s. GPQA stays -4.5pp vs native (sub-floor decode is
+  # the remaining gap on this card - see the cache-route recipe notes).
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
 
 serve_args:
   - --trust-remote-code
@@ -42,7 +53,7 @@ serve_args:
   - --block-size 256
   - --max-model-len 131072
   - --gpu-memory-utilization 0.97
-  - --max-num-batched-tokens 4096
+  - --max-num-batched-tokens 256
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
@@ -63,3 +74,7 @@ tuning:
     - kind: env
       name: VLLM_MOE_W2_DELTA_GB
       values: ["1.5", "1", "0"]
+# batched-tokens 256 (was 4096): the prefill-FP4 ensure guarantee needs
+# each chunk's per-layer working set to fit the 204-slot pool rotation -
+# measured at 256 (2026-07-17 campaign, q1x_*). Longer prompts pay more
+# chunk overhead; quality first on this recipe.

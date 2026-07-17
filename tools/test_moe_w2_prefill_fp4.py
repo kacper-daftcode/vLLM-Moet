@@ -192,5 +192,109 @@ ok &= n_res == routed
 moe_w2_cubit._PREFILL_FP4_ENSURE = False
 moe_w2_delta._SPLIT = False
 
+# ===========================================================================
+# BASE-CACHE mode (three-tier): prefill-FP4 over the base pool. Layout and
+# tier setup crib tools/test_three_tier_split.py; the new prefill4 base
+# builders must (a) divert both-resident pairs to w4q (split coupling),
+# (b) leave base-only pairs on the 2-bit base slots, (c) count misses for
+# neither-resident pairs, (d) ENSURE mode == full quintal from empty pool.
+# ===========================================================================
+from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (  # noqa: E402
+    pack_scales as _ps)
+
+c13len, s13len = st["planes13"].shape[1], st["sc13"].shape[1]
+c2len, s2len = st["planes2"].shape[1], st["sc2"].shape[1]
+moe_w2_cubit._LAYERS[0] = dict(
+    N13=2 * I, K13=H, N2=H, K2=I, E=E, base=True,
+    off_s13=c13len, off_c2=c13len + s13len,
+    off_s2=c13len + s13len + c2len,
+    off4_s13=2 * c13len, off4_c2=2 * c13len + s13len,
+    off4_s2=2 * c13len + s13len + 2 * c2len,
+)
+_bslot = c13len + s13len + c2len + s2len
+moe_w2_delta._BASE_GB = (E + 5) * _bslot / 2**30
+btier = moe_w2_delta.DeltaTier(1, E, dev,
+                               w13_bytes=c13len + s13len,
+                               w2_bytes=c2len + s2len,
+                               pool_gb=moe_w2_delta._BASE_GB,
+                               policy="lru", tag="base")
+btier.miss_count = torch.zeros(1, dtype=torch.int32, device=dev)
+moe_w2_delta._BASE_TIER = btier
+btier.add_layer_host_planes(0, torch.cat((st["planes13"], st["sc13"]), dim=1),
+                            torch.cat((st["planes2"], st["sc2"]), dim=1))
+btier.ensure_resident(0, torch.arange(E, device=dev))
+torch.cuda.synchronize()
+
+# ---- base + SPLIT: mixed residency, opportunistic prefill
+moe_w2_delta._SPLIT = True
+tier_bs = moe_w2_delta.DeltaTier(1, E, dev,
+                                 w13_bytes=2 * I * H * 5 // 16,
+                                 w2_bytes=H * I * 5 // 16,
+                                 pool_gb=(E + 2) * (2 * I * H * 5 // 16
+                                                    + H * I * 5 // 16) / 2**30,
+                                 policy="freq", tag="fp4", host_pinned=False)
+moe_w2_delta._TIER = tier_bs
+btier._coupled_fp4 = tier_bs
+tier_bs.add_layer_host_planes(0, rf13, rf2)
+with tier_bs._lock:
+    for e in promoted:
+        tier_bs._promote(0, e, tier_bs._take_slots_batch(1)[0])
+torch.cuda.synchronize()
+got = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+ok &= check(f"BASE prefill w4q SPLIT mixed ({len(promoted)}/{E})",
+            got, reference(set(promoted), dequant_split))
+
+# ---- base + SPLIT ENSURE from an EMPTY need-pool -> full quintal
+tier_be = moe_w2_delta.DeltaTier(1, E, dev,
+                                 w13_bytes=2 * I * H * 5 // 16,
+                                 w2_bytes=H * I * 5 // 16,
+                                 pool_gb=(E + 2) * (2 * I * H * 5 // 16
+                                                    + H * I * 5 // 16) / 2**30,
+                                 policy="freq", tag="fp4", host_pinned=False)
+moe_w2_delta._TIER = tier_be
+btier._coupled_fp4 = tier_be
+tier_be.add_layer_host_planes(0, rf13, rf2)
+moe_w2_cubit._PREFILL_FP4_ENSURE = True
+got = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+ok &= check("BASE prefill w4q ENSURE (empty pool -> full quintal)",
+            got, reference(set(range(E)), dequant_split))
+n_res = int((tier_be.slot_table[0] >= 0).sum())
+routed = int(topk_ids.unique().numel())
+print(f"BASE ensure promoted {n_res} for {routed} routed",
+      "PASS" if n_res == routed else "FAIL")
+ok &= n_res == routed
+moe_w2_cubit._PREFILL_FP4_ENSURE = False
+moe_w2_delta._SPLIT = False
+
+# ---- base + NON-SPLIT FP4 (full-FP4 need-pool sections)
+fp13sc = torch.cat((fp13, torch.stack([_ps(s13[e]) for e in range(E)])), dim=1)
+fp2sc = torch.cat((fp2, torch.stack([_ps(s2[e]) for e in range(E)])), dim=1)
+tier_bn = moe_w2_delta.DeltaTier(1, E, dev,
+                                 w13_bytes=fp13sc.shape[1],
+                                 w2_bytes=fp2sc.shape[1],
+                                 pool_gb=(E + 2) * (fp13sc.shape[1]
+                                                    + fp2sc.shape[1]) / 2**30,
+                                 policy="freq", tag="fp4", host_pinned=False)
+moe_w2_delta._TIER = tier_bn
+btier._coupled_fp4 = None
+tier_bn.add_layer_host_planes(0, fp13sc, fp2sc)
+with tier_bn._lock:
+    for e in promoted:
+        tier_bn._promote(0, e, tier_bn._take_slots_batch(1)[0])
+torch.cuda.synchronize()
+got = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+ok &= check(f"BASE prefill w4 NON-SPLIT mixed ({len(promoted)}/{E})",
+            got, reference(set(promoted), dequant_fp4))
+
+# ---- flag off in base mode: bit-exact vs the tier-less base path
+moe_w2_cubit._PREFILL_FP4 = False
+off_b = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+moe_w2_delta._TIER = None
+legacy_b = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+bit = torch.equal(off_b, legacy_b)
+print(f"BASE flag off vs base-only: {'bit-exact PASS' if bit else 'MISMATCH FAIL'}")
+ok &= bit
+moe_w2_cubit._PREFILL_FP4 = True
+
 print("RESULT:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

@@ -35,6 +35,13 @@ env:
   # (1x5090), both p=1 vs native. The split capacity fix (2x
   # slots/GiB) is the path out of degraded mode on these cards.
   VLLM_MOE_W2_FORCE_POOL: "1"
+  # S4 verify-row masking under MTP: fires stop paying for verify rows
+  # the sampler discards (fin-03 measured on this card class: re-forwards
+  # 24%->1.2% prose / 16.9%->7.5% code; our PRO6000 A/B: better accuracy,
+  # tokens AND tok/s). NOTE: prefill-FP4 ensure is NOT set here - the
+  # 1 GiB need-pool (~85 non-split slots) is below one prefill layer's
+  # working set, ensure would thrash it (warns "pool too tight").
+  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
 
 serve_args:
   - --trust-remote-code

@@ -1666,12 +1666,404 @@ index 32a2d8689..3e83d5a87 100644
          dg_ws = deepgemm_post_process_weight_scale_block(
              ws=ws,
              mn=r,
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py b/vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py
+new file mode 100644
+index 000000000..10770e789
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py
+@@ -0,0 +1,386 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""bf12 — lossless 12-bit residency for the BF16 dense remainder (Phase 0).
++
++Opt-in via VLLM_MOE_W2_BF12=1. After weight load, every LinearBase whose
++quant method is UnquantizedLinearMethod and whose weight is a large BF16
++matrix (attention projections, shared experts, dense MLP, DSA indexer
++projections, router gates — everything the checkpoint's exclude_modules
++keep at BF16) is re-packed into a lossless 12-bit container and the BF16
++parameter is freed:
++
++  BF16 word = HI byte (sign+e7..e1) : LO byte (e0+m6..m0). Measured on the
++  real GLM-5.2/Kimi-K2.7 checkpoints, HI takes 30-36 distinct values and
++  the top-7 exponent classes x sign cover 99.9%+ of weights, so:
++
++  nibble plane  u8[n/2]  code = (sign<<3) | ecls, 2 codes/byte
++  LO plane      u8[n]    raw low bytes (mantissa plane is ~uniform)
++  escapes       flat scatter list (byte position, true HI byte), ~3e-4
++  LUT16         u8[16]   code -> HI byte (sign folded in; 7/15 = escape)
++
++  12.05 bits/weight, bit-exact by construction and re-verified against
++  the live tensor at every boot (VLLM_MOE_W2_BF12_VERIFY=0 opts out).
++  Full-checkpoint sweeps: GLM-5.2 53.19->40.04 GiB, Kimi-K2.7
++  22.71->17.10 GiB, roundtrip PASS on every tensor (internal/bf12).
++
++Phase 0 forward = decode into a shared scratch (fixed address, allocated
++before any cudagraph capture; decode is 4 strided byte-copies + one LUT
++gather + one escape scatter, all stream-ordered torch ops -> capture- and
++compile-safe) followed by the stock unquantized GEMM on the scratch view.
++Outputs are bit-identical to the uncompressed path (same GEMM, identical
++bytes). This trades a little decode bandwidth for VRAM; the read-in-place
++SASS kernel is Phase 1.
++
++Not converted here: embed_tokens/lm_head (not LinearBase; and the scratch
++for a vocab-sharded lm_head would exceed its own saving — Phase 1 reads
++planes in place instead) and the MTP drafter's routed experts (FusedMoE,
++not LinearBase; Phase 1 target through the moe-desc kernel family).
++"""
++
++import os
++
++import torch
++
++import vllm.envs as envs
++from vllm.logger import init_logger
++from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
++from vllm.model_executor.layers.linear import (
++    LinearBase,
++    UnquantizedLinearMethod,
++)
++from vllm.model_executor.layers.utils import dispatch_unquantized_gemm
++from vllm.platforms import current_platform
++from vllm.utils.torch_utils import direct_register_custom_op
++
++logger = init_logger(__name__)
++
++
++def enabled() -> bool:
++    return os.getenv("VLLM_MOE_W2_BF12", "0") == "1"
++
++
++def _min_numel() -> int:
++    # Default 1M weights (2 MiB BF16): below that the plane/scratch
++    # bookkeeping isn't worth the launch overhead.
++    return int(os.getenv("VLLM_MOE_W2_BF12_MIN_NUMEL", str(1 << 20)))
++
++
++def _verify() -> bool:
++    return os.getenv("VLLM_MOE_W2_BF12_VERIFY", "1") == "1"
++
++
++def _excludes() -> list[str]:
++    raw = os.getenv("VLLM_MOE_W2_BF12_EXCLUDE", "")
++    return [p for p in raw.split(",") if p]
++
++
++def _paranoia() -> int:
++    """Diagnostic modes (no VRAM saving, syncs — debugging only):
++    1 = keep BF16 originals, bit-check the decode every forward, GEMM on
++        the originals (isolates decode correctness);
++    2 = same checks, but GEMM on the scratch AND a reference GEMM on the
++        original, logging any output mismatch per layer (isolates the
++        GEMM-on-scratch effect)."""
++    return int(os.getenv("VLLM_MOE_W2_BF12_PARANOIA", "0"))
++
++
++def _private_scratch() -> bool:
++    """Diagnostic: dedicated decode buffer per layer (no sharing, no VRAM
++    saving) — isolates shared-scratch ordering effects."""
++    return os.getenv("VLLM_MOE_W2_BF12_PRIVATE", "0") == "1"
++
++
++def _force_sync() -> bool:
++    """Diagnostic: torch.cuda.synchronize() after every bf12 linear."""
++    return os.getenv("VLLM_MOE_W2_BF12_SYNC", "0") == "1"
++
++
++_LAYER_NAMES: dict[int, str] = {}
++_LAYER_REFS: dict[int, torch.Tensor] = {}
++_LAYER_PRIVATE: dict[int, torch.Tensor] = {}
++_MISMATCH_LOGGED: set[int] = set()
++
++
++# Decode scratch, sized to the largest converted layer, allocated during
++# conversion (before profiling/capture -> fixed addresses for cudagraphs).
++# TWO buffers per device, not one: the fused-MoE runner executes the
++# shared-experts MLP on the process-wide aux stream OVERLAPPED with the
++# router gate / routed experts on the main stream
++# (SharedExperts._run_in_aux_stream), so a single shared buffer would be
++# written concurrently by two streams (measured: degraded outputs on GLM).
++# Decode+GEMM run back-to-back on ONE stream inside this op, so keying the
++# buffer by "am I on the aux stream" restores plain stream-ordered
++# correctness with zero cross-stream syncs, in eager and under capture
++# alike (capture records the real stream objects, ids preserved).
++_SCRATCH: dict[tuple, torch.Tensor] = {}
++_AUX_STREAM_ID: int | None = None
++
++
++def _aux_stream_id() -> int | None:
++    global _AUX_STREAM_ID
++    if _AUX_STREAM_ID is None:
++        try:
++            from vllm.utils.torch_utils import aux_stream
++            aux = aux_stream()
++            _AUX_STREAM_ID = -1 if aux is None else aux.stream_id
++        except Exception:  # noqa: BLE001 - no aux overlap on this platform
++            _AUX_STREAM_ID = -1
++    return _AUX_STREAM_ID
++
++
++def _scratch_key(dev: torch.device) -> tuple:
++    on_aux = torch.cuda.current_stream(dev).stream_id == _aux_stream_id()
++    return (dev.index, "aux" if on_aux else "main")
++
++
++def _scratch_u8(dev: torch.device, nbytes: int) -> torch.Tensor:
++    buf = _SCRATCH.get(_scratch_key(dev))
++    if buf is None or buf.numel() < nbytes:
++        raise RuntimeError(
++            f"bf12 scratch missing/small for {_scratch_key(dev)}: "
++            f"need {nbytes} B — layer converted after scratch sizing?")
++    return buf[:nbytes]
++
++
++def encode_bf12(w: torch.Tensor):
++    """BF16 [N, K] (CUDA or CPU) -> (nib, lo, esc_bytepos, esc_hi, lut16).
++
++    Lossless: decode_bf12() reproduces w bit-for-bit. numel must be even.
++    """
++    assert w.dtype == torch.bfloat16 and w.numel() % 2 == 0
++    w_u8 = w.reshape(-1).view(torch.uint8)      # little-endian byte pairs
++    hi = w_u8[1::2].contiguous()
++    lo = w_u8[0::2].contiguous()
++
++    ecls = (hi & 0x7F).to(torch.long)
++    top7 = torch.bincount(ecls, minlength=128).argsort(descending=True)[:7]
++    lut7 = top7.to(torch.uint8)
++
++    # class index per weight; 7 = escape
++    inv = torch.full((128,), 7, dtype=torch.uint8, device=w.device)
++    inv[top7] = torch.arange(7, dtype=torch.uint8, device=w.device)
++    cls = inv[ecls]
++    codes = ((hi >> 7) << 3) | cls
++
++    nib = codes[0::2] | (codes[1::2] << 4)
++
++    esc_idx = torch.nonzero(cls == 7, as_tuple=False).reshape(-1)
++    esc_bytepos = esc_idx * 2 + 1          # HI byte offset in LE u8 view
++    esc_hi = hi[esc_idx]
++
++    # LUT16: code (incl. sign bit) -> HI byte; escape slots hold a
++    # placeholder that the scatter always overwrites.
++    lut16 = torch.zeros(16, dtype=torch.uint8, device=w.device)
++    lut16[:7] = lut7
++    lut16[8:15] = lut7 | 0x80
++    return nib, lo, esc_bytepos, esc_hi, lut16
++
++
++def decode_bf12(layer, out_u8: torch.Tensor) -> None:
++    """Decode a converted layer's planes into out_u8 (u8[2n], LE bf16)."""
++    _decode_into(layer.bf12_nib, layer.bf12_lo, layer.bf12_esc_bytepos,
++                 layer.bf12_esc_hi, layer.bf12_lut16, out_u8)
++
++
++def _decode_into(nib, lo, esc_bytepos, esc_hi, lut16,
++                 out_u8: torch.Tensor) -> None:
++    out_u8[0::2] = lo
++    out_u8[1::4] = lut16[(nib & 0xF).to(torch.long)]
++    out_u8[3::4] = lut16[(nib >> 4).to(torch.long)]
++    out_u8[esc_bytepos] = esc_hi
++
++
++# The decode+GEMM pair is one opaque custom op. The shared scratch is
++# resolved INSIDE the op (not passed as an argument): each call fully
++# rewrites the region it reads, so the op is pure from the compiler's
++# point of view — nothing to functionalize, clone or reorder against.
++# Kernels still record in stream order under cudagraph capture, and the
++# scratch address is fixed (allocated before any capture).
++def _bf12_linear(
++    x: torch.Tensor,
++    nib: torch.Tensor,
++    lo: torch.Tensor,
++    esc_bytepos: torch.Tensor,
++    esc_hi: torch.Tensor,
++    lut16: torch.Tensor,
++    n: int,
++    k: int,
++    layer_id: int,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    priv = _LAYER_PRIVATE.get(layer_id)
++    out_u8 = priv if priv is not None else _scratch_u8(x.device, n * k * 2)
++    _decode_into(nib, lo, esc_bytepos, esc_hi, lut16, out_u8)
++    w = out_u8.view(torch.bfloat16).view(n, k)
++    ref = _LAYER_REFS.get(layer_id)
++    if ref is not None:
++        if layer_id not in _MISMATCH_LOGGED:
++            bad = (out_u8 != ref.reshape(-1).view(torch.uint8)).sum().item()
++            if bad:
++                _MISMATCH_LOGGED.add(layer_id)
++                logger.warning("bf12 PARANOIA: %s decodes %d/%d bytes wrong",
++                               _LAYER_NAMES.get(layer_id, layer_id), bad,
++                               out_u8.numel())
++        if _paranoia() >= 2:
++            y_s = dispatch_unquantized_gemm()(None, x, w, bias)
++            y_r = dispatch_unquantized_gemm()(None, x, ref, bias)
++            if not torch.equal(y_s, y_r):
++                key = -layer_id - 1  # separate log-once space for GEMM diffs
++                if key not in _MISMATCH_LOGGED:
++                    _MISMATCH_LOGGED.add(key)
++                    d = (y_s.float() - y_r.float()).abs().max().item()
++                    logger.warning(
++                        "bf12 PARANOIA2: %s GEMM scratch!=ref  M=%d maxdiff "
++                        "%.3e", _LAYER_NAMES.get(layer_id, layer_id),
++                        x.shape[0] if x.dim() == 2 else -1, d)
++            return y_s
++        w = ref  # mode 1: forwards always use the original weight
++    if envs.VLLM_BATCH_INVARIANT and current_platform.is_cuda_alike():
++        return linear_batch_invariant(x, w, bias)
++    y = dispatch_unquantized_gemm()(None, x, w, bias)
++    if _force_sync():
++        torch.cuda.synchronize()
++    return y
++
++
++def _bf12_linear_fake(
++    x: torch.Tensor,
++    nib: torch.Tensor,
++    lo: torch.Tensor,
++    esc_bytepos: torch.Tensor,
++    esc_hi: torch.Tensor,
++    lut16: torch.Tensor,
++    n: int,
++    k: int,
++    layer_id: int,
++    bias: torch.Tensor | None = None,
++) -> torch.Tensor:
++    return x.new_empty((*x.shape[:-1], n))
++
++
++direct_register_custom_op(
++    "bf12_linear",
++    _bf12_linear,
++    fake_impl=_bf12_linear_fake,
++)
++
++
++class Bf12LinearMethod(UnquantizedLinearMethod):
++    """Unquantized linear over bf12 planes: decode to scratch, then the
++    stock unquantized GEMM. Weight bytes identical to the BF16 original
++    -> outputs bit-identical to the uncompressed path."""
++
++    def __init__(self, n: int, k: int):
++        super().__init__()
++        self._shape = (n, k)
++
++    def apply(self, layer, x, bias=None):
++        n, k = self._shape
++        return torch.ops.vllm.bf12_linear(
++            x, layer.bf12_nib, layer.bf12_lo, layer.bf12_esc_bytepos,
++            layer.bf12_esc_hi, layer.bf12_lut16, n, k,
++            getattr(layer, "bf12_layer_id", -1), bias)
++
++
++def _convert_layer(layer: LinearBase, name: str) -> int:
++    """Encode one layer in place; returns bytes freed (0 if skipped)."""
++    w = layer.weight.data
++    nib, lo, esc_bytepos, esc_hi, lut16 = encode_bf12(w)
++
++    if _verify():
++        out = torch.empty(w.numel() * 2, dtype=torch.uint8, device=w.device)
++        probe = type("P", (), {})()
++        probe.bf12_nib, probe.bf12_lo = nib, lo
++        probe.bf12_esc_bytepos, probe.bf12_esc_hi = esc_bytepos, esc_hi
++        probe.bf12_lut16 = lut16
++        decode_bf12(probe, out)
++        # byte-view compare: true bitwise identity (bf16 NaN != NaN)
++        if not torch.equal(out, w.reshape(-1).view(torch.uint8)):
++            logger.warning("bf12: %s failed bit-exact verify — left as BF16",
++                           name)
++            return 0
++
++    n, k = w.shape
++    layer_id = len(_LAYER_NAMES)
++    _LAYER_NAMES[layer_id] = name
++    if _paranoia():
++        _LAYER_REFS[layer_id] = w.clone()
++    if _private_scratch():
++        _LAYER_PRIVATE[layer_id] = torch.empty(
++            n * k * 2, dtype=torch.uint8, device=w.device)
++    del layer._parameters["weight"]
++    layer.register_buffer("bf12_nib", nib, persistent=False)
++    layer.register_buffer("bf12_lo", lo, persistent=False)
++    layer.register_buffer("bf12_esc_bytepos", esc_bytepos, persistent=False)
++    layer.register_buffer("bf12_esc_hi", esc_hi, persistent=False)
++    layer.register_buffer("bf12_lut16", lut16, persistent=False)
++    layer.bf12_layer_id = layer_id
++    layer.quant_method = Bf12LinearMethod(n, k)
++
++    raw = n * k * 2
++    packed = (nib.numel() + lo.numel() + esc_hi.numel()
++              + esc_bytepos.numel() * 8 + 16)
++    return raw - packed
++
++
++def convert_model(model: torch.nn.Module, vllm_config=None) -> None:
++    """Walk the loaded model and convert every eligible BF16 Linear.
++
++    Runs once post-load, pre-capture. Never raises past the caller's
++    non-fatal guard; a layer that fails verify simply stays BF16.
++    """
++    if not enabled():
++        return
++    if vllm_config is not None and vllm_config.parallel_config.use_ubatching:
++        # The shared decode scratch is stream-ordered; DBO runs two
++        # interleaved forwards -> would race. Not a Phase-0 config.
++        logger.warning("bf12: disabled under ubatching/DBO")
++        return
++
++    min_numel = _min_numel()
++    excludes = _excludes()
++    targets: list[tuple[str, LinearBase]] = []
++    for name, mod in model.named_modules():
++        if not isinstance(mod, LinearBase):
++            continue
++        if type(mod.quant_method) is not UnquantizedLinearMethod:
++            continue
++        w = getattr(mod, "weight", None)
++        if w is None or w.dtype != torch.bfloat16 or w.dim() != 2:
++            continue
++        if w.numel() < min_numel or w.numel() % 2:
++            continue
++        if any(p in name for p in excludes):
++            continue
++        targets.append((name, mod))
++    if not targets:
++        return
++
++    dev = targets[0][1].weight.device
++    scratch_bytes = max(m.weight.numel() for _, m in targets) * 2
++    for key in ((dev.index, "main"), (dev.index, "aux")):
++        cur = _SCRATCH.get(key)
++        if cur is None or cur.numel() < scratch_bytes:
++            # grow-only: convert_model runs once per model (target then
++            # drafter) and every converted layer must fit its buffer
++            _SCRATCH[key] = torch.empty(scratch_bytes, dtype=torch.uint8,
++                                        device=dev)
++
++    freed = 0
++    esc_total = 0
++    n_conv = 0
++    for name, mod in targets:
++        saved = _convert_layer(mod, name)
++        if saved:
++            freed += saved
++            esc_total += mod.bf12_esc_hi.numel()
++            n_conv += 1
++    torch.cuda.empty_cache()
++    logger.info(
++        "bf12: %d/%d BF16 linears -> 12-bit planes, %.2f GiB freed "
++        "(scratch 2x%.0f MiB main+aux, escapes %.1e, verify %s)",
++        n_conv, len(targets), freed / (1 << 30),
++        scratch_bytes / (1 << 20),
++        esc_total / max(1, sum(m.bf12_lo.numel() for _, m in targets
++                               if hasattr(m, "bf12_lo"))),
++        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..01fdf5917
+index 000000000..930ebfaaa
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2167 @@
+@@ -0,0 +1,2370 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3433,6 +3825,155 @@ index 000000000..01fdf5917
 +        tl.store(d + 7, tl.zeros_like(m4), mask=mask)
 +
 +
++@triton.jit
++def _desc_build_kernel_base_delta_prefill4(
++    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr,
++    a1b, as1b, c13b, a2b, as2b, c2b,
++    a1b_rm, a2b_rm,
++    bpoolb, bslot_bytes, off_s13, off_c2, off_s2,
++    fpoolb, fslot_bytes, off4_s13, off4_c2, off4_s2,
++    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
++    n_experts, pairs, cap6, mblock,
++    BLOCK: tl.constexpr,
++):
++    """PREFILL variant of _desc_build_kernel_base_delta (prefill-FP4 over
++    the base cache): FP4-resident pairs divert to the w4 tier exactly like
++    decode, but as FOUR M<=4 sub-entries per 16-token pair (d[2]/d[3] at
++    index p*4+sub — the same capacity argument as the resident prefill4
++    builder). w2 pair entries read the BASE pool; w4 sub-entries read the
++    FP4 pool sections and the ROW-MAJOR activation bases (AFRAG repack
++    leaves them valid). A live pair resident in NEITHER pool contributes
++    zero and bumps miss_ptr (with ensure_resident on both tiers this is
++    the pool-too-small warning path, not a steady state)."""
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    live = p < npost // mblock
++    is4 = fslot >= 0
++    bhit = bslot >= 0
++    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
++    n_miss = tl.sum(tl.where(mask & live & ~bhit & ~is4, 1, 0))
++    tl.atomic_add(miss_ptr, n_miss)
++    base = p.to(tl.int64) * mblock
++    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
++    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
++    # w2 tables (pair granularity, base pool)
++    for gi in tl.static_range(2):
++        d = d_ptr + gi * cap6 + p * 6
++        if gi == 0:
++            b, s, a, as_, c = (bs, bs + off_s13, a1b + base * a1_rb,
++                               as1b + base * as1_rb, c13b + base * c13_rb)
++        else:
++            b, s, a, as_, c = (bs + off_c2, bs + off_s2, a2b + base * a2_rb,
++                               as2b + base * as2_rb, c2b + base * c2_rb)
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, b, mask=mask)
++        tl.store(d + 3, s, mask=mask)
++        tl.store(d + 4, c, mask=mask)
++        tl.store(d + 5, m2, mask=mask)
++    # w4 tables (sub-entries, FP4 pool sections)
++    for sub in tl.static_range(4):
++        rbase = base + sub * 4
++        m4 = tl.where(live & is4, 4, 0).to(tl.int64)
++        for gi in tl.static_range(2):
++            d = d_ptr + (2 + gi) * cap6 + (p * 4 + sub) * 6
++            if gi == 0:
++                b, s, a, as_, c = (fs, fs + off4_s13,
++                                   a1b_rm + rbase * a1_rb,
++                                   as1b + rbase * as1_rb,
++                                   c13b + rbase * c13_rb)
++            else:
++                b, s, a, as_, c = (fs + off4_c2, fs + off4_s2,
++                                   a2b_rm + rbase * a2_rb,
++                                   as2b + rbase * as2_rb,
++                                   c2b + rbase * c2_rb)
++            tl.store(d + 0, a, mask=mask)
++            tl.store(d + 1, as_, mask=mask)
++            tl.store(d + 2, b, mask=mask)
++            tl.store(d + 3, s, mask=mask)
++            tl.store(d + 4, c, mask=mask)
++            tl.store(d + 5, m4, mask=mask)
++
++
++@triton.jit
++def _desc_build_kernel_base_delta_split_prefill4(
++    eids_ptr, npost_ptr, bslot_ptr, fslot_ptr, miss_ptr, d_ptr, d4s_ptr,
++    a1b, as1b, c13b, a2b, as2b, c2b,
++    a1b_rm, a2b_rm,
++    bpoolb, bslot_bytes, off_s13, off_c2, off_s2,
++    fpoolb, fslot_bytes, w13r_bytes,
++    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
++    n_experts, pairs, cap6, cap8, mblock,
++    BLOCK: tl.constexpr,
++):
++    """PREFILL variant of _desc_build_kernel_base_delta_split: quintal
++    refinement read AGAINST the base slot, so a pair diverts to w4q only
++    when resident in BOTH tables (same coupling as decode); diverted pairs
++    are emitted as FOUR M<=4 w4q sub-entries (d4s at p*4+sub) reading the
++    ROW-MAJOR activation bases. FP4-mapped/base-missing pairs count as
++    misses exactly like decode (the base tier's eviction hard-excludes
++    FP4-mapped experts, and prefill ensure_resident fetches the base first,
++    so this is transient)."""
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    bslot = tl.load(bslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    live = p < npost // mblock
++    bhit = bslot >= 0
++    is4 = (fslot >= 0) & bhit          # split serve needs BOTH resident
++    m2 = tl.where(live & bhit & ~is4, mblock, 0).to(tl.int64)
++    n_miss = tl.sum(tl.where(mask & live & ~bhit, 1, 0))
++    tl.atomic_add(miss_ptr, n_miss)
++    base = p.to(tl.int64) * mblock
++    bs = bpoolb + tl.maximum(bslot, 0) * bslot_bytes
++    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
++    for gi in tl.static_range(2):      # w2 tables (base pool sections)
++        d = d_ptr + gi * cap6 + p * 6
++        if gi == 0:
++            b, s, a, as_, c = (bs, bs + off_s13, a1b + base * a1_rb,
++                               as1b + base * as1_rb, c13b + base * c13_rb)
++        else:
++            b, s, a, as_, c = (bs + off_c2, bs + off_s2, a2b + base * a2_rb,
++                               as2b + base * as2_rb, c2b + base * c2_rb)
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, b, mask=mask)
++        tl.store(d + 3, s, mask=mask)
++        tl.store(d + 4, c, mask=mask)
++        tl.store(d + 5, m2, mask=mask)
++    for sub in tl.static_range(4):     # w4s sub-entries (base + refinement)
++        rbase = base + sub * 4
++        m4 = tl.where(live & is4, 4, 0).to(tl.int64)
++        for gi in tl.static_range(2):
++            d = d4s_ptr + gi * cap8 + (p * 4 + sub) * 8
++            if gi == 0:
++                bb, rr, ss, a, as_, c = (
++                    bs, fs, bs + off_s13,
++                    a1b_rm + rbase * a1_rb, as1b + rbase * as1_rb,
++                    c13b + rbase * c13_rb)
++            else:
++                bb, rr, ss, a, as_, c = (
++                    bs + off_c2, fs + w13r_bytes, bs + off_s2,
++                    a2b_rm + rbase * a2_rb, as2b + rbase * as2_rb,
++                    c2b + rbase * c2_rb)
++            tl.store(d + 0, a, mask=mask)
++            tl.store(d + 1, as_, mask=mask)
++            tl.store(d + 2, bb, mask=mask)
++            tl.store(d + 3, rr, mask=mask)
++            tl.store(d + 4, ss, mask=mask)
++            tl.store(d + 5, c, mask=mask)
++            tl.store(d + 6, m4, mask=mask)
++            tl.store(d + 7, tl.zeros_like(m4), mask=mask)
++
++
 +def _launch(tier: str, K: int, desc: torch.Tensor, n_rows: int, pairs: int,
 +            stream):
 +    fn = _fns[(tier, K)]
@@ -3468,6 +4009,7 @@ index 000000000..01fdf5917
 +    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 +        moe_align_block_size,
 +    )
++    global _pf4_ensure_logged
 +
 +    st = _LAYERS[layer_key]
 +    T, H = x.shape
@@ -3527,7 +4069,7 @@ index 000000000..01fdf5917
 +    d = ws["desc"]
 +    cap = d.shape[1]
 +    miss_rows = None
-+    use_pf4 = False        # prefill-FP4 (resident mode only; see _PREFILL_FP4)
++    use_pf4 = False        # prefill-FP4 (resident AND base modes; _PREFILL_FP4)
 +    if torch.cuda.is_current_stream_capturing():
 +        # first capture freezes the workspace sizes (see _workspaces)
 +        _WS["frozen"] = True
@@ -3541,12 +4083,27 @@ index 000000000..01fdf5917
 +        # decode path: FP4-resident pairs divert to the w4 tier.
 +        btier = moe_w2_delta._BASE_TIER
 +        tier = moe_w2_delta._TIER        # FP4 need-pool (None unless opted in)
++        use_pf4 = (_PREFILL_FP4 and prefill and tier is not None
++                   and tier.n_slots > 0)
 +        if torch.cuda.is_current_stream_capturing():
 +            btier.notify_capture()
 +            if tier is not None:
 +                tier.notify_capture()
 +        elif prefill:
 +            btier.ensure_resident(layer_key, topk_ids.view(-1))
++            if use_pf4 and _PREFILL_FP4_ENSURE:
++                # decode-class guarantee for the FP4 side too: fetch the
++                # chunk's routed set into the need-pool AFTER the base rows
++                # (split w4q reads the refinement AGAINST the base slot, and
++                # the base eviction hard-excludes FP4-mapped experts, so the
++                # base ensure must land first). Layer pins rotate per tier.
++                if not _pf4_ensure_logged:
++                    _pf4_ensure_logged = True
++                    logger.info("moe_w2 prefill-FP4 ensure mode (base "
++                                "cache): eager chunk working sets fetched "
++                                "to both tiers (first call: layer %d, T=%d)",
++                                layer_key, T)
++                tier.ensure_resident(layer_key, topk_ids.view(-1))
 +        moe_w2_delta.mark_seen(btier.seen[layer_key], topk_ids.view(-1).long())
 +        if tier is not None:
 +            # the gate's force_promote reads the FP4 tier's own seen scatter
@@ -3578,7 +4135,44 @@ index 000000000..01fdf5917
 +        slot_row = btier.slot_table[layer_key]
 +        use_fp4 = tier is not None and not prefill
 +        use_w4s_base = use_fp4 and moe_w2_delta.split_enabled()
-+        if use_w4s_base:
++        if use_pf4 and moe_w2_delta.split_enabled():
++            # prefill-FP4 over the base cache, SPLIT: w2 pair entries from
++            # the base pool + w4q SUB-entries (M<=4) coupling base codes
++            # with the quintal refinement. See the prefill4 builders.
++            fslot_row = tier.slot_table[layer_key]
++            d4s = ws["desc4s"]
++            _desc_build_kernel_base_delta_split_prefill4[
++                    (triton.cdiv(pairs, 256),)](
++                expert_blocks, num_post, slot_row, fslot_row,
++                btier.miss_count, d, d4s,
++                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
++                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
++                ws["a1"].data_ptr(), ws["a2"].data_ptr(),
++                btier.pool.data_ptr(), btier.slot_bytes,
++                st["off_s13"], st["off_c2"], st["off_s2"],
++                tier.pool.data_ptr(), tier.slot_bytes, tier.w13_bytes,
++                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
++                (st["K2"] // 32) * 4, 2 * st["K13"],
++                st["E"], pairs, cap * 6, d4s.shape[1] * 8, mblock, BLOCK=256)
++        elif use_pf4:
++            # prefill-FP4 over the base cache, NON-split: w4 sub-entries
++            # read full-FP4 sections from the need-pool slots.
++            fslot_row = tier.slot_table[layer_key]
++            _desc_build_kernel_base_delta_prefill4[
++                    (triton.cdiv(pairs, 256),)](
++                expert_blocks, num_post, slot_row, fslot_row,
++                btier.miss_count, d,
++                a1_base.data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
++                a2_base.data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
++                ws["a1"].data_ptr(), ws["a2"].data_ptr(),
++                btier.pool.data_ptr(), btier.slot_bytes,
++                st["off_s13"], st["off_c2"], st["off_s2"],
++                tier.pool.data_ptr(), tier.slot_bytes,
++                st["off4_s13"], st["off4_c2"], st["off4_s2"],
++                st["K13"], (st["K13"] // 32) * 4, 4 * st["K2"], st["K2"],
++                (st["K2"] // 32) * 4, 2 * st["K13"],
++                st["E"], pairs, cap * 6, mblock, BLOCK=256)
++        elif use_w4s_base:
 +            fslot_row = tier.slot_table[layer_key]
 +            d4s = ws["desc4s"]
 +            _desc_build_kernel_base_delta_split[(triton.cdiv(pairs, 256),)](
@@ -3626,10 +4220,12 @@ index 000000000..01fdf5917
 +        # FP4-mapped/base-missing pair contributed zero and must replay).
 +        e_pair = expert_blocks.to(torch.long).clamp_(0, st["E"] - 1)
 +        resident = (slot_row[e_pair] >= 0)
-+        if use_fp4 and not use_w4s_base:
++        if (use_fp4 or use_pf4) and not moe_w2_delta.split_enabled():
++            # non-split: a full-FP4 slot serves the pair without its base
++            # row (decode d[2]/d[3] or the prefill4 sub-entries).
 +            resident |= (fslot_row[e_pair] >= 0)
 +        miss_rows = resident.repeat_interleave(mblock)[:slots]
-+        if not use_fp4:
++        if not use_fp4 and not use_pf4:
 +            tier = None      # downstream w4 launches key off `tier`
 +    else:
 +        tier = moe_w2_delta._TIER       # peek only; created by the plane builder
@@ -3659,7 +4255,6 @@ index 000000000..01fdf5917
 +                    # decode-class guarantee: fetch the chunk's routed set
 +                    # into the pool before the desc build reads slot_table
 +                    # (base-cache prefill idiom; layer pins rotate).
-+                    global _pf4_ensure_logged
 +                    if not _pf4_ensure_logged:
 +                        _pf4_ensure_logged = True
 +                        logger.info("moe_w2 prefill-FP4 ensure mode: eager "
@@ -3841,10 +4436,10 @@ index 000000000..01fdf5917
 +    return enabled() and _ensure_ready()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..8b6de80da
+index 000000000..efbe5068f
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2088 @@
+@@ -0,0 +1,2106 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -4837,8 +5432,26 @@ index 000000000..8b6de80da
 +        Decode steps with misses are unaffected (force_promote already
 +        zeroes after its snapshot); this closes the window for miss-free
 +        and prefill steps. A mark lost to an in-flight scatter only delays
-+        one lazy promotion (the manager's own idiom)."""
++        one lazy promotion (the manager's own idiom).
++
++        ALSO closes the step's PIN scope. step_begin (the other clear
++        site) only runs on the base-cache runner path, so on delta-only
++        configs (GPU-resident planes + FP4 tier: the DS4 1-GPU/TP2 and
++        GLM TP4 quality recipes) the gate's force_promote hit-pins
++        accumulated FOREVER — once the pool filled, every eviction pass
++        (incl. the emergency pass, whose only hard exclusion is these
++        pins) found zero victims and the gate silently stopped promoting
++        (measured on the fin-03 line at tau=1.0: 22.9k fires -> 2
++        re-forwards, [pool 341, pinned 341]). The step is fully executed
++        when the runner calls this (replays done; nothing reads the pool
++        until the next step's passes re-pin what they touch), so clearing
++        here restores the one-step scope on every config. Ported as
++        knowledge from fin-03 commit 6e4af0052 (its gate line diverged
++        pre-fire-floor; the fix concept carries verbatim)."""
 +        self.seen.zero_()
++        with self._lock:
++            self._step_pins.clear()
++            self._layer_pins.clear()
 +
 +    # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
 +
@@ -5935,10 +6548,10 @@ index 000000000..8b6de80da
 +    return _TIER
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 000000000..dbc599815
+index 000000000..dfc3b271a
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,231 @@
+@@ -0,0 +1,296 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -6049,6 +6662,17 @@ index 000000000..dbc599815
 +# Diagnostic: when 0, a fired step force-promotes (warms cache) but SKIPS the
 +# 2nd forward — isolates re-forward correctness from force_promote. Default 1.
 +_REFORWARD = os.getenv("VLLM_MOE_W2_GATE_REFORWARD", "1") == "1"
++# S4 verify-row masking (VLLM_MOE_W2_GATE_SPEC_MASK=1, default off): on MTP
++# verify steps the row aggregation skips rows the sampler cannot emit — the
++# min-over-ALL-rows firing otherwise pays replays for uncertainty on rows
++# that get DISCARDED after the first rejected draft. Knowledge-ported from
++# the fin-03 gate-signal session (commit 6e4af0052 there): measured on DS4
++# 1x PRO6000, MTP k=2, tau=0.60: re-forwards 24% -> 1.2% on prose
++# (-31% -> -4% tok/s) and 16.9% -> 7.5% on code, quality flat. Their wider
++# study also stands as the verdict AGAINST porting the ML signal machinery:
++# no scalar or fitted combination beat max_prob materially (live labels
++# 10.9% -> 10.3% fire@recall90), so max_prob stays the only signal here.
++_SPEC_MASK = os.getenv("VLLM_MOE_W2_GATE_SPEC_MASK", "0") == "1"
 +
 +# observability (cheap; only mutated when the gate is enabled)
 +_n_steps = 0
@@ -6099,7 +6723,48 @@ index 000000000..dbc599815
 +    return _REFORWARD
 +
 +
-+def should_reforward(logits: torch.Tensor) -> bool:
++def _spec_relevant_mask(logits: torch.Tensor, spec) -> torch.Tensor | None:
++    """S4: rows the sampler can actually emit on an MTP verify step — the
++    prefix of would-be-accepted drafts (greedy: draft == argmax of the
++    previous row), the first rejection, and the bonus row only when every
++    draft is accepted. Pure GPU ops (argmax + per-request cumprod over
++    <= k elements), no host syncs; the decision sync below stays the only
++    one. Returns None (no masking) when shapes don't line up — masking is
++    an optimization, never a correctness dependency."""
++    try:
++        n_rows = logits.shape[0]
++        num_draft = spec.num_draft_tokens          # python list per request
++        if sum(num_draft) == 0:
++            return None
++        if n_rows != sum(num_draft) + len(num_draft):
++            return None
++        draft_ids = spec.draft_token_ids
++        am = logits.argmax(dim=-1)
++        mask = torch.zeros(n_rows, dtype=torch.bool, device=logits.device)
++        row = 0
++        dpos = 0
++        for nd in num_draft:
++            if nd == 0:
++                mask[row] = True
++                row += 1
++                continue
++            seg = am[row:row + nd]
++            drafts = draft_ids[dpos:dpos + nd]
++            acc = seg == drafts
++            prefix = torch.cumprod(acc.int(), dim=0).bool()
++            rel = torch.ones(nd, dtype=torch.bool, device=logits.device)
++            if nd > 1:
++                rel[1:] = prefix[:-1]              # row i needs 0..i-1 accepted
++            mask[row:row + nd] = rel
++            mask[row + nd] = prefix[-1]            # bonus row iff all accepted
++            row += nd + 1
++            dpos += nd
++        return mask
++    except Exception:  # noqa: BLE001 - masking is an optimization only
++        return None
++
++
++def should_reforward(logits: torch.Tensor, spec=None) -> bool:
 +    """Decide whether to re-forward this decode step at FP4.
 +
 +    `logits` is the per-request next-token logits [num_reqs, vocab] from the
@@ -6107,6 +6772,10 @@ index 000000000..dbc599815
 +    whole batch shares one CUDA graph, so a re-forward recomputes all rows
 +    together. Costs ONE GPU->CPU sync (the `.item()` below), incurred only when
 +    the gate is enabled.
++
++    `spec` is the step's SpecDecodeMetadata (or None): with
++    VLLM_MOE_W2_GATE_SPEC_MASK=1 the min-aggregation skips MTP verify rows
++    the sampler cannot reach (see _SPEC_MASK above).
 +
 +    `margin` and `max_prob` are computed directly from logits without a full
 +    softmax: margin = top1_logit - top2_logit == log p1 - log p2 (the softmax
@@ -6127,10 +6796,19 @@ index 000000000..dbc599815
 +    tau = _current_tau()
 +    top2 = torch.topk(logits, 2, dim=-1).values  # [R, 2]
 +    if _SIGNAL == "margin":
-+        worst = (top2[:, 0] - top2[:, 1]).min()
++        rows = top2[:, 0] - top2[:, 1]
 +    else:  # max_prob
 +        lse = torch.logsumexp(logits, dim=-1)
-+        worst = torch.exp(top2[:, 0] - lse).min()
++        rows = torch.exp(top2[:, 0] - lse)
++    mask = None
++    if _SPEC_MASK and spec is not None:
++        mask = _spec_relevant_mask(logits, spec)
++    if mask is not None:
++        # masked rows are pushed to +inf so the min ignores them; an
++        # all-masked batch (cannot happen: row 0 of each request is always
++        # reachable) would fall through to no-fire, which is safe.
++        rows = torch.where(mask, rows, torch.full_like(rows, float("inf")))
++    worst = rows.min()
 +    fire = bool((worst <= tau).item())
 +    if fire:
 +        _n_fired += 1
@@ -13579,7 +14257,7 @@ index 4ab45b2ae..35a89634e 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..2535bd199 100644
+index 74938a823..10fe4cdba 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -13872,7 +14550,7 @@ index 74938a823..2535bd199 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4598,238 @@ class GPUModelRunner(
+@@ -4395,6 +4598,239 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -14019,7 +14697,8 @@ index 74938a823..2535bd199 100644
 +                        and moe_w2_gate.reforward_enabled()
 +                    )
 +                else:
-+                    fire = moe_w2_gate.should_reforward(logits)
++                    fire = moe_w2_gate.should_reforward(
++                        logits, spec=spec_decode_metadata)
 +                    _tp = get_tp_group()
 +
 +                    def _or_tp(flag: bool) -> bool:
@@ -14111,7 +14790,7 @@ index 74938a823..2535bd199 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +4851,95 @@ class GPUModelRunner(
+@@ -4416,6 +4852,95 @@ class GPUModelRunner(
  
          return None
  
@@ -14207,7 +14886,7 @@ index 74938a823..2535bd199 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +4965,12 @@ class GPUModelRunner(
+@@ -4441,6 +4966,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -14220,7 +14899,7 @@ index 74938a823..2535bd199 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5135,23 @@ class GPUModelRunner(
+@@ -4605,6 +5136,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -14244,7 +14923,7 @@ index 74938a823..2535bd199 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5243,35 @@ class GPUModelRunner(
+@@ -4696,13 +5244,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -14285,7 +14964,7 @@ index 74938a823..2535bd199 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5280,33 @@ class GPUModelRunner(
+@@ -4711,16 +5281,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -14323,7 +15002,7 @@ index 74938a823..2535bd199 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5317,155 @@ class GPUModelRunner(
+@@ -4731,18 +5318,155 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -14484,7 +15163,7 @@ index 74938a823..2535bd199 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +5932,40 @@ class GPUModelRunner(
+@@ -5209,6 +5933,40 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -14525,7 +15204,7 @@ index 74938a823..2535bd199 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +6014,33 @@ class GPUModelRunner(
+@@ -5257,6 +6015,33 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
@@ -14559,7 +15238,7 @@ index 74938a823..2535bd199 100644
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +6753,8 @@ class GPUModelRunner(
+@@ -5969,7 +6754,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -14569,7 +15248,7 @@ index 74938a823..2535bd199 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7660,9 @@ class GPUModelRunner(
+@@ -6875,8 +7661,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -14581,7 +15260,7 @@ index 74938a823..2535bd199 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7715,8 @@ class GPUModelRunner(
+@@ -6929,7 +7716,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
@@ -14606,10 +15285,40 @@ index 657fc8267..dee74ffb4 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a313..75eb17b84 100644
+index 5e266a313..74ef537d5 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
-@@ -616,6 +616,31 @@ class Worker(WorkerBase):
+@@ -383,6 +383,29 @@ class Worker(WorkerBase):
+         ):
+             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
+ 
++            # bf12 (VLLM_MOE_W2_BF12=1): repack the BF16 dense remainder
++            # (attention / shared-expert / dense-MLP linears) into lossless
++            # 12-bit planes and free the BF16 params. Must run after weight
++            # load and before profiling/cudagraph capture — the decode
++            # scratch address is baked into every captured graph.
++            if not load_dummy_weights:
++                try:
++                    from vllm.model_executor.layers.quantization.utils import (
++                        moe_w2_bf12,
++                    )
++
++                    if moe_w2_bf12.enabled():
++                        moe_w2_bf12.convert_model(
++                            self.model_runner.model, self.vllm_config
++                        )
++                        drafter = getattr(self.model_runner, "drafter", None)
++                        if drafter is not None and hasattr(drafter, "model"):
++                            moe_w2_bf12.convert_model(
++                                drafter.model, self.vllm_config
++                            )
++                except Exception as e:  # noqa: BLE001 - never fatal
++                    logger.warning("bf12 conversion skipped: %s", e)
++
+         if self.vllm_config.weight_transfer_config is not None:
+             self.weight_transfer_engine = WeightTransferEngineFactory.create_engine(
+                 self.vllm_config.weight_transfer_config,
+@@ -616,6 +639,31 @@ class Worker(WorkerBase):
          ):
              self.model_runner._init_kv_zero_meta()
  
@@ -14641,7 +15350,7 @@ index 5e266a313..75eb17b84 100644
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-@@ -788,6 +813,16 @@ class Worker(WorkerBase):
+@@ -788,6 +836,16 @@ class Worker(WorkerBase):
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
  
@@ -14658,7 +15367,7 @@ index 5e266a313..75eb17b84 100644
      def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          return self.model_runner.get_supported_tasks()
  
-@@ -905,6 +940,8 @@ class Worker(WorkerBase):
+@@ -905,6 +963,8 @@ class Worker(WorkerBase):
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
@@ -14667,7 +15376,7 @@ index 5e266a313..75eb17b84 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -914,15 +951,69 @@ class Worker(WorkerBase):
+@@ -914,15 +974,69 @@ class Worker(WorkerBase):
              and not get_pp_group().is_last_rank
          )
  
