@@ -1,0 +1,41 @@
+id: quality
+# The QUALITY suite: dataset evals with PARITY-VS-NATIVE as the KPI.
+# Run on quality-tier recipes at release time (matrix entries with
+# `quality: true`), alongside `standard` (perf). Every probe stores the raw
+# llm-inference-bench JSON as an artifact and compares against a committed
+# NATIVE baseline from bench/baselines/ (measured by the same tool on the
+# same checkpoint — accuracy flips + completion-token inflation are the
+# headline, not absolute scores).
+#
+# Probes are keyed by `id` (suite_params overrides match on it). The think
+# probe is expensive (~7 h on 2x PRO6000) — recipes opt IN via
+# suite_params: { gpqa-think: { enabled: true } } ... recipes that cannot
+# think (no reasoning mode) simply omit it; the runner skips disabled
+# entries.
+allow_recipe_overrides: true
+probes:
+  - kind: quality
+    id: gsm8k
+    profile: gsm8k
+    runs: 200
+    concurrency: 2
+    max_tokens: 6000
+    baseline: ds4-flash/native-tp2-gsm8k-c2
+  - kind: quality
+    id: gpqa
+    profile: gpqa-diamond
+    runs: 198
+    concurrency: 2
+    max_tokens: 30000
+    baseline: ds4-flash/native-tp2-gpqa-nt
+  - kind: quality
+    id: gpqa-think
+    profile: gpqa-diamond
+    runs: 198
+    concurrency: 2
+    max_tokens: 65536
+    baseline: ds4-flash/native-tp2-gpqa-think-high
+    request_overrides:
+      chat_template_kwargs: {thinking: true, reasoning_effort: high}
+      temperature: 1.0
+      top_p: 1.0

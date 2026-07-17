@@ -20,3 +20,6 @@ planes_cache:
   GLM-5.2-NVFP4: /workspace/.planes-cache-glm-bench
 
 log_dir: /root/logs/bench
+
+# external eval tool for the quality suite (git SHA recorded in results)
+quality_tool: /root/workspace/llm-inference-bench/llm_decode_bench.py

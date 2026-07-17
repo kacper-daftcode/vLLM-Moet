@@ -110,15 +110,25 @@ def run_recipe(recipe_id, box, release, suite_name, gpus=None, port=None,
             probes_mod.warmup(srv.base, model, nw, log)
         for p in common.merge_suite(suite, recipe):
             kind = p.pop("kind")
+            key = p.pop("id", None) or kind
             fn = probes_mod.PROBES[kind]
-            log(f"probe {kind} {p}")
+            if kind == "quality":
+                # quality artifacts (raw tool JSONs) live next to the result;
+                # the tool path is a box quirk (external checkout).
+                p.setdefault("artifacts_dir",
+                             common.artifacts_dir(release, box["id"]))
+                p.setdefault("artifact_tag",
+                             f"{recipe_id.replace('/', '__')}__{key}")
+                if box.get("quality_tool"):
+                    p.setdefault("tool", box["quality_tool"])
+            log(f"probe {key} {p}")
             try:
-                result["probes"][kind] = fn(srv.base, model, log=log,
-                                            context=recipe.get("context"), **p)
+                result["probes"][key] = fn(srv.base, model, log=log,
+                                           context=recipe.get("context"), **p)
             except Exception as e:  # noqa: BLE001 — keep benching, record it
-                failures.append(kind)
-                result["probes"][kind] = {"error": f"{type(e).__name__}: {e}"}
-                log(f"probe {kind} FAILED: {e}")
+                failures.append(key)
+                result["probes"][key] = {"error": f"{type(e).__name__}: {e}"}
+                log(f"probe {key} FAILED: {e}")
             if kind == "decode":
                 # acceptance counters scraped immediately, before other traffic
                 result["server_metrics"] = probes_mod.scrape_server_log(log_path)

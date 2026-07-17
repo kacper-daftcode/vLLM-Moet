@@ -133,14 +133,36 @@ def main():
     recipes = [lint_recipe(rid) for rid in recipe_ids]
     lint_model_registry(recipes)
 
-    for suite in ("standard", "quick"):
+    baselines = common.load_baseline_registry()
+    for bid, spec in baselines.items():
+        f = os.path.join(common.baselines_dir(), (spec or {}).get("file", ""))
+        if not (spec or {}).get("file") or not os.path.exists(f):
+            err(f"baseline {bid}: reference file missing ({f})")
+        for field in ("checkpoint", "mode", "provenance"):
+            if not (spec or {}).get(field):
+                warn(f"baseline {bid}: missing `{field}`")
+
+    for suite in ("standard", "quick", "quality"):
         try:
             s = common.load_suite(suite)
-            kinds = [p["kind"] for p in s["probes"]]
             import probes as probes_mod
-            for k in kinds:
+            seen_keys = set()
+            for p in s["probes"]:
+                k = p["kind"]
                 if k not in probes_mod.PROBES:
                     err(f"suite {suite}: unknown probe kind {k!r}")
+                key = p.get("id") or k
+                if key in seen_keys:
+                    err(f"suite {suite}: duplicate probe key {key!r} "
+                        "(give multi-instance kinds unique `id`s)")
+                seen_keys.add(key)
+                b = p.get("baseline")
+                if b and b not in baselines:
+                    err(f"suite {suite}: probe {key} references unknown "
+                        f"baseline {b!r}")
+        except FileNotFoundError:
+            if suite != "quality":
+                err(f"suite {suite}: missing")
         except Exception as e:  # noqa: BLE001
             err(f"suite {suite}: unloadable ({e})")
 

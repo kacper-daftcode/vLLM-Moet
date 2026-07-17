@@ -128,6 +128,45 @@ installs it).
   `warmup.decode_requests` so the pool is warm before measurement, and pool
   hit-rate lines from the log are attached to the result.
 
+## Quality process (parity vs native)
+
+Perf tells you the config is fast; the **quality suite** proves it serves
+the model's full capability. The KPI is **parity with the native serving
+path** (stock `VLLM_MOE_W2=0` on the same checkpoint), not absolute scores:
+paired accuracy flips + McNemar p + completion-token inflation. Token
+inflation is a first-class damage signal — the +8–11% inflation this
+process was born from was a real quality bug (2-bit prefill KV) that
+accuracy alone did not resolve (see `internal/PREFILL_KV_INFLATION_
+FINDINGS.md` history in the repo notes).
+
+Pieces:
+
+- `bench/suites/quality.yaml` — GSM8K-200, GPQA-diamond (non-think) and
+  GPQA-diamond THINK (official sampling, `request_overrides` carries the
+  chat-template kwargs). Probes are keyed by `id`; recipes override via
+  `suite_params`.
+- `bench/baselines/` — committed NATIVE reference results + `registry.yaml`
+  (checkpoint, mode, hardware, provenance). Re-measure on checkpoint
+  revision or native-path changes; the eval tool fails loudly on dataset
+  hash mismatch.
+- The probe shells out to **llm-inference-bench** (external checkout; path
+  from the box yaml `quality_tool` or `LLM_BENCH`; its git SHA lands in the
+  result). Raw tool JSONs are committed as artifacts next to the result
+  (`results/<release>/<box>/artifacts/`) so flips stay reviewable per item.
+- **Quality releases have their own cadence** (`quality_release` in
+  `matrix.yaml`): a full quality campaign is hours of GPU (the think probe
+  alone is ~7 h on 2x PRO 6000), so it runs when the serving numerics
+  change, not per perf release. The README "Quality vs native" table and
+  `docs/benchmarks/<quality_release>.md` render from it; `render.py
+  --check` guards drift like the perf table.
+
+Running it:
+
+```bash
+python3 bench/runner/bench.py run --recipe deepseek-v4-flash/pro6000x2-tp2-maxq \
+    --box bench/boxes/rtx-pro6000x4.yaml --release v2026.07.17-quality --suite quality
+```
+
 ## Regression policy
 
 `render.py` compares each (recipe, box) against `previous_release` in

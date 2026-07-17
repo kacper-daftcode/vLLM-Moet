@@ -1,0 +1,135 @@
+{
+ "schema": 1,
+ "release": "v2026.07.17-quality",
+ "box": "rtx-pro6000x4",
+ "recipe": "deepseek-v4-flash/pro6000x2-tp2-maxq",
+ "suite": "quality",
+ "provenance": "imported",
+ "source": "2026-07-15/16 campaign (logs ds4-2x6000: maxq.log, gpqa-think.log; fork c2c066e3a via worktree prefill-fp4-tier; internal/PREFILL_KV_INFLATION_FINDINGS.md)",
+ "summary": "2x RTX PRO 6000 TP2 - MAX QUALITY: native parity incl. GPQA think",
+ "context": 131072,
+ "gpus_used": [
+  0,
+  1
+ ],
+ "started": "2026-07-15T19:03:00+0000",
+ "finished": "2026-07-16T22:30:00+0000",
+ "status": "ok",
+ "probes": {
+  "gsm8k": {
+   "accuracy_pct": 97.5,
+   "correct": 195,
+   "of": 200,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 115.7,
+   "tokens_p50": 106,
+   "tokens_p90": 180,
+   "vs_baseline": {
+    "acc_delta_pp": 0.5,
+    "flips_only_baseline": 0,
+    "flips_only_candidate": 1,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": -0.4
+   },
+   "profile": "gsm8k",
+   "runs": 200,
+   "concurrency": 2,
+   "max_tokens": 6000,
+   "baseline": "ds4-flash/native-tp2-gsm8k-c2",
+   "request_overrides": {},
+   "artifact": "quality__deepseek-v4-flash__pro6000x2-tp2-maxq__gsm8k.json"
+  },
+  "gsm8k-run2": {
+   "accuracy_pct": 97.5,
+   "correct": 195,
+   "of": 200,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 115.4,
+   "tokens_p50": 106,
+   "tokens_p90": 180,
+   "vs_baseline": {
+    "acc_delta_pp": 0.5,
+    "flips_only_baseline": 0,
+    "flips_only_candidate": 1,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": -0.7
+   },
+   "profile": "gsm8k",
+   "runs": 200,
+   "concurrency": 2,
+   "max_tokens": 6000,
+   "baseline": "ds4-flash/native-tp2-gsm8k-c2",
+   "request_overrides": {},
+   "artifact": "quality__deepseek-v4-flash__pro6000x2-tp2-maxq__gsm8k-run2.json"
+  },
+  "gpqa": {
+   "accuracy_pct": 74.75,
+   "correct": 148,
+   "of": 198,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 523.7,
+   "tokens_p50": 300,
+   "tokens_p90": 789,
+   "vs_baseline": {
+    "acc_delta_pp": 0.51,
+    "flips_only_baseline": 11,
+    "flips_only_candidate": 12,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": -7.0
+   },
+   "profile": "gpqa-diamond",
+   "runs": 198,
+   "concurrency": 2,
+   "max_tokens": 30000,
+   "baseline": "ds4-flash/native-tp2-gpqa-nt",
+   "request_overrides": {},
+   "artifact": "quality__deepseek-v4-flash__pro6000x2-tp2-maxq__gpqa.json"
+  },
+  "gpqa-think": {
+   "accuracy_pct": 88.38,
+   "correct": 175,
+   "of": 198,
+   "truncated_no_answer": 1,
+   "hit_max_tokens": 2,
+   "tokens_avg": 11800.9,
+   "tokens_p50": 4527,
+   "tokens_p90": 35466,
+   "vs_baseline": {
+    "acc_delta_pp": 1.52,
+    "flips_only_baseline": 7,
+    "flips_only_candidate": 10,
+    "mcnemar_p": 0.6291,
+    "token_inflation_pct": 6.0
+   },
+   "profile": "gpqa-diamond",
+   "runs": 198,
+   "concurrency": 2,
+   "max_tokens": 65536,
+   "baseline": "ds4-flash/native-tp2-gpqa-think-high",
+   "request_overrides": {
+    "chat_template_kwargs": {
+     "thinking": true,
+     "reasoning_effort": "high"
+    },
+    "temperature": 1.0,
+    "top_p": 1.0
+   },
+   "artifact": "quality__deepseek-v4-flash__pro6000x2-tp2-maxq__gpqa-think.json"
+  },
+  "needle": {
+   "cases": [
+    {
+     "words": 90000,
+     "prompt_tokens": 121152,
+     "depth": 0.5,
+     "pass": true
+    }
+   ],
+   "all_pass": true
+  }
+ },
+ "notes": "decode agg @c2: 98-110 tok/s short-form, ~97 think long-form (native 122.5) - the -21% think-mode decode cost is a standing follow-up."
+}

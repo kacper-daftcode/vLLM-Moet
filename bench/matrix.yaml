@@ -1,5 +1,9 @@
 current_release: baseline-2026-07-10
 previous_release: null
+# Quality campaigns (bench/suites/quality.yaml vs bench/baselines/) are
+# expensive and run on their own cadence; the README quality table renders
+# from this release id.
+quality_release: v2026.07.17-quality
 regression_threshold_pct: 5
 
 entries:
@@ -29,3 +33,6 @@ entries:
     retune: true
   - recipe: kimi-k2.7-code-nvfp4/pro6000x2-basecache
     blocking: false
+  - recipe: deepseek-v4-flash/pro6000x2-tp2-maxq
+    blocking: false
+    quality: true

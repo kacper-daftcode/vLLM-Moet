@@ -1,0 +1,47 @@
+# NATIVE reference results for the quality suite (bench/suites/quality.yaml).
+#
+# A baseline is the same llm-inference-bench output JSON the quality probe
+# produces, measured against the STOCK serving path (VLLM_MOE_W2=0) of the
+# same checkpoint on reference hardware. The probe passes it to
+# --compare-baseline; parity (accuracy flips, McNemar p, completion-token
+# inflation) is the project's quality KPI — see docs/quality.md.
+#
+# Re-measure when: the checkpoint revision changes, the native serving path
+# changes materially (pins/backends), or the eval tool's dataset/prompt
+# changes (dataset_sha256 mismatch fails the comparison loudly).
+# Baselines are measured via the runner against the native pseudo-recipes
+# (recipes with `role: baseline` — not shipped to users, excluded from the
+# README table).
+baselines:
+  ds4-flash/native-tp2-gsm8k-c2:
+    file: ds4-flash/native-tp2-gsm8k-c2.json
+    checkpoint: DeepSeek-V4-Flash
+    mode: "non-think, greedy, conc 2, max_tokens 6000"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-12
+    provenance: imported   # pre-harness campaign JSON (logs ds4-2x6000)
+    anchors: "97.0% (194/200), tokens avg 116.2"
+  ds4-flash/native-tp2-gsm8k-c1:
+    file: ds4-flash/native-tp2-gsm8k-c1.json
+    checkpoint: DeepSeek-V4-Flash
+    mode: "non-think, greedy, conc 1, max_tokens 6000"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-14
+    provenance: imported
+    anchors: "96.5% (193/200), tokens avg 115.3; rerun bit-identical 200/200"
+  ds4-flash/native-tp2-gpqa-nt:
+    file: ds4-flash/native-tp2-gpqa-nt.json
+    checkpoint: DeepSeek-V4-Flash
+    mode: "non-think, greedy, conc 2, max_tokens 30000"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-15
+    provenance: imported
+    anchors: "74.24% (147/198), tokens avg 563 (official non-think: 71.2)"
+  ds4-flash/native-tp2-gpqa-think-high:
+    file: ds4-flash/native-tp2-gpqa-think-high.json
+    checkpoint: DeepSeek-V4-Flash
+    mode: "think high, temp 1.0 top-p 1.0, conc 2, max_tokens 65536"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-16
+    provenance: imported
+    anchors: "86.87% (172/198), tokens avg 11134 (official think-high: 87.4)"

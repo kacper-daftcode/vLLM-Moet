@@ -267,15 +267,43 @@ def merge_suite(suite, recipe):
     """Suite probe list with the recipe's per-probe overrides applied.
 
     Only suites with allow_recipe_overrides (the release suite) take recipe
-    suite_params — `quick` stays deliberately small for smoke runs."""
+    suite_params — `quick` stays deliberately small for smoke runs.
+    Overrides are keyed by the probe's `id` when present (suites may carry
+    several probes of one kind — e.g. quality gsm8k + gpqa), else by kind."""
     params = recipe.get("suite_params", {}) \
         if suite.get("allow_recipe_overrides") else {}
     out = []
     for probe in suite["probes"]:
         p = dict(probe)
-        p.update(params.get(p["kind"], {}))
+        p.update(params.get(p.get("id") or p["kind"], {}))
         out.append(p)
     return out
+
+
+# ---- quality baselines (native reference results) ---------------------------
+
+def baselines_dir():
+    return os.path.join(BENCH_DIR, "baselines")
+
+
+def load_baseline_registry():
+    path = os.path.join(baselines_dir(), "registry.yaml")
+    if not os.path.exists(path):
+        return {}
+    return _load_yaml(path).get("baselines", {})
+
+
+def baseline_path(baseline_id):
+    """Absolute path of a baseline's reference JSON (KeyError if unknown)."""
+    reg = load_baseline_registry()
+    spec = reg[baseline_id]
+    return os.path.join(baselines_dir(), spec["file"])
+
+
+def artifacts_dir(release, box_id):
+    d = os.path.join(BENCH_DIR, "results", release, box_id, "artifacts")
+    os.makedirs(d, exist_ok=True)
+    return d
 
 
 def run(cmd, **kw):

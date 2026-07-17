@@ -7,6 +7,7 @@ are derived, never the only record."""
 
 import hashlib
 import json
+import os
 import random
 import re
 import statistics
@@ -241,6 +242,110 @@ def coherence(base, model, log=print, **_):
             "texts": texts}
 
 
+def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
+            max_tokens=6000, baseline=None, request_overrides=None,
+            tool=None, artifacts_dir=None, artifact_tag=None, **_):
+    """Dataset-eval probe (GSM8K / GPQA-diamond / …) via llm-inference-bench.
+
+    Runs the pinned external tool against the recipe's server and keeps BOTH
+    representations: the raw tool JSON (append-only artifact next to the
+    result — flips and per-item data stay reviewable) and compact aggregates
+    in the result itself. `baseline` names an entry in bench/baselines/
+    (a NATIVE reference measured by the same tool): the tool then computes
+    the paired comparison (accuracy flips, completion-token inflation) that
+    is THE quality KPI of this project — parity with native, not absolute
+    scores. `request_overrides` is merged into every request payload (e.g.
+    {"chat_template_kwargs": {"thinking": true}, "temperature": 1.0} for
+    think-mode evals)."""
+    import json as _json
+    import subprocess
+    import sys as _sys
+
+    tool = tool or os.environ.get(
+        "LLM_BENCH", "/root/workspace/llm-inference-bench/llm_decode_bench.py")
+    if not os.path.exists(tool):
+        raise RuntimeError(
+            f"quality probe needs llm-inference-bench (looked at {tool}; "
+            "set `quality_tool` in the box yaml or LLM_BENCH)")
+    port = base.rsplit(":", 1)[1].split("/", 1)[0]
+    tag = artifact_tag or profile
+    out_json = os.path.join(artifacts_dir or "/tmp",
+                            f"quality__{tag}.json")
+    cmd = [_sys.executable, tool, "--port", port, "--model", model,
+           "--test-profile", profile,
+           "--profile-runs", str(runs),
+           "--profile-concurrency", str(concurrency),
+           "--max-tokens", str(max_tokens),
+           "--display-mode", "plain", "--no-hw-monitor",
+           "--output", out_json]
+    from common import baseline_path  # late import: probes stays standalone
+    if baseline:
+        cmd += ["--compare-baseline", baseline_path(baseline)]
+    if request_overrides:
+        cmd += ["--request-overrides-json", _json.dumps(request_overrides)]
+    log(f"[quality] {profile} runs={runs} c={concurrency}"
+        + (f" baseline={baseline}" if baseline else "")
+        + (" +overrides" if request_overrides else ""))
+    t0 = time.time()
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=8 * 3600)
+    if r.returncode != 0 or not os.path.exists(out_json):
+        raise RuntimeError(
+            f"tool exit {r.returncode}: {(r.stderr or r.stdout)[-400:]}")
+    with open(out_json) as f:
+        data = _json.load(f)
+    acc = (data.get("accuracy") or {})
+    toks = [x.get("completion_tokens") or 0 for x in data.get("runs", [])
+            if x.get("phase") == "profile"]
+    toks.sort()
+    res = {
+        "profile": profile, "runs": runs, "concurrency": concurrency,
+        "max_tokens": max_tokens,
+        "request_overrides": request_overrides or {},
+        "accuracy_pct": round(100.0 * acc.get("accuracy", 0.0), 2),
+        "correct": acc.get("correct"), "of": acc.get("scored"),
+        "truncated_no_answer": acc.get("truncated_no_answer"),
+        "hit_max_tokens": acc.get("hit_max_tokens"),
+        "tokens_avg": round(sum(toks) / len(toks), 1) if toks else None,
+        "tokens_p50": toks[len(toks) // 2] if toks else None,
+        "tokens_p90": toks[int(0.9 * len(toks))] if toks else None,
+        "tool_sha": _tool_sha(tool),
+        "duration_s": round(time.time() - t0, 1),
+        "artifact": os.path.basename(out_json),
+    }
+    if baseline:
+        res["baseline"] = baseline
+        cmp_ = data.get("comparison") or {}
+        ct = cmp_.get("completion_tokens") or {}
+        if cmp_:
+            bm, cm = ct.get("baseline_mean"), ct.get("candidate_mean")
+            res["vs_baseline"] = {
+                "acc_delta_pp": round(cmp_["delta_pp"], 2)
+                if cmp_.get("delta_pp") is not None else None,
+                "flips_only_baseline": cmp_.get("flips_baseline_only_correct"),
+                "flips_only_candidate": cmp_.get("flips_candidate_only_correct"),
+                "mcnemar_p": cmp_.get("mcnemar_exact_p"),
+                "token_inflation_pct": round((cm - bm) / bm * 100, 1)
+                if bm and cm else None,
+            }
+    log(f"[quality] {profile}: {res['accuracy_pct']}% "
+        f"({res['correct']}/{res['of']}), tokens avg {res['tokens_avg']}"
+        + (f", vs {baseline}: {res.get('vs_baseline')}" if baseline else ""))
+    return res
+
+
+def _tool_sha(tool):
+    try:
+        import subprocess
+        d = os.path.dirname(os.path.abspath(tool))
+        sha = subprocess.run(["git", "-C", d, "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+        dirty = subprocess.run(["git", "-C", d, "status", "--short"],
+                               capture_output=True, text=True).stdout.strip()
+        return sha + ("+dirty" if dirty else "") if sha else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 PROBES = {
     "decode": decode,
     "batch_decode": batch_decode,
@@ -248,6 +353,7 @@ PROBES = {
     "needle": needle,
     "arithmetic": arithmetic,
     "coherence": coherence,
+    "quality": quality,
 }
 
 

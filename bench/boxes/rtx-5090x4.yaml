@@ -16,3 +16,6 @@ models:
   DeepSeek-V4-Flash: /workspace/ds4flash-official
 
 log_dir: /root/logs/bench
+
+# external eval tool for the quality suite (git SHA recorded in results)
+quality_tool: /root/workspace/llm-inference-bench/llm_decode_bench.py

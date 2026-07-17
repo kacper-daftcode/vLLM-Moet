@@ -1,0 +1,63 @@
+id: deepseek-v4-flash/pro6000x2-tp2-maxq
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "2x RTX PRO 6000 TP2 - MAX QUALITY: native parity incl. GPQA think"
+
+requires:
+  gpus: 2
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 2400
+
+# The quality ceiling of the DS4 family (validated 2026-07-15/16, worktree
+# prefill-fp4-tier == trunk c2c066e3a+):
+#   GSM8K-200 97.5%/116 tok (x2 runs; native 97.0/116)
+#   GPQA-diamond non-think 74.75%/524 vs native 74.24/563 (flips 11/12)
+#   GPQA-diamond THINK HIGH 88.38% vs native 86.87 (official 87.4-88.1)
+#   needle 121k PASS; decode ~98-110 tok/s agg @c2 (think-mode long-form:
+#   ~97 vs native 122 - the -21% is the standing follow-up).
+# Every lever in the quality position, each measured:
+#   pool 34 GiB quintal SPLIT >> fire floor (2692 slots) -> tau 1.0 fires
+#   cover their whole step; uncapped promote sound ABOVE the floor;
+#   PREFILL_FP4=ensure -> decode-class guarantee for prefill (the 2-bit
+#   prefill KV was the whole +8-11% token inflation - see
+#   internal/PREFILL_KV_INFLATION_FINDINGS.md); PREFILL_T=16 routes short
+#   prompts (T<=96) into the guarantee (largest decode step at seqs 2
+#   spec 2 = 6 tokens).
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "34"
+  VLLM_MOE_W2_DELTA_SPLIT: "1"
+  VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_GATE_TAU: "1.0"
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "0"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.92
+  - --max-num-batched-tokens 4096
+  - --max-num-seqs 2
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  batch_decode:
+    concurrency: [1, 2]
+  needle:
+    sizes_words: [8000, 90000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2", "needle.all_pass"]
+  axes: []
