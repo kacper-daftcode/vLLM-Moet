@@ -110,6 +110,42 @@ def main():
     assert st["reads"] > 0
     print(f"pack reads: {st['reads']} rows, {st['read_bytes']/2**20:.1f} MiB")
 
+    # ---- CHECKPOINT IDENTITY GATE: a pack written for model A must be
+    # rebuilt (never trusted) when opened for model B with IDENTICAL expert
+    # geometry, and a legacy sidecar without ckpt_id is stale by definition
+    # — silently serving another checkpoint's rows is the worst failure
+    # mode (correct-looking logits, wrong model).
+    import json as _json
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_store as _stmod)
+    _ckpt_orig = _stmod._ckpt_id
+    try:
+        shutil.rmtree(PACK_DIR, ignore_errors=True)
+        _stmod._ckpt_id = lambda: "ckpt-A"
+        tier_a = make_tier("t-mmap")
+        for li in range(N_LAYERS):
+            tier_a.add_layer_host_planes(li, *parts[li])
+        assert len(tier_a._store) == N_LAYERS
+        _stmod._ckpt_id = lambda: "ckpt-B"
+        tier_b = make_tier("t-mmap")
+        assert len(tier_b._store) == 0, \
+            "pack from ckpt-A trusted for ckpt-B (identity gate broken)"
+        for li in range(N_LAYERS):          # rebuild under B works
+            tier_b.add_layer_host_planes(li, *parts[li])
+        check_tier(tier_b, parts, "identity rebuild")
+        # legacy sidecar (pre-fix, no ckpt_id) -> stale
+        sc = tier_b._store._sidecar_path
+        with open(sc) as f:
+            legacy = _json.load(f)
+        legacy.pop("ckpt_id", None)
+        with open(sc, "w") as f:
+            _json.dump(legacy, f)
+        tier_c = make_tier("t-mmap")
+        assert len(tier_c._store) == 0, "legacy sidecar (no ckpt_id) trusted"
+        print("[identity] A->B rebuild + legacy-stale  OK")
+    finally:
+        _stmod._ckpt_id = _ckpt_orig
+
     # ---- tiered backend (pinned arena + O_DIRECT), tag must be "base" ----
     shutil.rmtree(PACK_DIR, ignore_errors=True)
     os.environ["VLLM_MOE_W2_BASE_RAM_GB"] = "0.1"   # 67 slots > 64 rows

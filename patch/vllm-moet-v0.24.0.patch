@@ -6937,10 +6937,10 @@ index 000000000..684cd1283
 +        _mark_broken(f"store failed: {e}")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 000000000..c0b937425
+index 000000000..6b7908f84
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
-@@ -0,0 +1,656 @@
+@@ -0,0 +1,685 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Host-side expert stores for the 2-bit MoE tiers (moe_w2_delta.DeltaTier).
@@ -6998,6 +6998,26 @@ index 000000000..c0b937425
 +
 +_ALIGN = 4096
 +_PACK_VERSION = 1
++
++
++def _ckpt_id():
++    """Identity of the checkpoint the pack's rows derive from — the SAME
++    function the planes cache uses (model path + sha1 of the safetensors
++    index), so both persistent caches agree on what "same model" means.
++    A pack is raw expert rows at (layer*E + expert)*stride: NOTHING in its
++    geometry distinguishes two checkpoints with equal expert dimensions,
++    so without this field a shared STORE_DIR silently serves the other
++    model's weights (correct-looking logits, wrong model — the worst
++    failure mode). None when no vllm config is current (offline tools,
++    unit tests): None only ever matches a pack also written without a
++    config, never a production pack."""
++    try:
++        from vllm.model_executor.layers.quantization.utils.moe_w2_planes_cache import (  # noqa: E501
++            _ckpt_id as planes_ckpt_id,
++        )
++        return planes_ckpt_id()
++    except Exception:  # noqa: BLE001 - uninitialized config/offline use
++        return None
 +
 +
 +def _rank_suffix() -> str:
@@ -7081,23 +7101,32 @@ index 000000000..c0b937425
 +        self._sidecar_path = os.path.join(dir_, base + ".json")
 +        self._meta = dict(version=_PACK_VERSION, tag=tag, E=n_experts,
 +                          n_layers=n_layers, slot_bytes=slot_bytes,
-+                          stride=self.stride, layers=[])
++                          stride=self.stride, ckpt_id=_ckpt_id(), layers=[])
++        # Identity + geometry gate for the persistent-quant-cache property.
++        # ckpt_id (checkpoint path + safetensors-index sha1, the planes
++        # cache's convention) is what actually ties the raw rows to A MODEL
++        # — geometry alone cannot (two checkpoints with equal expert dims
++        # sharing a STORE_DIR would silently swap weights). n_layers guards
++        # the row addressing ((layer*E + e)*stride: a different layer count
++        # re-maps every offset). A sidecar WITHOUT ckpt_id (pre-fix packs)
++        # is treated as stale — one rebuild re-stamps it; operators can
++        # instead pre-stamp known-good packs (tools/stamp_pack_identity.py).
++        _CHECK = ("version", "E", "n_layers", "slot_bytes", "stride",
++                  "ckpt_id")
 +        if os.path.exists(self._sidecar_path):
 +            try:
 +                with open(self._sidecar_path) as f:
 +                    old = json.load(f)
-+                match = all(old.get(k) == self._meta[k] for k in
-+                            ("version", "E", "slot_bytes", "stride"))
++                match = all(old.get(k) == self._meta[k] for k in _CHECK)
 +                if match:
 +                    self._meta["layers"] = sorted(
 +                        int(li) for li in old.get("layers", []))
 +                else:
 +                    logger.warning(
-+                        "moe_w2 store: pack %s shape mismatch "
++                        "moe_w2 store: pack %s identity/shape mismatch "
 +                        "(have %s, want %s) — rebuilding", self.path,
-+                        {k: old.get(k) for k in ("E", "slot_bytes", "stride")},
-+                        {k: self._meta[k] for k in ("E", "slot_bytes",
-+                                                    "stride")})
++                        {k: old.get(k) for k in _CHECK},
++                        {k: self._meta[k] for k in _CHECK})
 +            except (OSError, ValueError, json.JSONDecodeError) as e:
 +                logger.warning("moe_w2 store: unreadable sidecar %s (%s) — "
 +                               "rebuilding", self._sidecar_path, e)
