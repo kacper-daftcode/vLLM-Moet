@@ -341,6 +341,141 @@ works). Do not shrink the pool below 14 GiB to "play it safe" — pool size is t
 perf knob (see the KPI note above; 11 GiB costs ~12% decode and doubles the missing pairs
 per step) and 14 GiB needs util 0.95 to leave room for KV.
 
+### DeepSeek‑V4‑Flash on 1× RTX 6000 Pro (96 GB, SM120) — max‑quality (A) & max‑throughput (B)
+
+Two single‑card DeepSeek‑V4‑Flash configs measured on one RTX 6000 Pro (Blackwell, 96 GB). Both
+**boot straight from the on‑disk planes cache** (`VLLM_MOE_W2_PLANES_CACHE`) via the `moe_w2`
+loader‑skip added in this PR — no per‑boot re‑quant of the 149 GB fp8 checkpoint, no ~51 GiB
+host‑staging transient, no swap. Build the pack once (first boot with `VLLM_MOE_W2_STORE_DIR` set),
+convert it to a resident planes cache, and every subsequent start loads the 2‑bit planes directly.
+
+**Prebuilt cache (no build needed):** download the ready‑made planes cache + FP4 delta pack from
+[`anoane/DeepSeek‑V4‑Flash‑vllm‑moet‑sm120‑cache`](https://huggingface.co/anoane/DeepSeek-V4-Flash-vllm-moet-sm120-cache)
+(`hf download … --local-dir /data/ds4-cache`) and mount the two folders: `planescache/` →
+`/planescache` (`VLLM_MOE_W2_PLANES_CACHE`) and `moet_store/` → `/store` (`VLLM_MOE_W2_STORE_DIR`).
+You still need the model config + tokenizer from the original
+[`deepseek-ai/DeepSeek-V4-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) as `/model`.
+
+| config | weights | MTP | sampling | decode (seqs 1) | aggregate | rec. ctx |
+|--------|---------|-----|----------|----------------:|----------:|---------:|
+| **A** best quality | 2‑bit base **+ 6 GiB FP4 pool** | off | temp 1 / top_p 1 / **min_p 0.05** | **~75 tok/s** | — | **256K** |
+| **B** max throughput | 2‑bit base (no pool) | off | temp 1 / top_p 1 | ~89 tok/s | **~2085 tok/s @ C=256** | 256K |
+
+#### Config A — best quality (fills the 96 GB card)
+
+```bash
+docker run -d --name ds4-quality --gpus '"device=0"' --network host --ipc host --shm-size 64g \
+  -v /path/to/DeepSeek-V4-Flash:/model:ro \
+  -v /path/to/planescache:/planescache \
+  -v /path/to/moet_store:/store \
+  -e VLLM_MOE_W2=1 \
+  -e VLLM_MOE_W2_PLANES_CACHE=/planescache \
+  -e VLLM_MOE_W2_STORE_DIR=/store \
+  -e VLLM_MOE_W2_DELTA_GB=6 \
+  -e VLLM_MOE_W2_GATE=1 \
+  -e VLLM_MOE_W2_GATE_MAX_PROMOTE=64 \
+  -e VLLM_MOE_W2_FORCE_POOL=1 \
+  -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
+  vllm-moet-sm120:v024 \
+  --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
+  --kv-cache-dtype fp8 --block-size 256 --max-model-len 262144 \
+  --gpu-memory-utilization 0.99 --max-num-batched-tokens 1024 --max-num-seqs 1 \
+  --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+  --port 8000
+# NO --speculative-config: MTP is intentionally OFF (see the MTP row below).
+```
+
+Per‑request sampling (client side): `temperature=1.0, top_p=1.0, min_p=0.05` (`temp=0` is banned —
+reasoning‑model loops).
+
+- **`VLLM_MOE_W2=1`** — 2-bit routed-expert path; native fp8 (149 GB) does not fit 96 GB.
+- **`VLLM_MOE_W2_PLANES_CACHE=/planescache`** — boot the 2-bit base from this cache (loader-skip): no per-boot re-quant, no host staging, no swap.
+- **`VLLM_MOE_W2_STORE_DIR=/store`** — serve the FP4 delta pool from the on-disk pack (`pread`, VRAM/RAM/SSD split), not pinned shmem.
+- **`VLLM_MOE_W2_DELTA_GB=6`** — VRAM FP4 recovery pool. **6 GiB is the ceiling on 96 GB** — 72.7 GB 2-bit base + 6 GB pool + KV + activations fills the card at util 0.99 (DELTA=7 OOMs at model load). With MTP off, 6 GB = 512 slots ≥ the 438-slot fire floor → full-fidelity fires. A DELTA sweep (0/4/6) showed coding quality flat within seed noise, so 6 is chosen for its long-context-retrieval benefit at no cost.
+- **`VLLM_MOE_W2_GATE=1`** — uncertainty gate: on a low-confidence decode step, re-forward it with the routed experts upgraded to FP4 (recovers quality over pure 2-bit).
+- **`VLLM_MOE_W2_GATE_MAX_PROMOTE=64`** — cap on experts force-promoted per fired step (optional; unset = uncapped also works).
+- **`VLLM_MOE_W2_FORCE_POOL=1`** — downgrade the boot fire-floor check to a warning (we operate right at the floor by design).
+- **`VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`** — the graph-memory profiler over-reserves ~2 GiB while the real graph pool is ~0.06 GiB; disabling reclaims it for pool + KV so DELTA=6 fits at 256K.
+- **`--gpu-memory-utilization 0.99`** — DELTA=6 is tight; 0.99 vs 0.95 buys ~4 GiB more KV. Safe only because the graph profiler is disabled.
+- **`--max-num-batched-tokens 1024`** — prefill-chunk sweet spot for DELTA=6: 2048 OOMs, 256 is slower; 1024 cuts 256K prefill ~30% (65 s vs ~95 s).
+- **`--max-num-seqs 1`** — single stream by design: the fire floor scales with `min(seqs, 4)`; seqs>1 pushes the 6 GB pool sub-floor and loses full fidelity.
+- **`--kv-cache-dtype fp8` / `--block-size 256`** — DS4's `fp8_ds_mla` attention asserts fp8 KV (compact ~1.8 KB/token).
+- **MTP — off** (`--speculative-config` omitted): MTP's `(1+n_spec)=3` triples the fire floor → forces the pool sub-floor (+110% token inflation → slower, 58 vs 75 tok/s, and degraded), and blocks `min_p`.
+- **`min_p=0.05` (sampling)** — filters low-probability wrong tokens → ~+1 rung on the hardest coding rungs. Only possible with MTP off; ≥ 0.10 over-filters.
+
+**Measured:** ~75 tok/s single‑stream at 262144 ctx, VRAM ~97 GB (fills the card), full‑fidelity FP4
+fires (sub‑floor cleared). Context / needle‑retrieval behaviour is in the table below.
+
+#### Config B — throughput / concurrency (no pool)
+
+Pure 2‑bit base, **no FP4 pool** — `VLLM_MOE_W2_DELTA_GB=0` frees the whole card for KV + activations;
+`--max-num-batched-tokens 2048` + a small `--max-model-len 32768` batch to saturate the GPU. **Whether
+to enable MTP depends on how many parallel streams you serve** (see below).
+
+```bash
+docker run -d --name ds4-throughput --gpus '"device=0"' --network host --ipc host --shm-size 64g \
+  -v /path/to/DeepSeek-V4-Flash:/model:ro \
+  -v /path/to/planescache:/planescache \
+  -e VLLM_MOE_W2=1 \
+  -e VLLM_MOE_W2_PLANES_CACHE=/planescache \
+  -e VLLM_MOE_W2_DELTA_GB=0 \
+  vllm-moet-sm120:v024 \
+  --model /model --served-model-name deepseek-v4-flash --trust-remote-code \
+  --kv-cache-dtype fp8 --block-size 256 --max-model-len 32768 \
+  --gpu-memory-utilization 0.95 --max-num-batched-tokens 2048 \
+  --tokenizer-mode deepseek_v4 --no-scheduler-reserve-full-isl \
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}' \
+  --port 8000 \
+  --max-num-seqs 256                       # MTP OFF -> max aggregate throughput (default here)
+
+# --- Low-latency / few-stream variant: MTP k=2 (swap the last line for these two) ---
+#   --max-num-seqs 192 \
+#   --speculative-config '{"method":"deepseek_mtp","num_speculative_tokens":2}'
+```
+
+**MTP is a concurrency knob.** Aggregate decode (tok/s) vs concurrent streams C (DELTA=0, ctx 32K):
+
+| C (streams) | 1 | 8 | 32 | 64 | 96 | 128 | 192 | 256 |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|
+| **MTP k=2** (seqs 192) | **115** | **234** | 442 | **1122** | — | 858 | 927 | — |
+| **MTP off** (seqs 256) | 89 | 220 | **513** | 752 | 1097 | **1368** | **1748** | **2085** |
+
+- **Few streams / latency‑sensitive — up to ~64 concurrent → MTP k=2.** ~30% faster single‑stream
+  (115 vs 89 tok/s), and aggregate peaks at **~1122 tok/s @ C=64**.
+- **High concurrency — ~96 streams and up → MTP off.** Once the batch saturates the GPU, MTP's
+  draft+verify is wasted compute in a diverse batch (little acceptance), so it **collapses past its
+  C=64 peak** (927 @ C=192 vs 1748 off); MTP‑off scales **monotonically to ~2085 @ C=256** — the only
+  way to reach the ~2000 tok/s headline.
+
+With no pool there is no gate firing to destabilise attention, so Config B is also the more reliable
+long‑context retrieval path.
+
+#### Context size & needle‑in‑a‑haystack retrieval
+
+A unique code is planted at early (depth 0.05), middle (0.50) and late (0.95) positions and queried;
+the **recommended** length is the largest where all three depths retrieve reliably (16 samples/cell,
+2 reps × N=8), and the **absolute‑max** is the largest `--max-model-len` that still boots (KV fits).
+
+| length | needle pass rate | note |
+|---|:--:|---|
+| 192K | ~92% | robust at all depths |
+| **256K** | **~90%** | **recommended** — reliable across depths; majority‑vote best‑of‑N recovers to ~100% |
+| 288K | ~75% | marginal — the early‑depth needle degrades and best‑of‑N no longer recovers it |
+
+- **Recommended context: `--max-model-len 262144` (256K)** for both configs — the robust ceiling.
+- **Config A (FP4 pool) degrades long‑context retrieval above ~256K.** The pool's async gate/fire
+  perturbs attention; in a controlled A/B at 300K where only the pool differs, the pool config misses
+  the needle most of the time while the no‑pool config retrieves it consistently. Keep Config A
+  **≤ 256K** for dependable recall; for retrieval‑heavy long‑context work use **Config B (no pool)**,
+  which stays reliable to ~300K.
+- **Absolute‑max — boots for capacity, but retrieval is NOT reliable there.** Config A
+  `--max-model-len 913920` (~914K), Config B `--max-model-len 1048576` (1M). ⚠️ These are *capacity*
+  ceilings only: above 256K you cannot trust retrieval near the **start** of the context even with
+  best‑of‑N.
+- ⚠️ **Single‑run needle numbers on this engine are noisy** (the pass rate swings run‑to‑run), so use
+  best‑of‑N / repeated sampling for anything beyond 256K.
+
 ## Quality
 
 Method: baseline is the untouched official checkpoint; our variant changes only the expert
