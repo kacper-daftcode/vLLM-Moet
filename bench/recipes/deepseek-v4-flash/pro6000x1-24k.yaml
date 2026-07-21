@@ -26,6 +26,20 @@ env:
   # only sound mode is INCREMENTAL promotion - uncapped measured
   # 94.5% / +110%% tokens vs 96.5%/95.0%% with cap 64. Remove the
   # cap only on configs with pool >= the step routed union.
+  # Budget sweep 2026-07-17 (per-STEP semantics, warm server,
+  # 64->128->192->64): accuracy flat 97.0-97.5% vs native 97.0,
+  # token inflation +2.2..+4.3% at every budget (run-to-run noise
+  # dominates the axis; 192 re-heats refusal storms). 64 CONFIRMED
+  # as the operating point ON GSM8K.
+  # 2026-07-21 GPQA-diamond REVISION PENDING: NT-198 condemns the
+  # whole sub-floor fire regime this recipe runs in - partial fires
+  # 68.2-70.2% vs gate-OFF 73.23% vs FULL fire contract (pool >=
+  # floor: 6 GiB non-split, uncapped, no MTP) 75.25% vs native
+  # 74.24%. GSM8K does not see it. Rule: gate ON <=> pool >= FIRE
+  # FLOOR (DS4 no-MTP: 438 slots ~5.1 GiB; MTP-2: 1315 ~15.4 GiB).
+  # This recipe will flip to either (MTP + gate OFF) fast mode or
+  # (no MTP + 6 GiB pool + uncapped gate) quality mode once the
+  # think-mode axis lands - see internal/AGENDA_NATIVE_GRADE_MATRIX.
   VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
   # DEGRADED gate mode, explicit consent: the pool is below the
   # FIRE FLOOR (one step's routed union), so the boot guard would
