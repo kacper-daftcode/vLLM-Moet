@@ -1,0 +1,99 @@
+{
+  "schema_version": "vllm-moet-exact-image-verification-v3",
+  "frozen_release_candidate": {
+    "official_vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "origin_main_cutoff": "94be3aa3d7a8b82c7fc9687990a7edb6035f69f3",
+    "wrapper_head_commit": "0a73c2bcf262ba0aa53560d6290ad2af350e34fc",
+    "source_patch_sha256": "241ba984b1c56f5dc7adbc8d7f519d60b5746024bf7dfeb875e3546a668e79a7",
+    "image_id": "sha256:fc6e1244d60855fe45ccc0236daaaa722abcb8d354200eb92aca104bd954d3f2",
+    "image_source_patch_label": "241ba984b1c56f5dc7adbc8d7f519d60b5746024bf7dfeb875e354200eb92aca104bd954d3f2",
+    "image_wrapper_commit_label": "0a73c2bcf262ba0aa53560d6290ad2af350e34fc"
+  },
+  "immediately_preceding_comprehensive_artifact": {
+    "official_vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "integrated_origin_main_commit": "7d2429c109b625f23ed7926eb4e80f5d8d80f2e5",
+    "wrapper_head_commit": "5e69228e1e8e6f7345ae96657ab33b50e5805be7",
+    "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+    "validation_scope": "three quality seeds and three exact 120K context depths"
+  },
+  "applied_tree": {
+    "files_changed": 70,
+    "insertions": 14223,
+    "deletions": 226,
+    "apply_check": "pass",
+    "source_diff_whitespace_check": "pass",
+    "python_compile": "pass",
+    "fresh_applied_source_match": "70/70 baked source files matched"
+  },
+  "baked_source_sha256": {
+    "vllm/forward_context.py": "b3b5d84c16e0f5c886186cc06fcd65e1aa577ee6e58c2746ecea4c599f778ec7",
+    "vllm/v1/worker/gpu_model_runner.py": "63a08d992701cfca677de0e35eab2bc00e97a4514ae6d69858d544460d35be3f",
+    "vllm/v1/worker/gpu_ubatch_wrapper.py": "cc9526d859ccecdeb69b42140c92ba13c6fb80a8091734ab518a819c322dd1e7",
+    "vllm/v1/worker/gpu_worker.py": "76331291a8cd98236a17d85ffced0a4ed2d749da7e68f163e5ffb3df922faca5",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py": "3fa37293b68084358bc0bf6c9630a81ee722d2c8a936f010837f71f7cde27ca0",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_delta.py": "25235377b2e86c0a5bc84d7fdbcf7bdac0a57f8b4080a66754e795b902bbe736",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_gate.py": "d035e371fd93a7840733ecb3c9b2b89675a5448efac0da834fd5628c1052691b",
+    "vllm/model_executor/layers/quantization/utils/moe_w2_planes.py": "3555b5561063ca000be91fabaf3e65a8da4b56e6c75e93c46611aa82c66e5a56",
+    "tests/model_executor/layers/quantization/test_moe_w2_padded_routes.py": "5452b492bcdeb64413dab659e5baa1b28571f08af1d6cb2abf67a25836a054d1",
+    "tests/model_executor/layers/quantization/test_moe_w2_step_pins.py": "aed09d21defaba3e524a98640005c9ba00b8b8bc3dac539ec5948250743ea1db"
+  },
+  "canonical_synthetic_safety_probes": {
+    "checkpoint_residency_sha256": "e7eb19fc75dc8b49d587b9f07c87c5db182cd764a2f85998aac78d85a03698b8",
+    "checkpoint_next_shard_retry_sha256": "27de4d773ac034dce3d9f6d29b70275ec195219fd69077343a47843dc764c107",
+    "constrained_pack_build_sha256": "28d4b707ff1f49cf3b52091483a47d20ae855f001bd9937b48a69dcd0d13fe80",
+    "image_identity_match": true
+  },
+  "frozen_rc_exact_image_validation": {
+    "source_focused_manager_window_cgroup_route_pin": "21 passed on CUDA",
+    "store_safety": "37 passed",
+    "mxfp4_stream_safety": "10 passed",
+    "gpu_store_backends": "all pinned, mmap, reboot, tiered, eviction, overflow, scan, and preheat checks passed",
+    "forward_matrix_e8": "base 2-bit, full-FP4 delta, and split-FP4 refinement passed",
+    "three_tier_split_e8": {
+      "mixed_max_relative_error": 0.02446,
+      "mixed_cosine_similarity": 0.999867,
+      "transient_miss_count": 2,
+      "transient_max_relative_error": 0.02661,
+      "eviction_mapped_experts": "4/4",
+      "result": "pass"
+    },
+    "checkpoint_residency_128_mib": "pass",
+    "checkpoint_retry_512_mib": "pass",
+    "constrained_pack_48x8x4_mib": "pass below 2 GiB with zero swap"
+  },
+  "split_fp4_base_cache_boundary": {
+    "support": "split-FP4 refinement over the base cache is supported behind the explicit split flag with residency coupling and the fp4s tier tag",
+    "serving_sentinel": "split mode was disabled, so the guarded release-candidate serving run used full-nibble FP4 delta planes",
+    "separate_fixture": "the exact-image E=8 three-tier fixture covered mixed residency, a transient base miss, and eviction"
+  },
+  "serving_validation": {
+    "frozen_release_candidate": {
+      "quality_seeds": [
+        42,
+        43
+      ],
+      "responses": 80,
+      "strict_machine_exact": 79,
+      "semantically_correct": 80,
+      "sink_detections": 0,
+      "retry_free_prewarms": "20/20",
+      "pool_gates": "4/4",
+      "exact_120k_context": "1/1 at depth 0.9 with zero prompt-token tolerance"
+    },
+    "immediately_preceding_comprehensive_artifact": {
+      "quality": "120/120 machine-exact, 120/120 semantically correct, 0/120 sinks across three seeds",
+      "retry_free_prewarms": "30/30",
+      "pool_gates": "6/6",
+      "exact_120k_context": "3/3 at depths 0.1, 0.5, and 0.9 with zero prompt-token tolerance"
+    }
+  },
+  "project_validation": {
+    "evaluation_and_context_harness": "39 passed, 17 subtests passed",
+    "ruff": "changed W2 harness and targeted project files pass; broad upstream helper lint is outside this receipt",
+    "format": "changed W2 harness and targeted project files pass",
+    "benchmark_lint": "0 errors, 0 warnings",
+    "benchmark_render_check": "up to date"
+  },
+  "evidence_boundary": "The frozen release candidate is the current exact image and received focused exact-image GPU, cold-restage, two-seed quality, and deepest-context sentinel validation. The immediately preceding 41d7b2f artifact remains the comprehensive three-seed and three-depth serving series; those broader counts are historical evidence and are not relabeled as frozen-RC reruns."
+}
