@@ -11,14 +11,25 @@ requires:
 context: 32768
 load_timeout_s: 3600
 
-# Quality-validated 2026-07-13 (GSM8K-200 95.0%, needle 32k PASS, ~17 tok/s):
-# base 14 GiB is the STARVATION FLOOR for MTP-2 x 2 seqs (11 GiB corrupted
-# math - the boot guard now refuses it); gate tau 0.60 (code default) with a
-# small NON-SPLIT FP4 need-pool (bit-faithful nibbles; split's mag-0 merge
-# is lossy - see internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md).
+# Quality-validated 2026-07-23, WINDOW-MATCHED protocol (greedy GPQA is
+# serving-window sensitive for the MODEL itself - native @32k scores 69.04
+# vs 74.24 @131k; compare only same-window):
+#   GSM8K-200 95.0% (native 97.0; the -2pp is the 32 GB base-coverage
+#   ceiling, stable across 4 runs on 2 card counts), GPQA-diamond NT
+#   68.88% vs native@32k 68.88% - EXACT parity, McNemar-clean.
+# QUALITY MODE = NO MTP: speculative decode over the streamed base costs
+# a deterministic -2.5..-3.5pp NT on this cell (mechanism under
+# investigation; drafter healthy at 68% acceptance - see agenda lesson
+# 11). Re-enable MTP only after that bug lands fixed.
+# GEOMETRY (2026-07-22): the merged trunk grew ~2 GiB on base-cache
+# boots (bisect pending, agenda lesson 12) - the historical base 14 /
+# seqs 2 / batched 1024 now OOMs at load on 31.4 GiB. Validated boot:
+# base 12 + seqs 1 + batched 512 (single-user semantics anyway).
+# Gate tau 0.60 cap64 + S4 stays: on 36-40% coverage the FP4 need-pool
+# does real work (GSM8K +1.5pp vs gate-off, measured 2026-07-22).
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_BASE_CACHE_GB: "14"
+  VLLM_MOE_W2_BASE_CACHE_GB: "12"
   VLLM_MOE_W2_DELTA_GB: "1"
   VLLM_MOE_W2_GATE: "1"
   # pool below the FIRE FLOOR (one step's routed union ~10 GiB
@@ -35,12 +46,11 @@ env:
   # (1x5090), both p=1 vs native. The split capacity fix (2x
   # slots/GiB) is the path out of degraded mode on these cards.
   VLLM_MOE_W2_FORCE_POOL: "1"
-  # S4 verify-row masking under MTP: fires stop paying for verify rows
-  # the sampler discards (fin-03 measured on this card class: re-forwards
-  # 24%->1.2% prose / 16.9%->7.5% code; our PRO6000 A/B: better accuracy,
-  # tokens AND tok/s). NOTE: prefill-FP4 ensure is NOT set here - the
-  # 1 GiB need-pool (~85 non-split slots) is below one prefill layer's
-  # working set, ensure would thrash it (warns "pool too tight").
+  # S4 verify-row masking: a NO-OP while MTP is off (kept for the day
+  # the MTP x base-cache bug is fixed and spec comes back). NOTE:
+  # prefill-FP4 ensure is NOT set here - the 1 GiB need-pool (~85
+  # non-split slots) is below one prefill layer's working set, ensure
+  # would thrash it (warns "pool too tight").
   VLLM_MOE_W2_GATE_SPEC_MASK: "1"
 
 serve_args:
@@ -49,11 +59,10 @@ serve_args:
   - --block-size 256
   - --max-model-len 32768
   - --gpu-memory-utilization 0.95
-  - --max-num-batched-tokens 1024
-  - --max-num-seqs 2
+  - --max-num-batched-tokens 512
+  - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
-  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
   - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
 
 warmup:
@@ -63,7 +72,7 @@ suite_params:
   decode:
     runs: 7
   batch_decode:
-    concurrency: [1, 2]
+    concurrency: [1]
   needle:
     sizes_words: [6000]
 
@@ -73,6 +82,6 @@ tuning:
   axes:
     - kind: env
       name: VLLM_MOE_W2_BASE_CACHE_GB
-      # 11 removed: below the per-step working-set floor (MTP-2 x 2 seqs)
-      # - silent quality corruption, now refused by the boot guard.
-      values: ["14", "16"]
+      # 12 = the validated post-regression boot (agenda lesson 12);
+      # retest 13-14 after the VRAM bisect lands.
+      values: ["12", "13"]

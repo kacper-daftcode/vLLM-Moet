@@ -1,0 +1,66 @@
+id: deepseek-v4-flash/5090x2-tp2-basecache
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "2x RTX 5090 (64 GB) - TP2 host-resident 2-bit base + FP4 need-pool"
+
+requires:
+  gpus: 2
+  vram_gb: 32
+  host_ram_gb: 96
+
+context: 32768
+load_timeout_s: 3600
+
+# First validation 2026-07-23 (cell bring-up), WINDOW-MATCHED protocol
+# (greedy GPQA is serving-window sensitive for the model itself; compare
+# only same-window - native @32k = 69.04 vs 74.24 @131k):
+#   GSM8K-200 95.0% (native 97.0; -2pp = base-coverage ceiling, same as
+#   the 1x5090 cell), GPQA-diamond NT 67.51% vs native@32k 69.04%
+#   (-1.5pp, 3 items, McNemar ns - parity edge).
+# QUALITY MODE = NO MTP: spec decode over the streamed base costs a
+# deterministic -2.5..-3.5pp NT (agenda lesson 11; drafter itself is
+# healthy - 68% acceptance). Re-enable after the fix lands.
+# TP2 halves both the per-rank plane bytes (36.3 GiB hosted per rank)
+# and the slot size, so base 13/rank covers ~36% of experts; the pool
+# is sub-floor - INCREMENTAL fires only (cap 64, FORCE_POOL consent).
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_BASE_CACHE_GB: "13"
+  VLLM_MOE_W2_DELTA_GB: "1"
+  VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
+  VLLM_MOE_W2_FORCE_POOL: "1"
+  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 32768
+  - --gpu-memory-utilization 0.95
+  - --max-num-batched-tokens 512
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 8
+
+suite_params:
+  decode:
+    runs: 7
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [6000]
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_BASE_CACHE_GB
+      values: ["13", "14"]

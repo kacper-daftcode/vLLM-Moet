@@ -17,6 +17,8 @@ entries:
     blocking: false
   - recipe: deepseek-v4-flash/5090x1-basecache
     blocking: false
+  - recipe: deepseek-v4-flash/5090x2-tp2-basecache
+    blocking: false
 
   - recipe: glm-5.2-nvfp4/pro6000x4-tp4-mtp
     blocking: true
