@@ -1,0 +1,63 @@
+# vLLM-Moet on official vLLM v0.25.0 — SM120 (RTX PRO 6000 / RTX 5090)
+#
+# This is a side-by-side upgrade candidate. Dockerfile.sm120-v024 remains the
+# proven rollback until the v0.25 image passes the baked SM120 and live canary
+# gates documented in docs/v025-port.md.
+#
+# Build (linux/amd64 NVIDIA host, from the repo root):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v025 \
+#     -t vllm-moet-sm120:v025-w2candidate .
+
+ARG VLLM_BASE=vllm/vllm-openai:v0.25.0@sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97
+FROM ${VLLM_BASE}
+
+LABEL org.opencontainers.image.version="v0.25.0-w2candidate" \
+      ai.kostudios.vllm-moet.base="vllm/vllm-openai:v0.25.0" \
+      ai.kostudios.vllm-moet.patch-sha256="ea1e8462008e8d3530e8938483a4f8974258196acc6a0bbcc4124bc4a719ed5d"
+
+# v0.25.0 already vendors the same SM120-capable DeepGEMM commit used by the
+# v0.24 recipe (a6b593d2826719dcf4892609af7b84ee23aaf32a), so no replacement
+# wheel is built here. git is needed only to apply the source overlay.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+
+# The W2 NVFP4 sparse-MLA patch was validated against FlashInfer 0.6.14's JIT
+# source/API layout. vLLM v0.25.0 pins 0.6.13, so preserve the proven 0.6.14
+# pair until the hardware canary explicitly qualifies the upstream pin.
+RUN pip uninstall -y --break-system-packages flashinfer-cubin || true
+RUN pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.14 \
+    && pip install --no-cache-dir --break-system-packages \
+        --index-url https://flashinfer.ai/whl/cu130 \
+        "flashinfer-jit-cache==0.6.14+cu130"
+
+# Combined v0.25.0 overlay: W2 streaming/recovery and stores, DSpark confidence
+# scheduling, NVFP4 KV, and the SM120 fixes not absorbed by the release.
+COPY patch/vllm-moet-v0.25.0.patch /tmp/vllm-moet.patch
+RUN SP="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
+    && cd "$SP" \
+    && git apply --check /tmp/vllm-moet.patch \
+    && git apply --verbose /tmp/vllm-moet.patch \
+    && python3 -m py_compile \
+       vllm/v1/worker/gpu/spec_decode/dspark/scheduler.py \
+       vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py \
+       vllm/model_executor/layers/quantization/utils/moe_w2_store.py \
+    && python3 -c "from vllm.model_executor.layers.quantization.utils import moe_w2_cubit; print('moe_w2 hook OK')" \
+    && python3 -c "import vllm.v1.worker.gpu.spec_decode.dspark.speculator; print('dspark OK')" \
+    && rm /tmp/vllm-moet.patch
+
+# Prebuilt SM120 W2/W4 GEMM cubins, including K=6144 for GLM-5.x.
+COPY kernels/cubins-sm120/ /cubit-share/
+ENV VLLM_MOE_W2_CUBIT_DIR=/cubit-share
+
+# Bake the NVFP4 sparse-MLA read and packed-write kernels so the first serve
+# does not pay JIT compilation. See Dockerfile.sm120-v024 for layout details.
+RUN SP="$(python3 -c 'import vllm, os; print(os.path.dirname(os.path.dirname(vllm.__file__)))')" \
+    && cd "$SP" \
+    && python3 tools/nvfp4_flashinfer_sm120/patch_flashinfer.py \
+    && rm -f "$SP/flashinfer_jit_cache/jit_cache/sparse_mla_sm120/sparse_mla_sm120.so" \
+    && FLASHINFER_CUDA_ARCH_LIST=12.0f python3 -c \
+       "from flashinfer.jit.mla import gen_sparse_mla_sm120_module; gen_sparse_mla_sm120_module().build(verbose=False)" \
+    && mkdir -p /opt/nvfp4-ds-mla \
+    && TORCH_CUDA_ARCH_LIST=12.0a python3 -c \
+       "from torch.utils.cpp_extension import load; load(name='nvfp4_ds_mla_cache_ext', sources=['$SP/csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu'], extra_cuda_cflags=['-O3', '--generate-code=arch=compute_120a,code=sm_120a'], build_directory='/opt/nvfp4-ds-mla')"
+ENV VLLM_NVFP4_DS_MLA_EXT_DIR=/opt/nvfp4-ds-mla

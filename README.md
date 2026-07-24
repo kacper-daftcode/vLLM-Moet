@@ -18,6 +18,12 @@ cannot even fit on. Three ideas carry it:
    bit‑deterministic), an **NVFP4 KV cache** (352 B/token), and agent‑ready tool/reasoning
    parsing.
 
+> **v0.25.0 upgrade candidate:** [`Dockerfile.sm120-v025`](Dockerfile.sm120-v025)
+> and [`docs/v025-port.md`](docs/v025-port.md) carry the rebased 61-file overlay
+> on official vLLM v0.25.0. The results below remain v0.24 measurements until
+> the candidate passes its own SM120 model-load, 128K, quality, and performance
+> gates; the v0.24 image stays the rollback.
+
 ---
 
 ## GLM‑5.2 (753B) — the headline model
@@ -250,6 +256,10 @@ git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 
 # official vllm-openai:v0.24.0 image + patch + pins + SM120 cubins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v024 -t vllm-moet-sm120:v024 .
+
+# side-by-side v0.25.0 candidate (do not replace the v0.24 live image yet)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v025 \
+  -t vllm-moet-sm120:v025-w2candidate .
 ```
 
 **Easiest path — run a benchmarked recipe.** The recipes image downloads the
@@ -438,6 +448,13 @@ Quality release **`v2026.07.17-quality`** — dataset evals vs the committed **n
 <!-- bench:quality:end -->
 
 ## Repository layout
+- **`patch/vllm-moet-v0.25.0.patch`** — the v0.25 candidate delta (61 files,
+  +13,342/-134 source lines) against exact official tag commit `702f4814`.
+- **`Dockerfile.sm120-v025`** — pinned official v0.25.0 image plus the candidate
+  overlay; the exact image is built side-by-side with v0.24 and still requires
+  its documented disposable serve gate before production promotion.
+- **`docs/v025-port.md`** — exact identities, absorbed-upstream inventory,
+  compatibility decisions, completed source gates, and remaining promotion gates.
 - **`patch/vllm-moet-v0.24.0.patch`** — the delta vs official vLLM `v0.24.0` (37 files,
   +7.4k lines; applies clean on the tag). Goes with the pins above.
 - **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
