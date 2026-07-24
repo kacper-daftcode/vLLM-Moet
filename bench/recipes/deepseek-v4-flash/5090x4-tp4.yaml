@@ -10,22 +10,26 @@ requires:
 context: 32768
 load_timeout_s: 2400
 
-# 2026-07-13: gate ON (tau 0.60 = code default), NON-SPLIT pool 3 GiB/rank
-# (1444 slots >= the fire floor 1346 at 1 seq x FP-growth 1.7; 2 seqs
-# would need 8.4 GiB - beyond this card. Per-rank TP4 slots are 4x
-# smaller, making this the cheapest class that clears the fire-floor
-# hardstop -> uncapped fires + high tau are legal). Split is
-# quality-banned (internal/SPLIT_FP4_ZERO_LOSS_NEXT_SESSION.md). Not yet
-# quality-benched on this topology - GSM8K/needle pending free 5090s.
+# Quality-validated 2026-07-21..23 (window-matched protocol; native@32k
+# NT = 69.04, native think-high@131k = 86.87):
+#   GSM8K 97.0-97.5 | GPQA NT 68.69 vs 69.04 (matched, ns) |
+#   THINK-HIGH @65k budget: 85.86 vs 86.87 (2 items, 1 truncation).
+# Operating point: gate tau 0.60 + S4 + UNCAPPED fires (pool 4.5/rank
+# clears the MTP-2 fire floor - no warning at boot), prefill-FP4
+# ensure. ~165 tok/s agg (GSM8K conc2); gate-off ceiling 209 tok/s
+# holds NT (75.25) but drops think to 83.84 - the gate earns its keep
+# exactly on think-class decode. MTP-2 on RESIDENT routes is healthy
+# (unlike streamed-base cells - see the spec-drift note in the
+# basecache recipes).
 env:
   VLLM_MOE_W2: "1"
   VLLM_MOE_W2_DELTA_GB: "4.5"
   VLLM_MOE_W2_GATE: "1"
-  # tau 1.0 = quality mode, measured 2026-07-13: GSM8K-200 97.0%
-  # (194/200) - EXACT native parity, flips 1<->1 - at 183.6 tok/s.
-  # Drop to the 0.60 default for +6% decode (96.0%, n.s.). Legal
-  # because the pool clears the fire floor (1536 >= 1346 slots).
-  VLLM_MOE_W2_GATE_TAU: "1.0"
+  VLLM_MOE_W2_GATE_TAU: "0.60"
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "0"
+  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
 
 serve_args:
   - --trust-remote-code

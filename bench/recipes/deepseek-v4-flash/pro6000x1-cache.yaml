@@ -1,0 +1,69 @@
+id: deepseek-v4-flash/pro6000x1-cache
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "1x RTX PRO 6000 - RAM-cached base, full fire contract, MTP-1"
+
+requires:
+  gpus: 1
+  vram_gb: 96
+  host_ram_gb: 512
+
+context: 24576
+load_timeout_s: 3600
+
+# The RAM-1TB column cell: 2-bit base HOST-resident (pinned store), GPU
+# holds a 52 GiB base cache (~72% expert coverage) + a 17 GiB NON-SPLIT
+# FP4 need-pool (1365 slots >= the MTP fire floor 1315 -> uncapped fires
+# legal even with spec on).
+# Quality (WINDOW-MATCHED, native@24k NT = 74.62):
+#   GSM8K 97.0/96.5 | NT no-spec 73.74 (McNemar p=1 vs native) |
+#   NT MTP-1 71.72 (paired vs no-spec: 13/9 discordant, p=0.52 - NO
+#   significant loss) | NT MTP-2 68.69 (14/4, p=0.031 - REAL loss).
+# SPEC-DRIFT (2026-07-24, closed investigation): accepted-draft KV
+# carries verify-batch micro-noise that 2-bit amplifies along the
+# sequence; the cost scales with accepted drafts. Kernel, miss/replay,
+# graphs, drafter all exonerated (op test: tools/test_moe_w2_base_verify
+# ALL PASS). Hence MTP-1 here: most of the spec speedup, no measurable
+# quality cost. Do NOT raise to MTP-2 on quality cells.
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_BASE_CACHE_GB: "52"
+  VLLM_MOE_W2_DELTA_GB: "17"
+  VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_GATE_TAU: "1.0"
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "0"
+  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
+
+serve_args:
+  - --trust-remote-code
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 24576
+  - --gpu-memory-utilization 0.97
+  - --max-num-batched-tokens 1024
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":1}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 8
+
+suite_params:
+  decode:
+    runs: 7
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [6000]
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_BASE_CACHE_GB
+      values: ["52", "56"]

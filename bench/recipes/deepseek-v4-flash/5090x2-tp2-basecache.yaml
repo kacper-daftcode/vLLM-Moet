@@ -17,9 +17,10 @@ load_timeout_s: 3600
 #   GSM8K-200 95.0% (native 97.0; -2pp = base-coverage ceiling, same as
 #   the 1x5090 cell), GPQA-diamond NT 67.51% vs native@32k 69.04%
 #   (-1.5pp, 3 items, McNemar ns - parity edge).
-# QUALITY MODE = NO MTP: spec decode over the streamed base costs a
-# deterministic -2.5..-3.5pp NT (agenda lesson 11; drafter itself is
-# healthy - 68% acceptance). Re-enable after the fix lands.
+# SPEC = MTP-1 (2026-07-24): spec-drift closed - cost scales with
+# accepted drafts (2-bit amplifies verify-batch KV noise); MTP-1 has no
+# significant paired loss (p=0.52 on 1x6000-cache), MTP-2 does (p=0.031).
+# 5090-cell validation queued; numbers below are no-spec measurements.
 # TP2 halves both the per-rank plane bytes (36.3 GiB hosted per rank)
 # and the slot size, so base 13/rank covers ~36% of experts; the pool
 # is sub-floor - INCREMENTAL fires only (cap 64, FORCE_POOL consent).
@@ -44,6 +45,7 @@ serve_args:
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":1}
   - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
 
 warmup:

@@ -1,7 +1,7 @@
 id: deepseek-v4-flash/pro6000x1-24k
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "1x RTX PRO 6000 - quality 128k single-stream (~150 tok/s)"
+summary: "1x RTX PRO 6000 - resident FAST mode, above-native NT @32k"
 
 requires:
   gpus: 1
@@ -10,54 +10,32 @@ requires:
 context: 131072
 load_timeout_s: 2400
 
-# Quality-validated 2026-07-13: GSM8K-200 96.5% vs native 97.0% (McNemar
-# p=1), needle @121k PASS, 149 tok/s single-stream. Resident planes eat
-# 72.7 GiB, so the last ~5 GiB split between the FP4 need-pool and KV:
-# SPLIT-capable 1.5 GiB pool + one 128k stream at util 0.97 (0.95 leaves
-# only 1.04 GiB KV and the boot fails; MTP scratch has a ~1.7 GiB fixed
-# floor). Two streams need dropping the window to 64k. Gate tau 0.60 =
-# code default.
+# FAST mode (default), quality-validated 2026-07-21..24 with the
+# WINDOW-MATCHED protocol (greedy GPQA swings with the serving window
+# for the model itself; native@32k NT = 69.04):
+#   GSM8K ~97 | GPQA NT 73.23 vs native@32k 69.04 (ABOVE native).
+# Point: MTP-2 + gate OFF + prefill-FP4 ensure over a NON-SPLIT
+# 3.4 GiB pool (covers the L0/L1 prefill unions ~212 experts; split
+# is quality-banned - lossy mag-0 merge - and 1.5 GiB starved the
+# ensure guarantee: measured 68.7 -> 73.2 through 1.5split/3.0split/
+# 3.4nonsplit). Gate stays OFF because the MTP-2 fire floor (~15.4
+# GiB non-split) cannot fit next to 72.7 GiB resident planes - the
+# sub-floor incremental gate is condemned by paired NT (68.2-70.2,
+# GSM8K-invisible).
+# QUALITY mode (think-grade, no spec): drop MTP, DELTA_GB=6,
+# GATE=1 TAU=0.60 MAX_PROMOTE=0 SPEC_MASK=1 -> NT 75.25 vs
+# native@24k 74.62, THINK-HIGH @44k 85.86 vs 86.87. Slower
+# (no spec); pick it when think-mode quality is the workload.
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_DELTA_GB: "1.5"
-  VLLM_MOE_W2_GATE: "1"
-  # pool below the FIRE FLOOR (one step's routed union ~10 GiB
-  # non-split at TP1): fires cannot cover their own step, so the
-  # only sound mode is INCREMENTAL promotion - uncapped measured
-  # 94.5% / +110%% tokens vs 96.5%/95.0%% with cap 64. Remove the
-  # cap only on configs with pool >= the step routed union.
-  # Budget sweep 2026-07-17 (per-STEP semantics, warm server,
-  # 64->128->192->64): accuracy flat 97.0-97.5% vs native 97.0,
-  # token inflation +2.2..+4.3% at every budget (run-to-run noise
-  # dominates the axis; 192 re-heats refusal storms). 64 CONFIRMED
-  # as the operating point ON GSM8K.
-  # 2026-07-21 GPQA-diamond REVISION PENDING: NT-198 condemns the
-  # whole sub-floor fire regime this recipe runs in - partial fires
-  # 68.2-70.2% vs gate-OFF 73.23% vs FULL fire contract (pool >=
-  # floor: 6 GiB non-split, uncapped, no MTP) 75.25% vs native
-  # 74.24%. GSM8K does not see it. Rule: gate ON <=> pool >= FIRE
-  # FLOOR (DS4 no-MTP: 438 slots ~5.1 GiB; MTP-2: 1315 ~15.4 GiB).
-  # This recipe will flip to either (MTP + gate OFF) fast mode or
-  # (no MTP + 6 GiB pool + uncapped gate) quality mode once the
-  # think-mode axis lands - see internal/AGENDA_NATIVE_GRADE_MATRIX.
-  VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
-  # DEGRADED gate mode, explicit consent: the pool is below the
-  # FIRE FLOOR (one step's routed union), so the boot guard would
-  # refuse to serve. Fires upgrade incrementally (cap 64); tau->1
-  # does NOT converge to native on this card. Measured quality at
-  # this operating point: GSM8K-200 96.5% (1xPRO6000) / 95.0%
-  # (1x5090), both p=1 vs native. The split capacity fix (2x
-  # slots/GiB) is the path out of degraded mode on these cards.
+  VLLM_MOE_W2_DELTA_GB: "3.4"
+  VLLM_MOE_W2_GATE: "0"
   VLLM_MOE_W2_FORCE_POOL: "1"
-  # S4 verify-row masking: skip gate fires on MTP verify rows the sampler
-  # cannot reach. A/B on THIS config (2026-07-17): 95.0%/133tok/105.4
-  # tok/s -> 97.0%/127/111.1 - better on all three axes.
-  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
-  # prefill-FP4 ensure: the guarantee needs only one layer's chunk
-  # working set (~120-180 split slots at batched<=256), which this pool
-  # holds. Measured (2026-07-17): tokens 127->119-121 at 97.0-97.5%
-  # GSM8K, ~102 tok/s. GPQA stays -4.5pp vs native (sub-floor decode is
-  # the remaining gap on this card - see the cache-route recipe notes).
+  VLLM_MOE_W2_FORCE_RESIDENT: "1"
+  # prefill-FP4 ensure: with the 3.4 GiB non-split pool the guarantee
+  # holds for every prefill chunk's per-layer union (measured L0:212
+  # L1:205 at 1.6-2k prompts; 1.5 GiB silently zeroed chunk
+  # contributions - the mechanism behind the old -4.5pp GPQA note).
   VLLM_MOE_W2_PREFILL_FP4: "ensure"
   VLLM_MOE_W2_PREFILL_T: "16"
 
@@ -65,7 +43,7 @@ serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 131072
+  - --max-model-len 32768
   - --gpu-memory-utilization 0.97
   - --max-num-batched-tokens 256
   - --max-num-seqs 1
@@ -78,7 +56,7 @@ suite_params:
   batch_decode:
     concurrency: [1]
   needle:
-    sizes_words: [8000, 90000]
+    sizes_words: [8000, 24000]
     depth: 0.5
 
 tuning:
@@ -87,8 +65,10 @@ tuning:
   axes:
     - kind: env
       name: VLLM_MOE_W2_DELTA_GB
-      values: ["1.5", "1", "0"]
-# batched-tokens 256 (was 4096): the prefill-FP4 ensure guarantee needs
-# each chunk's per-layer working set to fit the 204-slot pool rotation -
-# measured at 256 (2026-07-17 campaign, q1x_*). Longer prompts pay more
-# chunk overhead; quality first on this recipe.
+      values: ["3.4", "6"]
+# WINDOW 32768 (was 131072): the measured FAST-mode geometry. The 128k
+# window only fits next to a 1.5 GiB pool, and 1.5 GiB starves the
+# prefill-ensure guarantee (silent chunk zeroing -> the old -4.5pp GPQA).
+# A 128k variant needs the cache route (pro6000x1-cache).
+# batched-tokens 256: each prefill chunk's per-layer working set must
+# fit the pool rotation - measured at 256 (2026-07-17 campaign).

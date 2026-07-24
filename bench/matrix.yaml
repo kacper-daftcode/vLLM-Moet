@@ -1,5 +1,9 @@
+schema: 2
 current_release: baseline-2026-07-10
 previous_release: null
+historical_releases:
+  - baseline-2026-07-10
+  - v2026.07.17-quality
 # Quality campaigns (bench/suites/quality.yaml vs bench/baselines/) are
 # expensive and run on their own cadence; the README quality table renders
 # from this release id.
@@ -18,6 +22,8 @@ entries:
   - recipe: deepseek-v4-flash/5090x1-basecache
     blocking: false
   - recipe: deepseek-v4-flash/5090x2-tp2-basecache
+    blocking: false
+  - recipe: deepseek-v4-flash/pro6000x1-cache
     blocking: false
 
   - recipe: glm-5.2-nvfp4/pro6000x4-tp4-mtp

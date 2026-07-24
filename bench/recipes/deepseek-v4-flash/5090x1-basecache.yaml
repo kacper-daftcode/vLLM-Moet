@@ -17,10 +17,12 @@ load_timeout_s: 3600
 #   GSM8K-200 95.0% (native 97.0; the -2pp is the 32 GB base-coverage
 #   ceiling, stable across 4 runs on 2 card counts), GPQA-diamond NT
 #   68.88% vs native@32k 68.88% - EXACT parity, McNemar-clean.
-# QUALITY MODE = NO MTP: speculative decode over the streamed base costs
-# a deterministic -2.5..-3.5pp NT on this cell (mechanism under
-# investigation; drafter healthy at 68% acceptance - see agenda lesson
-# 11). Re-enable MTP only after that bug lands fixed.
+# SPEC = MTP-1 (2026-07-24): the spec-drift investigation closed - the
+# quality cost of speculation scales with ACCEPTED drafts (verify-batch
+# KV micro-noise amplified by 2-bit; paired on 1x6000-cache: MTP-1
+# p=0.52 = no significant loss, MTP-2 p=0.031 = real -3..-5). MTP-1
+# keeps most of the speedup at quality parity. 5090-cell validation
+# runs queued; numbers below are the no-spec measurements.
 # GEOMETRY (2026-07-22): the merged trunk grew ~2 GiB on base-cache
 # boots (bisect pending, agenda lesson 12) - the historical base 14 /
 # seqs 2 / batched 1024 now OOMs at load on 31.4 GiB. Validated boot:
@@ -63,6 +65,7 @@ serve_args:
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":1}
   - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
 
 warmup:
