@@ -1,0 +1,22 @@
+{
+  "schema_version": "ds4-w2-p1-public-cleanup-v1",
+  "result": "pass",
+  "stop_handshake_accepted": true,
+  "controller_cleanup_exit_code": 0,
+  "cleanup_completed_at_utc": "2026-07-11T22:37:13Z",
+  "watchdog_done_marker_present": true,
+  "abort_receipt_present": false,
+  "evaluation_container_absent_after": true,
+  "production_pack_fingerprint_unchanged": true,
+  "immutable_seed_pack_fingerprint_unchanged": true,
+  "stopped_services_expected_count": 2,
+  "stopped_services_active_after_count": 2,
+  "generated_store_removed_after_evidence_sync": true,
+  "generated_store_removed_bytes": 230317622095,
+  "controller_log": {
+    "line_count": 31,
+    "byte_count": 2646,
+    "sha256": "d328c7b47d08c0fd0564cdee2c41f56afe1d3ef9321e543f0a6f764b342e161f"
+  },
+  "verification_note": "The final container-inspect receipt was captured before stop. Post-stop absence is established by the guarded controller's successful remove-and-reinspect path and zero cleanup exit code; topology-specific identifiers remain private."
+}

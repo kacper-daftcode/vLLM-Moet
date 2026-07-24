@@ -1,0 +1,184 @@
+{
+  "schema_version": "ds4-w2-p2-public-runtime-clean-v2",
+  "log_snapshot": {
+    "scope": "complete container log through all three fresh zero-tolerance 120K cases and the last pre-stop health check; the controller log separately proves stop and cleanup",
+    "line_count": 6122,
+    "byte_count": 1224051,
+    "sha256": "0149680f7126f1926bb889deaa27f72b5bc5a9bc31b3163d1ea550bb9260d950",
+    "first_timestamp_utc": "2026-07-12T01:55:26.284950Z",
+    "last_timestamp_utc": "2026-07-12T02:38:10.131082Z",
+    "span_seconds": 2563.846132
+  },
+  "exact_pattern_scan": {
+    "replay_skipped": 0,
+    "gate_skipped": 0,
+    "draft_prefetch_skipped": 0,
+    "unrestored_experts": 0,
+    "pool_too_tight": 0,
+    "pool_too_small": 0,
+    "fixed_point_replay_hit_maximum": 0,
+    "error_severity": 0,
+    "traceback": 0,
+    "actionable_or_nonzero_oom": 0,
+    "abort": 0,
+    "timeout": 0
+  },
+  "http_response_scan": {
+    "health_200": 2665,
+    "chat_200": 153,
+    "tokenize_200": 48,
+    "non_200": 0,
+    "interpretation": "The 153 chat responses are exactly 30 frozen prewarm prompts, 120 scored responses, and 3 admitted context cases. Calibration-only seed qualification contributes tokenize calls but no chat response."
+  },
+  "wording_caveats": {
+    "cgroup_event_records": {
+      "matching_lines": 748,
+      "all_values_zero": true,
+      "interpretation": "These container-log records are startup/cache-control snapshots. The separate watchdog trace is authoritative for full-lane soft memory.high events."
+    },
+    "generic_skipped": {
+      "matching_lines": 0,
+      "interpretation": "No uppercase SKIPPED lines occurred in the current integrated run; replay, gate, and draft-prefetch skip patterns were also zero."
+    },
+    "startup_and_shape_warnings": {
+      "uppercase_warning_lines": 27,
+      "inference_shape_jit_notices": 0,
+      "serving_correctness_or_safety_failures": 0
+    }
+  },
+  "base_kpi_windows": {
+    "window_count": 151,
+    "steps_per_window": 64,
+    "windows_with_fp_residue": 148,
+    "windows_with_unrestored_experts": 0,
+    "replay_percent": {
+      "min": 0.0,
+      "max": 100.0,
+      "mean": 95.169
+    },
+    "average_missing_pairs_per_step": {
+      "min": 0.0,
+      "max": 94.9,
+      "mean": 79.785
+    },
+    "fp_residue_steps": {
+      "min": 0,
+      "max": 64,
+      "mean": 60.921
+    },
+    "nonzero_residue_steps": {
+      "min": 1,
+      "max": 64,
+      "mean": 62.155,
+      "total": 9199
+    },
+    "reported_average_residual_pairs": {
+      "min": 0,
+      "max": 35,
+      "mean_of_window_reports": 21.887
+    },
+    "cumulative_replay_percent": {
+      "max": 98.4,
+      "min": 90.6
+    },
+    "final_window": {
+      "replay_percent": 0.0,
+      "cumulative_replay_percent": 95.2,
+      "cumulative_steps": 9664,
+      "fp_residue_steps": 0,
+      "average_residual_pairs": 0,
+      "base_pool_slots": 1213,
+      "base_expert_coverage_percent": 11.0
+    }
+  },
+  "selected_context_receipts": {
+    "exact_120k_cases": 3,
+    "interim_kpi_windows": [
+      {
+        "depth": 0.1,
+        "replay_percent": 64.1,
+        "fp_residue_steps": 42,
+        "average_residual_pairs": 23
+      },
+      {
+        "depth": 0.5,
+        "replay_percent": 23.4,
+        "fp_residue_steps": 15,
+        "average_residual_pairs": 35
+      },
+      {
+        "depth": 0.9,
+        "replay_percent": 20.3,
+        "fp_residue_steps": 13,
+        "average_residual_pairs": 35
+      }
+    ],
+    "terminal_kpi_windows": [
+      {
+        "depth": 0.1,
+        "replay_percent": 0.0,
+        "fp_residue_steps": 0,
+        "average_residual_pairs": 0
+      },
+      {
+        "depth": 0.5,
+        "replay_percent": 0.0,
+        "fp_residue_steps": 0,
+        "average_residual_pairs": 0
+      },
+      {
+        "depth": 0.9,
+        "replay_percent": 0.0,
+        "fp_residue_steps": 0,
+        "average_residual_pairs": 0
+      }
+    ],
+    "interpretation": "All three exact retrieval requests exhibited a nonzero interim residue window and then closed with a zero-replay, zero-residue latest window. This is empirical retrieval evidence, not proof that every internal forward was miss-free."
+  },
+  "memory_watchdog": {
+    "samples": 2516,
+    "elapsed_seconds": 2568.8,
+    "trace_byte_count": 632512,
+    "trace_sha256": "edaa1ce45a7f60a20a8e96aea70f25eff9424b5440399867e1e78326d5d13719",
+    "host_mem_available_min_bytes": 103752298496,
+    "host_mem_available_max_bytes": 118599213056,
+    "host_mem_available_final_bytes": 106434854912,
+    "host_floor_headroom_min_bytes": 77982494720,
+    "host_swap_free_min_bytes": 8589918208,
+    "cgroup_memory_current_max_bytes": 103079694336,
+    "cgroup_memory_peak_bytes": 103081906176,
+    "cgroup_anon_max_bytes": 12596084736,
+    "cgroup_file_max_bytes": 94313668608,
+    "cgroup_file_mapped_max_bytes": 4109418496,
+    "cgroup_hard_max_bytes": 107374182400,
+    "cgroup_hard_headroom_min_bytes": 4294488064,
+    "cgroup_peak_based_hard_headroom_bytes": 4292276224,
+    "cgroup_soft_high_bytes": 103079215104,
+    "cgroup_soft_high_headroom_min_bytes": -479232,
+    "cgroup_peak_above_soft_high_bytes": 2691072,
+    "samples_above_soft_high": 2,
+    "soft_high_event_delta": 28089,
+    "cgroup_swap_current_max_bytes": 0,
+    "hard_max_event_delta": 0,
+    "oom_event_delta": 0,
+    "oom_kill_event_delta": 0,
+    "host_swap_in_pages_delta": 0,
+    "host_swap_out_pages_delta": 0,
+    "host_oom_kill_delta": 0,
+    "psi_full_avg10_max": 0.79,
+    "psi_nonzero_samples": 71,
+    "host_wide_reclaim_counters": {
+      "pgscan_delta": 143429711,
+      "pgsteal_delta": 143412339,
+      "major_fault_delta": 836341,
+      "attribution_note": "These counters are host-wide and are not exclusively attributable to the evaluation cgroup."
+    },
+    "interpretation": "The integrated 128K lane retained more than 4.29 GB of hard cgroup headroom with no swap, hard-limit, or OOM event. File-cache growth crossed the soft memory.high boundary narrowly and produced observable reclaim; those events are intentionally not reported as zero."
+  },
+  "kpi_semantics": {
+    "window_boundary": "Residue and replay fields describe the latest 64-step KPI window, not cumulative correctness.",
+    "residue_boundary": "Residue records second-order misses exposed after mandatory first-order fetch and replay. Under the default continuation threshold, those experts are available to later steps while their current-step contribution remains zero.",
+    "unrestored_boundary": "Zero unrestored experts establishes fetch/store liveness. It does not establish a miss-free forward, bit-identical logits, or identical token streams across boots."
+  },
+  "sanitization_note": "Topology-specific and private runtime provenance identifiers are intentionally omitted."
+}

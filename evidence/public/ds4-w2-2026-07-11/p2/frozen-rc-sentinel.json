@@ -1,0 +1,87 @@
+{
+  "schema_version": "ds4-w2-frozen-rc-sentinel-v1",
+  "artifact": {
+    "official_vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "origin_main_cutoff": "94be3aa3d7a8b82c7fc9687990a7edb6035f69f3",
+    "wrapper_commit": "0a73c2bcf262ba0aa53560d6290ad2af350e34fc",
+    "source_patch_sha256": "241ba984b1c56f5dc7adbc8d7f519d60b5746024bf7dfeb875e3546a668e79a7",
+    "image_id": "sha256:fc6e1244d60855fe45ccc0236daaaa722abcb8d354200eb92aca104bd954d3f2"
+  },
+  "quality": {
+    "window_tokens": 131072,
+    "eval_seeds": [
+      42,
+      43
+    ],
+    "responses": 80,
+    "strict_machine_exact": 79,
+    "semantic_correct": 80,
+    "sink_detections": 0,
+    "http_200": 80,
+    "finish_reason_stop": 80,
+    "fixed_prewarms_passed": 20,
+    "fixed_prewarm_retries": 0,
+    "pool_gates_passed": 4,
+    "pool_gates_total": 4,
+    "fp4_eviction_deltas": {
+      "42": 46560,
+      "43": 44345
+    },
+    "max_unrestored_base_experts": 0,
+    "format_only_diagnostic": {
+      "seed": 43,
+      "item": "r17",
+      "expected": "3/8",
+      "returned": "\\(\\frac{3}{8}\\)",
+      "strict_exact": false,
+      "semantically_correct": true,
+      "sink": false
+    }
+  },
+  "context": {
+    "window_tokens": 131072,
+    "target_prompt_tokens": 120000,
+    "observed_tokenizer_tokens": 120000,
+    "observed_usage_prompt_tokens": 120000,
+    "prompt_token_tolerance": 0,
+    "needle_depth": 0.9,
+    "seed": 20260711,
+    "exact_answer": true,
+    "http_status": 200,
+    "finish_reason": "stop",
+    "wall_seconds": 250.673,
+    "formal_tokenizer_only_calibration_rejections": 2,
+    "rejected_calibrations_sent_chat_requests": false
+  },
+  "complete_run_memory": {
+    "samples": 1713,
+    "window_seconds": 1744.3,
+    "min_mem_available_bytes": 103726841856,
+    "max_cgroup_current_bytes": 103079645184,
+    "max_cgroup_peak_bytes": 103082033152,
+    "min_cgroup_hard_headroom_bytes": 4294537216,
+    "min_memory_high_headroom_bytes": -430080,
+    "max_cgroup_swap_bytes": 0,
+    "memory_high_event_delta": 19598,
+    "memory_max_event_delta": 0,
+    "oom_event_delta": 0,
+    "oom_kill_event_delta": 0,
+    "host_swap_in_page_delta": 0,
+    "host_swap_out_page_delta": 0,
+    "host_oom_kill_delta": 0,
+    "max_psi_full_avg10": 0.54
+  },
+  "cleanup": {
+    "controller_exit_status": 0,
+    "evaluation_container_absent": true,
+    "production_pack_fingerprint_unchanged": true,
+    "immutable_seed_pack_fingerprint_unchanged": true,
+    "production_services_active": true,
+    "production_health_codes": [
+      200,
+      200
+    ],
+    "disposable_payload_pack_bytes_removed": 230317621248
+  },
+  "evidence_boundary": "The frozen RC reran two quality seeds and the deepest exact 120K context case. The immediately preceding 41d7b2f integrated artifact retains the comprehensive three-seed and three-depth series. The RC-only source delta is split-FP4/base coupling and padded-route hardening; split mode remained off in the serving sentinel and was verified separately by the exact-image GPU fixture."
+}

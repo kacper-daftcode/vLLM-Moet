@@ -1,0 +1,208 @@
+{
+  "schema_version": "ds4-w2-p1-public-aggregate-v1",
+  "evaluation_scope": {
+    "seeds": [
+      42,
+      43,
+      44
+    ],
+    "responses_per_seed": 40,
+    "response_total": 120,
+    "order": "reasoning-coding-interleaved-fixed",
+    "prewarm": {
+      "suite_version": "ds4-w2-prewarm-v4",
+      "cases_per_seed": 10,
+      "accepted_per_seed": {
+        "42": 10,
+        "43": 10,
+        "44": 10
+      },
+      "accepted_combined": 30,
+      "total_combined": 30,
+      "retries": 0
+    }
+  },
+  "baseline_context": {
+    "machine_exact": 76,
+    "responses": 120,
+    "sinks": 16,
+    "sink_rate": 0.13333333333333333,
+    "comparability_caveat": "The baseline is a corrected re-score of historical warm runs under a different runtime and prewarm contract. It is operational context, not a causal control arm for any single change."
+  },
+  "final_quality": {
+    "per_seed": [
+      {
+        "seed": 42,
+        "machine_exact": 39,
+        "machine_lenient": 39,
+        "semantic_equivalent": 40,
+        "responses": 40,
+        "sinks": 0,
+        "request_errors": 0,
+        "non_200_responses": 0,
+        "non_stop_finishes": 0,
+        "retries": 0
+      },
+      {
+        "seed": 43,
+        "machine_exact": 40,
+        "machine_lenient": 40,
+        "semantic_equivalent": 40,
+        "responses": 40,
+        "sinks": 0,
+        "request_errors": 0,
+        "non_200_responses": 0,
+        "non_stop_finishes": 0,
+        "retries": 0
+      },
+      {
+        "seed": 44,
+        "machine_exact": 40,
+        "machine_lenient": 40,
+        "semantic_equivalent": 40,
+        "responses": 40,
+        "sinks": 0,
+        "request_errors": 0,
+        "non_200_responses": 0,
+        "non_stop_finishes": 0,
+        "retries": 0
+      }
+    ],
+    "combined": {
+      "machine_exact": 119,
+      "machine_lenient": 119,
+      "semantic_equivalent": 120,
+      "responses": 120,
+      "sinks": 0,
+      "request_errors": 0,
+      "non_200_responses": 0,
+      "non_stop_finishes": 0,
+      "retries": 0
+    },
+    "latex_normalization_caveat": {
+      "seed": 42,
+      "item": "r17",
+      "expected": "3/8",
+      "returned_final": "\\(\\frac{3}{8}\\)",
+      "machine_exact": false,
+      "machine_lenient": false,
+      "sink": false,
+      "interpretation": "The returned value is mathematically equivalent to 3/8, but the frozen scorer does not normalize this LaTeX wrapper. The public machine score remains 119/120; 120/120 is reported separately as a semantic-equivalence interpretation."
+    }
+  },
+  "receipt_derived_performance": {
+    "latency_seconds": {
+      "percentile_method": "nearest-rank",
+      "per_seed": [
+        {
+          "seed": 42,
+          "sum": 428.445,
+          "mean": 10.711125,
+          "p50": 9.7485,
+          "p95": 17.671,
+          "max": 29.01
+        },
+        {
+          "seed": 43,
+          "sum": 441.176,
+          "mean": 11.0294,
+          "p50": 10.7295,
+          "p95": 15.435,
+          "max": 31.227
+        },
+        {
+          "seed": 44,
+          "sum": 418.249,
+          "mean": 10.456225,
+          "p50": 9.6525,
+          "p95": 16.364,
+          "max": 30.377
+        }
+      ],
+      "combined": {
+        "sum": 1287.87,
+        "mean": 10.73225,
+        "p50": 9.981,
+        "p95": 17.671,
+        "max": 31.227
+      }
+    },
+    "completion_tokens": {
+      "percentile_method": "nearest-rank",
+      "per_seed": [
+        {
+          "seed": 42,
+          "sum": 3082,
+          "mean": 77.05,
+          "p50": 70.5,
+          "p95": 145,
+          "max": 230
+        },
+        {
+          "seed": 43,
+          "sum": 3202,
+          "mean": 80.05,
+          "p50": 78.5,
+          "p95": 136,
+          "max": 235
+        },
+        {
+          "seed": 44,
+          "sum": 2996,
+          "mean": 74.9,
+          "p50": 70,
+          "p95": 136,
+          "max": 253
+        }
+      ],
+      "combined": {
+        "sum": 9280,
+        "mean": 77.33333333333333,
+        "p50": 71.5,
+        "p95": 138,
+        "max": 253
+      }
+    },
+    "serial_completion_tokens_per_receipt_wall_second": 7.205696227103666,
+    "throughput_caveat": "The derived rate divides completion-token receipts by summed per-request wall time. It is not a concurrent engine-throughput benchmark."
+  },
+  "near_edge_context": {
+    "served_window_tokens": 32768,
+    "target_prompt_tokens": 30000,
+    "depths": [
+      0.1,
+      0.5,
+      0.9
+    ],
+    "accepted": 3,
+    "of": 3,
+    "exact_prompt_token_count_required": true,
+    "exact_terminal_passphrase_required": true,
+    "role": "P1 near-edge validation and rehearsal of the P2 context harness; it is not a 128K P2 result."
+  },
+  "pool_activity_during_scoring": {
+    "per_seed": [
+      {
+        "seed": 42,
+        "evictions": 76911,
+        "promotions": 76911
+      },
+      {
+        "seed": 43,
+        "evictions": 80902,
+        "promotions": 80902
+      },
+      {
+        "seed": 44,
+        "evictions": 75113,
+        "promotions": 75113
+      }
+    ],
+    "combined": {
+      "evictions": 232926,
+      "promotions": 232926
+    },
+    "policy_boundary": "All three quality runs passed their pre-score and post-score liveness/churn policy. Replay rate and second-order residue were retained telemetry, not rejection thresholds; the separate strict zero-residue diagnostic did not pass."
+  },
+  "sanitization_note": "Topology-specific and private runtime provenance identifiers are intentionally omitted."
+}
