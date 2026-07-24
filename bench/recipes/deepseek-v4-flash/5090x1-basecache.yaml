@@ -40,6 +40,9 @@ env:
   # 94.5% / +110%% tokens vs 96.5%/95.0%% with cap 64. Remove the
   # cap only on configs with pool >= the step routed union.
   VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
+  # This forced sub-floor cell is explicitly approximate: strict mode may
+  # reject a step whose routed union cannot fit the 12 GiB base pool.
+  VLLM_MOE_W2_REPLAY_MODE: "approximate"
   # DEGRADED gate mode, explicit consent: the pool is below the
   # FIRE FLOOR (one step's routed union), so the boot guard would
   # refuse to serve. Fires upgrade incrementally (cap 64); tau->1
@@ -55,6 +58,13 @@ env:
   # would thrash it (warns "pool too tight").
   VLLM_MOE_W2_GATE_SPEC_MASK: "1"
 
+# SPEC ON HOLD on this cell (2026-07-24 pinned-tree validation): with the
+# CURRENT committed replay policy (single mandatory pass, second-order
+# residue kept) MTP-1 on TP1's slot-starved base measured NT 62.44 vs
+# native@32k 69.04 - the residual-zeros mechanism bites hardest here.
+# The strict-replay work (in flight on the fork) fixes it: MTP-1 on that
+# branch measured 72.08 (+3 over native). Re-enable spec when strict
+# lands: --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":1}
 serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
@@ -65,7 +75,6 @@ serve_args:
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
-  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":1}
   - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
 
 warmup:
