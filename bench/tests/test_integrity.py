@@ -15,6 +15,7 @@ RUNNER = Path(__file__).resolve().parents[1] / "runner"
 sys.path.insert(0, str(RUNNER))
 
 import common  # noqa: E402
+import envinfo  # noqa: E402
 import integrity  # noqa: E402
 import probes  # noqa: E402
 from serverctl import Server, ServerFailed  # noqa: E402
@@ -138,6 +139,27 @@ class IntegrityTests(unittest.TestCase):
         tampered = copy.deepcopy(inputs)
         tampered["recipe_snapshot"]["id"] = "other"
         self.assertTrue(integrity.self_binding_errors(tampered))
+
+    def test_vllm_fingerprint_accepts_linked_worktree_git_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d, "vllm-worktree")
+            package = repo / "vllm"
+            package.mkdir(parents=True)
+            origin = package / "__init__.py"
+            origin.write_text("")
+            (repo / ".git").write_text("gitdir: /tmp/main/.git/worktrees/wt\n")
+            completed = [
+                types.SimpleNamespace(returncode=0, stdout=str(origin) + "\n"),
+                types.SimpleNamespace(returncode=0, stdout="a" * 40 + "\n"),
+                types.SimpleNamespace(returncode=0, stdout=""),
+            ]
+            with mock.patch.object(envinfo, "run", side_effect=completed):
+                got = envinfo._vllm_tree("/unused-venv")
+        self.assertEqual(got, {
+            "path": str(repo),
+            "sha": "a" * 40,
+            "dirty": False,
+        })
 
     def test_schema2_result_is_not_silently_overwritten(self):
         with tempfile.TemporaryDirectory() as d:

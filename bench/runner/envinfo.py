@@ -75,7 +75,8 @@ def _vllm_tree(venv):
         return None
     d = os.path.dirname(r.stdout.strip())          # .../vllm/__init__.py
     repo = os.path.dirname(d)
-    if not os.path.isdir(os.path.join(repo, ".git")):
+    # Linked worktrees use a `.git` pointer file rather than a directory.
+    if not os.path.exists(os.path.join(repo, ".git")):
         return None
     return {
         "path": repo,
