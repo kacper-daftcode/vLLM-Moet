@@ -57,7 +57,12 @@ def _nwarp(k):
     return 1
 
 
-NWARP = int(os.environ.get("MOEW2_NWARP", "0")) or _nwarp(K)
+if os.environ.get("MOEW2_NWARP", "").strip() not in ("", "0"):
+    raise ValueError(
+        "MOEW2_NWARP override is unsafe: runtime launch geometry is part "
+        "of the cubin ABI and is derived from K. Add a versioned manifest/"
+        "filename before introducing a non-default geometry.")
+NWARP = _nwarp(K)
 MC = int(os.environ.get("MOEW2_MC", "1"))      # m-chunks per pair-entry
 # MC=1: decode (rows 0..7 via c0/c1; rows 8..15 stay zero);  MC=4: the c2/c3
 # QMMA quadrants carry rows 8..15 in the SAME decode pass = the FULL m16 tile.

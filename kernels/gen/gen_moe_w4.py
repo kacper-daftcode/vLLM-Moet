@@ -42,7 +42,12 @@ def _nwarp(k):
     return 1
 
 
-NWARP = int(os.environ.get("MOEW4_NWARP", "0")) or _nwarp(K)
+if os.environ.get("MOEW4_NWARP", "").strip() not in ("", "0"):
+    raise ValueError(
+        "MOEW4_NWARP override is unsafe: runtime launch geometry is part "
+        "of the cubin ABI and is derived from K. Add a versioned manifest/"
+        "filename before introducing a non-default geometry.")
+NWARP = _nwarp(K)
 KSLICE = K // NWARP
 assert KSLICE % 128 == 0
 NTHR = NWARP * 32

@@ -71,7 +71,9 @@ for li in range(L):
                            for e in range(E)])
     sc2 = torch.stack([pack_scales(s2[e]) for e in range(E)])
     st = dict(N13=2 * I, K13=H, N2=H, K2=I, E=E, base=False,
-              planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2)
+              planes13=planes13, sc13=sc13, planes2=planes2, sc2=sc2,
+              activation="silu", swiglu_limit=None, swiglu_alpha=1.0,
+              swiglu_beta=0.0)
     moe_w2_cubit._LAYERS[li] = st
     layers.append(dict(w13=w13, s13=s13, w2=w2, s2=s2, st=st))
 
@@ -296,4 +298,4 @@ print(f"DONE rounds={ROUNDS} promoted={tier._n_promoted} "
       f"evicted={tier._n_evicted} slot-verifications={verified_slots} "
       f"fails={fails}")
 print("RESULT:", "PASS" if fails == 0 else "FAIL")
-sys.exit(0 if fails else 1)
+sys.exit(1 if fails else 0)

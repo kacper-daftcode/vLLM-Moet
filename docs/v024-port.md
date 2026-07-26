@@ -2,9 +2,11 @@
 
 The project targets **official vLLM v0.24.0**, which ships DeepSeek‑V4 + SM120 natively
 (`vllm/models/deepseek_v4/`, FlashInfer SM120 sparse‑MLA, GLM‑5.x `GlmMoeDsaForCausalLM`).
-Our overlay is a **7.4k‑line patch** (37 files): the 2‑bit expert planes, the FP4 delta
-cache, the confidence gate, the cubit dispatch, the expert stores — plus the SM120 fixes
-below.
+Our overlay is a generated patch: the 2‑bit expert planes, the FP4 delta cache,
+the confidence gate, the cubit dispatch, the expert stores — plus the SM120
+fixes below. `patch/FILES.txt` and `patch/SOURCE.txt` are the authoritative
+scope and source fingerprint; static prose intentionally does not duplicate
+their counts.
 
 ## Apply
 
@@ -34,15 +36,18 @@ Environment pins that go with the patch (both required on SM120):
    on family 120.
 4. `capture_error_mode="thread_local"` on **all four** CUDA‑graph capture paths
    (`compilation/cuda_graph.py`, `compilation/breakable_cudagraph.py`,
-   `v1/worker/gpu/cudagraph_utils.py`, `v1/worker/gpu_ubatch_wrapper.py`) — the FP4 delta
-   cache promotes experts from a background thread; without thread_local its side‑stream work
-   invalidates capture (`CUDA_ERROR_STREAM_CAPTURE_INVALIDATED`).
+   `v1/worker/gpu/cudagraph_utils.py`, `v1/worker/gpu_ubatch_wrapper.py`). The
+   residency manager now snapshots at `step_end` and commits only at a
+   between-step safe point, but thread-local capture remains a defense against
+   unrelated helper-thread CUDA work.
 
 ## Our hooks
 
 - `mxfp4.py` (`Mxfp4MoEMethod`) — FP4‑checkpoint path (DeepSeek‑V4‑Flash): host‑stage experts
   at `create_weights`, build 2‑bit planes at `process_weights_after_loading`, `moe_w2_forward`
-  in `apply`.
+  in `apply`; the layer contract preserves the checkpoint's SwiGLU clamp
+  (`swiglu_limit=10` on DS4) and rejects unsupported activation/bias/EP
+  semantics before replacing weights.
 - `fp8.py` (`Fp8MoEMethod`) — FP8 block‑quant checkpoint path (DS4‑Flash‑Base,
   **GLM‑5.2‑FP8**): same three hooks; the loader re‑quantizes fp8+f32‑block‑128 to the
   sign‑symmetric 2‑bit codebook at load (`build_layer_planes_fp8`, float64 math, golden‑tested
@@ -61,21 +66,19 @@ Environment pins that go with the patch (both required on SM120):
   RAM; the GPU pool caches hot experts through the same slot‑table/manager/eviction machinery
   as the delta tier. Decode misses zero the pair's contribution, bump an in‑graph miss
   counter, and the runner fetches all missing routed experts synchronously (batched pinned
-  H2D, 51.6 GiB/s measured) and replays the step's graph once — replay bit‑identical to a
-  resident forward (unit‑tested, `internal` test_base_cache). Prefill prefetches per layer
+  H2D, 51.6 GiB/s measured) and replays the step's graph — replay bit‑identical to a
+  resident forward (`tools/test_moe_w2_base_verify.py`). Prefill prefetches per layer
   via `ensure_resident`. TP MAX‑reduces the miss decision. Under **PP** a miss is local to
   its stage (per‑stage counter, inputs still held in the stage's static buffers), so each
   stage re‑runs only its own **segment** before activations flow downstream — no cross‑stage
   collective; TP ranks within a stage replay together. The replay iterates toward a **fixed
-  point, adaptively**: corrected early layers can re‑route later layers onto experts the
+  point**: corrected early layers can re‑route later layers onto experts the
   first pass never fetched (second‑order misses, otherwise zeroed *inside* the replay —
-  measured as cross‑request greedy nondeterminism). The first‑order restore pass is
-  mandatory; further passes run only while the step is within `VLLM_MOE_W2_FP_THRESH` of
-  miss‑free (default 0 = mandatory pass only; file‑tunable via `…_FP_THRESH_FILE`;
-  `VLLM_MOE_W2_FP_MAX` bounds ping‑pong). An unconditional loop collapsed decode at low
-  coverage (GLM TP2 29→16 tok/s, DS4‑14 GiB 43→15 — chasing a moving target at up to 8
-  forwards/step); the live A/B behind the default: thresh 16 → 19.2, thresh 0 → 28.3 tok/s
-  at identical quality probes. Slots touched by any pass of a step are pinned against
+  measured as cross‑request greedy nondeterminism). Strict mode is the default:
+  it reaches zero residue or fails the request after `VLLM_MOE_W2_FP_MAX`.
+  The historical adaptive policy remains only as explicit
+  `VLLM_MOE_W2_REPLAY_MODE=approximate`; `FP_THRESH(_FILE)` then controls
+  which residues are chased. Slots touched by any pass of a step are pinned against
   eviction until the next step (the passes must not cannibalize each other's fetches); on
   tight pools an emergency eviction pass (synchronous callers only) relaxes the 2‑tick
   coldness bound rather than leave a miss UNRESTORED. Coexists with the FP4 need‑pool (explicit

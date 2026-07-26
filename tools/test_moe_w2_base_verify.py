@@ -20,7 +20,7 @@ shapes T=1 (plain decode) vs T=3 (MTP-2 verify) and checks:
      (a large value = borderline-greedy flips under verify batching).
 
 Run inside the vllm image on one GPU:
-  VLLM_MOE_W2_CUBIT_DIR=/cubit-share VLLM_MOE_W2_BASE_CACHE_GB=1 \
+  VLLM_MOE_W2_CUBIT_DIR=/cubit-share VLLM_MOE_W2_BASE_CACHE_GB=2 \
     python3 tools/test_moe_w2_base_verify.py
 """
 import os
@@ -29,7 +29,10 @@ import sys
 import torch
 
 os.environ.setdefault("VLLM_MOE_W2", "1")
-os.environ.setdefault("VLLM_MOE_W2_BASE_CACHE_GB", "1")
+# Eight independent layer keys are exercised in one process. Keep enough slots
+# for all 8*E rows so a later scenario cannot evict its own just-fetched rows
+# merely because earlier scenarios intentionally remain resident.
+os.environ.setdefault("VLLM_MOE_W2_BASE_CACHE_GB", "2")
 
 from vllm.model_executor.layers.quantization.utils import moe_w2_cubit  # noqa: E402
 from vllm.model_executor.layers.quantization.utils import moe_w2_delta  # noqa: E402

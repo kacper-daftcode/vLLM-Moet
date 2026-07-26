@@ -29,6 +29,7 @@ H = int(os.environ.get("H", "4096"))     # 4096 DS4, 6144 GLM-5.x, 7168 Kimi-K2.
 I = int(os.environ.get("I", "2048"))     # per-rank I under TP (1024 TP2, 512 TP4)
 T = int(os.environ.get("T", "9"))        # T>96 exercises the PREFILL tier (mc4/afrag)
 TOPK = 6
+SWIGLU_LIMIT = float(os.environ.get("SWIGLU_LIMIT", "10"))
 LEVELS = torch.tensor([-4.0, -1.0, 1.0, 4.0], device=dev)
 
 w13_pack = torch.randint(0, 256, (E, 2 * I, H // 2), dtype=torch.uint8, device=dev)
@@ -36,7 +37,10 @@ s13 = torch.randint(118, 124, (E, 2 * I, H // 32), dtype=torch.uint8, device=dev
 w2_pack = torch.randint(0, 256, (E, H, I // 2), dtype=torch.uint8, device=dev)
 s2 = torch.randint(118, 124, (E, H, I // 32), dtype=torch.uint8, device=dev)
 
-st = dict(N13=2 * I, K13=H, N2=H, K2=I, E=E)
+st = dict(N13=2 * I, K13=H, N2=H, K2=I, E=E,
+          activation="silu",
+          swiglu_limit=SWIGLU_LIMIT if SWIGLU_LIMIT > 0 else None,
+          swiglu_alpha=1.0, swiglu_beta=0.0)
 st["planes13"] = torch.stack([pack_fragment_major(mxfp4_to_codes(w13_pack[e])) for e in range(E)])
 st["sc13"] = torch.stack([pack_scales(s13[e]) for e in range(E)])
 st["planes2"] = torch.stack([pack_fragment_major(mxfp4_to_codes(w2_pack[e])) for e in range(E)])
@@ -47,6 +51,14 @@ moe_w2_cubit._LAYERS[0] = st
 def dequant(pack, sc):
     codes = mxfp4_to_codes(pack)
     return LEVELS[codes.long()] * torch.exp2(sc.float() - 127.0).repeat_interleave(32, -1)
+
+
+def activate(c13):
+    gate, up = c13[:I], c13[I:]
+    if SWIGLU_LIMIT > 0:
+        gate = gate.clamp(max=SWIGLU_LIMIT)
+        up = up.clamp(min=-SWIGLU_LIMIT, max=SWIGLU_LIMIT)
+    return torch.nn.functional.silu(gate) * up
 
 
 x = (torch.randn(T, H, device=dev) * 0.3).to(torch.bfloat16)
@@ -63,7 +75,7 @@ for t in range(T):
         e = int(topk_ids[t, j])
         w13d = dequant(w13_pack[e], s13[e])
         c13 = a_deq[t] @ w13d.T
-        act = torch.nn.functional.silu(c13[:I]) * c13[I:]
+        act = activate(c13)
         act_deq = moe_w2_cubit.a32_dequant_ref(
             act.to(torch.bfloat16).unsqueeze(0), gemm=2)
         w2d = dequant(w2_pack[e], s2[e])
@@ -123,7 +135,7 @@ for t in range(T):
         dq2 = dequant_fp4 if e in promoted else dequant
         w13d = (dq13(w13_pack[e], s13[e]))
         c13 = a_deq[t] @ w13d.T
-        act = torch.nn.functional.silu(c13[:I]) * c13[I:]
+        act = activate(c13)
         act_deq = moe_w2_cubit.a32_dequant_ref(
             act.to(torch.bfloat16).unsqueeze(0), gemm=2)
         w2d = dq2(w2_pack[e], s2[e])
@@ -174,7 +186,7 @@ for t in range(T):
         dq = dequant_split if e in promoted else dequant
         w13d = dq(w13_pack[e], s13[e])
         c13 = a_deq[t] @ w13d.T
-        act = torch.nn.functional.silu(c13[:I]) * c13[I:]
+        act = activate(c13)
         act_deq = moe_w2_cubit.a32_dequant_ref(
             act.to(torch.bfloat16).unsqueeze(0), gemm=2)
         w2d = dq(w2_pack[e], s2[e])
