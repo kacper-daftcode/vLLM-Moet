@@ -60,7 +60,6 @@ medians; prefill = 8k‑token prompt, uncached):
 | hardware | decode | prefill 8k | max context window (served, needle‑validated) | host RAM |
 |---|---:|---:|---:|---:|
 | **1× RTX PRO 6000 (96 GB)** | **161 tok/s** | **5 340 tok/s** | 24K | — |
-| 1× RTX PRO 6000 (96 GB) | — | — | **512K** | — |
 | 2× RTX PRO 6000 (TP2) | 210 tok/s | 5 790 tok/s | 24K | — |
 | 4× RTX 5090 (TP4) | 214 tok/s | 6 100 tok/s | 16K | — |
 | **1× RTX 5090 (32 GB)** | **~31 tok/s** (14 GiB pool + NVMe stores) | ~400–540 tok/s | **32K** | **~30 GiB** |
@@ -342,12 +341,11 @@ docker run --rm --gpus '"device=0"' --network host --ipc host --shm-size 64g \
 
 `VLLM_MOE_W2=0` = stock FP4 path (needs ≥2 cards for DS4; GLM's stock NVFP4 does not fit this
 box at all). TP: `--tensor-parallel-size 2|4` + `--disable-custom-all-reduce`. Single‑5090
-DS4 (host‑resident base): `-e VLLM_MOE_W2_BASE_CACHE_GB=14 -e VLLM_MOE_W2_DELTA_GB=0` with
-`--max-model-len 8192 --gpu-memory-utilization 0.95 --max-num-seqs 2` (~80 GiB free host
-RAM — **or add the two NVMe‑store lines from the section above and run in ~30 GiB**; MTP
-works). Do not shrink the pool below 14 GiB to "play it safe" — pool size is the dominant
-perf knob (see the KPI note above; 11 GiB costs ~12% decode and doubles the missing pairs
-per step) and 14 GiB needs util 0.95 to leave room for KV.
+DS4 uses the supported `deepseek-v4-flash/5090x1-basecache` recipe: a 12 GiB
+host-resident base cache plus a 1 GiB FP4 recovery pool, capped gate, MTP‑1 and
+explicit approximate replay at 32K. `VLLM_MOE_W2_DELTA_GB=0` is unsupported
+for DS4 serving: it disables the quality-recovery path and leaves the model on
+bare 2-bit experts.
 
 ## Quality
 
@@ -418,7 +416,6 @@ Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recip
 | deepseek-v4-flash | 1x RTX 5090 (32 GB) | host-resident 2-bit base, GPU as expert cache | 8K | **38** | — | — | — | acc 2.83 † |
 | deepseek-v4-flash | 4x RTX 5090 TP4 | consumer-card throughput | 16K | **214.4** | 1 560 @32 | 6 101 | — | acc 2.6 † |
 | deepseek-v4-flash | 1x RTX PRO 6000 | throughput (24K ctx, FP4 delta auto, MTP k=2) | 24K | **161.2** | 933 @32 | 5 340 | — | acc 2.6 † |
-| deepseek-v4-flash | 1x RTX PRO 6000 | 512K window (delta pool traded for KV) | 512K | — | — | — | PASS ≤453K tok | † |
 | deepseek-v4-flash | 2x RTX PRO 6000 TP2 | throughput | 24K | **209.6** | 380 @3 | 5 791 | — | acc 2.6 † |
 | glm-5.2-nvfp4 | 2x RTX PRO 6000 TP2 | host-resident base, 44 GiB/rank expert cache | 32K | **33** | — | — | PASS ≤27K tok | acc 3 † |
 | glm-5.2-nvfp4 | 4x RTX PRO 6000 TP4 | 2-bit base + MTP k=2, 128K window | 128K | **105** | — | 2 500 | PASS ≤276K tok | † |

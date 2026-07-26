@@ -103,9 +103,18 @@ def collect(release):
     return rows
 
 
+def supported(rows):
+    """Hide retired recipes from current README tables, not historical reports."""
+    return {
+        key: result
+        for key, result in rows.items()
+        if os.path.exists(common.recipe_path(result["recipe"]))
+    }
+
+
 def render_readme_block(release, prev_release, threshold):
-    cur = collect(release)
-    prev = collect(prev_release) if prev_release else {}
+    cur = supported(collect(release))
+    prev = supported(collect(prev_release)) if prev_release else {}
     lines = [
         BEGIN,
         "",
@@ -166,7 +175,7 @@ def render_quality_block(qrelease):
     """The quality table: parity vs the committed NATIVE baselines
     (bench/baselines/). Rendered from the quality release's results —
     quality campaigns are expensive and run on their own cadence."""
-    cur = collect(qrelease)
+    cur = supported(collect(qrelease))
     lines = [
         QBEGIN,
         "",

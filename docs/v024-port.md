@@ -225,20 +225,17 @@ N identical‑length greedy requests, 384 tok each, aggregate decode tok/s, medi
 (decode stays HBM‑bound; the per‑step expert working set grows sublinearly with batch).
 At 32 streams each request still gets ~29 tok/s (PRO 6000) / ~49 tok/s (TP4).
 
-**Long context (512K) on one 96 GB card** — validated live (`tools/needle_probe.py`, unique
-secret embedded in filler, greedy): PASS at **102 238 / 256 294 / 453 286 prompt tokens**
-(depth 0.1) and at 453K with the needle mid‑context (depth 0.5); cold TTFT 27 s / 64 s /
-~2 min. Server config for the 512K window on 1× PRO 6000: `--max-model-len 524288
---gpu-memory-utilization 0.97 --max-num-batched-tokens 2048 --max-num-seqs 1` with
-`VLLM_MOE_W2=1 VLLM_MOE_W2_DELTA_GB=0` (the FP4 delta pool trades against KV headroom at
-extreme context; with delta 1 GiB use ≤256K). The KV fit comes from DS4's compressed KV +
-upstream's FP8 Lightning‑Indexer cache; vLLM reports 947K cached tokens in this config.
+**The former 512K single-card DS4 mode is retired.** It obtained KV headroom by setting
+`VLLM_MOE_W2_DELTA_GB=0`, which disables FP4 recovery and serves bare 2-bit experts.
+Needle retrieval alone did not establish native-grade model quality. Supported DS4 recipes
+must retain a positive FP4 recovery pool; maximum context is therefore the value validated
+by the selected recipe, not the old 512K capacity probe.
 
 **Delta pool auto‑sizing.** `VLLM_MOE_W2_DELTA_GB=auto` resolves the delta‑vs‑KV trade
 automatically: the pool allocation is deferred until after the KV cache is allocated
 (and before cudagraph capture — the graphs bake the pool pointer), then sized as
 `free VRAM − VLLM_MOE_W2_DELTA_RESERVE_GB` (default 3, capture/workspace headroom),
 optionally capped by `VLLM_MOE_W2_DELTA_MAX_GB`. At extreme context it lands at 0 slots
-(pure 2‑bit, pinned host store released — the manual `DELTA_GB=0` rule, without the manual
-step); at 24K ctx / util 0.95 it recovers a ~1.6 GiB pool (133 slots) and benches at
-166 tok/s single‑stream (1× PRO 6000, MTP k=2, graphs).
+(a capacity-only bare-2bit mode, unsupported for DS4 serving); at 24K ctx / util 0.95 it
+recovers a ~1.6 GiB pool (133 slots) and benches at 166 tok/s single‑stream
+(1× PRO 6000, MTP k=2, graphs).

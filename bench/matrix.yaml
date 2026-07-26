@@ -17,8 +17,6 @@ regression_threshold_pct: 5
 entries:
   - recipe: deepseek-v4-flash/pro6000x1-24k
     blocking: true
-  - recipe: deepseek-v4-flash/pro6000x1-512k
-    blocking: true
   - recipe: deepseek-v4-flash/pro6000x2-tp2
     blocking: false
   - recipe: deepseek-v4-flash/5090x4-tp4

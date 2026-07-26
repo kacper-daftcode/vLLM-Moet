@@ -98,7 +98,8 @@ def lint_results(release):
         if res.get("provenance") not in ("live", "imported"):
             err(f"{where}: bad provenance {res.get('provenance')!r}")
         if not os.path.exists(common.recipe_path(rid)):
-            err(f"{where}: references unknown recipe {rid}")
+            (warn if release in historical else err)(
+                f"{where}: references retired/unknown recipe {rid}")
         if res.get("provenance") == "live":
             required = ["serve_cmd", "env_fingerprint"]
             if res.get("status") != "failed":
