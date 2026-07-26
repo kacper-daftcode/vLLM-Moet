@@ -1,13 +1,17 @@
 models:
   DeepSeek-V4-Flash:
     hf_repo: deepseek-ai/DeepSeek-V4-Flash
+    revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
     approx_gb: 149
   GLM-5.2-NVFP4:
     hf_repo: nvidia/GLM-5.2-NVFP4
+    revision: aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
     approx_gb: 433
   Kimi-K2.7-Code-NVFP4:
     hf_repo: nvidia/Kimi-K2.7-Code-NVFP4
+    revision: 9f28d60908c98034bb288e755566764eac77cc0d
     approx_gb: 595
   Kimi-K2.7-Code-eagle3:
     hf_repo: AQ-MedAI/Kimi-K2.7-Code-eagle3
+    revision: 4ad05cb906e07bc93c4c40f9e24613e5c61f3a3c
     approx_gb: 4

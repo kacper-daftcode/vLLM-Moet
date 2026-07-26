@@ -30,6 +30,8 @@ Runs anywhere python3+pyyaml exist; --print shows the exec without running
 """
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import shlex
@@ -55,11 +57,18 @@ def load_yaml(path):
 def list_recipes():
     root = os.path.join(HOME, "recipes")
     out = []
+    include_baselines = os.environ.get("SHOW_BASELINES") == "1"
     for model in sorted(os.listdir(root)):
         mdir = os.path.join(root, model)
         if os.path.isdir(mdir):
-            out += [f"{model}/{fn[:-5]}" for fn in sorted(os.listdir(mdir))
-                    if fn.endswith(".yaml")]
+            for fn in sorted(os.listdir(mdir)):
+                if not fn.endswith(".yaml"):
+                    continue
+                rid = f"{model}/{fn[:-5]}"
+                recipe = load_yaml(os.path.join(mdir, fn))
+                if recipe.get("role") == "baseline" and not include_baselines:
+                    continue
+                out.append(rid)
     return out
 
 
@@ -100,35 +109,144 @@ def check_gpus(recipe):
             f"{', '.join(small)} (SKIP_GPU_CHECK=1 to override)")
 
 
+def _sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _model_manifest(path):
+    if not os.path.exists(os.path.join(path, "config.json")):
+        return None
+    h = hashlib.sha256()
+    h.update(b"vllm-moet-model-manifest-v1\0")
+    with open(os.path.join(path, "config.json"), "rb") as f:
+        h.update(hashlib.sha256(f.read()).digest())
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path, "rb") as f:
+                raw = f.read()
+            h.update(hashlib.sha256(raw).digest())
+            files = sorted(set(json.loads(raw)["weight_map"].values()))
+        except (OSError, KeyError, ValueError, json.JSONDecodeError):
+            return None
+    else:
+        try:
+            files = sorted(
+                fn for fn in os.listdir(path)
+                if fn.endswith((".safetensors", ".bin")))
+        except OSError:
+            return None
+        if not files:
+            return None
+    for name in files:
+        shard = os.path.join(path, name)
+        try:
+            st = os.stat(shard)
+        except OSError:
+            return None
+        content_sha256 = _sha256_file(shard)
+        h.update(json.dumps({
+            "name": name,
+            "size": st.st_size,
+            "content_sha256": content_sha256,
+        }, sort_keys=True, separators=(",", ":")).encode())
+    return h.hexdigest()
+
+
 def ensure_model(name, registry, do_print):
     path = os.path.join(MODELS_DIR, name)
-    if os.path.exists(os.path.join(path, "config.json")) \
-            and not os.environ.get("FORCE_DOWNLOAD"):
-        print(f"serve_recipe: {name}: present at {path}")
-        return path
     if name not in registry:
         die(f"model {name} not in models.yaml registry")
-    repo = registry[name]["hf_repo"]
-    size = registry[name].get("approx_gb", "?")
-    print(f"serve_recipe: {name}: downloading {repo} (~{size} GB) "
+    spec = registry[name]
+    repo = spec["hf_repo"]
+    revision = spec.get("revision")
+    if not revision:
+        die(f"model {name}: models.yaml must pin an immutable revision")
+    marker_path = os.path.join(path, ".vllm-moet-snapshot.json")
+    marker = None
+    try:
+        with open(marker_path) as f:
+            marker = json.load(f)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    marker_identity_matches = (
+        isinstance(marker, dict)
+        and marker.get("schema") == 2
+        and marker.get("repo") == repo
+        and marker.get("revision") == revision
+    )
+    manifest = _model_manifest(path) if marker_identity_matches else None
+    if (marker_identity_matches
+            and marker.get("manifest_sha256") == manifest
+            and manifest is not None
+            and not os.environ.get("FORCE_DOWNLOAD")):
+        print(f"serve_recipe: {name}: pinned snapshot present at {path}")
+        return path
+
+    size = spec.get("approx_gb", "?")
+    print(f"serve_recipe: {name}: downloading {repo}@{revision} (~{size} GB) "
           f"-> {path}", flush=True)
     if do_print:
         return path
     os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
     try:
         from huggingface_hub import snapshot_download
-        snapshot_download(repo_id=repo, local_dir=path)
+        snapshot_download(repo_id=repo, revision=revision, local_dir=path)
     except ImportError:
         die("huggingface_hub not installed")
     except Exception as e:  # noqa: BLE001 — auth/network/disk: user-facing
         if "hf_transfer" in str(e):
             os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
             from huggingface_hub import snapshot_download
-            snapshot_download(repo_id=repo, local_dir=path)
+            snapshot_download(repo_id=repo, revision=revision, local_dir=path)
         else:
             die(f"download of {repo} failed: {e}\n"
                 "  (gated repo? pass -e HF_TOKEN=...; disk full? the "
                 f"volume behind {MODELS_DIR} needs ~{size} GB)")
+    config_path = os.path.join(path, "config.json")
+    if not os.path.exists(config_path):
+        die(f"download of {repo}@{revision} has no config.json")
+    index_path = os.path.join(path, "model.safetensors.index.json")
+    if os.path.exists(index_path):
+        try:
+            with open(index_path) as f:
+                weight_map = json.load(f)["weight_map"]
+            missing = sorted({
+                shard for shard in weight_map.values()
+                if not os.path.exists(os.path.join(path, shard))
+            })
+        except (OSError, KeyError, ValueError, json.JSONDecodeError) as e:
+            die(f"invalid safetensors index for {name}: {e}")
+        if missing:
+            die(f"download of {name} is incomplete: {len(missing)} "
+                "referenced shard(s) missing")
+    else:
+        weights = [
+            fn for fn in os.listdir(path)
+            if fn.endswith((".safetensors", ".bin"))
+        ]
+        if not weights:
+            die(f"download of {name} contains no recognized weight files")
+    manifest = _model_manifest(path)
+    if manifest is None:
+        die(f"download of {name} failed model-manifest validation")
+    expected_marker = {
+        "schema": 2,
+        "repo": repo,
+        "revision": revision,
+        "manifest_sha256": manifest,
+    }
+    os.makedirs(path, exist_ok=True)
+    tmp = f"{marker_path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(expected_marker, f, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, marker_path)
     return path
 
 
@@ -181,6 +299,10 @@ def main():
     if not os.path.exists(rpath):
         die(f"unknown recipe {args.recipe!r} (see --list)")
     recipe = load_yaml(rpath)
+    if (recipe.get("role") == "baseline" and not args.do_print
+            and os.environ.get("ALLOW_BASELINE_RECIPE") != "1"):
+        die("baseline recipes are internal measurement configs; set "
+            "ALLOW_BASELINE_RECIPE=1 explicitly")
     registry = load_yaml(os.path.join(HOME, "models.yaml"))["models"]
 
     check_gpus(recipe)

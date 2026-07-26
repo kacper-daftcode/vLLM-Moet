@@ -94,6 +94,11 @@ def _status_mark(res, delta_pct, threshold):
 def collect(release):
     rows = {}
     for box_id, res in common.iter_results(release):
+        try:
+            if common.load_recipe(res["recipe"]).get("role") == "baseline":
+                continue
+        except (KeyError, FileNotFoundError, ValueError):
+            pass
         rows[(res["recipe"], box_id)] = res
     return rows
 

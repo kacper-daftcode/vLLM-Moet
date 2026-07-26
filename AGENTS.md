@@ -114,6 +114,8 @@ smoke results (`bench/results/smoke/`).
 ```bash
 python3 tools/check_patch_files.py       # patch <-> FILES.txt <-> SOURCE.txt
 python3 bench/runner/lint.py             # recipes/boxes/suites/results schemas
+python3 bench/runner/lint.py --release current  # strict live release gate
+python3 -m unittest discover -s bench/tests -p 'test_*.py' -v
 python3 bench/runner/render.py --check   # README table == committed results
 ```
 

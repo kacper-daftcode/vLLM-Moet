@@ -81,10 +81,34 @@ instrumentation to push further.
 
 ## Reproduce
 ```bash
-python3 tools/probe_quant_quality.py <port>           # acceptance + coherence + arithmetic
-python3 tools/needle_probe.py <port> 48000 0.1        # long-context retrieval
-# ablation variants are produced offline by tools/repack_expert_bits.py (quality probe only)
+# Native reference collection (internal baseline recipe, pinned model/context)
+python3 bench/runner/bench.py run \
+  --recipe deepseek-v4-flash/pro6000x2-tp2-native \
+  --box bench/boxes/<box>.yaml --release <native-release> \
+  --suite quality-native
+
+# Candidate paired against strict baselines in bench/baselines/registry.yaml
+python3 bench/runner/bench.py run \
+  --recipe deepseek-v4-flash/pro6000x2-tp2-maxq \
+  --box bench/boxes/<box>.yaml --release <quality-release> \
+  --suite quality
 ```
-These are engineering‑grade fidelity checks, not a standardized benchmark sweep (MMLU/GSM8K‑style
-evals are a natural next step). Discipline: every surprising delta is re‑measured against a
-same‑GPU placebo control before it's believed.
+Schema‑2 quality runs bind the exact recipe, effective suite, model revision,
+serving context, canonical serve-argument hash, evaluator hash, raw artifact
+and native baseline hash. Candidate and native serving geometry must match
+exactly—not only context, but TP/speculation, batching, sequence count and
+compilation arguments. DS4 greedy GPQA moved about five points between native
+MTP‑2 and no-spec at the same 24k window; that geometry delta is larger than
+most candidate effects. GSM8K‑200 remains the fast screen; paired GPQA/McNemar,
+completion-token behavior, THINK mode and needle retrieval form the release
+gate.
+
+For non‑think GPQA, token parity is gated on paired p50/p90 and the number of
+additional truncations; the raw mean remains reported as an advisory metric.
+This is deliberate: two stock-native C2 runs scored the same 147/198 but had
+token means 422 and 563 (+33%) because one intrinsically unstable item moved
+from 6,821 tokens to the 30,000-token cap. Their p50/p90 differed by at most
+1%. The robust gate still catches systematic inflation such as the measured
+2-bit prefill-KV regression, without making one native long-tail trajectory a
+release oracle. Lightweight arithmetic/coherence tools remain useful for
+debugging, but cannot certify native-grade quality.

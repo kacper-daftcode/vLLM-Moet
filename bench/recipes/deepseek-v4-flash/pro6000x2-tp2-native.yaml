@@ -1,0 +1,34 @@
+id: deepseek-v4-flash/pro6000x2-tp2-native
+role: baseline
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "2x RTX PRO 6000 TP2 - stock FP4 native quality baseline"
+
+requires:
+  gpus: 2
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 2400
+
+env:
+  VLLM_MOE_W2: "0"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.92
+  - --max-num-batched-tokens 4096
+  - --max-num-seqs 2
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  gpqa-think:
+    enabled: true

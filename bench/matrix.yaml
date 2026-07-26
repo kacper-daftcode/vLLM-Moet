@@ -4,6 +4,10 @@ previous_release: null
 historical_releases:
   - baseline-2026-07-10
   - v2026.07.17-quality
+# Fresh releases must add exact full digests per box before their gate can
+# pass: runtime_manifests.<release>.<box> with patch_sha256, cubins, moet_sha,
+# and either vllm_sha (venv) or image_id (Docker).
+runtime_manifests: {}
 # Quality campaigns (bench/suites/quality.yaml vs bench/baselines/) are
 # expensive and run on their own cadence; the README quality table renders
 # from this release id.

@@ -1,0 +1,29 @@
+id: quality-native
+# Collect a stock/native reference with the same probe implementation used by
+# candidate quality runs. The result remains a normal immutable schema-v2 run;
+# promotion into bench/baselines is a separate reviewed operation.
+allow_recipe_overrides: true
+probes:
+  - kind: quality
+    id: gsm8k
+    profile: gsm8k
+    runs: 200
+    concurrency: 2
+    max_tokens: 6000
+  - kind: quality
+    id: gpqa
+    profile: gpqa-diamond
+    runs: 198
+    concurrency: 2
+    max_tokens: 30000
+  - kind: quality
+    id: gpqa-think
+    enabled: false
+    profile: gpqa-diamond
+    runs: 198
+    concurrency: 2
+    max_tokens: 65536
+    request_overrides:
+      chat_template_kwargs: {thinking: true, reasoning_effort: high}
+      temperature: 1.0
+      top_p: 1.0

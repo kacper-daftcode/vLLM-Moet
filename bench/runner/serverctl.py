@@ -7,6 +7,7 @@ next recipe starts."""
 import json
 import os
 import signal
+import socket
 import subprocess
 import time
 import urllib.request
@@ -40,10 +41,12 @@ def tail(log_path, lines=80):
 
 
 class Server:
-    def __init__(self, cmd, env, log_path, port, gpus, container=None):
+    def __init__(self, cmd, env, log_path, port, gpus, container=None,
+                 expected_model=None):
         self.cmd, self.env, self.log_path = cmd, env, log_path
         self.port, self.gpus = port, gpus
         self.container = container          # docker runtime: container name
+        self.expected_model = expected_model
         self.proc = None
         self.load_time_s = None
 
@@ -52,6 +55,19 @@ class Server:
         return f"http://127.0.0.1:{self.port}"
 
     def start(self, timeout_s):
+        # Refuse an occupied port before truncating logs or spawning a second
+        # server. Otherwise any existing /health endpoint could be mistaken
+        # for the process this run intended to measure.
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            probe.bind(("127.0.0.1", self.port))
+        except OSError as e:
+            raise ServerFailed(
+                f"benchmark port {self.port} is already occupied", str(e)
+            ) from e
+        finally:
+            probe.close()
         os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
         logf = open(self.log_path, "w")
         self.proc = subprocess.Popen(
@@ -67,8 +83,19 @@ class Server:
                 with urllib.request.urlopen(self.base + "/health",
                                             timeout=5) as r:
                     if r.status == 200:
+                        if self.expected_model is not None:
+                            actual = self.model_id()
+                            if actual != self.expected_model:
+                                self.stop()
+                                raise ServerFailed(
+                                    "healthy endpoint serves unexpected "
+                                    f"model {actual!r}, expected "
+                                    f"{self.expected_model!r}",
+                                    tail(self.log_path))
                         self.load_time_s = round(time.time() - t0, 1)
                         return
+            except ServerFailed:
+                raise
             except Exception:
                 pass
             time.sleep(10)

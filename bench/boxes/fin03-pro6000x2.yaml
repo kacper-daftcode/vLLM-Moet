@@ -1,0 +1,29 @@
+id: fin03-pro6000x2
+gpus:
+  name: "NVIDIA RTX PRO 6000 Blackwell Server Edition"
+  count: 2
+  vram_gb: 96
+host_ram_gb: 176
+
+runtime: venv
+venv: /root/venv-moet
+
+env:
+  NCCL_P2P_DISABLE: "1"
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_MOE_W2_CUBIT_DIR: /root/workspace/vllm-moet/kernels/cubins-sm120
+  VLLM_MOE_W2_STORE_DIR: /root/models/packs-ds4
+  FLASHINFER_CUDA_ARCH_LIST: "12.0f"
+  CUDA_HOME: /usr/local/cuda-13.0
+  PATH_PREPEND: /usr/local/cuda-13.0/bin
+  LD_LIBRARY_PATH_PREPEND: /usr/local/cuda-13.0/lib64
+
+models:
+  DeepSeek-V4-Flash: /root/models/DeepSeek-V4-Flash
+
+planes_cache:
+  DeepSeek-V4-Flash: /root/models/.planes-cache-ds4
+
+quality_tool: /root/workspace/llm-inference-bench/llm_decode_bench.py
+quality_tool_sha256: f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1
+log_dir: /root/logs/bench

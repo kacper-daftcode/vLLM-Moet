@@ -132,6 +132,7 @@ def main():
                  "cost is a standing follow-up.",
     }
     path = common.result_path(RELEASE, BOX, RECIPE)
+    common.reserve_result(path)
     common.write_result(path, result)
     print(f"imported -> {path}")
 

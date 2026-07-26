@@ -14,34 +14,69 @@
 # README table).
 baselines:
   ds4-flash/native-tp2-gsm8k-c2:
-    file: ds4-flash/native-tp2-gsm8k-c2.json
+    file: ds4-flash/native-tp2-gsm8k-c2-v2.json
+    artifact_sha256: 65193b67f57f3f74684acdf9c23bc213c2108454a2dce60925b9682ca2516053
     checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: aa2c05f53de3918c6d612f1427a0497cbc1e4f53f3353b070368f16f2e547b74
+    context: 131072
+    strict: true
+    protocol: {profile: gsm8k, runs: 200, concurrency: 2, max_tokens: 6000, request_overrides: {}}
     mode: "non-think, greedy, conc 2, max_tokens 6000"
     hardware: 2x RTX PRO 6000 (TP2)
-    measured: 2026-07-12
-    provenance: imported   # pre-harness campaign JSON (logs ds4-2x6000)
+    measured: 2026-07-24
+    provenance: live
     anchors: "97.0% (194/200), tokens avg 116.2"
   ds4-flash/native-tp2-gsm8k-c1:
     file: ds4-flash/native-tp2-gsm8k-c1.json
+    artifact_sha256: 6504d1aa1bafb124f721f36605e9f6b22200260948cd5b52404c8dd6b0744c19
     checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    context: 131072
+    strict: false
+    protocol: {profile: gsm8k, runs: 200, concurrency: 1, max_tokens: 6000, request_overrides: {}}
     mode: "non-think, greedy, conc 1, max_tokens 6000"
     hardware: 2x RTX PRO 6000 (TP2)
     measured: 2026-07-14
     provenance: imported
     anchors: "96.5% (193/200), tokens avg 115.3; rerun bit-identical 200/200"
   ds4-flash/native-tp2-gpqa-nt:
-    file: ds4-flash/native-tp2-gpqa-nt.json
+    file: ds4-flash/native-tp2-gpqa-nt-v2.json
+    artifact_sha256: 61efd5e317c1546c93e23594a78f739a847dab7f681cbd7fddf8bd18aee357e0
     checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: aa2c05f53de3918c6d612f1427a0497cbc1e4f53f3353b070368f16f2e547b74
+    context: 131072
+    strict: true
+    protocol: {profile: gpqa-diamond, runs: 198, concurrency: 2, max_tokens: 30000, request_overrides: {}}
     mode: "non-think, greedy, conc 2, max_tokens 30000"
     hardware: 2x RTX PRO 6000 (TP2)
-    measured: 2026-07-15
-    provenance: imported
-    anchors: "74.24% (147/198), tokens avg 563 (official non-think: 71.2)"
+    measured: 2026-07-24
+    provenance: live
+    anchors: "74.24% (147/198), tokens avg 422, p50 301, p90 800; prior native C2 rerun: same 147/198 but avg 563 from one 30k tail (official non-think: 71.2)"
   ds4-flash/native-tp2-gpqa-think-high:
-    file: ds4-flash/native-tp2-gpqa-think-high.json
+    file: ds4-flash/native-tp2-gpqa-think-high-v2.json
+    artifact_sha256: 5fc511041c36922bda8ec782c323a5e8417b54f4e058e11e1bb61c3c00a90890
     checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: aa2c05f53de3918c6d612f1427a0497cbc1e4f53f3353b070368f16f2e547b74
+    context: 131072
+    strict: true
+    protocol:
+      profile: gpqa-diamond
+      runs: 198
+      concurrency: 2
+      max_tokens: 65536
+      request_overrides:
+        chat_template_kwargs: {thinking: true, reasoning_effort: high}
+        temperature: 1.0
+        top_p: 1.0
     mode: "think high, temp 1.0 top-p 1.0, conc 2, max_tokens 65536"
     hardware: 2x RTX PRO 6000 (TP2)
-    measured: 2026-07-16
-    provenance: imported
-    anchors: "86.87% (172/198), tokens avg 11134 (official think-high: 87.4)"
+    measured: 2026-07-24
+    provenance: live
+    anchors: "86.36% (171/198), pinned schema-v2 native remeasurement"

@@ -18,6 +18,7 @@ sys.path.insert(0, __file__.rsplit("/", 1)[0])
 
 import common
 import envinfo
+import integrity
 import probes as probes_mod
 from serverctl import Server, ServerFailed, gpu_mem_used_mib, tail
 
@@ -41,6 +42,17 @@ def run_recipe(recipe_id, box, release, suite_name, gpus=None, port=None,
                dry_run=False):
     recipe = common.load_recipe(recipe_id)
     suite = common.load_suite(suite_name)
+    effective_probes = common.merge_suite(suite, recipe)
+    bindings = integrity.result_bindings(
+        recipe, suite_name, effective_probes, common.load_model_registry(),
+        release=release, box=box)
+    bindings["model_manifests"] = {
+        name: common._model_manifest(box["models"][name])
+        for name in [
+            recipe["model"],
+            *recipe.get("requires", {}).get("extra_models", []),
+        ]
+    }
     reason = common.compat(recipe, box)
     if reason:
         log(f"SKIP {recipe_id}: {reason}")
@@ -64,13 +76,15 @@ def run_recipe(recipe_id, box, release, suite_name, gpus=None, port=None,
         prefix = (f"CUDA_VISIBLE_DEVICES={','.join(map(str, gpus))} "
                   if runtime == "venv" else "")
         print(prefix + display)
-        for p in common.merge_suite(suite, recipe):
+        for p in effective_probes:
             print(f"probe: {p}")
         return "dry-run"
 
+    preflight_gpus(gpus)
     log_path = f"{box['log_dir']}/{release}/{recipe_id.replace('/', '__')}.log"
     result = {
-        "schema": 1,
+        "schema": 2,
+        "complete": False,
         "release": release, "box": box["id"], "recipe": recipe_id,
         "suite": suite_name, "provenance": "live",
         "summary": recipe.get("summary", ""),
@@ -80,22 +94,25 @@ def run_recipe(recipe_id, box, release, suite_name, gpus=None, port=None,
         "serve_env": knobs,
         "serve_cmd": display,
         "env_fingerprint": envinfo.collect(box, knobs),
+        "inputs": bindings,
         "probes": {},
     }
 
-    preflight_gpus(gpus)
+    path = common.result_path(release, box["id"], recipe_id)
+    common.reserve_result(path)
     srv = Server(cmd, env, log_path, port, gpus,
                  container=(common.container_name(port)
-                            if runtime == "docker" else None))
+                            if runtime == "docker" else None),
+                 expected_model=recipe["served_name"])
     log(f"starting {recipe_id} (load timeout "
         f"{recipe.get('load_timeout_s', common.DEFAULT_LOAD_TIMEOUT_S)}s), "
         f"log: {log_path}")
     try:
         srv.start(recipe.get("load_timeout_s", common.DEFAULT_LOAD_TIMEOUT_S))
     except ServerFailed as e:
-        result.update(status="failed", error=str(e), log_tail=e.log_tail,
+        result.update(status="failed", complete=True,
+                      error=str(e), log_tail=e.log_tail,
                       finished=common.now_iso())
-        path = common.result_path(release, box["id"], recipe_id)
         common.write_result(path, result)
         log(f"FAILED {recipe_id}: {e} -> {path}")
         return "failed"
@@ -108,26 +125,55 @@ def run_recipe(recipe_id, box, release, suite_name, gpus=None, port=None,
         nw = recipe.get("warmup", {}).get("decode_requests", 0)
         if nw:
             probes_mod.warmup(srv.base, model, nw, log)
-        for p in common.merge_suite(suite, recipe):
+        for configured_probe in effective_probes:
+            p = dict(configured_probe)
             kind = p.pop("kind")
             key = p.pop("id", None) or kind
+            enabled = p.pop("enabled")
+            if not enabled:
+                result["probes"][key] = {"status": "disabled"}
+                log(f"probe {key} disabled")
+                continue
             fn = probes_mod.PROBES[kind]
             if kind == "quality":
                 # quality artifacts (raw tool JSONs) live next to the result;
                 # the tool path is a box quirk (external checkout).
+                model_spec = common.load_model_registry()[recipe["model"]]
+                p.setdefault("candidate_model", recipe["model"])
+                p.setdefault("model_revision", model_spec["revision"])
+                p.setdefault(
+                    "serve_args_sha256",
+                    integrity.canonical_sha256(recipe.get("serve_args", [])),
+                )
                 p.setdefault("artifacts_dir",
                              common.artifacts_dir(release, box["id"]))
                 p.setdefault("artifact_tag",
                              f"{recipe_id.replace('/', '__')}__{key}")
                 if box.get("quality_tool"):
                     p.setdefault("tool", box["quality_tool"])
+                if box.get("quality_tool_sha256"):
+                    p.setdefault(
+                        "expected_tool_sha256",
+                        box["quality_tool_sha256"])
             log(f"probe {key} {p}")
             try:
-                result["probes"][key] = fn(srv.base, model, log=log,
-                                           context=recipe.get("context"), **p)
+                probe_result = fn(
+                    srv.base, model, log=log,
+                    context=recipe.get("context"), **p)
+                probe_result["status"] = (
+                    "ok" if probes_mod.probe_succeeded(
+                        kind, probe_result, p)
+                    else "failed")
+                result["probes"][key] = probe_result
+                if probe_result["status"] != "ok":
+                    failures.append(key)
+                    log(f"probe {key} FAILED acceptance predicate")
             except Exception as e:  # noqa: BLE001 — keep benching, record it
                 failures.append(key)
-                result["probes"][key] = {"error": f"{type(e).__name__}: {e}"}
+                result["probes"][key] = {
+                    "status": "failed",
+                    "error": f"{type(e).__name__}: {e}",
+                }
                 log(f"probe {key} FAILED: {e}")
             if kind == "decode":
                 # acceptance counters scraped immediately, before other traffic
@@ -138,11 +184,11 @@ def run_recipe(recipe_id, box, release, suite_name, gpus=None, port=None,
         srv.stop()
 
     result["status"] = "partial" if failures else "ok"
+    result["complete"] = True
     if failures:
         result["failed_probes"] = failures
         result["log_tail"] = tail(log_path)
     result["finished"] = common.now_iso()
-    path = common.result_path(release, box["id"], recipe_id)
     common.write_result(path, result)
     log(f"{result['status'].upper()} {recipe_id} -> {path}")
     return result["status"]

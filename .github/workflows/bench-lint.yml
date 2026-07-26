@@ -30,6 +30,10 @@ jobs:
         run: python3 tools/check_patch_files.py
       - name: Lint recipes, boxes, suites, matrix, results
         run: python3 bench/runner/lint.py
+      - name: Enforce the current release gate
+        run: python3 bench/runner/lint.py --release current
+      - name: Benchmark integrity unit tests
+        run: python3 -m unittest discover -s bench/tests -p 'test_*.py' -v
       - name: Verify README table + report match committed results
         run: python3 bench/runner/render.py --check
       - name: Smoke the recipe launcher (--list + --print on every recipe)

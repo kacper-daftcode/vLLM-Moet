@@ -245,6 +245,7 @@ def main():
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir,
                             args.recipe.replace("/", "__") + "__sweep.json")
+    common.reserve_result(out_path)
     common.write_result(out_path, {
         "schema": 1, "release": args.release, "box": box["id"],
         "recipe": args.recipe, "objective": tuning["objective"],

@@ -1,7 +1,7 @@
 id: deepseek-v4-flash/pro6000x2-tp2-maxq
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "2x RTX PRO 6000 TP2 - MAX QUALITY: native parity incl. GPQA think"
+summary: "2x RTX PRO 6000 TP2 - max-quality candidate (revalidation required)"
 
 requires:
   gpus: 2
@@ -10,8 +10,9 @@ requires:
 context: 131072
 load_timeout_s: 2400
 
-# The quality ceiling of the DS4 family (validated 2026-07-15/16, worktree
-# prefill-fp4-tier == trunk c2c066e3a+):
+# Historical quality ceiling of the DS4 family (2026-07-15/16). These imported
+# anchors predate the SwiGLU-clamp fix and schema-v2 artifact bindings; they are
+# context only until the pinned native/candidate campaign is re-run:
 #   GSM8K-200 97.5%/116 tok (x2 runs; native 97.0/116)
 #   GPQA-diamond non-think 74.75%/524 vs native 74.24/563 (flips 11/12)
 #   GPQA-diamond THINK HIGH 88.38% vs native 86.87 (official 87.4-88.1)
@@ -51,6 +52,8 @@ serve_args:
   - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
 
 suite_params:
+  gpqa-think:
+    enabled: true
   batch_decode:
     concurrency: [1, 2]
   needle:

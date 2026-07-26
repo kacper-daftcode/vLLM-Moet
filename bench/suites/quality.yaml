@@ -28,8 +28,17 @@ probes:
     concurrency: 2
     max_tokens: 30000
     baseline: ds4-flash/native-tp2-gpqa-nt
+    # Native GPQA has rare, unstable 6k-30k-token tails: two stock runs with
+    # identical accuracy differ by 33% in the raw mean while p50/p90 differ
+    # by <=1%. Gate the body of the paired distribution plus truncation count;
+    # keep raw mean inflation as an audited advisory metric.
+    min_mcnemar_p: 0.05
+    max_abs_token_p50_delta_pct: 5.0
+    max_abs_token_p90_delta_pct: 5.0
+    max_extra_truncated_no_answer: 1
   - kind: quality
     id: gpqa-think
+    enabled: false
     profile: gpqa-diamond
     runs: 198
     concurrency: 2

@@ -37,6 +37,61 @@ def find_files(directory, extension):
 Refactored version:
 '''
 
+
+def probe_succeeded(kind, result, config=None):
+    config = config or {}
+    if not isinstance(result, dict) or result.get("error"):
+        return False
+    if result.get("pass") is False or result.get("all_pass") is False:
+        return False
+    if kind == "decode":
+        return bool(result.get("samples_tok_s")) and (
+            result.get("median_tok_s") or 0) > 0
+    if kind == "batch_decode":
+        return bool(result.get("levels"))
+    if kind == "prefill":
+        return bool(result.get("samples")) and (
+            result.get("median_tok_s") or 0) > 0
+    if kind == "needle":
+        return result.get("all_pass") is True and bool(result.get("cases"))
+    if kind == "arithmetic":
+        return (
+            isinstance(result.get("score"), int)
+            and result.get("of", 0) > 0
+            and result["score"] >= int(config.get("min_score", 1))
+        )
+    if kind == "coherence":
+        return result.get("pass") is True
+    if kind == "quality":
+        complete = bool(
+            result.get("artifact")
+            and result.get("artifact_sha256")
+            and result.get("of") == result.get("runs")
+            and not result.get("historical_baseline")
+        )
+        if not complete:
+            return False
+        vs = result.get("vs_baseline") or {}
+        if "min_mcnemar_p" in config:
+            p_value = vs.get("mcnemar_p")
+            if p_value is None or p_value < float(config["min_mcnemar_p"]):
+                return False
+        for field, config_key in (
+            ("token_p50_delta_pct", "max_abs_token_p50_delta_pct"),
+            ("token_p90_delta_pct", "max_abs_token_p90_delta_pct"),
+        ):
+            if config_key in config:
+                value = vs.get(field)
+                if value is None or abs(value) > float(config[config_key]):
+                    return False
+        if "max_extra_truncated_no_answer" in config:
+            extra = vs.get("extra_truncated_no_answer")
+            if (extra is None
+                    or extra > int(config["max_extra_truncated_no_answer"])):
+                return False
+        return True
+    return False
+
 COHERENCE_PROMPTS = [
     "Q: What is the capital of Australia?\nA:",
     "Q: A farmer has 17 sheep. All but 9 run away. How many sheep does the farmer have left?\nA:",
@@ -114,25 +169,53 @@ def decode(base, model, runs=5, max_tokens=512, log=print, **_):
 def batch_decode(base, model, concurrency=(1, 4, 8), max_tokens=384, runs=3,
                  log=print, **_):
     def stream_prompt(i):
-        random.seed(0xD00D ^ i)
-        return " ".join(random.choice(WORDS) for _ in range(32))
+        rng = random.Random(0xD00D ^ i)
+        return " ".join(rng.choice(WORDS) for _ in range(32))
 
     levels = {}
     for n in concurrency:
         aggs = []
         for r in range(runs):
             done = [None] * n
+            prompts = [stream_prompt(i + r * 100) for i in range(n)]
+            started = [None]
+            errors = [None] * n
+            barrier = threading.Barrier(
+                n + 1,
+                action=lambda: started.__setitem__(0, time.perf_counter()))
+
             def worker(i):
-                d, _dt = _completion(base, model, stream_prompt(i + r * 100),
-                                     max_tokens, timeout=1800)
-                done[i] = d["usage"]["completion_tokens"]
-            t0 = time.perf_counter()
-            ths = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+                try:
+                    barrier.wait(timeout=30)
+                    d, _dt = _completion(
+                        base, model, prompts[i], max_tokens, timeout=1800)
+                    done[i] = d["usage"]["completion_tokens"]
+                except BaseException as e:
+                    errors[i] = e
+
+            ths = [
+                threading.Thread(target=worker, args=(i,), daemon=True)
+                for i in range(n)
+            ]
+            started_threads = []
+            try:
+                for t in ths:
+                    t.start()
+                    started_threads.append(t)
+                barrier.wait(timeout=30)
+            except BaseException:
+                barrier.abort()
+                for t in started_threads:
+                    t.join(timeout=5)
+                raise
             for t in ths:
-                t.start()
-            for t in ths:
-                t.join()
-            wall = time.perf_counter() - t0
+                t.join(timeout=1810)
+            if any(t.is_alive() for t in ths):
+                raise TimeoutError("batch probe worker did not terminate")
+            if any(errors):
+                first = next(e for e in errors if e is not None)
+                raise RuntimeError("batch probe worker failed") from first
+            wall = time.perf_counter() - started[0]
             aggs.append(round(sum(done) / wall, 1))
         med = statistics.median(sorted(aggs))
         levels[str(n)] = {
@@ -244,7 +327,10 @@ def coherence(base, model, log=print, **_):
 
 def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
             max_tokens=6000, baseline=None, request_overrides=None,
-            tool=None, artifacts_dir=None, artifact_tag=None, **_):
+            tool=None, artifacts_dir=None, artifact_tag=None, context=None,
+            candidate_model=None, model_revision=None,
+            serve_args_sha256=None,
+            expected_tool_sha256=None, allow_historical_baseline=False, **_):
     """Dataset-eval probe (GSM8K / GPQA-diamond / …) via llm-inference-bench.
 
     Runs the pinned external tool against the recipe's server and keeps BOTH
@@ -267,33 +353,196 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
         raise RuntimeError(
             f"quality probe needs llm-inference-bench (looked at {tool}; "
             "set `quality_tool` in the box yaml or LLM_BENCH)")
+    from integrity import sha256_file
+    tool_sha256 = sha256_file(tool)
+    if (not expected_tool_sha256
+            or tool_sha256 != expected_tool_sha256):
+        raise RuntimeError(
+            "quality evaluator hash does not match the pinned box "
+            f"configuration: got {tool_sha256}, expected "
+            f"{expected_tool_sha256}")
     port = base.rsplit(":", 1)[1].split("/", 1)[0]
     tag = artifact_tag or profile
     out_json = os.path.join(artifacts_dir or "/tmp",
                             f"quality__{tag}.json")
+    tmp_json = f"{out_json}.tmp.{os.getpid()}.{time.time_ns()}"
     cmd = [_sys.executable, tool, "--port", port, "--model", model,
            "--test-profile", profile,
            "--profile-runs", str(runs),
            "--profile-concurrency", str(concurrency),
            "--max-tokens", str(max_tokens),
            "--display-mode", "plain", "--no-hw-monitor",
-           "--output", out_json]
-    from common import baseline_path  # late import: probes stays standalone
+           "--output", tmp_json]
+    from common import (  # late import: probes stays standalone
+        baseline_path,
+        load_baseline_registry,
+    )
+    historical_baseline = False
+    baseline_sha256 = None
     if baseline:
+        spec = load_baseline_registry()[baseline]
+        if not spec.get("strict") and not allow_historical_baseline:
+            raise RuntimeError(
+                f"baseline {baseline} is imported historical evidence, "
+                "not a strict schema-v2 gate; re-measure it through the "
+                "harness or explicitly opt into debug-only historical use")
+        historical_baseline = not spec.get("strict")
+        protocol = spec.get("protocol") or {}
+        checks = {
+            "model": (spec.get("model"), candidate_model),
+            "model_revision": (spec.get("model_revision"), model_revision),
+            "context": (spec.get("context"), context),
+            "profile": (protocol.get("profile"), profile),
+            "runs": (protocol.get("runs"), runs),
+            "concurrency": (protocol.get("concurrency"), concurrency),
+            "max_tokens": (protocol.get("max_tokens"), max_tokens),
+            "request_overrides": (
+                protocol.get("request_overrides") or {},
+                request_overrides or {},
+            ),
+        }
+        if spec.get("strict"):
+            checks["serve_args_sha256"] = (
+                spec.get("serve_args_sha256"),
+                serve_args_sha256,
+            )
+        mismatch = [
+            f"{key}: baseline={left!r}, candidate={right!r}"
+            for key, (left, right) in checks.items() if left != right
+        ]
+        if mismatch:
+            raise RuntimeError(
+                f"baseline {baseline} is incompatible: "
+                + "; ".join(mismatch))
+        expected_hash = spec.get("artifact_sha256")
+        from integrity import sha256_file
+        actual_hash = sha256_file(baseline_path(baseline))
+        if not expected_hash or actual_hash != expected_hash:
+            raise RuntimeError(
+                f"baseline {baseline} artifact hash mismatch")
+        baseline_sha256 = actual_hash
         cmd += ["--compare-baseline", baseline_path(baseline)]
     if request_overrides:
         cmd += ["--request-overrides-json", _json.dumps(request_overrides)]
+    try:
+        reserve_fd = os.open(
+            out_json, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    except FileExistsError as e:
+        raise RuntimeError(
+            f"quality artifact already exists: {out_json}; use a new "
+            "release/run id") from e
+    else:
+        os.close(reserve_fd)
     log(f"[quality] {profile} runs={runs} c={concurrency}"
         + (f" baseline={baseline}" if baseline else "")
         + (" +overrides" if request_overrides else ""))
     t0 = time.time()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=8 * 3600)
-    if r.returncode != 0 or not os.path.exists(out_json):
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=8 * 3600)
+    except BaseException:
+        for path in (tmp_json, out_json):
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+        raise
+    if r.returncode != 0 or not os.path.exists(tmp_json):
+        try:
+            os.unlink(tmp_json)
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(out_json)
+        except FileNotFoundError:
+            pass
         raise RuntimeError(
             f"tool exit {r.returncode}: {(r.stderr or r.stdout)[-400:]}")
-    with open(out_json) as f:
+    with open(tmp_json) as f:
         data = _json.load(f)
+    meta = data.get("metadata") or {}
+    expected_overrides = request_overrides or {}
+    errors = []
+    if meta.get("interrupted") is not False:
+        errors.append("artifact is interrupted")
+    if meta.get("model") != model:
+        errors.append(f"model {meta.get('model')!r} != {model!r}")
+    if meta.get("test_profile") != profile:
+        errors.append(
+            f"profile {meta.get('test_profile')!r} != {profile!r}")
+    if meta.get("requested_runs") != runs:
+        errors.append(
+            f"requested_runs {meta.get('requested_runs')} != {runs}")
+    if meta.get("fixed_concurrency") != concurrency:
+        errors.append(
+            f"concurrency {meta.get('fixed_concurrency')} != {concurrency}")
+    if meta.get("max_tokens") != max_tokens:
+        errors.append(f"max_tokens {meta.get('max_tokens')} != {max_tokens}")
+    recorded_overrides = meta.get("request_overrides") or {}
+    if recorded_overrides and recorded_overrides != expected_overrides:
+        errors.append(
+            "request_overrides in raw artifact differ from requested values")
     acc = (data.get("accuracy") or {})
+    if acc.get("scored") != runs:
+        errors.append(f"scored {acc.get('scored')} != requested {runs}")
+    profile_rows = [
+        row for row in data.get("runs", [])
+        if row.get("phase") == "profile"
+    ]
+    if len(profile_rows) != runs:
+        errors.append(
+            f"profile rows {len(profile_rows)} != requested {runs}")
+    if any(
+        row.get("error") or row.get("cancelled")
+        for row in profile_rows
+    ):
+        errors.append("profile rows contain errors/cancellations")
+    dataset_sha = meta.get("dataset_sha256")
+    if not isinstance(dataset_sha, str) or len(dataset_sha) != 64:
+        errors.append("missing/invalid dataset_sha256")
+    if baseline:
+        cmp_ = data.get("comparison") or {}
+        if cmp_.get("paired_items") != runs:
+            errors.append(
+                f"paired_items {cmp_.get('paired_items')} != {runs}")
+        if not cmp_.get("profile_match") or not cmp_.get("dataset_match"):
+            errors.append("baseline comparison profile/dataset mismatch")
+    if errors:
+        try:
+            os.unlink(tmp_json)
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(out_json)
+        except FileNotFoundError:
+            pass
+        raise RuntimeError("invalid quality artifact: " + "; ".join(errors))
+    # Older evaluator versions apply CLI overrides to every payload but do
+    # not echo them into metadata. Bind the exact harness invocation into the
+    # raw artifact before hashing so it remains independently auditable.
+    data["harness_invocation"] = {
+        "schema": 1,
+        "candidate_model": candidate_model,
+        "model_revision": model_revision,
+        "serve_args_sha256": serve_args_sha256,
+        "served_model": model,
+        "context": context,
+        "profile": profile,
+        "runs": runs,
+        "concurrency": concurrency,
+        "max_tokens": max_tokens,
+        "request_overrides": expected_overrides,
+        "baseline": baseline,
+        "baseline_artifact_sha256": baseline_sha256,
+        "tool_sha256": tool_sha256,
+    }
+    with open(tmp_json, "w") as f:
+        _json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_json, out_json)
+    artifact_sha = sha256_file(out_json)
     toks = [x.get("completion_tokens") or 0 for x in data.get("runs", [])
             if x.get("phase") == "profile"]
     toks.sort()
@@ -309,8 +558,13 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
         "tokens_p50": toks[len(toks) // 2] if toks else None,
         "tokens_p90": toks[int(0.9 * len(toks))] if toks else None,
         "tool_sha": _tool_sha(tool),
+        "tool_sha256": tool_sha256,
         "duration_s": round(time.time() - t0, 1),
         "artifact": os.path.basename(out_json),
+        "artifact_sha256": artifact_sha,
+        "dataset_sha256": dataset_sha,
+        "historical_baseline": historical_baseline,
+        "baseline_artifact_sha256": baseline_sha256,
     }
     if baseline:
         res["baseline"] = baseline
@@ -318,14 +572,30 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
         ct = cmp_.get("completion_tokens") or {}
         if cmp_:
             bm, cm = ct.get("baseline_mean"), ct.get("candidate_mean")
+            bp50, cp50 = ct.get("baseline_p50"), ct.get("candidate_p50")
+            bp90, cp90 = ct.get("baseline_p90"), ct.get("candidate_p90")
+            truncated = cmp_.get("truncated_no_answer") or {}
+            hit_max = cmp_.get("hit_max_tokens") or {}
+
+            def pct_delta(candidate, reference):
+                return (round((candidate - reference) / reference * 100, 1)
+                        if reference and candidate is not None else None)
+
             res["vs_baseline"] = {
                 "acc_delta_pp": round(cmp_["delta_pp"], 2)
                 if cmp_.get("delta_pp") is not None else None,
                 "flips_only_baseline": cmp_.get("flips_baseline_only_correct"),
                 "flips_only_candidate": cmp_.get("flips_candidate_only_correct"),
                 "mcnemar_p": cmp_.get("mcnemar_exact_p"),
-                "token_inflation_pct": round((cm - bm) / bm * 100, 1)
-                if bm and cm else None,
+                "token_inflation_pct": pct_delta(cm, bm),
+                "token_p50_delta_pct": pct_delta(cp50, bp50),
+                "token_p90_delta_pct": pct_delta(cp90, bp90),
+                "extra_truncated_no_answer": (
+                    truncated.get("candidate", 0)
+                    - truncated.get("baseline", 0)),
+                "extra_hit_max_tokens": (
+                    hit_max.get("candidate", 0)
+                    - hit_max.get("baseline", 0)),
             }
     log(f"[quality] {profile}: {res['accuracy_pct']}% "
         f"({res['correct']}/{res['of']}), tokens avg {res['tokens_avg']}"

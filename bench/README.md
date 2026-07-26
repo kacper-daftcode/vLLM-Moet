@@ -43,8 +43,11 @@ Concepts:
   release live under `results/<release>/`, keyed by box.
 - **Result** — one JSON per (release, box, recipe): environment fingerprint
   (GPU/driver/package versions/git SHAs/patch hash), the exact serve command,
-  load time, and every probe's raw samples + aggregates. `provenance: live`
-  for harness runs; `imported` for pre-harness numbers carried over.
+  load time, and every probe's raw samples + aggregates. New schema‑2 results
+  bind canonical snapshots/hashes of the recipe, effective suite, model
+  revisions, release and box; the runner reserves their paths before launch
+  and refuses silent overwrite. `provenance: live` is required for a fresh
+  gate; schema‑1/imported evidence is historical only.
 
 ## The release process
 
@@ -58,6 +61,8 @@ Concepts:
      ```
      and point the box file's `docker_image` at the recipes image.
    - venv: apply `patch/` on the v0.24.0 tag per `docs/v024-port.md`.
+   Every local model path must carry `.vllm-moet-snapshot.json` matching the
+   pinned revision in `models.yaml`, and every indexed shard must exist.
    The runner records what it actually ran against (SHAs, versions, patch
    hash, image id), so a mismatched env is visible in the result, not silent.
 3. **Run the matrix** on every box you have hardware for:
@@ -87,7 +92,9 @@ Concepts:
 6. **Open the release PR** with: recipe changes, `results/<release>/`, the
    rendered README block and report. CI (`bench-lint`) validates schemas,
    re-renders, and fails on drift. `lint.py --release <release>` additionally
-   fails if any `blocking: true` matrix entry has no result.
+   requires every blocking cell to have a complete schema‑2 `live+ok` result
+   whose current recipe/suite/model/box bindings match and whose source trees
+   are clean. `partial`, imported, dirty or copied results cannot close a cell.
 7. Tag.
 
 ## Commands
@@ -136,8 +143,14 @@ path** (stock `VLLM_MOE_W2=0` on the same checkpoint), not absolute scores:
 paired accuracy flips + McNemar p + completion-token inflation. Token
 inflation is a first-class damage signal — the +8–11% inflation this
 process was born from was a real quality bug (2-bit prefill KV) that
-accuracy alone did not resolve (see `internal/PREFILL_KV_INFLATION_
-FINDINGS.md` history in the repo notes).
+accuracy alone did not resolve (see `docs/quality.md`).
+
+GPQA non-think has a rare native long-tail exception: two stock C2 runs with
+identical 147/198 accuracy differed by 33% in mean tokens because one item
+moved to the 30k cap. Its release predicate therefore uses paired token p50,
+p90 and extra truncations; the raw mean is still recorded and rendered for
+audit. This preserves sensitivity to broad inflation without overfitting a
+release decision to one unstable native trajectory.
 
 Pieces:
 
@@ -146,13 +159,15 @@ Pieces:
   chat-template kwargs). Probes are keyed by `id`; recipes override via
   `suite_params`.
 - `bench/baselines/` — committed NATIVE reference results + `registry.yaml`
-  (checkpoint, mode, hardware, provenance). Re-measure on checkpoint
-  revision or native-path changes; the eval tool fails loudly on dataset
-  hash mismatch.
+  (checkpoint revision, exact serving context, canonical serve-argument hash,
+  protocol, artifact hash, hardware and provenance). Candidate and baseline
+  serving geometry—including TP, speculation, batching and sequence count—must
+  match exactly; imported historical baselines cannot gate schema‑2 runs.
 - The probe shells out to **llm-inference-bench** (external checkout; path
-  from the box yaml `quality_tool` or `LLM_BENCH`; its git SHA lands in the
-  result). Raw tool JSONs are committed as artifacts next to the result
-  (`results/<release>/<box>/artifacts/`) so flips stay reviewable per item.
+  from the box yaml `quality_tool` or `LLM_BENCH`; its full file hash and
+  invocation land in the artifact). Raw tool JSONs are committed next to the
+  result (`results/<release>/<box>/artifacts/`) so flips stay reviewable per
+  item and compact metrics can be recomputed by lint.
 - **Quality releases have their own cadence** (`quality_release` in
   `matrix.yaml`): a full quality campaign is hours of GPU (the think probe
   alone is ~7 h on 2x PRO 6000), so it runs when the serving numerics

@@ -16,12 +16,25 @@ def _git(repo, *args):
     return r.stdout.strip() if r.returncode == 0 else None
 
 
-def _sha256_file(path, short=12):
+def _git_dirty(repo, ignored_prefixes=()):
+    status = _git(repo, "status", "--porcelain") or ""
+    for line in status.splitlines():
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if any(path.startswith(prefix) for prefix in ignored_prefixes):
+            continue
+        return True
+    return False
+
+
+def _sha256_file(path, short=None):
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
-    return h.hexdigest()[:short]
+    digest = h.hexdigest()
+    return digest[:short] if short else digest
 
 
 def _cubins_fingerprint(cubin_dir):
@@ -32,8 +45,8 @@ def _cubins_fingerprint(cubin_dir):
         p = os.path.join(cubin_dir, fn)
         if os.path.isfile(p):
             h.update(fn.encode())
-            h.update(_sha256_file(p, 64).encode())
-    return h.hexdigest()[:12]
+            h.update(_sha256_file(p).encode())
+    return h.hexdigest()
 
 
 def _pkg_versions(venv, names):
@@ -66,8 +79,8 @@ def _vllm_tree(venv):
         return None
     return {
         "path": repo,
-        "sha": _git(repo, "rev-parse", "--short=12", "HEAD"),
-        "dirty": bool(_git(repo, "status", "--porcelain")),
+        "sha": _git(repo, "rev-parse", "HEAD"),
+        "dirty": _git_dirty(repo),
     }
 
 
@@ -81,8 +94,10 @@ def collect(box, serve_env):
         "box": box["id"],
         "gpus": gpus,
         "driver": gpus[0].rsplit(",", 1)[-1].strip() if gpus else None,
-        "moet_sha": _git(REPO_DIR, "rev-parse", "--short=12", "HEAD"),
-        "moet_dirty": bool(_git(REPO_DIR, "status", "--porcelain")),
+        "moet_sha": _git(REPO_DIR, "rev-parse", "HEAD"),
+        # Campaign results and reservation locks are expected outputs, not
+        # source changes; excluding them keeps later matrix cells clean.
+        "moet_dirty": _git_dirty(REPO_DIR, ("bench/results/",)),
         "patch_sha256": _sha256_file(patch) if os.path.exists(patch) else None,
         "cubins": _cubins_fingerprint(serve_env.get("VLLM_MOE_W2_CUBIT_DIR")),
         "runtime": box.get("runtime", "venv"),
@@ -96,6 +111,6 @@ def collect(box, serve_env):
         r = run(["docker", "image", "inspect",
                  "--format", "{{.Id}}", box.get("docker_image", "")],
                 timeout=30)
-        info["docker_image_id"] = (r.stdout.strip()[:19]
-                                   if r.returncode == 0 else None)
+        info["docker_image_id"] = (
+            r.stdout.strip() if r.returncode == 0 else None)
     return info
