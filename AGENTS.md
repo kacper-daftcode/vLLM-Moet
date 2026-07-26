@@ -97,6 +97,20 @@ smoke results (`bench/results/smoke/`).
 - The `patch/` trio (patch, `FILES.txt`, `SOURCE.txt`) changes **only** via
   `--update`. If your commit would touch any of them for another reason,
   you are doing something wrong.
+- **Hardware is shared too, and a written claim is not a lock.** Two sessions
+  landed on the same GPU 48 s apart on 2026-07-25 because both had surveyed
+  free cards minutes earlier. Re-check `docker ps` and `nvidia-smi` **in the
+  same command that launches**, and again ~15 s after the container is up; if
+  a foreign container holds your GPU, **whoever started later kills their
+  own**. The rule caught the next collision the same day, at the preflight,
+  with no container created.
+- Name containers with a per-session prefix so ownership is readable straight
+  from `docker ps`, and never remove another session's container — dump its
+  log first even when it is your own, because a crashed engine's stack trace
+  lives only there.
+- Long-lived cross-session state (who holds what, findings that change how the
+  other session should read its numbers) goes in an `internal/COORDINATION_*.md`
+  with an append-only message log. Read it when you start a work block.
 - A pre-commit hook in this checkout runs the patch guard whenever `patch/`
   is staged. Do not bypass it with `--no-verify`.
 - Commit identity: no global git identity is configured on this box —
