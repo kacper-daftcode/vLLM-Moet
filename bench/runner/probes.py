@@ -7,6 +7,7 @@ are derived, never the only record."""
 
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -36,6 +37,55 @@ def find_files(directory, extension):
 
 Refactored version:
 '''
+
+
+def paired_token_stats(baseline_report, candidate_report):
+    """Robust paired completion-token statistics keyed by dataset item."""
+    def rows(report):
+        return {
+            row.get("item_id", row.get("run_index")): row
+            for row in report.get("runs", [])
+            if (row.get("phase") == "profile"
+                and row.get("ok")
+                and (row.get("completion_tokens") or 0) > 0)
+        }
+
+    baseline = rows(baseline_report)
+    candidate = rows(candidate_report)
+    item_ids = sorted(baseline.keys() & candidate.keys())
+    ratios = [
+        candidate[item_id]["completion_tokens"]
+        / baseline[item_id]["completion_tokens"]
+        for item_id in item_ids
+    ]
+    if not ratios:
+        return {}
+    longer = sum(ratio > 1.0 for ratio in ratios)
+    shorter = sum(ratio < 1.0 for ratio in ratios)
+    discordant = longer + shorter
+    if discordant:
+        k = min(longer, shorter)
+        tail = sum(
+            math.comb(discordant, i) for i in range(k + 1)
+        ) / (2 ** discordant)
+        sign_p = min(1.0, 2.0 * tail)
+    else:
+        sign_p = 1.0
+    return {
+        "paired_items": len(item_ids),
+        "ratio_median": statistics.median(ratios),
+        "ratio_geomean": math.exp(
+            statistics.fmean(math.log(ratio) for ratio in ratios)),
+        "longer": longer,
+        "shorter": shorter,
+        "sign_p": sign_p,
+        "baseline_runaways": sum(
+            baseline[item_id]["completion_tokens"] >= 2000
+            for item_id in item_ids),
+        "candidate_runaways": sum(
+            candidate[item_id]["completion_tokens"] >= 2000
+            for item_id in item_ids),
+    }
 
 
 def probe_succeeded(kind, result, config=None):
@@ -79,11 +129,19 @@ def probe_succeeded(kind, result, config=None):
         for field, config_key in (
             ("token_p50_delta_pct", "max_abs_token_p50_delta_pct"),
             ("token_p90_delta_pct", "max_abs_token_p90_delta_pct"),
+            ("token_ratio_median_delta_pct",
+             "max_abs_token_ratio_median_delta_pct"),
+            ("token_ratio_geomean_delta_pct",
+             "max_abs_token_ratio_geomean_delta_pct"),
         ):
             if config_key in config:
                 value = vs.get(field)
                 if value is None or abs(value) > float(config[config_key]):
                     return False
+        if "min_token_sign_p" in config:
+            sign_p = vs.get("token_sign_p")
+            if sign_p is None or sign_p < float(config["min_token_sign_p"]):
+                return False
         if "max_extra_truncated_no_answer" in config:
             extra = vs.get("extra_truncated_no_answer")
             if (extra is None
@@ -517,6 +575,11 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
         except FileNotFoundError:
             pass
         raise RuntimeError("invalid quality artifact: " + "; ".join(errors))
+    if baseline:
+        with open(baseline_path(baseline)) as baseline_file:
+            baseline_data = _json.load(baseline_file)
+        data.setdefault("comparison", {})["paired_token_robust"] = (
+            paired_token_stats(baseline_data, data))
     # Older evaluator versions apply CLI overrides to every payload but do
     # not echo them into metadata. Bind the exact harness invocation into the
     # raw artifact before hashing so it remains independently auditable.
@@ -576,6 +639,7 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
             bp90, cp90 = ct.get("baseline_p90"), ct.get("candidate_p90")
             truncated = cmp_.get("truncated_no_answer") or {}
             hit_max = cmp_.get("hit_max_tokens") or {}
+            robust = cmp_.get("paired_token_robust") or {}
 
             def pct_delta(candidate, reference):
                 return (round((candidate - reference) / reference * 100, 1)
@@ -590,6 +654,15 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
                 "token_inflation_pct": pct_delta(cm, bm),
                 "token_p50_delta_pct": pct_delta(cp50, bp50),
                 "token_p90_delta_pct": pct_delta(cp90, bp90),
+                "token_ratio_median_delta_pct": pct_delta(
+                    robust.get("ratio_median"), 1.0),
+                "token_ratio_geomean_delta_pct": pct_delta(
+                    robust.get("ratio_geomean"), 1.0),
+                "token_sign_p": robust.get("sign_p"),
+                "token_longer": robust.get("longer"),
+                "token_shorter": robust.get("shorter"),
+                "baseline_runaways": robust.get("baseline_runaways"),
+                "candidate_runaways": robust.get("candidate_runaways"),
                 "extra_truncated_no_answer": (
                     truncated.get("candidate", 0)
                     - truncated.get("baseline", 0)),

@@ -77,30 +77,59 @@ class IntegrityTests(unittest.TestCase):
             "artifact_sha256": "a" * 64,
             "vs_baseline": {
                 "mcnemar_p": 0.25,
-                "token_p50_delta_pct": -2.0,
-                "token_p90_delta_pct": 2.5,
+                "token_ratio_median_delta_pct": 0.6,
+                "token_ratio_geomean_delta_pct": 1.8,
+                "token_sign_p": 0.67,
                 "extra_truncated_no_answer": 1,
             },
         }
         self.assertTrue(probes.probe_succeeded("quality", quality))
         native_gate = {
             "min_mcnemar_p": 0.05,
-            "max_abs_token_p50_delta_pct": 5,
-            "max_abs_token_p90_delta_pct": 5,
+            "max_abs_token_ratio_median_delta_pct": 5,
+            "max_abs_token_ratio_geomean_delta_pct": 5,
+            "min_token_sign_p": 0.05,
             "max_extra_truncated_no_answer": 1,
         }
         self.assertTrue(probes.probe_succeeded(
             "quality", quality, native_gate))
         for field, value in (
             ("mcnemar_p", 0.01),
-            ("token_p50_delta_pct", -5.1),
-            ("token_p90_delta_pct", 5.1),
+            ("token_ratio_median_delta_pct", -5.1),
+            ("token_ratio_geomean_delta_pct", 5.1),
+            ("token_sign_p", 0.01),
             ("extra_truncated_no_answer", 2),
         ):
             failed = copy.deepcopy(quality)
             failed["vs_baseline"][field] = value
             self.assertFalse(probes.probe_succeeded(
                 "quality", failed, native_gate), field)
+
+    def test_paired_token_stats_are_item_robust(self):
+        def report(tokens):
+            return {
+                "runs": [
+                    {
+                        "phase": "profile",
+                        "ok": True,
+                        "item_id": item_id,
+                        "completion_tokens": value,
+                    }
+                    for item_id, value in tokens.items()
+                ]
+            }
+
+        got = probes.paired_token_stats(
+            report({"a": 10, "b": 20, "c": 3000}),
+            report({"a": 11, "b": 19, "c": 6000}),
+        )
+        self.assertEqual(got["paired_items"], 3)
+        self.assertAlmostEqual(got["ratio_median"], 1.1)
+        self.assertEqual((got["longer"], got["shorter"]), (2, 1))
+        self.assertEqual(
+            (got["baseline_runaways"], got["candidate_runaways"]),
+            (1, 1),
+        )
 
     def test_recipe_semantic_change_changes_binding(self):
         recipe = {

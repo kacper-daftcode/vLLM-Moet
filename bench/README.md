@@ -147,10 +147,11 @@ accuracy alone did not resolve (see `docs/quality.md`).
 
 GPQA non-think has a rare native long-tail exception: two stock C2 runs with
 identical 147/198 accuracy differed by 33% in mean tokens because one item
-moved to the 30k cap. Its release predicate therefore uses paired token p50,
-p90 and extra truncations; the raw mean is still recorded and rendered for
-audit. This preserves sensitivity to broad inflation without overfitting a
-release decision to one unstable native trajectory.
+moved to the 30k cap. Its release predicate therefore uses paired per-item
+median/geometric-mean ratios, an exact sign test and extra truncations. Raw
+mean, p50/p90 and runaway counts are still recorded for audit. This preserves
+sensitivity to broad inflation without overfitting a release decision to a few
+unstable trajectories.
 
 Pieces:
 

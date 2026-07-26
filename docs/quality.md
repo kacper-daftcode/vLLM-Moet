@@ -103,12 +103,13 @@ most candidate effects. GSM8K‑200 remains the fast screen; paired GPQA/McNemar
 completion-token behavior, THINK mode and needle retrieval form the release
 gate.
 
-For non‑think GPQA, token parity is gated on paired p50/p90 and the number of
-additional truncations; the raw mean remains reported as an advisory metric.
-This is deliberate: two stock-native C2 runs scored the same 147/198 but had
-token means 422 and 563 (+33%) because one intrinsically unstable item moved
-from 6,821 tokens to the 30,000-token cap. Their p50/p90 differed by at most
-1%. The robust gate still catches systematic inflation such as the measured
-2-bit prefill-KV regression, without making one native long-tail trajectory a
-release oracle. Lightweight arithmetic/coherence tools remain useful for
-debugging, but cannot certify native-grade quality.
+For non‑think GPQA, token parity is gated on the paired per-item median and
+geometric-mean token ratios, an exact sign test, and additional truncations.
+Raw mean, aggregate p50/p90 and the runaway census remain reported for audit.
+This is deliberate: native C2 runs with identical accuracy differed by 33% in
+mean tokens from one chronic tail, while identical-accuracy candidate reruns
+moved aggregate p90 by over 6%. The paired robust gate still catches systematic
+inflation such as the measured 2-bit prefill-KV regression without making a
+few unstable trajectories the release oracle. Lightweight
+arithmetic/coherence tools remain useful for debugging, but cannot certify
+native-grade quality.

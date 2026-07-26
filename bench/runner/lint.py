@@ -254,6 +254,21 @@ def lint_results(release):
                                     "truncated_no_answer") or {}
                                 hit_max = comparison.get(
                                     "hit_max_tokens") or {}
+                                baseline_id = configured_probe.get(
+                                    "baseline")
+                                with open(common.baseline_path(
+                                        baseline_id)) as baseline_file:
+                                    baseline_raw = json.load(baseline_file)
+                                expected_robust = (
+                                    probes_mod.paired_token_stats(
+                                        baseline_raw, raw))
+                                if comparison.get(
+                                        "paired_token_robust") != (
+                                            expected_robust):
+                                    err(f"{where}: probe {key} paired robust "
+                                        "token statistics do not match raw "
+                                        "artifacts")
+                                robust = expected_robust
 
                                 def pct_delta(candidate, reference):
                                     return (
@@ -279,6 +294,17 @@ def lint_results(release):
                                         cp50, bp50),
                                     "token_p90_delta_pct": pct_delta(
                                         cp90, bp90),
+                                    "token_ratio_median_delta_pct": pct_delta(
+                                        robust.get("ratio_median"), 1.0),
+                                    "token_ratio_geomean_delta_pct": pct_delta(
+                                        robust.get("ratio_geomean"), 1.0),
+                                    "token_sign_p": robust.get("sign_p"),
+                                    "token_longer": robust.get("longer"),
+                                    "token_shorter": robust.get("shorter"),
+                                    "baseline_runaways": robust.get(
+                                        "baseline_runaways"),
+                                    "candidate_runaways": robust.get(
+                                        "candidate_runaways"),
                                     "extra_truncated_no_answer": (
                                         truncated.get("candidate", 0)
                                         - truncated.get("baseline", 0)),
