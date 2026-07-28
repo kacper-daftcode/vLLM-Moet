@@ -7,11 +7,19 @@ historical_releases:
 # Fresh releases must add exact full digests per box before their gate can
 # pass: runtime_manifests.<release>.<box> with patch_sha256, cubins, moet_sha,
 # and either vllm_sha (venv) or image_id (Docker).
-runtime_manifests: {}
+runtime_manifests:
+  v2026.07.27-quality:
+    fin03-pro6000x2:
+      patch_sha256: 234b97c9f7153f9d1eb0964a4d9b0271dcbe31bbfb6cad2e29d9f7a686fa4fcb
+      cubins: c99ce7596131c1915d1a90a6a36bf84b9de56de01b71e63dc6ce1f1b43211c01
+      moet_sha: f521dc10bbcdc86dc45936d9b7fd4ac88582c907
+      vllm_sha: db13b2e9cd942cf015f3137c8b51644bbe67fb06
+      model_manifests:
+        DeepSeek-V4-Flash: 72248d76cccb7c8b2d5f05ba8206ba9345337c8af9d3b58ac43a672a5cb3d3f5
 # Quality campaigns (bench/suites/quality.yaml vs bench/baselines/) are
 # expensive and run on their own cadence; the README quality table renders
 # from this release id.
-quality_release: v2026.07.17-quality
+quality_release: v2026.07.27-quality
 regression_threshold_pct: 5
 
 entries:
