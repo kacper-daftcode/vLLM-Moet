@@ -61,8 +61,9 @@ serve_args:
   - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
 
 suite_params:
-  gpqa-think:
-    enabled: true
+  # gpqa-think opt-in removed 2026-07-30: THINK is advisory under the
+  # 2026-07-28 outcome criterion (the 88.38 vs 86.87 tau-1.0 record lives in
+  # the v2026.07.27-quality release).
   batch_decode:
     concurrency: [1, 2]
   needle:

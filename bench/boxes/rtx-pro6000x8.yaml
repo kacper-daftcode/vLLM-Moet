@@ -1,0 +1,30 @@
+id: rtx-pro6000x8
+# The local box after the 2026-07-29 hardware upgrade (planned reboot,
+# kernel 6.8.0-136): 8x RTX PRO 6000 at CUDA indices 0,1,3,4,5,6,8,9 plus
+# 2x RTX 5090 at 2,7 (the 5090 pair has no box file of its own yet). The
+# pre-upgrade 4x layout lives on as rtx-pro6000x4 for historical results.
+gpus:
+  name: "RTX PRO 6000 Blackwell Workstation"
+  count: 8
+  vram_gb: 96
+host_ram_gb: 1007
+
+runtime: docker
+docker_image: vllm-moet-recipes:v024-db13b2e9c
+shm_size: 64g
+
+env:
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+
+models:
+  GLM-5.2-NVFP4: /workspace/glm-5.2-nvfp4
+  DeepSeek-V4-Flash: /workspace/ds4flash-official
+
+planes_cache:
+  GLM-5.2-NVFP4: /workspace/.planes-cache-glm-bench
+
+log_dir: /root/logs/bench
+
+# external eval tool for the quality suite (git SHA recorded in results)
+quality_tool: /root/workspace/llm-inference-bench/llm_decode_bench.py
+quality_tool_sha256: f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1

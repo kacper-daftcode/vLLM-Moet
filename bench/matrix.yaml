@@ -4,10 +4,22 @@ previous_release: null
 historical_releases:
   - baseline-2026-07-10
   - v2026.07.17-quality
+  - v2026.07.27-quality
 # Fresh releases must add exact full digests per box before their gate can
 # pass: runtime_manifests.<release>.<box> with patch_sha256, cubins, moet_sha,
 # and either vllm_sha (venv) or image_id (Docker).
 runtime_manifests:
+  v2026.07.30-quality:
+    rtx-pro6000x8:
+      # pin-identical to v2026.07.27-quality: the tau-0.60 runs served the
+      # same image (v024-db13b2e9c); moet_sha names the publication commit
+      # whose patch/ trio described that runtime at serve time.
+      patch_sha256: 234b97c9f7153f9d1eb0964a4d9b0271dcbe31bbfb6cad2e29d9f7a686fa4fcb
+      cubins: c99ce7596131c1915d1a90a6a36bf84b9de56de01b71e63dc6ce1f1b43211c01
+      moet_sha: de4af53de37972ea2d4056cbec2fd6ad46774d3d
+      vllm_sha: db13b2e9cd942cf015f3137c8b51644bbe67fb06
+      model_manifests:
+        DeepSeek-V4-Flash: 72248d76cccb7c8b2d5f05ba8206ba9345337c8af9d3b58ac43a672a5cb3d3f5
   v2026.07.27-quality:
     fin03-pro6000x2:
       patch_sha256: 234b97c9f7153f9d1eb0964a4d9b0271dcbe31bbfb6cad2e29d9f7a686fa4fcb
@@ -19,7 +31,7 @@ runtime_manifests:
 # Quality campaigns (bench/suites/quality.yaml vs bench/baselines/) are
 # expensive and run on their own cadence; the README quality table renders
 # from this release id.
-quality_release: v2026.07.27-quality
+quality_release: v2026.07.30-quality
 regression_threshold_pct: 5
 
 entries:
