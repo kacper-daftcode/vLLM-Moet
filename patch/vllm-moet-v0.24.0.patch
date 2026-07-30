@@ -177,10 +177,10 @@ index 000000000..c4b64f25b
 +}
 diff --git a/tests/model_executor/layers/test_moe_w2_persistence.py b/tests/model_executor/layers/test_moe_w2_persistence.py
 new file mode 100644
-index 000000000..dcbeff36c
+index 000000000..9bea4d439
 --- /dev/null
 +++ b/tests/model_executor/layers/test_moe_w2_persistence.py
-@@ -0,0 +1,485 @@
+@@ -0,0 +1,516 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -469,11 +469,42 @@ index 000000000..dcbeff36c
 +    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL_FILE", "")
 +    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "strict")
 +    moe_w2_delta.gate_validate_base_clean(0)
-+    with pytest.raises(RuntimeError, match="gate replay introduced"):
++    with pytest.raises(RuntimeError, match="left 1 base-cache missing"):
 +        moe_w2_delta.gate_validate_base_clean(1)
 +
 +    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "approximate")
 +    moe_w2_delta.gate_validate_base_clean(1)
++
++
++def test_gate_repair_shares_the_base_replay_policy(monkeypatch):
++    """Gate-introduced misses are repaired under the base loop's own policy.
++
++    Strict keeps fetching+replaying until the step is clean or the shared
++    bound trips; approximate keeps the mandatory first-order restore and then
++    only chases residue inside its THRESH band. Anything else would leave the
++    gate unservable over a partial base pool (2026-07-28: 15 misses on 4x5090
++    TP4, 1 on 1xPRO6000).
++    """
++    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL", 0)
++    monkeypatch.setattr(moe_w2_delta, "_BASE_MISS_TOL_FILE", "")
++    monkeypatch.setattr(moe_w2_delta, "_FP_MAX", 32)
++
++    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "strict")
++    assert moe_w2_delta.gate_repair_continue(0, 15)
++    assert moe_w2_delta.gate_repair_continue(31, 1)
++    assert not moe_w2_delta.gate_repair_continue(0, 0)
++    assert not moe_w2_delta.gate_repair_continue(32, 1)
++
++    monkeypatch.setattr(moe_w2_delta, "_REPLAY_MODE", "approximate")
++    monkeypatch.setattr(moe_w2_delta, "_FP_THRESH", 8)
++    monkeypatch.setattr(moe_w2_delta, "_FP_THRESH_FILE", "")
++    assert moe_w2_delta.gate_repair_continue(0, 300)
++    assert moe_w2_delta.gate_repair_continue(1, 8)
++    assert not moe_w2_delta.gate_repair_continue(1, 9)
++
++    for passes, miss in ((0, 15), (1, 8), (1, 9), (31, 1), (32, 1)):
++        assert (moe_w2_delta.gate_repair_continue(passes, miss)
++                is moe_w2_delta.fp_continue(passes, miss))
 +
 +
 +def test_mandatory_promotion_failure_is_fail_closed():
@@ -5428,10 +5459,10 @@ index 000000000..2c053ed42
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..4574d5c27
+index 000000000..542656b93
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2233 @@
+@@ -0,0 +1,2269 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -5758,6 +5789,7 @@ index 000000000..4574d5c27
 +        self._kpi_unfixed = 0     # experts replay could NOT restore (window)
 +        self._kpi_deferred = 0    # slotless warm-up fetches (no reader; window)
 +        self._kpi_2nd = 0         # extra replays for second-order misses
++        self._kpi_gate_repairs = 0  # replays repairing gate-introduced misses
 +        self._kpi_fp_giveup = 0   # steps that accepted second-order residue
 +        self._kpi_fp_resid = 0    # residual missing pairs in those steps
 +        # Slots touched since step_begin(): promoted or hit by any pass of
@@ -6995,6 +7027,8 @@ index 000000000..4574d5c27
 +                        "(benign; pool ~= step working set)")
 +        if self._kpi_2nd:
 +            unfixed += (f"; second-order replays: {self._kpi_2nd}")
++        if self._kpi_gate_repairs:
++            unfixed += (f"; gate base repairs: {self._kpi_gate_repairs}")
 +        if self._kpi_fp_giveup:
 +            unfixed += (
 +                f"; fp-residue: {self._kpi_fp_giveup} steps "
@@ -7020,9 +7054,19 @@ index 000000000..4574d5c27
 +        self._kpi_unfixed = 0
 +        self._kpi_deferred = 0
 +        self._kpi_2nd = 0
++        self._kpi_gate_repairs = 0
 +        self._kpi_fp_giveup = 0
 +        self._kpi_fp_resid = 0
 +        self._kpi_prefetched = 0
++
++    def kpi_gate_repair(self, passes: int) -> None:
++        """Runner reports replays spent repairing gate-introduced base misses.
++
++        Each pass is a full extra re-forward, so this is the cost side of
++        serving a gate over a partial base pool — the same knob answer as the
++        replay rate: raise VLLM_MOE_W2_BASE_CACHE_GB.
++        """
++        self._kpi_gate_repairs += passes
 +
 +    def kpi_fp(self, replays: int, residual: int) -> None:
 +        """Runner reports the step's fixed-point outcome: total replay
@@ -7304,20 +7348,43 @@ index 000000000..4574d5c27
 +            "quality consent")
 +
 +
-+def gate_validate_base_clean(max_miss: int) -> None:
-+    """A gate re-forward runs after the base fixed-point loop.
++def gate_repair_continue(passes: int, max_miss: int) -> bool:
++    """Should the runner repair base misses a gate re-forward introduced?
 +
-+    It may re-route onto a base expert that was not resident in the accepted
-+    base pass. Strict mode cannot return those zero-contribution logits; the
-+    base and gate loops are not yet unified, so fail closed. Approximate mode
-+    retains its explicit degraded-quality contract.
++    A gate re-forward runs after the base fixed-point loop and upgrades early
++    layers to FP4, which can re-route a later layer onto a base pair outside a
++    partial pool — second-order misses of exactly the kind the base loop
++    already exists to chase. The two loops therefore share ONE policy: strict
++    fetches and replays until the step is miss-free or the bound trips,
++    approximate keeps the mandatory first-order restore plus its THRESH band.
++
++    Without this the gate was unservable over any base pool below full
++    coverage: measured 2026-07-28 on 4x5090 TP4 (base 12 GiB/rank, 64.6%
++    coverage, tau 0.60) the first fire died on all four ranks with 15 gate-
++    introduced misses, and on 1xPRO6000 (base 66 GiB, 88.9% coverage) with 1.
++    """
++    return fp_continue(passes, max_miss)
++
++
++def gate_validate_base_clean(max_miss: int) -> None:
++    """Fail closed when gate-introduced base misses remain unrepaired.
++
++    On the TP/single-GPU path this is reached only after
++    `gate_repair_continue` stopped — converged, or the shared bound
++    exhausted. The PP path keeps its single-pass replay contract, so there
++    the guard still fires on the first re-route. Approximate mode retains its
++    explicit degraded-quality contract in both.
 +    """
 +    if (_REPLAY_MODE == "strict"
 +            and max_miss > base_miss_tol()):
 +        raise RuntimeError(
-+            "moe_w2 strict FP4 gate replay introduced "
-+            f"{max_miss} base-cache missing pairs after the base replay "
-+            "already converged; refusing zero-contribution logits")
++            "moe_w2 strict FP4 gate replay left "
++            f"{max_miss} base-cache missing pairs unrepaired (tolerance "
++            f"{base_miss_tol()}); the shared gate/base repair loop is "
++            f"bounded at {_FP_MAX} passes and the PP gate replay is "
++            "single-pass by design — grow the base pool or set "
++            "VLLM_MOE_W2_REPLAY_MODE=approximate with explicit "
++            "degraded-quality consent")
 +
 +
 +# Base-cache KPI cadence: every N runner steps log the per-STEP replay rate,
@@ -15951,7 +16018,7 @@ index 4ab45b2ae..35a89634e 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..78c09c4c7 100644
+index 74938a823..98efecb5e 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -16027,7 +16094,7 @@ index 74938a823..78c09c4c7 100644
  AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
  # list when ubatching is enabled
  PerLayerAttnMetadata: TypeAlias = list[AttnMetadataDict] | AttnMetadataDict
-@@ -898,6 +950,12 @@ class GPUModelRunner(
+@@ -898,6 +950,15 @@ class GPUModelRunner(
          # Ephemeral state transferred between execute_model() and sample_tokens().
          self.execute_model_state: ExecuteModelState | None = None
          self.kv_connector_output: KVConnectorOutput | None = None
@@ -16037,10 +16104,13 @@ index 74938a823..78c09c4c7 100644
 +        # fire decision here. TP/single-GPU re-forwards inline instead.
 +        self._gate_ctx: dict | None = None
 +        self._gate_fire: bool = False
++        # One INFO line the first time a gate re-forward re-routes onto a base
++        # pair outside the pool and the shared repair loop fetches it.
++        self._moe_w2_gate_repair_seen: bool = False
          self.mamba_state_idx: dict[str, int] = {}
          self._mamba_bufs: mamba_utils.MambaBuffers | None = None
          self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
-@@ -1355,10 +1413,19 @@ class GPUModelRunner(
+@@ -1355,10 +1416,19 @@ class GPUModelRunner(
                          req_state.output_token_ids.extend(
                              new_token_ids[-num_new_tokens:]
                          )
@@ -16064,7 +16134,7 @@ index 74938a823..78c09c4c7 100644
                  del req_state.output_token_ids[num_output_tokens:]
                  if req_index is not None:
                      end_idx = (
-@@ -2473,8 +2540,11 @@ class GPUModelRunner(
+@@ -2473,8 +2543,11 @@ class GPUModelRunner(
                  cm.slot_mapping = slot_mappings[kv_cache_gid]
  
              if self.speculative_config and spec_decode_common_attn_metadata is None:
@@ -16077,7 +16147,7 @@ index 74938a823..78c09c4c7 100644
                      (
                          EagleProposer,
                          DFlashProposer,
-@@ -2482,16 +2552,20 @@ class GPUModelRunner(
+@@ -2482,16 +2555,20 @@ class GPUModelRunner(
                          ExtractHiddenStatesProposer,
                      ),
                  ):
@@ -16101,7 +16171,7 @@ index 74938a823..78c09c4c7 100644
                  self.drafter.set_per_group_block_table(
                      kv_cache_gid, cm.block_table_tensor
                  )
-@@ -3560,6 +3634,18 @@ class GPUModelRunner(
+@@ -3560,6 +3637,18 @@ class GPUModelRunner(
              intermediate_tensors = self.sync_and_gather_intermediate_tensors(
                  num_input_tokens, intermediate_tensors, True
              )
@@ -16120,7 +16190,7 @@ index 74938a823..78c09c4c7 100644
  
          if is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
              # Run the encoder, just like we do with other multimodal inputs.
-@@ -4306,6 +4392,36 @@ class GPUModelRunner(
+@@ -4306,6 +4395,36 @@ class GPUModelRunner(
              self.model_config.is_encoder_decoder and num_encoder_reqs > 0
          )
  
@@ -16157,7 +16227,7 @@ index 74938a823..78c09c4c7 100644
          # Run the model.
          # Use persistent buffers for CUDA graphs.
          # When spec decode is enabled, defer connector finalization
-@@ -4337,6 +4453,143 @@ class GPUModelRunner(
+@@ -4337,6 +4456,143 @@ class GPUModelRunner(
                  **model_kwargs,
              )
  
@@ -16301,7 +16371,7 @@ index 74938a823..78c09c4c7 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4648,354 @@ class GPUModelRunner(
+@@ -4395,6 +4651,424 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -16535,6 +16605,19 @@ index 74938a823..78c09c4c7 100644
 +                        # fire floor).
 +                        _gate_iters = 0
 +                        _step_budget = moe_w2_gate.step_promote_budget()
++                        _gate_btier = moe_w2_delta._BASE_TIER
++
++                        def _gate_base_miss():
++                            """(this rank's, worst rank's) base misses."""
++                            local = int(_gate_btier.miss_count.item())
++                            if _tp.world_size <= 1:
++                                return local, local
++                            t = torch.tensor([local], device=_gate_btier.dev)
++                            torch.distributed.all_reduce(
++                                t, op=torch.distributed.ReduceOp.MAX,
++                                group=_tp.device_group)
++                            return local, int(t.item())
++
 +                        while _gate_iters < moe_w2_gate.fire_fp_max():
 +                            # Promote this rank's COLD routed experts
 +                            # (per-rank shard side effect, never a per-rank
@@ -16602,20 +16685,77 @@ index 74938a823..78c09c4c7 100644
 +                            # The gate loop runs AFTER mandatory base replay.
 +                            # Its changed early-layer numerics can route a later
 +                            # layer onto a new, non-resident base expert. The
-+                            # descriptor then zeroes that contribution; strict
-+                            # mode must not return those fail-open logits.
-+                            _gate_btier = moe_w2_delta._BASE_TIER
++                            # descriptor then zeroes that contribution, so the
++                            # step is repaired the same way the base loop
++                            # repairs its own second-order misses: fetch the
++                            # pairs, replay, re-read — under ONE shared policy
++                            # (moe_w2_delta.gate_repair_continue). Only the
++                            # residue left when that policy stops is fail-open,
++                            # and strict refuses it below.
 +                            if _gate_btier is not None:
-+                                _gate_miss = int(
-+                                    _gate_btier.miss_count.item())
-+                                if _tp.world_size > 1:
-+                                    _gate_miss_t = torch.tensor(
-+                                        [_gate_miss], device=logits.device)
-+                                    torch.distributed.all_reduce(
-+                                        _gate_miss_t,
-+                                        op=torch.distributed.ReduceOp.MAX,
-+                                        group=_tp.device_group)
-+                                    _gate_miss = int(_gate_miss_t.item())
++                                _gate_miss_local, _gate_miss = _gate_base_miss()
++                                _gate_repairs = 0
++                                while moe_w2_delta.gate_repair_continue(
++                                        _gate_repairs, _gate_miss):
++                                    # Same consensus as the base loop: every
++                                    # rank completes its own pack I/O (pinned
++                                    # for the replay that follows) before any
++                                    # rank re-enters the collective.
++                                    _moe_w2_promote_consensus(
++                                        _gate_btier,
++                                        _tp,
++                                        _gate_miss_local,
++                                        pin=True,
++                                        where="TP gate base repair",
++                                    )
++                                    _gate_repairs += 1
++                                    with set_forward_context(
++                                        attn_metadata,
++                                        self.vllm_config,
++                                        num_tokens=num_tokens_padded,
++                                        num_tokens_across_dp=num_tokens_across_dp,
++                                        cudagraph_runtime_mode=cudagraph_mode,
++                                        batch_descriptor=batch_desc,
++                                        ubatch_slices=ubatch_slices_padded,
++                                        slot_mapping=slot_mappings,
++                                        skip_compiled=has_encoder_input,
++                                    ):
++                                        _repair_out = self._model_forward(
++                                            input_ids=input_ids,
++                                            positions=positions,
++                                            intermediate_tensors=intermediate_tensors,
++                                            inputs_embeds=inputs_embeds,
++                                            **model_kwargs,
++                                        )
++                                    if self.use_aux_hidden_state_outputs:
++                                        hidden_states, aux_hidden_states = (
++                                            _repair_out)
++                                    else:
++                                        hidden_states = _repair_out
++                                    sample_hidden_states = hidden_states[
++                                        logits_indices]
++                                    logits = self.model.compute_logits(
++                                        sample_hidden_states)
++                                    _gate_miss_local, _gate_miss = (
++                                        _gate_base_miss())
++                                if _gate_repairs:
++                                    _gate_btier.kpi_gate_repair(_gate_repairs)
++                                    # First repair of the process is INFO: it
++                                    # says the gate is re-routing off a
++                                    # partial base pool, which is a pool-
++                                    # sizing signal and used to be a crash.
++                                    if not self._moe_w2_gate_repair_seen:
++                                        self._moe_w2_gate_repair_seen = True
++                                        logger.info(
++                                            "moe_w2 gate base repair engaged: "
++                                            "%d pass(es), %d missing pairs "
++                                            "left (later repairs at DEBUG)",
++                                            _gate_repairs, _gate_miss)
++                                    else:
++                                        logger.debug(
++                                            "moe_w2 gate base repair: %d "
++                                            "pass(es), %d missing pairs left",
++                                            _gate_repairs, _gate_miss)
 +                                moe_w2_delta.gate_validate_base_clean(
 +                                    _gate_miss)
 +                            gate_collective_active = False
@@ -16656,7 +16796,7 @@ index 74938a823..78c09c4c7 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +5017,119 @@ class GPUModelRunner(
+@@ -4416,6 +5090,119 @@ class GPUModelRunner(
  
          return None
  
@@ -16776,7 +16916,7 @@ index 74938a823..78c09c4c7 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +5155,12 @@ class GPUModelRunner(
+@@ -4441,6 +5228,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -16789,7 +16929,7 @@ index 74938a823..78c09c4c7 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5325,23 @@ class GPUModelRunner(
+@@ -4605,6 +5398,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -16813,7 +16953,7 @@ index 74938a823..78c09c4c7 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5433,35 @@ class GPUModelRunner(
+@@ -4696,13 +5506,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -16854,7 +16994,7 @@ index 74938a823..78c09c4c7 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5470,33 @@ class GPUModelRunner(
+@@ -4711,16 +5543,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -16892,7 +17032,7 @@ index 74938a823..78c09c4c7 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5507,154 @@ class GPUModelRunner(
+@@ -4731,18 +5580,154 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -17052,7 +17192,7 @@ index 74938a823..78c09c4c7 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +6121,39 @@ class GPUModelRunner(
+@@ -5209,6 +6194,39 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -17092,7 +17232,7 @@ index 74938a823..78c09c4c7 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +6202,33 @@ class GPUModelRunner(
+@@ -5257,6 +6275,33 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
@@ -17126,7 +17266,7 @@ index 74938a823..78c09c4c7 100644
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +6941,8 @@ class GPUModelRunner(
+@@ -5969,7 +7014,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -17136,7 +17276,7 @@ index 74938a823..78c09c4c7 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7848,9 @@ class GPUModelRunner(
+@@ -6875,8 +7921,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -17148,7 +17288,7 @@ index 74938a823..78c09c4c7 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7903,8 @@ class GPUModelRunner(
+@@ -6929,7 +7976,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
