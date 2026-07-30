@@ -1,48 +1,64 @@
 id: deepseek-v4-flash/pro6000x1-cache
+role: quality
 model: DeepSeek-V4-Flash
 served_name: deepseek-v4-flash
-summary: "1x RTX PRO 6000 - RAM-cached base, full fire contract, MTP-1"
+summary: "1x RTX PRO 6000 - RAM-cached base, STRICT gate+repair, MTP-1, graphs"
 
 requires:
   gpus: 1
   vram_gb: 96
   host_ram_gb: 512
 
-context: 24576
+context: 131072
 load_timeout_s: 3600
 
-# The RAM-1TB column cell: 2-bit base HOST-resident (pinned store), GPU
-# holds a 52 GiB base cache (~72% expert coverage) + a 17 GiB NON-SPLIT
-# FP4 need-pool (1365 slots >= the MTP fire floor 1315 -> uncapped fires
-# legal even with spec on).
-# Quality (WINDOW-MATCHED, native@24k NT = 74.62):
-#   GSM8K 97.0/96.5 | NT no-spec 73.74 (McNemar p=1 vs native) |
-#   NT MTP-1 71.72 (paired vs no-spec: 13/9 discordant, p=0.52 - NO
-#   significant loss) | NT MTP-2 68.69 (14/4, p=0.031 - REAL loss).
-# SPEC-DRIFT (2026-07-24, closed investigation): accepted-draft KV
-# carries verify-batch micro-noise that 2-bit amplifies along the
-# sequence; the cost scales with accepted drafts. Kernel, miss/replay,
-# graphs, drafter all exonerated (op test: tools/test_moe_w2_base_verify
-# ALL PASS). Hence MTP-1 here: most of the spec speedup, no measurable
-# quality cost. Do NOT raise to MTP-2 on quality cells.
+# RUNTIME DEPENDENCY, read before serving: this recipe runs
+# REPLAY_MODE=strict with the gate over a PARTIAL base pool, which requires
+# the unified gate/base repair loop (commit 76c9997e5, branch
+# gate-base-unify-2026-07-28 - awaiting trunk landing). On plain db13b2e9c
+# the first gate fire that re-routes onto a base-cold pair KILLS the engine
+# (gate_validate_base_clean fail-closed). Do not ship this recipe in an
+# image that predates that landing.
+#
+# The cache-route quality cell, certified 2026-07-30 under the graphs-
+# mandatory rule (runtime db13b2e9c + 76c9997e5 binds, paired vs the NATIVE
+# MTP-1 anchor 140/198 at the same C1/32k serve geometry):
+#   GPQA-198 NT 141/198 vs 140/198 (delta +0.51 pp, flips 13/14, McNemar
+#   p=1.0); per-item tokens median -0.70%, geomean +0.81%, sign p=0.78;
+#   GSM8K-200 195/200, zero errors. Eager same-config evidence: 149/198
+#   vs 140 (p=0.16), tokens median +0.67% / geomean +0.47%.
+#   Strict no-spec sibling (tau0.70): GPQA 144/198 vs 142 (+1.01 pp,
+#   p=0.82), GSM8K 194/200 - the no-drafter variant if MTP is undesired.
+# OPERATIONAL: 33.8 tok/s aggregate C=1 over the full GSM8K-200; 95.7 tok/s
+#   median warm decode (512 ignore_eos); needle depth-0.5 PASS at 8,120 /
+#   29,711 (32k window boot) and at 127,865 prompt tokens on THIS 131k
+#   window boot (base 62) - the next rung is refused by the 131,072 model
+#   limit, not by memory (KV 687,865 tokens).
+# Fire floor with MTP-1: 43L x top-6 x (1+1) x 1.7 = 877 pairs -> delta
+# 11.5 GiB = 920 slots keeps uncapped promotion legal. Base 62 GiB =
+# ~84% coverage; steady-state base replay ~0-5%/step warm, gate repairs
+# land in the KPI line ("gate base repairs: N").
 env:
   VLLM_MOE_W2: "1"
-  VLLM_MOE_W2_BASE_CACHE_GB: "52"
-  VLLM_MOE_W2_DELTA_GB: "17"
+  VLLM_MOE_W2_BASE_CACHE_GB: "62"
+  VLLM_MOE_W2_DELTA_GB: "11.5"
+  VLLM_MOE_W2_DELTA_SPLIT: "0"
+  VLLM_MOE_W2_DELTA_POLICY: "need"
   VLLM_MOE_W2_GATE: "1"
-  VLLM_MOE_W2_GATE_TAU: "1.0"
+  VLLM_MOE_W2_GATE_TAU: "0.70"
   VLLM_MOE_W2_GATE_MAX_PROMOTE: "0"
   VLLM_MOE_W2_GATE_SPEC_MASK: "1"
   VLLM_MOE_W2_PREFILL_FP4: "ensure"
   VLLM_MOE_W2_PREFILL_T: "16"
+  VLLM_MOE_W2_REPLAY_MODE: "strict"
 
 serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 24576
-  - --gpu-memory-utilization 0.97
-  - --max-num-batched-tokens 1024
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.95
+  - --max-num-batched-tokens 256
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
   - --no-scheduler-reserve-full-isl
@@ -53,17 +69,17 @@ warmup:
   decode_requests: 8
 
 suite_params:
-  decode:
-    runs: 7
+  gsm8k:
+    concurrency: 1
+  gpqa:
+    concurrency: 1
   batch_decode:
     concurrency: [1]
   needle:
-    sizes_words: [6000]
+    sizes_words: [8000, 95000]
+    depth: 0.5
 
 tuning:
   objective: decode.median_tok_s
-  constraints: ["arithmetic.score>=2"]
-  axes:
-    - kind: env
-      name: VLLM_MOE_W2_BASE_CACHE_GB
-      values: ["52", "56"]
+  constraints: ["arithmetic.score>=2", "needle.all_pass"]
+  axes: []

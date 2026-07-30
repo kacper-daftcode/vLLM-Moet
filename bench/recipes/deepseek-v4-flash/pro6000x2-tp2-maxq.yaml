@@ -26,12 +26,21 @@ load_timeout_s: 2400
 #   internal/PREFILL_KV_INFLATION_FINDINGS.md); PREFILL_T=16 routes short
 #   prompts (T<=96) into the guarantee (largest decode step at seqs 2
 #   spec 2 = 6 tokens).
+# tau 1.0 -> 0.60 (2026-07-30): a live TAU_FILE sweep measured tau 1.0 at
+# 116.9 tok/s C=1 vs 149.6 at tau 0.60 (+28%; gate-off 150.5 is quality-
+# excluded: -2..-4 pp NT historically). tau 0.60 re-certified at the full
+# 131k geometry, C2, paired vs the frozen v2 native baselines:
+#   GPQA-198 NT 145/198 vs 147/198 (delta -1.01 pp, flips 13/11, McNemar
+#   p=0.84); per-item tokens median +0.00%, geomean +2.64%, sign p=1.0;
+#   runaways 2 vs native's 3, zero truncations both sides;
+#   GSM8K-200 191/200 vs 194/200 (flips 3/0, p=0.25), zero errors.
+# Artifacts: /root/logs/bench/i-audit/i-maxq-tau060-* (+ SHA256SUMS).
 env:
   VLLM_MOE_W2: "1"
   VLLM_MOE_W2_DELTA_GB: "34"
   VLLM_MOE_W2_DELTA_SPLIT: "1"
   VLLM_MOE_W2_GATE: "1"
-  VLLM_MOE_W2_GATE_TAU: "1.0"
+  VLLM_MOE_W2_GATE_TAU: "0.60"
   VLLM_MOE_W2_GATE_MAX_PROMOTE: "0"
   VLLM_MOE_W2_PREFILL_FP4: "ensure"
   VLLM_MOE_W2_PREFILL_T: "16"

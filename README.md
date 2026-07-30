@@ -415,7 +415,6 @@ Release **`baseline-2026-07-10`** — one row per supported recipe (`bench/recip
 |---|---|---|---:|---:|---:|---:|---|---|
 | deepseek-v4-flash | 1x RTX 5090 (32 GB) | host-resident 2-bit base, GPU as expert cache | 8K | **38** | — | — | — | acc 2.83 † |
 | deepseek-v4-flash | 4x RTX 5090 TP4 | consumer-card throughput | 16K | **214.4** | 1 560 @32 | 6 101 | — | acc 2.6 † |
-| deepseek-v4-flash | 1x RTX PRO 6000 | throughput (24K ctx, FP4 delta auto, MTP k=2) | 24K | **161.2** | 933 @32 | 5 340 | — | acc 2.6 † |
 | deepseek-v4-flash | 2x RTX PRO 6000 TP2 | throughput | 24K | **209.6** | 380 @3 | 5 791 | — | acc 2.6 † |
 | glm-5.2-nvfp4 | 2x RTX PRO 6000 TP2 | host-resident base, 44 GiB/rank expert cache | 32K | **33** | — | — | PASS ≤27K tok | acc 3 † |
 | glm-5.2-nvfp4 | 4x RTX PRO 6000 TP4 | 2-bit base + MTP k=2, 128K window | 128K | **105** | — | 2 500 | PASS ≤276K tok | † |

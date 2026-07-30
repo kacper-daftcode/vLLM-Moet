@@ -23,7 +23,7 @@ quality_release: v2026.07.27-quality
 regression_threshold_pct: 5
 
 entries:
-  - recipe: deepseek-v4-flash/pro6000x1-24k
+  - recipe: deepseek-v4-flash/pro6000x1
     blocking: true
   - recipe: deepseek-v4-flash/pro6000x2-tp2
     blocking: false

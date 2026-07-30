@@ -1,0 +1,75 @@
+id: deepseek-v4-flash/pro6000x1
+role: quality
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "1x RTX PRO 6000 - the single unified config (resident, MTP-2, graphs)"
+
+requires:
+  gpus: 1
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 2400
+
+# THE one 1xPRO6000 config (user directive 2026-07-30: no FAST/QUALITY split,
+# one config at max perf with native-grade quality). This is the former FAST
+# point promoted after passing the full paired outcome gate; the former
+# QUALITY mode existed to defend THINK parity, which the 2026-07-28 criterion
+# made advisory. Gate+MTP cannot coexist on this card resident (fire floor
+# 43L x top-6 x (1+2) x 1.7 = 15.4 GiB next to 72.7 GiB planes), so the
+# unified point is gate OFF + MTP-2 - and it measures ABOVE native anyway.
+#
+# QUALITY (2026-07-30, runtime db13b2e9c, graphs, paired vs the NATIVE MTP-2
+# GRAPHS anchor 140/198 at the same C1/32k serve geometry):
+#   GPQA-198 NT 139/198 vs 140/198 (delta -0.51 pp, flips 16/15, McNemar
+#   p=1.0); per-item tokens median +0.97%, geomean +2.90%, sign p=0.62;
+#   truncations 1 vs 0 (the chronic item, at the allowed limit);
+#   GSM8K-200 194/200, zero errors. Historical window-matched accuracy:
+#   NT 73.23 vs native@32k 69.04 (+4.2 pp).
+# OPERATIONAL: 79.1 tok/s aggregate C=1 over the full GSM8K-200 (graphs);
+#   B's audit: needle PASS at 130,535 prompt +512 output on this precision
+#   config at max-model-len 131072 (56.6 tok/s C=1 decode @131k window);
+#   the +100-word case is correctly refused by the 131,072 model limit.
+# Artifacts: /root/logs/bench/i-audit/i-pro6000-fast-unified-* and
+# /root/logs/bench/b-operational-audit/1xpro-fast*.
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_DELTA_GB: "3.4"
+  VLLM_MOE_W2_DELTA_SPLIT: "0"
+  VLLM_MOE_W2_GATE: "0"
+  VLLM_MOE_W2_FORCE_POOL: "1"
+  VLLM_MOE_W2_FORCE_RESIDENT: "1"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
+
+serve_args:
+  - --trust-remote-code
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.92
+  - --max-num-batched-tokens 256
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"deepseek_mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 4
+
+suite_params:
+  gsm8k:
+    concurrency: 1
+  gpqa:
+    concurrency: 1
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [8000, 98100]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2", "needle.all_pass"]
+  axes: []

@@ -1,0 +1,97 @@
+id: deepseek-v4-flash/5090x2-exact
+role: quality
+model: DeepSeek-V4-Flash
+served_name: deepseek-v4-flash
+summary: "2x RTX 5090 (64 GB total) - exact layer-wise FP4 streamed from RAM/NVMe"
+
+requires:
+  gpus: 2
+  vram_gb: 32
+  host_ram_gb: 96
+
+context: 131072
+load_timeout_s: 2400
+
+# The TP2 rung of the correctness-first fallback (see 5090x1-exact for the
+# mechanism): the router runs first, every routed full-FP4 row of the current
+# MoE layer is loaded synchronously before descriptor construction/GEMM, and
+# the previous layer's slots are immediately reusable. The 2-bit planes never
+# enter VRAM, so what a 5090 pair has to hold is the non-expert model, a 3.3
+# GiB FP4 slot pool (530 slots >= the 256 experts of one broad prefill layer)
+# and KV - which is why this cell reaches the model's full context on 64 GB.
+#
+# QUALITY (session F, 2026-07-28, first full-model TP2 exact boot; runtime
+# branch exact-layer-streaming-2026-07-27 over db13b2e9c), paired against the
+# geometry-matched native anchor native-c1-nospec32-gpqa198 (142/198):
+#   - GPQA-198 non-think C=1: 147/198 (74.24%), delta +2.53 pp, McNemar
+#     p=0.424; per-item token ratio median +0.41%, geomean +2.64%, sign
+#     p=0.773; zero runaways against the anchor's own one; zero errors;
+#   - GSM8K-200 C=1: 195/200 vs native 192/200, flips 0/3, p=0.25, per-item
+#     tokens median and geomean +0.00%, zero truncations;
+#   - GSM8K-20 19/20 == native subset; deterministic smoke byte-identical 2/2;
+#   - 18,142 zero-miss layer-stream telemetry lines over ~7 h, zero violations.
+#
+# OPERATIONAL (session I, 2026-07-28, this serve geometry, artifacts under
+# /root/logs/bench/i-audit/i-5090x2-exact.audit.txt):
+#   - canonical single-user C=1 decode: 4.8 tok/s (short prompt, 512
+#     ignore_eos tokens, median of 3) - about 1.4x the 1x5090 exact lane;
+#   - VALIDATED max context: needle PASS at 127,865 prompt tokens (95k words,
+#     depth 0.5, 455 s), after PASS at 8,120 / 32k / 64,538 / 121,152. The
+#     next rung up (98k words) is refused HTTP 400 because prompt + the
+#     probe's 2000-token budget crosses 131,072 - so this cell reaches the
+#     MODEL's ceiling. KV sizing at this window is 20.11 GiB = 4,354,736
+#     tokens: the model limit binds, never the cache.
+# Both fields are measured on the config below; do not copy them onto a
+# variant with different serve args.
+env:
+  VLLM_MOE_W2: "1"
+  # One mounted persistence root: planes at its v2/ subtree, exact/base packs
+  # under packs/. Container/box env may override these paths.
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}"
+  VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs"
+  # The base pool is a non-dereferenced standby required to initialize the
+  # host-backed loader; exact full-FP4 slots always win descriptor dispatch.
+  VLLM_MOE_W2_BASE_CACHE_GB: "0.1"
+  VLLM_MOE_W2_DELTA_GB: "3.3"
+  VLLM_MOE_W2_DELTA_SPLIT: "0"
+  VLLM_MOE_W2_EXACT_LAYERWISE: "1"
+  VLLM_MOE_W2_GATE: "0"
+  VLLM_MOE_W2_REPLAY_MODE: "strict"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
+  VLLM_MOE_W2_FUSED_UNPERMUTE: "0"
+  VLLM_MOE_W2_SWIGLU_CLAMP: "1"
+  VLLM_MOE_W2_SWIGLU_CLAMP_FP32: "1"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.95
+  - --max-num-batched-tokens 256
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --enforce-eager
+
+warmup:
+  decode_requests: 2
+
+suite_params:
+  gsm8k:
+    concurrency: 1
+  gpqa:
+    concurrency: 1
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [6000, 90000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2", "needle.all_pass"]
+  axes: []
