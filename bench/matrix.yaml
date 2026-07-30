@@ -23,8 +23,10 @@ quality_release: v2026.07.27-quality
 regression_threshold_pct: 5
 
 entries:
+  # blocking again once the first release measured on the unified recipe is
+  # imported (the historical result belongs to the retired pro6000x1-24k id).
   - recipe: deepseek-v4-flash/pro6000x1
-    blocking: true
+    blocking: false
   - recipe: deepseek-v4-flash/pro6000x2-tp2
     blocking: false
   - recipe: deepseek-v4-flash/5090x4-tp4
