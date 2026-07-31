@@ -5459,10 +5459,10 @@ index 000000000..2c053ed42
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..bed714e56
+index 000000000..ad1882e0a
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2369 @@
+@@ -0,0 +1,2383 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -6608,11 +6608,25 @@ index 000000000..bed714e56
 +                    self._accum_reset = False
 +                self._seen_accum.add_(self.seen)
 +                self.seen.zero_()
-+                self._seen_host.copy_(self._seen_accum, non_blocking=True)
-+                event = torch.cuda.Event()
-+                event.record(self._stream)
-+            self._snapshot_event = event
-+            self._snapshot_pending = True
++                if not self._snapshot_pending:
++                    # CHAIN, never overwrite: re-recording a fresh event on
++                    # every step kept the pending snapshot perpetually
++                    # too-new to consume (wait_stream(main) makes it fire
++                    # only after the NEXT step's already-enqueued work
++                    # drains, and by then the next step_end had replaced
++                    # it: consumes landed ~1/s in bursts and unions grew to
++                    # ~7800 pairs, blocking the whole pool as seen).
++                    # While pending, steps merge into the accumulator only;
++                    # the host copy + event happen on the FIRST step_end
++                    # after a consume, so _seen_host is never rewritten
++                    # under the manager's read and every window is
++                    # delivered by the next copy.
++                    self._seen_host.copy_(self._seen_accum,
++                                          non_blocking=True)
++                    event = torch.cuda.Event()
++                    event.record(self._stream)
++                    self._snapshot_event = event
++                    self._snapshot_pending = True
 +        with self._lock:
 +            self._step_pins.clear()
 +            self._layer_pins.clear()
