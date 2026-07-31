@@ -5459,10 +5459,10 @@ index 000000000..2c053ed42
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..a4c935a1d
+index 000000000..9c6175d90
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2318 @@
+@@ -0,0 +1,2333 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -6021,14 +6021,26 @@ index 000000000..a4c935a1d
 +                time.sleep(gap)
 +            last = time.monotonic()
 +            self._manager_idle.clear()
++            retry = False
 +            try:
 +                torch.cuda.set_device(self.dev)
-+                self._tick_once()
++                retry = bool(self._tick_once())
 +            except Exception as e:  # noqa: BLE001 - never kill serving
 +                logger.warning("delta tick failed: %s", e)
 +                time.sleep(1.0)
 +            finally:
 +                self._manager_idle.set()
++            if retry and not self._stop:
++                # Unfired snapshot event: the copy lands once the GPU drains
++                # the recording step. Self-wake after a micro-sleep instead
++                # of waiting for the next step's wake — that wake OVERWRITES
++                # the event with an equally-unfired one, so with fast steps
++                # the consume check always ran too early and NEVER consumed
++                # (livelock: lazy promotion silently dead; measured 2026-07-31
++                # on the gate-OFF resident cell as +4-8% GPQA token inflation
++                # with the manager thread permanently in _wake.wait()).
++                time.sleep(0.0005)
++                self._wake.set()
 +        self._manager_idle.set()
 +
 +    def wake(self):
@@ -6068,7 +6080,10 @@ index 000000000..a4c935a1d
 +            # this snapshot is consumed on the next wake (one step later,
 +            # the same tolerance the seen-window already documents).
 +            if not self._snapshot_event.query():
-+                return
++                # tell _loop to retry shortly (see the self-wake there);
++                # returning without it dropped this consume, and the next
++                # step's re-arm kept the event perpetually too fresh.
++                return True
 +            self._snapshot_pending = False
 +            # the consumed copy carries every window since the previous
 +            # consume; start a fresh accumulation at the next step_end
