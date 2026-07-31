@@ -17,9 +17,14 @@ def _git(repo, *args):
 
 
 def _git_dirty(repo, ignored_prefixes=()):
+    # NOTE: _git() strips the output, which eats the leading space of a
+    # ' D <path>' (worktree-deletion) FIRST line and desyncs the fixed
+    # XY+space column slice below - split on the status/path separator
+    # instead of slicing (measured: a results-attic deletion flagged the
+    # tree dirty although bench/results/ is ignored).
     status = _git(repo, "status", "--porcelain") or ""
     for line in status.splitlines():
-        path = line[3:]
+        path = line[2:].lstrip() if len(line) > 2 else ""
         if " -> " in path:
             path = path.split(" -> ", 1)[1]
         if any(path.startswith(prefix) for prefix in ignored_prefixes):
