@@ -119,7 +119,8 @@ baselines:
   ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k:
     # certified cross-TP pairing (TP1 candidate vs this TP2 anchor,
     # 2026-07-28 criterion): deepseek-v4-flash/pro6000x1
-    paired_serve_args_sha256: [e3e00c4b1e2ccb3d8737b9aa3d1b99ca10bd97cfa4b52f2491e777f3ed97b0bf]
+    paired_serve_args_sha256: [e3e00c4b1e2ccb3d8737b9aa3d1b99ca10bd97cfa4b52f2491e777f3ed97b0bf,
+                               0d4836fb3783ff83688dd0f249ac9b9e56548c6ff254d868f2ea79d156e12e72]
     file: ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k.json
     artifact_sha256: 660ff24d443ef149ec5270f266a014ecb74f83e42cb8dc9bce04930ad8126f11
     checkpoint: DeepSeek-V4-Flash
@@ -137,7 +138,8 @@ baselines:
   ds4-flash/native-tp2-c1-32k-mtp2g-gpqa:
     # certified cross-TP pairing (TP1 candidate vs this TP2 anchor,
     # 2026-07-28 criterion): deepseek-v4-flash/pro6000x1
-    paired_serve_args_sha256: [e3e00c4b1e2ccb3d8737b9aa3d1b99ca10bd97cfa4b52f2491e777f3ed97b0bf]
+    paired_serve_args_sha256: [e3e00c4b1e2ccb3d8737b9aa3d1b99ca10bd97cfa4b52f2491e777f3ed97b0bf,
+                               0d4836fb3783ff83688dd0f249ac9b9e56548c6ff254d868f2ea79d156e12e72]
     file: ds4-flash/native-tp2-c1-32k-mtp2g-gpqa.json
     artifact_sha256: cbcfc450d87110192de65d87b47731a991e759d5114fd58727bc9e7ea724d190
     checkpoint: DeepSeek-V4-Flash

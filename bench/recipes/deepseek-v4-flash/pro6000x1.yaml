@@ -36,7 +36,15 @@ env:
   VLLM_MOE_W2: "1"
   VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}/planes-ds4-tp1"
   VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs-ds4"
-  VLLM_MOE_W2_DELTA_GB: "3.4"
+  # 5.5 GiB (469 slots) + PROMOTE 16 at util 0.97 (2026-07-31): the 3.4 GiB
+  # pool sat at ~+4% GPQA token median - a coin flip against the 5% gate
+  # (r7/r7b failed at +5.7/+5.6). The bigger pool + doubled promotion budget
+  # took the paired run to med +0.47% / geo -0.69% / sign 1.000 at 142/198
+  # (hit-rate 37-39% tokens). Costs ~10% C=1 throughput (132 vs 147 tok/s):
+  # the FP4-served fraction is higher by design. Native-grade is the
+  # constraint, so this IS the max-perf point that satisfies it.
+  VLLM_MOE_W2_DELTA_GB: "5.5"
+  VLLM_MOE_W2_DELTA_PROMOTE: "16"
   VLLM_MOE_W2_DELTA_SPLIT: "0"
   VLLM_MOE_W2_GATE: "0"
   VLLM_MOE_W2_FORCE_POOL: "1"
@@ -49,7 +57,7 @@ serve_args:
   - --kv-cache-dtype fp8
   - --block-size 256
   - --max-model-len 32768
-  - --gpu-memory-utilization 0.95
+  - --gpu-memory-utilization 0.97
   - --max-num-batched-tokens 256
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
