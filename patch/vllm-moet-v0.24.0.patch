@@ -5459,10 +5459,10 @@ index 000000000..2c053ed42
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..9c6175d90
+index 000000000..bed714e56
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2333 @@
+@@ -0,0 +1,2369 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -6302,7 +6302,8 @@ index 000000000..9c6175d90
 +
 +    def _take_slots_batch(self, k: int, emergency: bool = False,
 +                          min_cold: int = 2,
-+                          admission_keys=None) -> list[int]:
++                          admission_keys=None,
++                          protect_hot: bool = False) -> list[int]:
 +        """Take up to k slots (lock held by caller): free list first, then ONE
 +        vectorized eviction pass over all slots. Replaces the old per-slot
 +        python scan per promotion — O(n_slots) per TAKEN slot — which at GLM
@@ -6387,6 +6388,25 @@ index 000000000..9c6175d90
 +            cpl = self._coupled_fp4._mirror[lic, eic] >= 0
 +            hard |= cpl
 +            blocked |= cpl
++        # Flood damper (protect_hot; quality pools only, where an unfetched
++        # candidate is BENIGN — planes serve it at base quality): the top
++        # half of the pool by policy key is untouchable, so a bulk caller
++        # whose demand exceeds the pool (prefill ensure: one chunk-layer's
++        # routed set can be several times n_slots) can only churn the cold
++        # half. Without this every prefill wiped the decode hot set, and
++        # with items cycling faster than the manager's 8/pass trickle could
++        # re-warm 290 slots, the pool NEVER reached steady state (measured
++        # 2026-07-31, resident gate-OFF cell: token-weighted hit-rate 5.5%
++        # vs 25-41% pre-convoy; GPQA tokens +12% median).
++        if protect_hot and k_evict > 0:
++            valid = li >= 0
++            nprot = min(self.n_slots // 2, int(valid.sum()))
++            if nprot > 0:
++                pkey = torch.where(valid, key,
++                                   torch.full_like(key, float("-inf")))
++                hot = torch.topk(pkey, nprot, largest=True).indices
++                hard[hot] = True
++                blocked[hot] = True
 +        # Pass 1: only >=min_cold-tick-cold victims (never disturbs slots a
 +        # CONCURRENT in-flight graph might still read — the background
 +        # manager's constraint; speculative prefetchers pass a much higher
@@ -6947,10 +6967,16 @@ index 000000000..9c6175d90
 +                    if int(self._mirror[li, ei]) < 0]
 +            if not cand:
 +                return 0
-+            # emergency=True: prefill MUST have its whole layer resident —
-+            # an unfetched expert here zeroes contributions for EVERY token
-+            # of the chunk (the existing pool-too-small warning path).
-+            slots = self._take_slots_batch(len(cand), emergency=True)
++            # BASE tier: emergency — prefill MUST have its whole layer
++            # resident, an unfetched expert zeroes contributions for EVERY
++            # token of the chunk (the pool-too-small warning path).
++            # QUALITY tiers (fp4/delta): an unfetched candidate is served
++            # from the resident planes at base quality — benign — while an
++            # eviction of a decode-hot slot costs every following step, so
++            # the take is non-emergency and hot-protected (flood damper).
++            base = self._tag == "base"
++            slots = self._take_slots_batch(len(cand), emergency=base,
++                                           protect_hot=not base)
 +            plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
 +            if not plan:
 +                return 0
@@ -6974,10 +7000,20 @@ index 000000000..9c6175d90
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +        if len(plan) < len(cand):
-+            logger.warning_once(
-+                "moe_w2 base cache: pool too small for one prefill layer "
-+                "(%d experts unfetched) — increase VLLM_MOE_W2_BASE_CACHE_GB",
-+                len(cand) - len(plan))
++            if self._tag == "base":
++                logger.warning_once(
++                    "moe_w2 base cache: pool too small for one prefill layer "
++                    "(%d experts unfetched) — increase "
++                    "VLLM_MOE_W2_BASE_CACHE_GB",
++                    len(cand) - len(plan))
++            else:
++                # expected under the flood damper: the chunk working set
++                # exceeds the cold half of the quality pool; the remainder
++                # is served from planes at base quality
++                logger.debug(
++                    "moe_w2 [%s] prefill ensure deferred %d of %d "
++                    "candidates (hot half protected)",
++                    self._tag, len(cand) - len(plan), len(cand))
 +        return len(plan)
 +
 +    def mark_need_only(self, layers=None) -> int:
