@@ -9,7 +9,7 @@ requires:
   vram_gb: 96
   host_ram_gb: 512
 
-context: 131072
+context: 32768
 load_timeout_s: 3600
 
 # RUNTIME DEPENDENCY, read before serving: this recipe runs
@@ -40,6 +40,8 @@ load_timeout_s: 3600
 # land in the KPI line ("gate base repairs: N").
 env:
   VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}/planes-ds4-tp1"
+  VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs-ds4"
   VLLM_MOE_W2_BASE_CACHE_GB: "62"
   VLLM_MOE_W2_DELTA_GB: "11.5"
   VLLM_MOE_W2_DELTA_SPLIT: "0"
@@ -56,7 +58,7 @@ serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 131072
+  - --max-model-len 32768
   - --gpu-memory-utilization 0.95
   - --max-num-batched-tokens 256
   - --max-num-seqs 1
@@ -69,14 +71,18 @@ warmup:
   decode_requests: 8
 
 suite_params:
+  # C1/32k MTP-1 anchors measured 2026-07-29 (native TP2, eager - the
+  # pre-graphs-rule anchor; geometry-matched pairing per protocol v2).
   gsm8k:
     concurrency: 1
+    baseline: ds4-flash/native-tp2-c1-32k-mtp1-gsm8k
   gpqa:
     concurrency: 1
+    baseline: ds4-flash/native-tp2-c1-32k-mtp1-gpqa
   batch_decode:
     concurrency: [1]
   needle:
-    sizes_words: [8000, 95000]
+    sizes_words: [8000, 22000]
     depth: 0.5
 
 tuning:

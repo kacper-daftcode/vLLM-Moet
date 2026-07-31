@@ -2,8 +2,10 @@
 """Structural checks for bench/ (CI + release gate). Stdlib+PyYAML only.
 
   lint.py                      # recipes, suites, boxes, matrix, all results
-  lint.py --release <id>       # + release gate: every blocking matrix entry
-                               #   must have a non-failed result for <id>
+  lint.py --release <id>       # + release gate: standard blocking entries,
+                               #   or quality entries for *-quality releases
+  lint.py --release <id> --suite quality
+                               #   explicit release-suite override
 
 Exit 1 on any error. Warnings don't fail the lint."""
 
@@ -29,6 +31,29 @@ def err(msg):
 def warn(msg):
     WARNINGS.append(msg)
     print(f"warn:  {msg}")
+
+
+def release_gate_suite(matrix, release, override=None):
+    """Resolve which matrix lane an explicit release must certify."""
+    if override:
+        return override
+    if release == matrix.get("quality_release") or release.endswith("-quality"):
+        return "quality"
+    return "standard"
+
+
+def release_gate_entries(matrix, gate_suite):
+    """Select entries required by the standard or quality release lane."""
+    selected = []
+    for entry in matrix["entries"]:
+        entry_suite = entry.get(
+            "suite", "quality" if entry.get("quality") else "standard")
+        if gate_suite == "quality":
+            if entry.get("quality") and entry_suite == "quality":
+                selected.append(entry)
+        elif entry.get("blocking") and entry_suite == "standard":
+            selected.append(entry)
+    return selected
 
 
 def lint_recipe(rid):
@@ -62,6 +87,10 @@ def lint_recipe(rid):
         if not t.get("objective"):
             err(f"recipe {rid}: tuning without objective")
         for ax in t.get("axes", []):
+            if not isinstance(ax, dict):
+                err(f"recipe {rid}: tuning axis must be a mapping with "
+                    f"name/kind, got {ax!r}")
+                continue
             if ax.get("kind") not in ("env", "serve_json"):
                 err(f"recipe {rid}: unknown tuning axis kind {ax.get('kind')!r}")
             if ax.get("restart") is False and ax.get("kind") == "env" \
@@ -409,6 +438,8 @@ def lint_model_registry(recipes):
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--release", default=None)
+    ap.add_argument("--suite", choices=("standard", "quality"), default=None,
+                    help="release gate lane (normally inferred from release id)")
     args = ap.parse_args()
 
     recipe_ids = common.list_recipe_ids()
@@ -543,6 +574,10 @@ def main():
     if args.release:
         release = (mx["current_release"]
                    if args.release == "current" else args.release)
+        gate_suite = release_gate_suite(mx, release, args.suite)
+        gated_entries = release_gate_entries(mx, gate_suite)
+        if not gated_entries:
+            err(f"release {release}: no {gate_suite} matrix entries to gate")
         historical = set(mx.get("historical_releases", []))
         by_recipe: dict[str, list[tuple[str, dict]]] = {}
         for result_box_id, res in common.iter_results(release):
@@ -552,23 +587,19 @@ def main():
             warn(f"release {release}: legacy schema-1/imported evidence is "
                  "allowlisted as historical; it does not certify a fresh "
                  "live release")
-            for entry in mx["entries"]:
-                if not entry.get("blocking"):
-                    continue
+            for entry in gated_entries:
                 rid = entry["recipe"]
                 statuses = {
                     r.get("status") for _box_id, r
                     in by_recipe.get(rid, [])
                 }
                 if not statuses & {"ok", "partial"}:
-                    err(f"release {release}: blocking recipe {rid} has no "
-                        "historical successful result")
+                    err(f"release {release}: {gate_suite} recipe {rid} has "
+                        "no historical successful result")
         else:
-            for entry in mx["entries"]:
-                if not entry.get("blocking"):
-                    continue
+            for entry in gated_entries:
                 rid = entry["recipe"]
-                expected_suite = entry.get("suite", "standard")
+                expected_suite = entry.get("suite", gate_suite)
                 valid = []
                 for result_box_id, result in by_recipe.get(rid, []):
                     try:
@@ -603,8 +634,8 @@ def main():
                     except Exception:
                         continue
                 if not valid:
-                    err(f"release {release}: blocking recipe {rid} needs a "
-                        f"complete schema-2 live+ok {expected_suite} result")
+                    err(f"release {release}: {gate_suite} recipe {rid} needs "
+                        f"a complete schema-2 live+ok {expected_suite} result")
 
     print(f"\nlint: {len(ERRORS)} error(s), {len(WARNINGS)} warning(s)")
     sys.exit(1 if ERRORS else 0)

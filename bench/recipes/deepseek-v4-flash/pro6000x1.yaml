@@ -8,7 +8,7 @@ requires:
   gpus: 1
   vram_gb: 96
 
-context: 131072
+context: 32768
 load_timeout_s: 2400
 
 # THE one 1xPRO6000 config (user directive 2026-07-30: no FAST/QUALITY split,
@@ -34,6 +34,8 @@ load_timeout_s: 2400
 # /root/logs/bench/b-operational-audit/1xpro-fast*.
 env:
   VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}/planes-ds4-tp1"
+  VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs-ds4"
   VLLM_MOE_W2_DELTA_GB: "3.4"
   VLLM_MOE_W2_DELTA_SPLIT: "0"
   VLLM_MOE_W2_GATE: "0"
@@ -46,8 +48,8 @@ serve_args:
   - --trust-remote-code
   - --kv-cache-dtype fp8
   - --block-size 256
-  - --max-model-len 131072
-  - --gpu-memory-utilization 0.92
+  - --max-model-len 32768
+  - --gpu-memory-utilization 0.95
   - --max-num-batched-tokens 256
   - --max-num-seqs 1
   - --tokenizer-mode deepseek_v4
@@ -59,14 +61,18 @@ warmup:
   decode_requests: 4
 
 suite_params:
+  # C1/32k anchors measured 2026-07-30 under the graphs rule (native TP2,
+  # MTP-2 + FULL_AND_PIECEWISE): geometry-matched pairing per protocol v2.
   gsm8k:
     concurrency: 1
+    baseline: ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k
   gpqa:
     concurrency: 1
+    baseline: ds4-flash/native-tp2-c1-32k-mtp2g-gpqa
   batch_decode:
     concurrency: [1]
   needle:
-    sizes_words: [8000, 98100]
+    sizes_words: [8000, 22000]
     depth: 0.5
 
 tuning:

@@ -10,11 +10,16 @@ gpus:
 host_ram_gb: 1007
 
 runtime: docker
-docker_image: vllm-moet-recipes:v024-db13b2e9c
+docker_image: vllm-moet-recipes:v024-a220c5598
 shm_size: 64g
 
 env:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # /planes mounts /workspace/moet-serve (the whole persistence root); the
+  # DS4 recipes address planes-ds4-tp<N> and packs-ds4 beneath it via the
+  # {planes_cache} placeholder. NCCL P2P measured SLOWER on this PCIe
+  # topology (138-146 vs 155.8 tok/s) - keep it disabled.
+  NCCL_P2P_DISABLE: "1"
 
 models:
   GLM-5.2-NVFP4: /workspace/glm-5.2-nvfp4
@@ -22,6 +27,7 @@ models:
 
 planes_cache:
   GLM-5.2-NVFP4: /workspace/.planes-cache-glm-bench
+  DeepSeek-V4-Flash: /workspace/moet-serve
 
 log_dir: /root/logs/bench
 
