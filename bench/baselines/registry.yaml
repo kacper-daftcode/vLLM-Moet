@@ -80,3 +80,75 @@ baselines:
     measured: 2026-07-24
     provenance: live
     anchors: "86.36% (171/198), pinned schema-v2 native remeasurement"
+  ds4-flash/native-tp2-c1-32k-mtp1-gsm8k:
+    # certified cross-TP pairing (TP1 candidate vs this TP2 anchor,
+    # 2026-07-28 criterion): deepseek-v4-flash/pro6000x1-cache
+    paired_serve_args_sha256: [d80560a51177ef6c7e918a5c7a397215cb9a6dfab4e3a25cb765c9ae92844c7b]
+    file: ds4-flash/native-tp2-c1-32k-mtp1-gsm8k.json
+    artifact_sha256: 558980fd42917f30f5237fa562f1ab940015cebbeea246c2e7f3b772dba26549
+    checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: 9ada175c426ee7994ab5a944e8296a64c494af3aee89ba78fadcf8c709e30c72
+    context: 32768
+    strict: true
+    protocol: {profile: gsm8k, runs: 200, concurrency: 1, max_tokens: 6000, request_overrides: {}}
+    mode: "non-think, greedy, conc 1, MTP-1, eager, 32k"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-30
+    provenance: live
+    anchors: "96.5% (193/200)"
+  ds4-flash/native-tp2-c1-32k-mtp1-gpqa:
+    # certified cross-TP pairing (TP1 candidate vs this TP2 anchor,
+    # 2026-07-28 criterion): deepseek-v4-flash/pro6000x1-cache
+    paired_serve_args_sha256: [d80560a51177ef6c7e918a5c7a397215cb9a6dfab4e3a25cb765c9ae92844c7b]
+    file: ds4-flash/native-tp2-c1-32k-mtp1-gpqa.json
+    artifact_sha256: 46b0c72432eeee5347b154b1593272afefc7329b2325ded920e101fa70f15d6b
+    checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: 9ada175c426ee7994ab5a944e8296a64c494af3aee89ba78fadcf8c709e30c72
+    context: 32768
+    strict: true
+    protocol: {profile: gpqa-diamond, runs: 198, concurrency: 1, max_tokens: 30000, request_overrides: {}}
+    mode: "non-think, greedy, conc 1, MTP-1, eager, 32k"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-30
+    provenance: live
+    anchors: "70.71% (140/198)"
+  ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k:
+    # certified cross-TP pairing (TP1 candidate vs this TP2 anchor,
+    # 2026-07-28 criterion): deepseek-v4-flash/pro6000x1
+    paired_serve_args_sha256: [e3e00c4b1e2ccb3d8737b9aa3d1b99ca10bd97cfa4b52f2491e777f3ed97b0bf]
+    file: ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k.json
+    artifact_sha256: 660ff24d443ef149ec5270f266a014ecb74f83e42cb8dc9bce04930ad8126f11
+    checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: d6a070868fd9b34754e42a2385317da73b357c8ca6d28c29ae1dc74e15298347
+    context: 32768
+    strict: true
+    protocol: {profile: gsm8k, runs: 200, concurrency: 1, max_tokens: 6000, request_overrides: {}}
+    mode: "non-think, greedy, conc 1, MTP-2, graphs, 32k"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-30
+    provenance: live
+    anchors: "96.5% (193/200)"
+  ds4-flash/native-tp2-c1-32k-mtp2g-gpqa:
+    # certified cross-TP pairing (TP1 candidate vs this TP2 anchor,
+    # 2026-07-28 criterion): deepseek-v4-flash/pro6000x1
+    paired_serve_args_sha256: [e3e00c4b1e2ccb3d8737b9aa3d1b99ca10bd97cfa4b52f2491e777f3ed97b0bf]
+    file: ds4-flash/native-tp2-c1-32k-mtp2g-gpqa.json
+    artifact_sha256: cbcfc450d87110192de65d87b47731a991e759d5114fd58727bc9e7ea724d190
+    checkpoint: DeepSeek-V4-Flash
+    model: DeepSeek-V4-Flash
+    model_revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
+    serve_args_sha256: d6a070868fd9b34754e42a2385317da73b357c8ca6d28c29ae1dc74e15298347
+    context: 32768
+    strict: true
+    protocol: {profile: gpqa-diamond, runs: 198, concurrency: 1, max_tokens: 30000, request_overrides: {}}
+    mode: "non-think, greedy, conc 1, MTP-2, graphs, 32k"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-07-30
+    provenance: live
+    anchors: "70.71% (140/198)"

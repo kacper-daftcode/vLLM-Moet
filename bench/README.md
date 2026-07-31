@@ -181,6 +181,9 @@ Running it:
 ```bash
 python3 bench/runner/bench.py run --recipe deepseek-v4-flash/pro6000x2-tp2-maxq \
     --box bench/boxes/rtx-pro6000x4.yaml --release v2026.07.17-quality --suite quality
+
+# Before promoting matrix.yaml quality_release:
+python3 bench/runner/lint.py --release v2026.07.17-quality --suite quality
 ```
 
 ## Regression policy

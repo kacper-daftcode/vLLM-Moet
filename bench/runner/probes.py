@@ -460,10 +460,24 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
             ),
         }
         if spec.get("strict"):
-            checks["serve_args_sha256"] = (
-                spec.get("serve_args_sha256"),
-                serve_args_sha256,
-            )
+            # A candidate normally matches the baseline's serve args verbatim
+            # (geometry lives in serve_args, W2 knobs in env — the maxq/native
+            # pairing). Cross-TP pairings can never satisfy that: native DS4
+            # does not fit one 96 GiB card, so a TP1 candidate's anchor is
+            # necessarily TP2 — which the 2026-07-28 outcome criterion allows
+            # ("serve-args, not silicon") and the accepted closures used
+            # (4x5090 TP4 and both 1xPRO6000 cells vs the TP2 anchors).
+            # Those pairings must be DECLARED: the registry entry lists each
+            # additionally-certified candidate serve_args sha under
+            # `paired_serve_args_sha256`, so every cross-geometry pairing is
+            # a visible, deliberate registry line — never an accident.
+            allowed = [spec.get("serve_args_sha256")]
+            allowed += list(spec.get("paired_serve_args_sha256") or [])
+            if serve_args_sha256 not in allowed:
+                checks["serve_args_sha256"] = (
+                    spec.get("serve_args_sha256"),
+                    serve_args_sha256,
+                )
         mismatch = [
             f"{key}: baseline={left!r}, candidate={right!r}"
             for key, (left, right) in checks.items() if left != right

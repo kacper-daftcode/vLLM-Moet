@@ -17,6 +17,7 @@ sys.path.insert(0, str(RUNNER))
 import common  # noqa: E402
 import envinfo  # noqa: E402
 import integrity  # noqa: E402
+import lint as bench_lint  # noqa: E402
 import probes  # noqa: E402
 from serverctl import Server, ServerFailed  # noqa: E402
 
@@ -28,6 +29,47 @@ _serve_spec.loader.exec_module(serve_recipe)
 
 
 class IntegrityTests(unittest.TestCase):
+    def test_release_gate_selects_quality_lane_independently(self):
+        matrix = {
+            "current_release": "perf-release",
+            "quality_release": "old-quality",
+            "entries": [
+                {"recipe": "m/perf", "blocking": True},
+                {
+                    "recipe": "m/maxq",
+                    "blocking": False,
+                    "quality": True,
+                },
+                {"recipe": "m/advisory", "blocking": False},
+            ],
+        }
+        self.assertEqual(
+            bench_lint.release_gate_suite(
+                matrix, "v2026.07.27-quality"),
+            "quality",
+        )
+        self.assertEqual(
+            [
+                entry["recipe"]
+                for entry in bench_lint.release_gate_entries(
+                    matrix, "quality")
+            ],
+            ["m/maxq"],
+        )
+        self.assertEqual(
+            [
+                entry["recipe"]
+                for entry in bench_lint.release_gate_entries(
+                    matrix, "standard")
+            ],
+            ["m/perf"],
+        )
+        self.assertEqual(
+            bench_lint.release_gate_suite(
+                matrix, "manual-id", override="quality"),
+            "quality",
+        )
+
     def test_canonical_hash_vector(self):
         value = {"b": [True, None, "x"], "a": 1}
         self.assertEqual(
