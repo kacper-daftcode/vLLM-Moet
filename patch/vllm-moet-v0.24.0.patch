@@ -2807,10 +2807,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..992959a04
+index 000000000..89dc77986
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2739 @@
+@@ -0,0 +1,2750 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3109,14 +3109,25 @@ index 000000000..992959a04
 +    if not enabled():
 +        return False
 +    # Draft/speculator modules (DSpark heads, Eagle) are SEPARATE models
-+    # built under a non-default compilation model tag, and their layer
-+    # indices restart at 0 — name-based filtering cannot tell draft
-+    # layer 0 from main layer 0 (measured: DSpark's own MoE stack would
-+    # collide with the main pack/planes namespace). Draft numerics only
-+    # move the acceptance rate — verify forwards through the main stack
-+    # are the correctness boundary — so drafts keep the native path.
++    # built under a non-default compilation model tag; a draft whose layer
++    # indices restart at 0 would collide with the main pack/planes
++    # namespace, so non-backbone tags are excluded by default. Draft
++    # numerics only move the acceptance rate — verify forwards through
++    # the main stack are the correctness boundary.
++    #
++    # EXCEPTION (opt-in, VLLM_MOE_W2_DRAFT=1): the DSpark head numbers its
++    # layers DISJOINTLY (layers.{num_hidden_layers+i}) so it CAN share the
++    # W2 planes path — set VLLM_MOE_W2_NUM_LAYERS to main+draft so the
++    # cutoff admits it. Motivation: the head is 3 full MoE decoder layers
++    # (~10-19 GiB native) which do not fit a 96 GiB card next to the
++    # fully-resident main planes; as 2-bit planes they cost ~5 GiB, and
++    # rejection sampling keeps the OUTPUT distribution exactly the
++    # target's regardless of draft precision.
 +    from vllm.compilation import backends as _cb
-+    if getattr(_cb, "model_tag", "backbone") != "backbone":
++    _tag = getattr(_cb, "model_tag", "backbone")
++    if _tag != "backbone" and not (
++            _tag == "dspark_head"
++            and os.getenv("VLLM_MOE_W2_DRAFT", "0") == "1"):
 +        return False
 +    name = layer_name or ""
 +    if "mtp" in name:
