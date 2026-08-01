@@ -177,10 +177,10 @@ index 000000000..c4b64f25b
 +}
 diff --git a/tests/model_executor/layers/test_moe_w2_persistence.py b/tests/model_executor/layers/test_moe_w2_persistence.py
 new file mode 100644
-index 000000000..9bea4d439
+index 000000000..31f9f62f6
 --- /dev/null
 +++ b/tests/model_executor/layers/test_moe_w2_persistence.py
-@@ -0,0 +1,516 @@
+@@ -0,0 +1,569 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +
@@ -423,7 +423,6 @@ index 000000000..9bea4d439
 +    "dtype,use_v2,use_ubatching,expert_parallel,match",
 +    [
 +        (torch.float16, False, False, False, "require model dtype"),
-+        (torch.bfloat16, True, False, False, "Model Runner V2"),
 +        (torch.bfloat16, False, True, False, "ubatching"),
 +        (torch.bfloat16, False, False, True, "expert parallelism"),
 +    ],
@@ -443,6 +442,60 @@ index 000000000..9bea4d439
 +    with mock.patch(
 +            "vllm.config.get_current_vllm_config", return_value=config):
 +        with pytest.raises(ValueError, match=match):
++            moe_w2_cubit._layer_contract(_contract_layer())
++
++
++def _v2_contract_config(pp_size: int = 1):
++    return SimpleNamespace(
++        model_config=SimpleNamespace(dtype=torch.bfloat16),
++        use_v2_model_runner=True,
++        parallel_config=SimpleNamespace(
++            use_ubatching=False,
++            ubatch_size=0,
++            enable_expert_parallel=False,
++            enable_eplb=False,
++            pipeline_parallel_size=pp_size,
++        ),
++    )
++
++
++def test_w2_config_contract_v2_runner_resident_subset(monkeypatch):
++    """V2 (the DSpark runner) serves the RESIDENT/delta-only contract:
++    accepted with the base cache and confidence gate off, fail-closed on
++    every config that needs the V1-only replay/gate hooks."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
++
++    # resident/delta-only, gate OFF: accepted
++    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
++    monkeypatch.setattr(moe_w2_gate, "_ENABLED", False)
++    with mock.patch(
++            "vllm.config.get_current_vllm_config",
++            return_value=_v2_contract_config()):
++        moe_w2_cubit._layer_contract(_contract_layer())
++
++    # base cache needs the mandatory replay loop: refused
++    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: True)
++    with mock.patch(
++            "vllm.config.get_current_vllm_config",
++            return_value=_v2_contract_config()):
++        with pytest.raises(ValueError, match="base cache"):
++            moe_w2_cubit._layer_contract(_contract_layer())
++    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
++
++    # confidence gate needs the re-forward hooks: refused
++    monkeypatch.setattr(moe_w2_gate, "_ENABLED", True)
++    with mock.patch(
++            "vllm.config.get_current_vllm_config",
++            return_value=_v2_contract_config()):
++        with pytest.raises(ValueError, match="confidence gate"):
++            moe_w2_cubit._layer_contract(_contract_layer())
++    monkeypatch.setattr(moe_w2_gate, "_ENABLED", False)
++
++    # pipeline parallelism: refused
++    with mock.patch(
++            "vllm.config.get_current_vllm_config",
++            return_value=_v2_contract_config(pp_size=2)):
++        with pytest.raises(ValueError, match="pipeline"):
 +            moe_w2_cubit._layer_contract(_contract_layer())
 +
 +
@@ -2754,10 +2807,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..2c053ed42
+index 000000000..992959a04
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2699 @@
+@@ -0,0 +1,2739 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3055,6 +3108,16 @@ index 000000000..2c053ed42
 +    measured with the drafter unmodified."""
 +    if not enabled():
 +        return False
++    # Draft/speculator modules (DSpark heads, Eagle) are SEPARATE models
++    # built under a non-default compilation model tag, and their layer
++    # indices restart at 0 — name-based filtering cannot tell draft
++    # layer 0 from main layer 0 (measured: DSpark's own MoE stack would
++    # collide with the main pack/planes namespace). Draft numerics only
++    # move the acceptance rate — verify forwards through the main stack
++    # are the correctness boundary — so drafts keep the native path.
++    from vllm.compilation import backends as _cb
++    if getattr(_cb, "model_tag", "backbone") != "backbone":
++        return False
 +    name = layer_name or ""
 +    if "mtp" in name:
 +        return False
@@ -3273,9 +3336,39 @@ index 000000000..2c053ed42
 +                "VLLM_MOE_W2 kernels use BF16 intermediates and currently "
 +                f"require model dtype bfloat16, got {cfg.model_config.dtype}")
 +        if cfg.use_v2_model_runner:
-+            raise ValueError(
-+                "VLLM_MOE_W2 is not integrated with Model Runner V2 "
-+                "(mandatory base replay and gate hooks are absent)")
++            # V2 integration (2026-08-01, the DSpark runner): the V2 GPU
++            # model runner carries the manager safe-point + step_end hooks
++            # only. That is the complete contract for RESIDENT/delta-only
++            # serving (a pool miss is served from the resident planes —
++            # correct base quality, no replay needed). The base-cache
++            # mandatory replay loops and the confidence-gate re-forwards
++            # are V1-runner code and are NOT ported: fail closed on any
++            # config that needs them.
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_delta)
++            if moe_w2_delta.base_enabled():
++                raise ValueError(
++                    "VLLM_MOE_W2 base cache (VLLM_MOE_W2_BASE_CACHE_GB) is "
++                    "not integrated with Model Runner V2: the mandatory "
++                    "base replay loop is absent — a pool miss would be a "
++                    "silent quality corruption. Serve base-cache configs "
++                    "on the V1 runner.")
++            try:
++                from vllm.model_executor.layers.quantization.utils import (
++                    moe_w2_gate)
++                gate_on = moe_w2_gate.enabled()
++            except ImportError:
++                gate_on = False
++            if gate_on:
++                raise ValueError(
++                    "the VLLM_MOE_W2 confidence gate is not integrated "
++                    "with Model Runner V2 (gate re-forward hooks are "
++                    "absent). Serve gate configs on the V1 runner or set "
++                    "VLLM_MOE_W2_GATE=0.")
++            if cfg.parallel_config.pipeline_parallel_size > 1:
++                raise ValueError(
++                    "VLLM_MOE_W2 on Model Runner V2 does not support "
++                    "pipeline parallelism.")
 +        pc = cfg.parallel_config
 +        if (getattr(pc, "use_ubatching", False)
 +                or getattr(pc, "ubatch_size", 0)):
@@ -14474,7 +14567,7 @@ index 6b750fe7e..167ad6851 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2ddc5..4571ff600 100644
+index 30ca2ddc5..fe746ec0d 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -47,6 +47,7 @@ from vllm.tasks import SupportedTask
@@ -14758,7 +14851,23 @@ index 30ca2ddc5..4571ff600 100644
  
              if self.lora_config:
                  # Activate LoRA adapters.
-@@ -1424,7 +1596,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1252,6 +1424,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+             del intermediate_tensors
+ 
++        # moe_w2 safe point (V2 integration, resident/delta-only contract):
++        # no background-manager store/CUDA mutation may overlap the forward
++        # (or a capture-time dummy run — pool pointers bake into graphs).
++        # Mirrors the V1 runner's wait at the top of its execute path.
++        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++        for _w2_tier in (moe_w2_delta._BASE_TIER, moe_w2_delta._TIER):
++            if _w2_tier is not None:
++                _w2_tier.wait_manager_idle()
++
+         # Run model.
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # Use explicit cudagraph replay for FULL mode.
+@@ -1424,7 +1605,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              sampler_output.sampled_token_ids,
              num_sampled,
              num_rejected,
@@ -14771,7 +14880,7 @@ index 30ca2ddc5..4571ff600 100644
          )
  
          if self.speculator is not None:
-@@ -1436,7 +1612,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1436,7 +1621,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -14782,7 +14891,7 @@ index 30ca2ddc5..4571ff600 100644
              draft_tokens = self.speculator.propose(
                  input_batch,
                  attn_metadata,
-@@ -1451,14 +1629,25 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1451,16 +1638,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  self.sampler.sampling_states.seeds.gpu,
                  mm_inputs=mm_inputs,
              )
@@ -14809,7 +14918,27 @@ index 30ca2ddc5..4571ff600 100644
 +                lengths=getattr(self.speculator, "_perreq_batch_len", None),
              )
  
++        # moe_w2 (V2 integration): the step is fully executed — the verify
++        # forward AND the speculator's drafts (draft heads run the native
++        # path; only the main stack touches the pool) are done. Close the
++        # tiers' SEEN window + pin scope exactly like the V1 runner does
++        # after its replay/gate loops: eviction exclusions and hit-pins
++        # must scope to ONE step, and the window's marks feed the manager
++        # via the snapshot chain.
++        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++        if (moe_w2_delta._BASE_TIER is not None
++                or moe_w2_delta._TIER is not None):
++            try:
++                if moe_w2_delta._BASE_TIER is not None:
++                    moe_w2_delta._BASE_TIER.step_end()
++                if moe_w2_delta._TIER is not None:
++                    moe_w2_delta._TIER.step_end()
++            except Exception:  # noqa: BLE001 - never crash serving
++                pass
++
          # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+         model_runner_output.kv_connector_output = kv_connector_output
 diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
 index fab53fef7..7bacdbc51 100644
 --- a/vllm/v1/worker/gpu/sample/gumbel.py
