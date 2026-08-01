@@ -1,0 +1,297 @@
+{
+ "schema": 2,
+ "complete": true,
+ "release": "v2026.07.31-quality",
+ "box": "rtx-pro6000x8",
+ "recipe": "deepseek-v4-flash/pro6000x1",
+ "suite": "quality",
+ "provenance": "live",
+ "summary": "1x RTX PRO 6000 - the single unified config (resident, MTP-2, graphs)",
+ "context": 32768,
+ "gpus_used": [
+  3
+ ],
+ "started": "2026-07-31T22:06:02+0000",
+ "serve_env": {
+  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+  "NCCL_P2P_DISABLE": "1",
+  "VLLM_MOE_W2": "1",
+  "VLLM_MOE_W2_PLANES_CACHE": "{planes_cache}/planes-ds4-tp1",
+  "VLLM_MOE_W2_STORE_DIR": "{planes_cache}/packs-ds4",
+  "VLLM_MOE_W2_DELTA_GB": "5.5",
+  "VLLM_MOE_W2_DELTA_PROMOTE": "16",
+  "VLLM_MOE_W2_DELTA_SPLIT": "0",
+  "VLLM_MOE_W2_GATE": "0",
+  "VLLM_MOE_W2_FORCE_POOL": "1",
+  "VLLM_MOE_W2_FORCE_RESIDENT": "1",
+  "VLLM_MOE_W2_PREFILL_FP4": "ensure",
+  "VLLM_MOE_W2_PREFILL_T": "16"
+ },
+ "serve_cmd": "docker run --rm \\\n  --name vllm-moet-bench-8792 \\\n  --gpus '\"device=3\"' \\\n  --network host \\\n  --ipc host \\\n  --shm-size 64g \\\n  -e PORT=8792 \\\n  -v /workspace/vllm-moet/bench/recipes/deepseek-v4-flash/pro6000x1.yaml:/opt/vllm-moet/recipes/deepseek-v4-flash/pro6000x1.yaml:ro \\\n  -v /workspace/vllm-moet/bench/models.yaml:/opt/vllm-moet/models.yaml:ro \\\n  -v /workspace/ds4flash-official:/models/DeepSeek-V4-Flash:ro \\\n  -v /workspace/moet-serve:/planes \\\n  -e PLANES_CACHE=/planes \\\n  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\\n  -e NCCL_P2P_DISABLE=1 \\\n  vllm-moet-recipes:v024-a220c5598 \\\n  deepseek-v4-flash/pro6000x1",
+ "env_fingerprint": {
+  "box": "rtx-pro6000x8",
+  "gpus": [
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02"
+  ],
+  "driver": "610.43.02",
+  "moet_sha": "125d92a0012e3dad94ca27741b2f3cc15b3af5e4",
+  "moet_dirty": false,
+  "patch_sha256": "9442556fce16d3fad9e26a9381cb03f7d14d1a7a127d9d2a96d81cfc7750db30",
+  "cubins": null,
+  "runtime": "docker",
+  "docker_image": "vllm-moet-recipes:v024-a220c5598",
+  "docker_image_id": "sha256:d0b226d58eecbc9362814c88d24fe4362760a2bd5a8c05f49848d47932f29ba6"
+ },
+ "inputs": {
+  "canonicalization": "json-sorted-v1",
+  "recipe_sha256": "2a8e425c2aaee887debc9ce0435c2364f933e7ab70b1346cf8680ad7926184c9",
+  "suite_sha256": "f747356f990b38fb1835844435953053406a028bb7020fead83643c1f30cb999",
+  "recipe_snapshot": {
+   "id": "deepseek-v4-flash/pro6000x1",
+   "role": "quality",
+   "model": "DeepSeek-V4-Flash",
+   "served_name": "deepseek-v4-flash",
+   "summary": "1x RTX PRO 6000 - the single unified config (resident, MTP-2, graphs)",
+   "requires": {
+    "gpus": 1,
+    "vram_gb": 96
+   },
+   "context": 32768,
+   "load_timeout_s": 2400,
+   "env": {
+    "VLLM_MOE_W2": "1",
+    "VLLM_MOE_W2_PLANES_CACHE": "{planes_cache}/planes-ds4-tp1",
+    "VLLM_MOE_W2_STORE_DIR": "{planes_cache}/packs-ds4",
+    "VLLM_MOE_W2_DELTA_GB": "5.5",
+    "VLLM_MOE_W2_DELTA_PROMOTE": "16",
+    "VLLM_MOE_W2_DELTA_SPLIT": "0",
+    "VLLM_MOE_W2_GATE": "0",
+    "VLLM_MOE_W2_FORCE_POOL": "1",
+    "VLLM_MOE_W2_FORCE_RESIDENT": "1",
+    "VLLM_MOE_W2_PREFILL_FP4": "ensure",
+    "VLLM_MOE_W2_PREFILL_T": "16"
+   },
+   "serve_args": [
+    "--trust-remote-code",
+    "--kv-cache-dtype fp8",
+    "--block-size 256",
+    "--max-model-len 32768",
+    "--gpu-memory-utilization 0.97",
+    "--max-num-batched-tokens 256",
+    "--max-num-seqs 1",
+    "--tokenizer-mode deepseek_v4",
+    "--no-scheduler-reserve-full-isl",
+    "--speculative-config {\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":2}",
+    "--compilation-config {\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}"
+   ],
+   "warmup": {
+    "decode_requests": 4
+   },
+   "suite_params": {
+    "gsm8k": {
+     "concurrency": 1,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k"
+    },
+    "gpqa": {
+     "concurrency": 1,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp2g-gpqa"
+    },
+    "batch_decode": {
+     "concurrency": [
+      1
+     ]
+    },
+    "needle": {
+     "sizes_words": [
+      8000,
+      22000
+     ],
+     "depth": 0.5
+    }
+   },
+   "tuning": {
+    "objective": "decode.median_tok_s",
+    "constraints": [
+     "arithmetic.score>=2",
+     "needle.all_pass"
+    ],
+    "axes": []
+   }
+  },
+  "suite_snapshot": {
+   "schema": 1,
+   "suite": "quality",
+   "probes": [
+    {
+     "kind": "quality",
+     "id": "gsm8k",
+     "profile": "gsm8k",
+     "runs": 200,
+     "concurrency": 1,
+     "max_tokens": 6000,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k",
+     "enabled": true
+    },
+    {
+     "kind": "quality",
+     "id": "gpqa",
+     "profile": "gpqa-diamond",
+     "runs": 198,
+     "concurrency": 1,
+     "max_tokens": 30000,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp2g-gpqa",
+     "min_mcnemar_p": 0.05,
+     "max_abs_token_ratio_median_delta_pct": 5.0,
+     "max_abs_token_ratio_geomean_delta_pct": 5.0,
+     "min_token_sign_p": 0.05,
+     "max_extra_truncated_no_answer": 1,
+     "enabled": true
+    },
+    {
+     "kind": "quality",
+     "id": "gpqa-think",
+     "enabled": false,
+     "profile": "gpqa-diamond",
+     "runs": 198,
+     "concurrency": 2,
+     "max_tokens": 65536,
+     "baseline": "ds4-flash/native-tp2-gpqa-think-high",
+     "request_overrides": {
+      "chat_template_kwargs": {
+       "thinking": true,
+       "reasoning_effort": "high"
+      },
+      "temperature": 1.0,
+      "top_p": 1.0
+     }
+    }
+   ]
+  },
+  "models": {
+   "DeepSeek-V4-Flash": {
+    "repo": "deepseek-ai/DeepSeek-V4-Flash",
+    "revision": "6976c7ff1b30a1b2cb7805021b8ba4684041f136"
+   }
+  },
+  "release": "v2026.07.31-quality",
+  "box": "rtx-pro6000x8",
+  "box_sha256": "dd7da978a688e106623737e0c068092b1efc5d2044142dfa6aa357b707f27e1f",
+  "model_manifests": {
+   "DeepSeek-V4-Flash": "72248d76cccb7c8b2d5f05ba8206ba9345337c8af9d3b58ac43a672a5cb3d3f5"
+  }
+ },
+ "probes": {
+  "gsm8k": {
+   "profile": "gsm8k",
+   "runs": 200,
+   "concurrency": 1,
+   "max_tokens": 6000,
+   "request_overrides": {},
+   "accuracy_pct": 96.5,
+   "correct": 193,
+   "of": 200,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 127.1,
+   "tokens_p50": 114,
+   "tokens_p90": 208,
+   "tool_sha": "86cf05c+dirty",
+   "tool_sha256": "f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1",
+   "duration_s": 238.1,
+   "artifact": "quality__deepseek-v4-flash__pro6000x1__gsm8k.json",
+   "artifact_sha256": "4d0512874f756d5073afe48684d585cc23199a36c40efce8578fb515635138bb",
+   "dataset_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+   "historical_baseline": false,
+   "baseline_artifact_sha256": "660ff24d443ef149ec5270f266a014ecb74f83e42cb8dc9bce04930ad8126f11",
+   "baseline": "ds4-flash/native-tp2-c1-32k-mtp2g-gsm8k",
+   "vs_baseline": {
+    "acc_delta_pp": 0.0,
+    "flips_only_baseline": 2,
+    "flips_only_candidate": 2,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": 10.3,
+    "token_p50_delta_pct": 8.1,
+    "token_p90_delta_pct": 17.0,
+    "token_ratio_median_delta_pct": 6.1,
+    "token_ratio_geomean_delta_pct": 8.5,
+    "token_sign_p": 0.00012927981647310304,
+    "token_longer": 124,
+    "token_shorter": 70,
+    "baseline_runaways": 0,
+    "candidate_runaways": 0,
+    "extra_truncated_no_answer": 0,
+    "extra_hit_max_tokens": 0
+   },
+   "status": "ok"
+  },
+  "gpqa": {
+   "profile": "gpqa-diamond",
+   "runs": 198,
+   "concurrency": 1,
+   "max_tokens": 30000,
+   "request_overrides": {},
+   "accuracy_pct": 69.19,
+   "correct": 137,
+   "of": 198,
+   "truncated_no_answer": 1,
+   "hit_max_tokens": 1,
+   "tokens_avg": 574.4,
+   "tokens_p50": 294,
+   "tokens_p90": 755,
+   "tool_sha": "86cf05c+dirty",
+   "tool_sha256": "f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1",
+   "duration_s": 955.5,
+   "artifact": "quality__deepseek-v4-flash__pro6000x1__gpqa.json",
+   "artifact_sha256": "158ed808bbd3392cfb6f52575b1e7034aaf514387d269ec0d74fa4c03566ffe8",
+   "dataset_sha256": "a8472c5a82ea2df8f209c17713aba1a6d409120c609ec0582dae0cb940c7e28c",
+   "historical_baseline": false,
+   "baseline_artifact_sha256": "cbcfc450d87110192de65d87b47731a991e759d5114fd58727bc9e7ea724d190",
+   "baseline": "ds4-flash/native-tp2-c1-32k-mtp2g-gpqa",
+   "vs_baseline": {
+    "acc_delta_pp": -1.52,
+    "flips_only_baseline": 20,
+    "flips_only_candidate": 17,
+    "mcnemar_p": 0.7428293587290682,
+    "token_inflation_pct": 2.1,
+    "token_p50_delta_pct": -4.3,
+    "token_p90_delta_pct": -3.1,
+    "token_ratio_median_delta_pct": 3.3,
+    "token_ratio_geomean_delta_pct": -2.4,
+    "token_sign_p": 0.39262604468046725,
+    "token_longer": 105,
+    "token_shorter": 92,
+    "baseline_runaways": 3,
+    "candidate_runaways": 4,
+    "extra_truncated_no_answer": 1,
+    "extra_hit_max_tokens": 1
+   },
+   "status": "ok"
+  },
+  "gpqa-think": {
+   "status": "disabled"
+  }
+ },
+ "load_time_s": 350.0,
+ "server_metrics_final": {
+  "spec_acceptance_length": 2.54,
+  "draft_acceptance_pct": 77.2,
+  "pool_lines": [],
+  "planes_cache_lines": [
+   "(EngineCore pid=1015) INFO 07-31 22:09:47 [moe_w2_cubit.py:1062] moe_w2: layer 39 planes from cache",
+   "(EngineCore pid=1015) INFO 07-31 22:09:48 [moe_w2_cubit.py:1062] moe_w2: layer 40 planes from cache",
+   "(EngineCore pid=1015) INFO 07-31 22:09:49 [moe_w2_cubit.py:1062] moe_w2: layer 41 planes from cache",
+   "(EngineCore pid=1015) INFO 07-31 22:09:50 [moe_w2_cubit.py:1062] moe_w2: layer 42 planes from cache"
+  ]
+ },
+ "status": "ok",
+ "finished": "2026-07-31T22:31:59+0000"
+}

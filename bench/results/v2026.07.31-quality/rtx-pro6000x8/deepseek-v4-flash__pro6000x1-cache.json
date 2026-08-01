@@ -1,0 +1,303 @@
+{
+ "schema": 2,
+ "complete": true,
+ "release": "v2026.07.31-quality",
+ "box": "rtx-pro6000x8",
+ "recipe": "deepseek-v4-flash/pro6000x1-cache",
+ "suite": "quality",
+ "provenance": "live",
+ "summary": "1x RTX PRO 6000 - RAM-cached base, STRICT gate+repair, MTP-1, graphs",
+ "context": 32768,
+ "gpus_used": [
+  6
+ ],
+ "started": "2026-08-01T01:27:43+0000",
+ "serve_env": {
+  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+  "NCCL_P2P_DISABLE": "1",
+  "VLLM_MOE_W2": "1",
+  "VLLM_MOE_W2_PLANES_CACHE": "{planes_cache}/planes-ds4-tp1",
+  "VLLM_MOE_W2_STORE_DIR": "{planes_cache}/packs-ds4",
+  "VLLM_MOE_W2_BASE_CACHE_GB": "62",
+  "VLLM_MOE_W2_DELTA_GB": "11.5",
+  "VLLM_MOE_W2_DELTA_SPLIT": "0",
+  "VLLM_MOE_W2_DELTA_POLICY": "need",
+  "VLLM_MOE_W2_GATE": "1",
+  "VLLM_MOE_W2_GATE_TAU": "0.70",
+  "VLLM_MOE_W2_GATE_MAX_PROMOTE": "0",
+  "VLLM_MOE_W2_GATE_SPEC_MASK": "1",
+  "VLLM_MOE_W2_PREFILL_FP4": "ensure",
+  "VLLM_MOE_W2_PREFILL_T": "16",
+  "VLLM_MOE_W2_REPLAY_MODE": "strict"
+ },
+ "serve_cmd": "docker run --rm \\\n  --name vllm-moet-bench-8794 \\\n  --gpus '\"device=6\"' \\\n  --network host \\\n  --ipc host \\\n  --shm-size 64g \\\n  -e PORT=8794 \\\n  -v /workspace/vllm-moet/bench/recipes/deepseek-v4-flash/pro6000x1-cache.yaml:/opt/vllm-moet/recipes/deepseek-v4-flash/pro6000x1-cache.yaml:ro \\\n  -v /workspace/vllm-moet/bench/models.yaml:/opt/vllm-moet/models.yaml:ro \\\n  -v /workspace/ds4flash-official:/models/DeepSeek-V4-Flash:ro \\\n  -v /workspace/moet-serve:/planes \\\n  -e PLANES_CACHE=/planes \\\n  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\\n  -e NCCL_P2P_DISABLE=1 \\\n  vllm-moet-recipes:v024-a220c5598 \\\n  deepseek-v4-flash/pro6000x1-cache",
+ "env_fingerprint": {
+  "box": "rtx-pro6000x8",
+  "gpus": [
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02"
+  ],
+  "driver": "610.43.02",
+  "moet_sha": "125d92a0012e3dad94ca27741b2f3cc15b3af5e4",
+  "moet_dirty": false,
+  "patch_sha256": "9442556fce16d3fad9e26a9381cb03f7d14d1a7a127d9d2a96d81cfc7750db30",
+  "cubins": null,
+  "runtime": "docker",
+  "docker_image": "vllm-moet-recipes:v024-a220c5598",
+  "docker_image_id": "sha256:d0b226d58eecbc9362814c88d24fe4362760a2bd5a8c05f49848d47932f29ba6"
+ },
+ "inputs": {
+  "canonicalization": "json-sorted-v1",
+  "recipe_sha256": "e95b78ff50e3a5f5d8284568b83a41022da7fbae2b1730c876a7aa9194a35d07",
+  "suite_sha256": "1b197713b891f20a7bfc11ffe4ad5e4a7898d5547a4e28166fdb3529cdd4b2c3",
+  "recipe_snapshot": {
+   "id": "deepseek-v4-flash/pro6000x1-cache",
+   "role": "quality",
+   "model": "DeepSeek-V4-Flash",
+   "served_name": "deepseek-v4-flash",
+   "summary": "1x RTX PRO 6000 - RAM-cached base, STRICT gate+repair, MTP-1, graphs",
+   "requires": {
+    "gpus": 1,
+    "vram_gb": 96,
+    "host_ram_gb": 512
+   },
+   "context": 32768,
+   "load_timeout_s": 3600,
+   "env": {
+    "VLLM_MOE_W2": "1",
+    "VLLM_MOE_W2_PLANES_CACHE": "{planes_cache}/planes-ds4-tp1",
+    "VLLM_MOE_W2_STORE_DIR": "{planes_cache}/packs-ds4",
+    "VLLM_MOE_W2_BASE_CACHE_GB": "62",
+    "VLLM_MOE_W2_DELTA_GB": "11.5",
+    "VLLM_MOE_W2_DELTA_SPLIT": "0",
+    "VLLM_MOE_W2_DELTA_POLICY": "need",
+    "VLLM_MOE_W2_GATE": "1",
+    "VLLM_MOE_W2_GATE_TAU": "0.70",
+    "VLLM_MOE_W2_GATE_MAX_PROMOTE": "0",
+    "VLLM_MOE_W2_GATE_SPEC_MASK": "1",
+    "VLLM_MOE_W2_PREFILL_FP4": "ensure",
+    "VLLM_MOE_W2_PREFILL_T": "16",
+    "VLLM_MOE_W2_REPLAY_MODE": "strict"
+   },
+   "serve_args": [
+    "--trust-remote-code",
+    "--kv-cache-dtype fp8",
+    "--block-size 256",
+    "--max-model-len 32768",
+    "--gpu-memory-utilization 0.95",
+    "--max-num-batched-tokens 256",
+    "--max-num-seqs 1",
+    "--tokenizer-mode deepseek_v4",
+    "--no-scheduler-reserve-full-isl",
+    "--speculative-config {\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":1}",
+    "--compilation-config {\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}"
+   ],
+   "warmup": {
+    "decode_requests": 8
+   },
+   "suite_params": {
+    "gsm8k": {
+     "concurrency": 1,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp1-gsm8k"
+    },
+    "gpqa": {
+     "concurrency": 1,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp1-gpqa"
+    },
+    "batch_decode": {
+     "concurrency": [
+      1
+     ]
+    },
+    "needle": {
+     "sizes_words": [
+      8000,
+      22000
+     ],
+     "depth": 0.5
+    }
+   },
+   "tuning": {
+    "objective": "decode.median_tok_s",
+    "constraints": [
+     "arithmetic.score>=2",
+     "needle.all_pass"
+    ],
+    "axes": []
+   }
+  },
+  "suite_snapshot": {
+   "schema": 1,
+   "suite": "quality",
+   "probes": [
+    {
+     "kind": "quality",
+     "id": "gsm8k",
+     "profile": "gsm8k",
+     "runs": 200,
+     "concurrency": 1,
+     "max_tokens": 6000,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp1-gsm8k",
+     "enabled": true
+    },
+    {
+     "kind": "quality",
+     "id": "gpqa",
+     "profile": "gpqa-diamond",
+     "runs": 198,
+     "concurrency": 1,
+     "max_tokens": 30000,
+     "baseline": "ds4-flash/native-tp2-c1-32k-mtp1-gpqa",
+     "min_mcnemar_p": 0.05,
+     "max_abs_token_ratio_median_delta_pct": 5.0,
+     "max_abs_token_ratio_geomean_delta_pct": 5.0,
+     "min_token_sign_p": 0.05,
+     "max_extra_truncated_no_answer": 1,
+     "enabled": true
+    },
+    {
+     "kind": "quality",
+     "id": "gpqa-think",
+     "enabled": false,
+     "profile": "gpqa-diamond",
+     "runs": 198,
+     "concurrency": 2,
+     "max_tokens": 65536,
+     "baseline": "ds4-flash/native-tp2-gpqa-think-high",
+     "request_overrides": {
+      "chat_template_kwargs": {
+       "thinking": true,
+       "reasoning_effort": "high"
+      },
+      "temperature": 1.0,
+      "top_p": 1.0
+     }
+    }
+   ]
+  },
+  "models": {
+   "DeepSeek-V4-Flash": {
+    "repo": "deepseek-ai/DeepSeek-V4-Flash",
+    "revision": "6976c7ff1b30a1b2cb7805021b8ba4684041f136"
+   }
+  },
+  "release": "v2026.07.31-quality",
+  "box": "rtx-pro6000x8",
+  "box_sha256": "dd7da978a688e106623737e0c068092b1efc5d2044142dfa6aa357b707f27e1f",
+  "model_manifests": {
+   "DeepSeek-V4-Flash": "72248d76cccb7c8b2d5f05ba8206ba9345337c8af9d3b58ac43a672a5cb3d3f5"
+  }
+ },
+ "probes": {
+  "gsm8k": {
+   "profile": "gsm8k",
+   "runs": 200,
+   "concurrency": 1,
+   "max_tokens": 6000,
+   "request_overrides": {},
+   "accuracy_pct": 97.0,
+   "correct": 194,
+   "of": 200,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 124.5,
+   "tokens_p50": 114,
+   "tokens_p90": 197,
+   "tool_sha": "86cf05c+dirty",
+   "tool_sha256": "f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1",
+   "duration_s": 875.8,
+   "artifact": "quality__deepseek-v4-flash__pro6000x1-cache__gsm8k.json",
+   "artifact_sha256": "b2c3614d916899fd51ca5d9c71ed4b5eff1f6b695b60eb4ebb563d67e1df739a",
+   "dataset_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+   "historical_baseline": false,
+   "baseline_artifact_sha256": "558980fd42917f30f5237fa562f1ab940015cebbeea246c2e7f3b772dba26549",
+   "baseline": "ds4-flash/native-tp2-c1-32k-mtp1-gsm8k",
+   "vs_baseline": {
+    "acc_delta_pp": 0.5,
+    "flips_only_baseline": 1,
+    "flips_only_candidate": 2,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": 8.0,
+    "token_p50_delta_pct": 8.1,
+    "token_p90_delta_pct": 13.8,
+    "token_ratio_median_delta_pct": 6.1,
+    "token_ratio_geomean_delta_pct": 7.1,
+    "token_sign_p": 6.771563217990284e-06,
+    "token_longer": 128,
+    "token_shorter": 65,
+    "baseline_runaways": 0,
+    "candidate_runaways": 0,
+    "extra_truncated_no_answer": 0,
+    "extra_hit_max_tokens": 0
+   },
+   "status": "ok"
+  },
+  "gpqa": {
+   "profile": "gpqa-diamond",
+   "runs": 198,
+   "concurrency": 1,
+   "max_tokens": 30000,
+   "request_overrides": {},
+   "accuracy_pct": 70.2,
+   "correct": 139,
+   "of": 198,
+   "truncated_no_answer": 1,
+   "hit_max_tokens": 1,
+   "tokens_avg": 579.5,
+   "tokens_p50": 308,
+   "tokens_p90": 812,
+   "tool_sha": "86cf05c+dirty",
+   "tool_sha256": "f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1",
+   "duration_s": 4602.3,
+   "artifact": "quality__deepseek-v4-flash__pro6000x1-cache__gpqa.json",
+   "artifact_sha256": "0845c879bf6ad818457e7921b6e48f03aeccf569e45496d150c784189b117de5",
+   "dataset_sha256": "a8472c5a82ea2df8f209c17713aba1a6d409120c609ec0582dae0cb940c7e28c",
+   "historical_baseline": false,
+   "baseline_artifact_sha256": "46b0c72432eeee5347b154b1593272afefc7329b2325ded920e101fa70f15d6b",
+   "baseline": "ds4-flash/native-tp2-c1-32k-mtp1-gpqa",
+   "vs_baseline": {
+    "acc_delta_pp": -0.51,
+    "flips_only_baseline": 18,
+    "flips_only_candidate": 17,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": 26.3,
+    "token_p50_delta_pct": 0.5,
+    "token_p90_delta_pct": 5.8,
+    "token_ratio_median_delta_pct": 3.1,
+    "token_ratio_geomean_delta_pct": 6.2,
+    "token_sign_p": 0.009757467919632565,
+    "token_longer": 116,
+    "token_shorter": 79,
+    "baseline_runaways": 3,
+    "candidate_runaways": 3,
+    "extra_truncated_no_answer": 1,
+    "extra_hit_max_tokens": 1
+   },
+   "status": "failed"
+  },
+  "gpqa-think": {
+   "status": "disabled"
+  }
+ },
+ "load_time_s": 230.0,
+ "server_metrics_final": {
+  "spec_acceptance_length": 1.94,
+  "draft_acceptance_pct": 93.9,
+  "pool_lines": [],
+  "planes_cache_lines": []
+ },
+ "status": "partial",
+ "failed_probes": [
+  "gpqa"
+ ],
+ "log_tail": "(APIServer pid=1) INFO 08-01 03:00:07 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.82, Accepted throughput: 7.00 tokens/s, Drafted throughput: 8.50 tokens/s, Accepted: 70 tokens, Drafted: 85 tokens, Per-position acceptance rate: 0.824, Avg Draft acceptance rate: 82.4%\n(APIServer pid=1) INFO:     127.0.0.1:39356 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO:     127.0.0.1:39370 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:00:17 [loggers.py:273] Engine 000: Avg prompt throughput: 15.3 tokens/s, Avg generation throughput: 24.5 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:00:17 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.94, Accepted throughput: 11.90 tokens/s, Drafted throughput: 12.60 tokens/s, Accepted: 119 tokens, Drafted: 126 tokens, Per-position acceptance rate: 0.944, Avg Draft acceptance rate: 94.4%\n(APIServer pid=1) INFO:     127.0.0.1:38342 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:00:27 [loggers.py:273] Engine 000: Avg prompt throughput: 50.2 tokens/s, Avg generation throughput: 16.4 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:00:27 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.90, Accepted throughput: 7.70 tokens/s, Drafted throughput: 8.60 tokens/s, Accepted: 77 tokens, Drafted: 86 tokens, Per-position acceptance rate: 0.895, Avg Draft acceptance rate: 89.5%\n(APIServer pid=1) INFO 08-01 03:00:37 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 30.9 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:00:37 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.96, Accepted throughput: 15.10 tokens/s, Drafted throughput: 15.80 tokens/s, Accepted: 151 tokens, Drafted: 158 tokens, Per-position acceptance rate: 0.956, Avg Draft acceptance rate: 95.6%\n(EngineCore pid=1015) INFO 08-01 03:00:45 [moe_w2_delta.py:1692] [base] KPI: replay 68.2% of last 500 steps (avg 1.6 missing pairs/step; cumulative 46.5% of 72000) — pool 9405 slots = 85.4% of experts; second-order replays: 47; gate base repairs: 52; replay EMA 73%. Rising replay% => raise the pool (VLLM_MOE_W2_BASE_CACHE_GB) before touching anything else.\n(APIServer pid=1) INFO 08-01 03:00:47 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 17.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.9%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:00:47 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.88, Accepted throughput: 8.00 tokens/s, Drafted throughput: 9.10 tokens/s, Accepted: 80 tokens, Drafted: 91 tokens, Per-position acceptance rate: 0.879, Avg Draft acceptance rate: 87.9%\n(APIServer pid=1) INFO:     127.0.0.1:59134 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:00:57 [loggers.py:273] Engine 000: Avg prompt throughput: 12.6 tokens/s, Avg generation throughput: 24.3 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.9%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:00:57 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.95, Accepted throughput: 11.80 tokens/s, Drafted throughput: 12.40 tokens/s, Accepted: 118 tokens, Drafted: 124 tokens, Per-position acceptance rate: 0.952, Avg Draft acceptance rate: 95.2%\n(APIServer pid=1) INFO 08-01 03:01:07 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 35.3 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:01:07 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.97, Accepted throughput: 17.40 tokens/s, Drafted throughput: 18.00 tokens/s, Accepted: 174 tokens, Drafted: 180 tokens, Per-position acceptance rate: 0.967, Avg Draft acceptance rate: 96.7%\n(APIServer pid=1) INFO:     127.0.0.1:55568 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO:     127.0.0.1:60120 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:01:17 [loggers.py:273] Engine 000: Avg prompt throughput: 8.1 tokens/s, Avg generation throughput: 15.0 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 1.1%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:01:17 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.90, Accepted throughput: 7.10 tokens/s, Drafted throughput: 7.90 tokens/s, Accepted: 71 tokens, Drafted: 79 tokens, Per-position acceptance rate: 0.899, Avg Draft acceptance rate: 89.9%\n(EngineCore pid=1015) INFO 08-01 03:01:24 [moe_w2_delta.py:1692] [base] KPI: replay 65.8% of last 500 steps (avg 1.2 missing pairs/step; cumulative 46.6% of 72500) — pool 9405 slots = 85.4% of experts; second-order replays: 31; gate base repairs: 48; replay EMA 64%. Rising replay% => raise the pool (VLLM_MOE_W2_BASE_CACHE_GB) before touching anything else.\n(APIServer pid=1) INFO:     127.0.0.1:44316 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:01:27 [loggers.py:273] Engine 000: Avg prompt throughput: 53.3 tokens/s, Avg generation throughput: 23.5 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:01:27 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.92, Accepted throughput: 11.20 tokens/s, Drafted throughput: 12.20 tokens/s, Accepted: 112 tokens, Drafted: 122 tokens, Per-position acceptance rate: 0.918, Avg Draft acceptance rate: 91.8%\n(APIServer pid=1) INFO 08-01 03:01:37 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 22.8 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:01:37 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.88, Accepted throughput: 10.70 tokens/s, Drafted throughput: 12.10 tokens/s, Accepted: 107 tokens, Drafted: 121 tokens, Per-position acceptance rate: 0.884, Avg Draft acceptance rate: 88.4%\n(APIServer pid=1) INFO:     127.0.0.1:54990 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:01:47 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 17.9 tokens/s, Running: 0 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.0%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:01:47 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.84, Accepted throughput: 8.20 tokens/s, Drafted throughput: 9.80 tokens/s, Accepted: 82 tokens, Drafted: 98 tokens, Per-position acceptance rate: 0.837, Avg Draft acceptance rate: 83.7%\n(APIServer pid=1) INFO 08-01 03:01:57 [loggers.py:273] Engine 000: Avg prompt throughput: 29.7 tokens/s, Avg generation throughput: 14.5 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:01:57 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.82, Accepted throughput: 6.50 tokens/s, Drafted throughput: 7.90 tokens/s, Accepted: 65 tokens, Drafted: 79 tokens, Per-position acceptance rate: 0.823, Avg Draft acceptance rate: 82.3%\n(APIServer pid=1) INFO:     127.0.0.1:52520 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:02:07 [loggers.py:273] Engine 000: Avg prompt throughput: 12.2 tokens/s, Avg generation throughput: 18.6 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:02:07 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.89, Accepted throughput: 8.70 tokens/s, Drafted throughput: 9.80 tokens/s, Accepted: 87 tokens, Drafted: 98 tokens, Per-position acceptance rate: 0.888, Avg Draft acceptance rate: 88.8%\n(EngineCore pid=1015) INFO 08-01 03:02:11 [moe_w2_delta.py:1692] [base] KPI: replay 71.0% of last 500 steps (avg 1.5 missing pairs/step; cumulative 46.8% of 73000) — pool 9405 slots = 85.4% of experts; second-order replays: 44; gate base repairs: 63; replay EMA 68%. Rising replay% => raise the pool (VLLM_MOE_W2_BASE_CACHE_GB) before touching anything else.\n(APIServer pid=1) INFO:     127.0.0.1:42810 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:02:17 [loggers.py:273] Engine 000: Avg prompt throughput: 19.8 tokens/s, Avg generation throughput: 23.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:02:17 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.91, Accepted throughput: 11.00 tokens/s, Drafted throughput: 12.10 tokens/s, Accepted: 110 tokens, Drafted: 121 tokens, Per-position acceptance rate: 0.909, Avg Draft acceptance rate: 90.9%\n(APIServer pid=1) INFO 08-01 03:02:27 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 43.7 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.9%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:02:27 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.97, Accepted throughput: 21.50 tokens/s, Drafted throughput: 22.20 tokens/s, Accepted: 215 tokens, Drafted: 222 tokens, Per-position acceptance rate: 0.968, Avg Draft acceptance rate: 96.8%\n(APIServer pid=1) INFO:     127.0.0.1:37910 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:02:37 [loggers.py:273] Engine 000: Avg prompt throughput: 19.4 tokens/s, Avg generation throughput: 19.1 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:02:37 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.92, Accepted throughput: 9.10 tokens/s, Drafted throughput: 9.90 tokens/s, Accepted: 91 tokens, Drafted: 99 tokens, Per-position acceptance rate: 0.919, Avg Draft acceptance rate: 91.9%\n(APIServer pid=1) INFO 08-01 03:02:47 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 21.9 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:02:47 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.90, Accepted throughput: 10.40 tokens/s, Drafted throughput: 11.50 tokens/s, Accepted: 104 tokens, Drafted: 115 tokens, Per-position acceptance rate: 0.904, Avg Draft acceptance rate: 90.4%\n(EngineCore pid=1015) INFO 08-01 03:02:47 [moe_w2_delta.py:1692] [base] KPI: replay 61.6% of last 500 steps (avg 1.1 missing pairs/step; cumulative 46.9% of 73500) — pool 9405 slots = 85.4% of experts; second-order replays: 32; gate base repairs: 44; replay EMA 53%. Rising replay% => raise the pool (VLLM_MOE_W2_BASE_CACHE_GB) before touching anything else.\n(APIServer pid=1) INFO 08-01 03:02:57 [loggers.py:273] Engine 000: Avg prompt throughput: 0.0 tokens/s, Avg generation throughput: 35.7 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.9%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:02:57 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.95, Accepted throughput: 17.40 tokens/s, Drafted throughput: 18.30 tokens/s, Accepted: 174 tokens, Drafted: 183 tokens, Per-position acceptance rate: 0.951, Avg Draft acceptance rate: 95.1%\n(APIServer pid=1) INFO:     127.0.0.1:55922 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:03:07 [loggers.py:273] Engine 000: Avg prompt throughput: 20.6 tokens/s, Avg generation throughput: 35.7 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:03:07 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.95, Accepted throughput: 17.40 tokens/s, Drafted throughput: 18.30 tokens/s, Accepted: 174 tokens, Drafted: 183 tokens, Per-position acceptance rate: 0.951, Avg Draft acceptance rate: 95.1%\n(APIServer pid=1) INFO:     127.0.0.1:57576 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(APIServer pid=1) INFO 08-01 03:03:17 [loggers.py:273] Engine 000: Avg prompt throughput: 24.0 tokens/s, Avg generation throughput: 19.9 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:03:17 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.88, Accepted throughput: 9.30 tokens/s, Drafted throughput: 10.60 tokens/s, Accepted: 93 tokens, Drafted: 106 tokens, Per-position acceptance rate: 0.877, Avg Draft acceptance rate: 87.7%\n(APIServer pid=1) INFO:     127.0.0.1:35216 - \"POST /v1/chat/completions HTTP/1.1\" 200 OK\n(EngineCore pid=1015) INFO 08-01 03:03:20 [moe_w2_delta.py:1692] [base] KPI: replay 57.4% of last 500 steps (avg 1.0 missing pairs/step; cumulative 46.9% of 74000) — pool 9405 slots = 85.4% of experts; second-order replays: 25; gate base repairs: 28; replay EMA 67%. Rising replay% => raise the pool (VLLM_MOE_W2_BASE_CACHE_GB) before touching anything else.\n(APIServer pid=1) INFO 08-01 03:03:27 [loggers.py:273] Engine 000: Avg prompt throughput: 17.2 tokens/s, Avg generation throughput: 31.6 tokens/s, Running: 1 reqs, Waiting: 0 reqs, GPU KV cache usage: 0.8%, Prefix cache hit rate: 0.0%\n(APIServer pid=1) INFO 08-01 03:03:27 [metrics.py:120] SpecDecoding metrics: Mean acceptance length: 1.94, Accepted throughput: 15.30 tokens/s, Drafted throughput: 16.30 tokens/s, Accepted: 153 tokens, Drafted: 163 tokens, Per-position acceptance rate: 0.939, Avg Draft acceptance rate: 93.9%\n(APIServer pid=1) INFO 08-01 03:03:32 [launcher.py:100] [shutdown] API server: shutdown triggered\n(APIServer pid=1) INFO 08-01 03:03:32 [launcher.py:116] [shutdown] API server: stopping engine client mode=abort timeout=0s\n(APIServer pid=1) INFO 08-01 03:03:32 [core_client.py:655] [shutdown] MPClient: start timeout=0s\n(APIServer pid=1) INFO 08-01 03:03:32 [core_client.py:657] [shutdown] MPClient: stopping engine manager\n(APIServer pid=1) WARNING 08-01 03:03:32 [utils.py:620] [shutdown] Process manager: force killing remaining processes count=1\n(EngineCore pid=1015) INFO 08-01 03:03:32 [core.py:1255] [shutdown] EngineCore: trigger received signal=SIGTERM\n(EngineCore pid=1015) INFO 08-01 03:03:32 [core.py:1374] [shutdown] EngineCore: start mode=abort timeout=0s\n(EngineCore pid=1015) INFO 08-01 03:03:32 [core.py:1405] [shutdown] EngineCore: request processing complete; starting resource teardown\n(EngineCore pid=1015) INFO 08-01 03:03:32 [core.py:1268] [shutdown] EngineCore: exiting busy loop\n(APIServer pid=1) INFO 08-01 03:03:32 [core_client.py:659] [shutdown] MPClient: engine manager stopped\n(APIServer pid=1) INFO 08-01 03:03:32 [core_client.py:660] [shutdown] MPClient: cleaning up background resources\n(APIServer pid=1) INFO 08-01 03:03:32 [core_client.py:662] [shutdown] MPClient: complete\n(APIServer pid=1) INFO 08-01 03:03:32 [launcher.py:125] [shutdown] API server: engine client stopped\n(APIServer pid=1) INFO 08-01 03:03:32 [launcher.py:128] [shutdown] API server: signalling HTTP server shutdown\n(APIServer pid=1) INFO 08-01 03:03:32 [launcher.py:149] [shutdown] API server: shutting down FastAPI HTTP server\n(APIServer pid=1) INFO:     Shutting down\n(APIServer pid=1) INFO:     Waiting for application shutdown.\n(APIServer pid=1) INFO:     Application shutdown complete.\n/usr/lib/python3.12/multiprocessing/resource_tracker.py:279: UserWarning: resource_tracker: There appear to be 1 leaked semaphore objects to clean up at shutdown\n  warnings.warn('resource_tracker: There appear to be %d '\n",
+ "finished": "2026-08-01T03:03:36+0000"
+}

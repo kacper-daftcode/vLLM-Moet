@@ -12,15 +12,19 @@ historical_releases:
 runtime_manifests:
   v2026.07.31-quality:
     rtx-pro6000x8:
-      # single-runtime campaign (r6): all three DS4 cells served
-      # v024-a220c5598 — the moe_w2 lazy-promotion repair line (unfired-
-      # consume retry deb3556af + prefill flood damper 132671e5e + chained
-      # seen-snapshots a220c5598). moet_sha is the publication commit whose
-      # patch/ trio described this runtime at serve time.
+      # INCOMPLETE campaign (2026-08-01): maxq + pro6000x1 live double-green
+      # on v024-a220c5598 (docker; the moe_w2 lazy-promotion repair line:
+      # unfired-consume retry deb3556af + prefill flood damper 132671e5e +
+      # chained seen-snapshots a220c5598), serve-time HEAD 125d92a. The
+      # strict cache cell failed its GPQA token gate on this runtime
+      # (geo/sign; freq-accrual follow-up in the ledger) and the campaign
+      # stopped for the DS4-Flash-0731 model migration. quality_release
+      # stays at v2026.07.30-quality; these fields describe what the two
+      # green results served (docker runtime: image_id, no repo cubins).
       patch_sha256: 9442556fce16d3fad9e26a9381cb03f7d14d1a7a127d9d2a96d81cfc7750db30
-      cubins: c99ce7596131c1915d1a90a6a36bf84b9de56de01b71e63dc6ce1f1b43211c01
-      moet_sha: 2a1b9e74831036bbb638c27383f8448e9580adae
-      vllm_sha: a220c5598cdb400ea9c33b197808847a9732410e
+      cubins: null
+      moet_sha: 125d92a0012e3dad94ca27741b2f3cc15b3af5e4
+      image_id: sha256:d0b226d58eecbc9362814c88d24fe4362760a2bd5a8c05f49848d47932f29ba6
       model_manifests:
         DeepSeek-V4-Flash: 72248d76cccb7c8b2d5f05ba8206ba9345337c8af9d3b58ac43a672a5cb3d3f5
   v2026.07.30-quality:
@@ -45,7 +49,7 @@ runtime_manifests:
 # Quality campaigns (bench/suites/quality.yaml vs bench/baselines/) are
 # expensive and run on their own cadence; the README quality table renders
 # from this release id.
-quality_release: v2026.07.31-quality
+quality_release: v2026.07.30-quality
 regression_threshold_pct: 5
 
 entries:

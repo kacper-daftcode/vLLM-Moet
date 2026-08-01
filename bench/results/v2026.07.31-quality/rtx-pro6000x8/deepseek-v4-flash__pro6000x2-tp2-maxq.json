@@ -1,0 +1,279 @@
+{
+ "schema": 2,
+ "complete": true,
+ "release": "v2026.07.31-quality",
+ "box": "rtx-pro6000x8",
+ "recipe": "deepseek-v4-flash/pro6000x2-tp2-maxq",
+ "suite": "quality",
+ "provenance": "live",
+ "summary": "2x RTX PRO 6000 TP2 - max-quality candidate (revalidation required)",
+ "context": 131072,
+ "gpus_used": [
+  0,
+  1
+ ],
+ "started": "2026-07-31T22:06:03+0000",
+ "serve_env": {
+  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+  "NCCL_P2P_DISABLE": "1",
+  "VLLM_MOE_W2": "1",
+  "VLLM_MOE_W2_DELTA_GB": "34",
+  "VLLM_MOE_W2_DELTA_SPLIT": "1",
+  "VLLM_MOE_W2_GATE": "1",
+  "VLLM_MOE_W2_GATE_TAU": "0.60",
+  "VLLM_MOE_W2_GATE_MAX_PROMOTE": "0",
+  "VLLM_MOE_W2_PREFILL_FP4": "ensure",
+  "VLLM_MOE_W2_PREFILL_T": "16"
+ },
+ "serve_cmd": "docker run --rm \\\n  --name vllm-moet-bench-8791 \\\n  --gpus '\"device=0,1\"' \\\n  --network host \\\n  --ipc host \\\n  --shm-size 64g \\\n  -e PORT=8791 \\\n  -v /workspace/vllm-moet/bench/recipes/deepseek-v4-flash/pro6000x2-tp2-maxq.yaml:/opt/vllm-moet/recipes/deepseek-v4-flash/pro6000x2-tp2-maxq.yaml:ro \\\n  -v /workspace/vllm-moet/bench/models.yaml:/opt/vllm-moet/models.yaml:ro \\\n  -v /workspace/ds4flash-official:/models/DeepSeek-V4-Flash:ro \\\n  -v /workspace/moet-serve:/planes \\\n  -e PLANES_CACHE=/planes \\\n  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\\n  -e NCCL_P2P_DISABLE=1 \\\n  vllm-moet-recipes:v024-a220c5598 \\\n  deepseek-v4-flash/pro6000x2-tp2-maxq",
+ "env_fingerprint": {
+  "box": "rtx-pro6000x8",
+  "gpus": [
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02"
+  ],
+  "driver": "610.43.02",
+  "moet_sha": "125d92a0012e3dad94ca27741b2f3cc15b3af5e4",
+  "moet_dirty": false,
+  "patch_sha256": "9442556fce16d3fad9e26a9381cb03f7d14d1a7a127d9d2a96d81cfc7750db30",
+  "cubins": null,
+  "runtime": "docker",
+  "docker_image": "vllm-moet-recipes:v024-a220c5598",
+  "docker_image_id": "sha256:d0b226d58eecbc9362814c88d24fe4362760a2bd5a8c05f49848d47932f29ba6"
+ },
+ "inputs": {
+  "canonicalization": "json-sorted-v1",
+  "recipe_sha256": "b199626b39f021135756be6d647404cf70749a0f4cc293f4f8bd9ed3ed5a4858",
+  "suite_sha256": "eb549c98d9af8edb42cd9a56565c5b73a3c98d319315f9decc26609c3a050e0f",
+  "recipe_snapshot": {
+   "id": "deepseek-v4-flash/pro6000x2-tp2-maxq",
+   "model": "DeepSeek-V4-Flash",
+   "served_name": "deepseek-v4-flash",
+   "summary": "2x RTX PRO 6000 TP2 - max-quality candidate (revalidation required)",
+   "requires": {
+    "gpus": 2,
+    "vram_gb": 96
+   },
+   "context": 131072,
+   "load_timeout_s": 2400,
+   "env": {
+    "VLLM_MOE_W2": "1",
+    "VLLM_MOE_W2_DELTA_GB": "34",
+    "VLLM_MOE_W2_DELTA_SPLIT": "1",
+    "VLLM_MOE_W2_GATE": "1",
+    "VLLM_MOE_W2_GATE_TAU": "0.60",
+    "VLLM_MOE_W2_GATE_MAX_PROMOTE": "0",
+    "VLLM_MOE_W2_PREFILL_FP4": "ensure",
+    "VLLM_MOE_W2_PREFILL_T": "16"
+   },
+   "serve_args": [
+    "--trust-remote-code",
+    "--tensor-parallel-size 2",
+    "--disable-custom-all-reduce",
+    "--kv-cache-dtype fp8",
+    "--block-size 256",
+    "--max-model-len 131072",
+    "--gpu-memory-utilization 0.92",
+    "--max-num-batched-tokens 4096",
+    "--max-num-seqs 2",
+    "--tokenizer-mode deepseek_v4",
+    "--no-scheduler-reserve-full-isl",
+    "--speculative-config {\"method\":\"deepseek_mtp\",\"num_speculative_tokens\":2}",
+    "--compilation-config {\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"custom_ops\":[\"all\"]}"
+   ],
+   "suite_params": {
+    "batch_decode": {
+     "concurrency": [
+      1,
+      2
+     ]
+    },
+    "needle": {
+     "sizes_words": [
+      8000,
+      90000
+     ],
+     "depth": 0.5
+    }
+   },
+   "tuning": {
+    "objective": "decode.median_tok_s",
+    "constraints": [
+     "arithmetic.score>=2",
+     "needle.all_pass"
+    ],
+    "axes": []
+   },
+   "warmup": {}
+  },
+  "suite_snapshot": {
+   "schema": 1,
+   "suite": "quality",
+   "probes": [
+    {
+     "kind": "quality",
+     "id": "gsm8k",
+     "profile": "gsm8k",
+     "runs": 200,
+     "concurrency": 2,
+     "max_tokens": 6000,
+     "baseline": "ds4-flash/native-tp2-gsm8k-c2",
+     "enabled": true
+    },
+    {
+     "kind": "quality",
+     "id": "gpqa",
+     "profile": "gpqa-diamond",
+     "runs": 198,
+     "concurrency": 2,
+     "max_tokens": 30000,
+     "baseline": "ds4-flash/native-tp2-gpqa-nt",
+     "min_mcnemar_p": 0.05,
+     "max_abs_token_ratio_median_delta_pct": 5.0,
+     "max_abs_token_ratio_geomean_delta_pct": 5.0,
+     "min_token_sign_p": 0.05,
+     "max_extra_truncated_no_answer": 1,
+     "enabled": true
+    },
+    {
+     "kind": "quality",
+     "id": "gpqa-think",
+     "enabled": false,
+     "profile": "gpqa-diamond",
+     "runs": 198,
+     "concurrency": 2,
+     "max_tokens": 65536,
+     "baseline": "ds4-flash/native-tp2-gpqa-think-high",
+     "request_overrides": {
+      "chat_template_kwargs": {
+       "thinking": true,
+       "reasoning_effort": "high"
+      },
+      "temperature": 1.0,
+      "top_p": 1.0
+     }
+    }
+   ]
+  },
+  "models": {
+   "DeepSeek-V4-Flash": {
+    "repo": "deepseek-ai/DeepSeek-V4-Flash",
+    "revision": "6976c7ff1b30a1b2cb7805021b8ba4684041f136"
+   }
+  },
+  "release": "v2026.07.31-quality",
+  "box": "rtx-pro6000x8",
+  "box_sha256": "dd7da978a688e106623737e0c068092b1efc5d2044142dfa6aa357b707f27e1f",
+  "model_manifests": {
+   "DeepSeek-V4-Flash": "72248d76cccb7c8b2d5f05ba8206ba9345337c8af9d3b58ac43a672a5cb3d3f5"
+  }
+ },
+ "probes": {
+  "gsm8k": {
+   "profile": "gsm8k",
+   "runs": 200,
+   "concurrency": 2,
+   "max_tokens": 6000,
+   "request_overrides": {},
+   "accuracy_pct": 96.5,
+   "correct": 193,
+   "of": 200,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 118.4,
+   "tokens_p50": 106,
+   "tokens_p90": 185,
+   "tool_sha": "86cf05c+dirty",
+   "tool_sha256": "f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1",
+   "duration_s": 188.4,
+   "artifact": "quality__deepseek-v4-flash__pro6000x2-tp2-maxq__gsm8k.json",
+   "artifact_sha256": "4dc9124b10979710bc37b73d3341aaec80bfd40da2a5902c6cbcf2b59bb4eaf6",
+   "dataset_sha256": "3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14",
+   "historical_baseline": false,
+   "baseline_artifact_sha256": "65193b67f57f3f74684acdf9c23bc213c2108454a2dce60925b9682ca2516053",
+   "baseline": "ds4-flash/native-tp2-gsm8k-c2",
+   "vs_baseline": {
+    "acc_delta_pp": -0.5,
+    "flips_only_baseline": 2,
+    "flips_only_candidate": 1,
+    "mcnemar_p": 1.0,
+    "token_inflation_pct": 2.2,
+    "token_p50_delta_pct": -0.9,
+    "token_p90_delta_pct": 6.9,
+    "token_ratio_median_delta_pct": 0.0,
+    "token_ratio_geomean_delta_pct": 1.4,
+    "token_sign_p": 0.8732481392970024,
+    "token_longer": 80,
+    "token_shorter": 77,
+    "baseline_runaways": 0,
+    "candidate_runaways": 0,
+    "extra_truncated_no_answer": 0,
+    "extra_hit_max_tokens": 0
+   },
+   "status": "ok"
+  },
+  "gpqa": {
+   "profile": "gpqa-diamond",
+   "runs": 198,
+   "concurrency": 2,
+   "max_tokens": 30000,
+   "request_overrides": {},
+   "accuracy_pct": 72.22,
+   "correct": 143,
+   "of": 198,
+   "truncated_no_answer": 0,
+   "hit_max_tokens": 0,
+   "tokens_avg": 466.4,
+   "tokens_p50": 306,
+   "tokens_p90": 859,
+   "tool_sha": "86cf05c+dirty",
+   "tool_sha256": "f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1",
+   "duration_s": 794.5,
+   "artifact": "quality__deepseek-v4-flash__pro6000x2-tp2-maxq__gpqa.json",
+   "artifact_sha256": "5d47f5edf9b7850e4f027b5be05b912921e530cb37c525453bd81fa0a9bd0fd9",
+   "dataset_sha256": "a8472c5a82ea2df8f209c17713aba1a6d409120c609ec0582dae0cb940c7e28c",
+   "historical_baseline": false,
+   "baseline_artifact_sha256": "61efd5e317c1546c93e23594a78f739a847dab7f681cbd7fddf8bd18aee357e0",
+   "baseline": "ds4-flash/native-tp2-gpqa-nt",
+   "vs_baseline": {
+    "acc_delta_pp": -2.02,
+    "flips_only_baseline": 14,
+    "flips_only_candidate": 10,
+    "mcnemar_p": 0.5412561893463135,
+    "token_inflation_pct": 10.4,
+    "token_p50_delta_pct": 1.5,
+    "token_p90_delta_pct": 7.0,
+    "token_ratio_median_delta_pct": 2.9,
+    "token_ratio_geomean_delta_pct": 2.6,
+    "token_sign_p": 0.07387580201820067,
+    "token_longer": 111,
+    "token_shorter": 85,
+    "baseline_runaways": 3,
+    "candidate_runaways": 4,
+    "extra_truncated_no_answer": 0,
+    "extra_hit_max_tokens": 0
+   },
+   "status": "ok"
+  },
+  "gpqa-think": {
+   "status": "disabled"
+  }
+ },
+ "load_time_s": 350.1,
+ "server_metrics_final": {
+  "spec_acceptance_length": 2.62,
+  "draft_acceptance_pct": 81.2,
+  "pool_lines": [],
+  "planes_cache_lines": []
+ },
+ "status": "ok",
+ "finished": "2026-07-31T22:28:24+0000"
+}
