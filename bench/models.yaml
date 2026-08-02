@@ -3,6 +3,13 @@ models:
     hf_repo: deepseek-ai/DeepSeek-V4-Flash
     revision: 6976c7ff1b30a1b2cb7805021b8ba4684041f136
     approx_gb: 149
+  DeepSeek-V4-Flash-0731:
+    # official release superseding the preview; DSpark speculative module
+    # attached (num_speculative_tokens up to 7), encoding module shipped
+    # in-repo (reasoning_effort low/high/max; probes pin thinking=true).
+    hf_repo: deepseek-ai/DeepSeek-V4-Flash-0731
+    revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+    approx_gb: 156
   GLM-5.2-NVFP4:
     hf_repo: nvidia/GLM-5.2-NVFP4
     revision: aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa

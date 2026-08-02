@@ -24,10 +24,14 @@ env:
 models:
   GLM-5.2-NVFP4: /workspace/glm-5.2-nvfp4
   DeepSeek-V4-Flash: /workspace/ds4flash-official
+  DeepSeek-V4-Flash-0731: /root/models/ds4-flash-0731
 
 planes_cache:
   GLM-5.2-NVFP4: /workspace/.planes-cache-glm-bench
   DeepSeek-V4-Flash: /workspace/moet-serve
+  # 0731 caches live on the root volume: /workspace is at 100% (the
+  # planes/packs for 0731 were built there from day one).
+  DeepSeek-V4-Flash-0731: /root/moet-serve-0731
 
 log_dir: /root/logs/bench
 
