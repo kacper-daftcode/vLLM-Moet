@@ -168,6 +168,14 @@ with the NVMe stores (below, RSS‑measured) instead of ~80 GiB pinned.
 base + pinned arena → GPU 2‑bit cache → GPU FP4) at a 128K single‑user window — see the GLM
 table above. Neither model can otherwise run on that hardware at any precision.
 
+For a dedicated 96 GiB card, the optional [canonical mapped-host W2
+path](docs/mapped-host-w2.md) places selected complete Runner V2 W2 layers in
+NUMA-local pinned memory and lets the normal cubins read them over UVA/PCIe.
+The validated DeepSeek-V4-Flash candidate maps layers 40–42, keeps DSpark-3
+GPU-resident, and retains the full 6 GiB FP4 correction tier. This trades
+decode throughput for substantially more KV/context capacity; it is explicit
+placement, not allocator overflow or replay.
+
 ---
 
 ## One tier further — expert stores on NVMe
@@ -457,6 +465,7 @@ Quality release **`v2026.07.30-quality`** — dataset evals vs the committed **n
   GLM‑5.x family) + generators (`gen/`) + `MANIFEST.md`.
 - **`docs/v024-port.md`** — the port: pins, SM120 fixes, apply recipe, benchmark methodology.
 - **`docs/quality.md`** — quality methodology.
+- **`docs/mapped-host-w2.md`** — mapped W2 architecture, configuration, evidence, and limits.
 - **`bench/`** — the release benchmark system: recipes (the tested serve configs, one YAML per
   supported model×hardware combo), the runner that stands up each config and measures it, and
   committed results per release. The table above is rendered from `bench/results/` by

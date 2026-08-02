@@ -68,6 +68,9 @@ entries:
     blocking: false
   - recipe: deepseek-v4-flash/pro6000x1-cache
     blocking: false
+  # Native-only candidate evidence; not a release gate or container claim.
+  - recipe: deepseek-v4-flash/pro6000x1-mapped-w2-dspark3
+    blocking: false
 
   - recipe: glm-5.2-nvfp4/pro6000x4-tp4-mtp
     blocking: true
