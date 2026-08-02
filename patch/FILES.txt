@@ -4,6 +4,7 @@
 # patch but not in the vllm fork branch the patch is generated from —
 # merge it into the branch first; do not ship the regeneration.
 csrc/nvfp4_ds_mla/concat_and_cache_nvfp4_ds_mla.cu
+tests/model_executor/layers/test_moe_w2_mapped_host.py
 tests/model_executor/layers/test_moe_w2_persistence.py
 tests/v1/spec_decode/test_dspark_scheduler.py
 tools/nvfp4_flashinfer_sm120/README.md
@@ -24,6 +25,7 @@ vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
+vllm/model_executor/layers/quantization/utils/moe_w2_mapped_host.py
 vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 vllm/model_executor/layers/quantization/utils/moe_w2_store.py
