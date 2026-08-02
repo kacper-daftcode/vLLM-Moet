@@ -177,7 +177,7 @@ index 000000000..c4b64f25b
 +}
 diff --git a/tests/model_executor/layers/test_moe_w2_persistence.py b/tests/model_executor/layers/test_moe_w2_persistence.py
 new file mode 100644
-index 000000000..31f9f62f6
+index 000000000..9b1650787
 --- /dev/null
 +++ b/tests/model_executor/layers/test_moe_w2_persistence.py
 @@ -0,0 +1,569 @@
@@ -482,13 +482,13 @@ index 000000000..31f9f62f6
 +            moe_w2_cubit._layer_contract(_contract_layer())
 +    monkeypatch.setattr(moe_w2_delta, "base_enabled", lambda: False)
 +
-+    # confidence gate needs the re-forward hooks: refused
++    # confidence gate is V2-integrated (runner _moe_w2_gate_reforward):
++    # accepted on the single-pipeline path
 +    monkeypatch.setattr(moe_w2_gate, "_ENABLED", True)
 +    with mock.patch(
 +            "vllm.config.get_current_vllm_config",
 +            return_value=_v2_contract_config()):
-+        with pytest.raises(ValueError, match="confidence gate"):
-+            moe_w2_cubit._layer_contract(_contract_layer())
++        moe_w2_cubit._layer_contract(_contract_layer())
 +    monkeypatch.setattr(moe_w2_gate, "_ENABLED", False)
 +
 +    # pipeline parallelism: refused
@@ -2807,10 +2807,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..89dc77986
+index 000000000..e509f8cb2
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2750 @@
+@@ -0,0 +1,2743 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3364,18 +3364,11 @@ index 000000000..89dc77986
 +                    "base replay loop is absent — a pool miss would be a "
 +                    "silent quality corruption. Serve base-cache configs "
 +                    "on the V1 runner.")
-+            try:
-+                from vllm.model_executor.layers.quantization.utils import (
-+                    moe_w2_gate)
-+                gate_on = moe_w2_gate.enabled()
-+            except ImportError:
-+                gate_on = False
-+            if gate_on:
-+                raise ValueError(
-+                    "the VLLM_MOE_W2 confidence gate is not integrated "
-+                    "with Model Runner V2 (gate re-forward hooks are "
-+                    "absent). Serve gate configs on the V1 runner or set "
-+                    "VLLM_MOE_W2_GATE=0.")
++            # The confidence gate is integrated with V2 (2026-08-02): the
++            # runner's _moe_w2_gate_reforward ports the V1 inline TP path
++            # (decision consensus + fixed-point promote->re-forward before
++            # sampling). Only the PP broadcast leg is V1-only, and PP is
++            # refused below anyway.
 +            if cfg.parallel_config.pipeline_parallel_size > 1:
 +                raise ValueError(
 +                    "VLLM_MOE_W2 on Model Runner V2 does not support "
@@ -14878,10 +14871,21 @@ index 6b750fe7e..167ad6851 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2ddc5..fe746ec0d 100644
+index 30ca2ddc5..dff713830 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
-@@ -47,6 +47,7 @@ from vllm.tasks import SupportedTask
+@@ -43,10 +43,18 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+ from vllm.model_executor.model_loader import get_model_loader
+ from vllm.multimodal import MULTIMODAL_REGISTRY
+ from vllm.sequence import IntermediateTensors
++
++# moe_w2 confidence gate (V2 port): guarded so serving still boots if only
++# part of the moe_w2 stack is present — mirrors the V1 runner's import.
++try:
++    from vllm.model_executor.layers.quantization.utils import moe_w2_gate
++except ImportError:  # pragma: no cover - partial moe_w2 stack
++    moe_w2_gate = None
+ from vllm.tasks import SupportedTask
  from vllm.utils.math_utils import cdiv
  from vllm.utils.mem_utils import DeviceMemoryProfiler, format_gib
  from vllm.utils.torch_utils import PIN_MEMORY, STR_DTYPE_TO_TORCH_DTYPE
@@ -14889,7 +14893,7 @@ index 30ca2ddc5..fe746ec0d 100644
  from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
  from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
  from vllm.v1.outputs import DraftTokenIds, ModelRunnerOutput
-@@ -102,6 +103,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
+@@ -102,6 +110,7 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
  from vllm.v1.worker.gpu.sample.sampler import Sampler
  from vllm.v1.worker.gpu.shutdown import free_before_shutdown
  from vllm.v1.worker.gpu.spec_decode import init_speculator
@@ -14897,10 +14901,12 @@ index 30ca2ddc5..fe746ec0d 100644
  from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
      set_eagle3_aux_hidden_state_layers,
  )
-@@ -186,13 +188,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -186,13 +195,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          # Speculative decoding.
          self.speculator = None
++        # first-fire INFO for the moe_w2 V2 confidence gate (then DEBUG)
++        self._moe_w2_v2_gate_fired = False
 +        self._dspark_padbucket = False
 +        self._dspark_dyn_sd_table: list[tuple[int, int, int]] | None = None
 +        self._pad_q: int | None = None
@@ -14921,7 +14927,7 @@ index 30ca2ddc5..fe746ec0d 100644
                  # Drafting may require auxiliary hidden states from target model outputs
                  self.use_aux_hidden_state_outputs = True
                  if self.use_pp:
-@@ -469,6 +480,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -469,6 +489,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cudagraph_mode,
              decode_query_len=self.decode_query_len,
              lora_capture_cases=self.lora_capture_cases,
@@ -14933,7 +14939,7 @@ index 30ca2ddc5..fe746ec0d 100644
          )
          if self.speculator is not None:
              self.speculator.init_cudagraph_manager(cudagraph_mode)
-@@ -602,7 +618,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -602,7 +627,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -14944,7 +14950,7 @@ index 30ca2ddc5..fe746ec0d 100644
              self.speculator.propose(
                  input_batch=input_batch,
                  attn_metadata=attn_metadata,
-@@ -685,6 +703,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -685,6 +712,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # NOTE(woosuk): It is TBD whether we keep this API or not.
          return 0
  
@@ -15022,7 +15028,7 @@ index 30ca2ddc5..fe746ec0d 100644
      @torch.inference_mode()
      def capture_model(self) -> int:
          assert self.cudagraph_manager is not None
-@@ -717,6 +806,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -717,6 +815,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              )
              if self.speculator is not None:
                  self.speculator.capture(attn_states)
@@ -15030,7 +15036,7 @@ index 30ca2ddc5..fe746ec0d 100644
  
          end_time = time.perf_counter()
          end_free_gpu_memory = torch.cuda.mem_get_info()[0]
-@@ -895,6 +985,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -895,6 +994,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  idx_mapping, total_num_logits, cu_num_logits, max_expand_len
              )
  
@@ -15051,7 +15057,7 @@ index 30ca2ddc5..fe746ec0d 100644
          # Get query_start_loc.
          # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
          num_reqs_padded = batch_desc.num_reqs or num_reqs
-@@ -960,7 +1064,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -960,7 +1073,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cu_num_logits,
              total_num_logits,
              self.model_state.num_new_sampled_tokens_per_step,
@@ -15069,7 +15075,7 @@ index 30ca2ddc5..fe746ec0d 100644
  
          # CPU upper bound on seq_lens; padded entries left at zero.
          num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
-@@ -991,6 +1105,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -991,6 +1114,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_draft_tokens_per_req=num_draft_tokens_per_req,
              query_start_loc=query_start_loc,
              query_start_loc_np=query_start_loc_np,
@@ -15077,7 +15083,166 @@ index 30ca2ddc5..fe746ec0d 100644
              seq_lens=seq_lens,
              seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
              dcp_local_seq_lens=dcp_local_seq_lens,
-@@ -1064,6 +1179,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1034,6 +1158,158 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         )
+         return block_tables, slot_mappings
+ 
++    def _moe_w2_gate_reforward(
++        self,
++        state: "ExecuteModelState",
++        input_batch: InputBatch,
++        hidden_states: torch.Tensor,
++        aux_hidden_states: list[torch.Tensor] | None,
++    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
++        """moe_w2 confidence gate, V2 port of the V1 inline TP path.
++
++        Runs on the runner thread at a safe point (the forward is complete,
++        the speculator has not launched its draft graphs, so the FULL
++        graph's input buffers still hold this step's tokens). On a fire it
++        iterates promote->re-forward until no rank promotes a cold routed
++        expert (the fixed-point policy the V1 runner uses; a single replay
++        is only first-order — upgraded early layers re-route later layers
++        onto still-cold experts inside the replay). PP is not supported
++        (dspark refuses PP; _layer_contract enforces it), so there is no
++        broadcast leg. Fail-safe by construction: any error keeps the
++        2-bit hidden states.
++        """
++        try:
++            if moe_w2_gate is None or not moe_w2_gate.enabled():
++                return hidden_states, aux_hidden_states
++            if self.is_pooling_model or not self.is_last_pp_rank:
++                return hidden_states, aux_hidden_states
++            # Decode-only, mirroring V1's guard (a spec verify step or a
++            # pure single-token decode): prefill chunks schedule many more
++            # tokens than requests and are excluded.
++            if (input_batch.num_draft_tokens == 0
++                    and input_batch.num_tokens > input_batch.num_reqs):
++                return hidden_states, aux_hidden_states
++
++            sample_hidden = hidden_states[input_batch.logits_indices]
++            logits = self.model.compute_logits(sample_hidden)
++
++            from vllm.distributed.parallel_state import get_tp_group
++            _tp = get_tp_group()
++
++            def _or_tp(flag: bool) -> bool:
++                if _tp.world_size <= 1:
++                    return flag
++                t = torch.tensor([1 if flag else 0], device=logits.device)
++                torch.distributed.all_reduce(
++                    t, op=torch.distributed.ReduceOp.MAX,
++                    group=_tp.device_group)
++                return bool(t.item())
++
++            def _and_tp(flag: bool) -> bool:
++                if _tp.world_size <= 1:
++                    return flag
++                t = torch.tensor([1 if flag else 0], device=logits.device)
++                torch.distributed.all_reduce(
++                    t, op=torch.distributed.ReduceOp.MIN,
++                    group=_tp.device_group)
++                return bool(t.item())
++
++            decision_error = None
++            try:
++                # spec=None: the opt-in GATE_SPEC_MASK row filter is a V1
++                # perf knob; without it every logits row (bonus + draft
++                # verify positions) counts, which only fires MORE often.
++                fire = moe_w2_gate.should_reforward(logits, spec=None)
++            except BaseException as e:  # noqa: BLE001 - consensus below
++                decision_error = e
++                fire = False
++            if not _and_tp(decision_error is None):
++                logger.error(
++                    "moe_w2 V2 gate decision failed on at least one rank; "
++                    "skipping optional re-forward%s",
++                    f": {decision_error}" if decision_error else "")
++                return hidden_states, aux_hidden_states
++            if not _or_tp(fire):
++                return hidden_states, aux_hidden_states
++
++            _iters = 0
++            _budget = moe_w2_gate.step_promote_budget()
++            while _iters < moe_w2_gate.fire_fp_max():
++                promote_error = None
++                try:
++                    n_promoted = moe_w2_gate.force_promote_step(
++                        max_promote=_budget)
++                except BaseException as e:  # noqa: BLE001
++                    promote_error = e
++                    n_promoted = 0
++                if not _and_tp(promote_error is None):
++                    logger.error(
++                        "moe_w2 V2 gate promotion failed on at least one "
++                        "rank; skipping optional re-forward%s",
++                        f": {promote_error}" if promote_error else "")
++                    break
++                if _budget is not None:
++                    _budget = max(_budget - n_promoted, 0)
++                if not (_or_tp(n_promoted > 0)
++                        and moe_w2_gate.reforward_enabled()):
++                    break
++                _iters += 1
++
++                batch_desc = state.batch_desc
++                if batch_desc is not None and (
++                        batch_desc.cg_mode == CUDAGraphMode.FULL):
++                    assert self.cudagraph_manager is not None
++                    model_output = self.cudagraph_manager.run_fullgraph(
++                        batch_desc)
++                else:
++                    model_inputs = state.model_inputs
++                    assert model_inputs is not None
++                    batch_descriptor = BatchDescriptor(
++                        num_tokens=input_batch.num_tokens_after_padding,
++                        has_lora=self.lora_config is not None,
++                        num_active_loras=(
++                            batch_desc.num_active_loras
++                            if batch_desc is not None else 0),
++                    )
++                    with set_forward_context(
++                        state.attn_metadata,
++                        self.vllm_config,
++                        num_tokens=input_batch.num_tokens_after_padding,
++                        cudagraph_runtime_mode=(
++                            batch_desc.cg_mode if batch_desc is not None
++                            else CUDAGraphMode.NONE),
++                        num_tokens_across_dp=state.num_tokens_across_dp,
++                        batch_descriptor=batch_descriptor,
++                        slot_mapping=state.slot_mappings_by_layer,
++                    ):
++                        if (batch_desc is not None
++                                and batch_desc.cg_mode
++                                == CUDAGraphMode.PIECEWISE):
++                            assert self.cudagraph_manager is not None
++                            model_output = self.cudagraph_manager.run_pw_graph(
++                                self.model, model_inputs)
++                        else:
++                            model_output = self.model(**model_inputs)
++
++                if self.use_aux_hidden_state_outputs:
++                    hidden_states, aux_hidden_states = model_output
++                else:
++                    hidden_states = model_output
++
++            if _iters and not self._moe_w2_v2_gate_fired:
++                self._moe_w2_v2_gate_fired = True
++                logger.info(
++                    "moe_w2 V2 gate engaged: %d re-forward pass(es) this "
++                    "step (later fires at DEBUG)", _iters)
++            elif _iters:
++                logger.debug("moe_w2 V2 gate: %d re-forward pass(es)",
++                             _iters)
++            return hidden_states, aux_hidden_states
++        except Exception:  # noqa: BLE001 - never crash serving
++            logger.exception("moe_w2 V2 gate re-forward failed; keeping "
++                             "the first forward's hidden states")
++            return hidden_states, aux_hidden_states
++
+     def sample(
+         self,
+         hidden_states: torch.Tensor,
+@@ -1064,6 +1340,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  input_batch,
                  # Draft logits are needed for probabilistic rejection sampling.
                  self.speculator.draft_logits,
@@ -15087,7 +15252,7 @@ index 30ca2ddc5..fe746ec0d 100644
              )
  
          return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
-@@ -1107,6 +1225,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1107,6 +1386,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          is_profile: bool = False,
      ) -> ModelRunnerOutput | IntermediateTensors | None:
          if not dummy_run:
@@ -15107,7 +15272,7 @@ index 30ca2ddc5..fe746ec0d 100644
              # Update the request states.
              self.update_pp_decode_requests()
              self.finish_requests(scheduler_output)
-@@ -1125,6 +1256,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1125,6 +1417,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          max_query_len = max(scheduler_output.num_scheduled_tokens.values())
          uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
  
@@ -15138,7 +15303,7 @@ index 30ca2ddc5..fe746ec0d 100644
          num_active_loras = 0
          if self.lora_config:
              req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-@@ -1160,6 +1315,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1160,6 +1476,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # Prepare all the inputs and copy to the input buffers.
              input_batch = self.prepare_inputs(scheduler_output, batch_desc)
              block_tables, slot_mappings = self.prepare_attn(input_batch)
@@ -15162,7 +15327,7 @@ index 30ca2ddc5..fe746ec0d 100644
  
              if self.lora_config:
                  # Activate LoRA adapters.
-@@ -1252,6 +1424,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1252,6 +1585,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
              del intermediate_tensors
  
@@ -15178,7 +15343,36 @@ index 30ca2ddc5..fe746ec0d 100644
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              # Use explicit cudagraph replay for FULL mode.
-@@ -1424,7 +1605,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1314,6 +1656,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+             hidden_states=hidden_states,
+             aux_hidden_states=aux_hidden_states,
+             finished_req_ids=finished_req_ids,
++            batch_desc=batch_desc,
++            model_inputs=None if dummy_run else model_inputs,
++            num_tokens_across_dp=num_tokens_across_dp,
+         )
+ 
+         if not self.is_last_pp_rank:
+@@ -1336,8 +1681,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+         hidden_states = self.execute_model_state.hidden_states
+         aux_hidden_states = self.execute_model_state.aux_hidden_states
+         finished_req_ids = self.execute_model_state.finished_req_ids
++        _gate_replay_state = self.execute_model_state
+         self.execute_model_state = None
+ 
++        # moe_w2 confidence gate (V2 port, TP/single-GPU inline path): decide
++        # on this step's logits and, on fire, promote+re-forward at FP4 before
++        # sampling — the refreshed hidden states feed the sampler AND the
++        # speculator (drafts verify against the FP4-refined target).
++        if hidden_states is not None:
++            hidden_states, aux_hidden_states = self._moe_w2_gate_reforward(
++                _gate_replay_state, input_batch, hidden_states,
++                aux_hidden_states)
++
+         if not self.is_last_pp_rank:
+             # Non-last PP rank: hidden_states is None because this rank produced
+             # IntermediateTensors instead of final hidden states. Receive the
+@@ -1424,7 +1779,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              sampler_output.sampled_token_ids,
              num_sampled,
              num_rejected,
@@ -15191,7 +15385,7 @@ index 30ca2ddc5..fe746ec0d 100644
          )
  
          if self.speculator is not None:
-@@ -1436,7 +1621,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1436,7 +1795,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -15202,7 +15396,7 @@ index 30ca2ddc5..fe746ec0d 100644
              draft_tokens = self.speculator.propose(
                  input_batch,
                  attn_metadata,
-@@ -1451,16 +1638,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1451,16 +1812,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  self.sampler.sampling_states.seeds.gpu,
                  mm_inputs=mm_inputs,
              )
@@ -15250,6 +15444,18 @@ index 30ca2ddc5..fe746ec0d 100644
          # Post-step KV connector related operations.
          kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
          model_runner_output.kv_connector_output = kv_connector_output
+@@ -1576,3 +1966,11 @@ class ExecuteModelState(NamedTuple):
+     hidden_states: torch.Tensor | None
+     aux_hidden_states: list[torch.Tensor] | None
+     finished_req_ids: set[str]
++    # moe_w2 confidence-gate replay (V2 port): everything a mid-step
++    # re-forward needs. batch_desc drives the FULL-graph relaunch (its
++    # input buffers still hold this step's tokens until the speculator's
++    # propose, which runs after sampling); model_inputs + the DP width
++    # cover the PIECEWISE/eager paths.
++    batch_desc: Any | None = None
++    model_inputs: dict[str, Any] | None = None
++    num_tokens_across_dp: torch.Tensor | None = None
 diff --git a/vllm/v1/worker/gpu/sample/gumbel.py b/vllm/v1/worker/gpu/sample/gumbel.py
 index fab53fef7..7bacdbc51 100644
 --- a/vllm/v1/worker/gpu/sample/gumbel.py
