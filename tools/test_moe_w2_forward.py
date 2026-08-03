@@ -148,6 +148,80 @@ print(f"DELTA mixed ({len(promoted)}/{E} promoted): max_rel={rel2:.3e} "
       f"cos={cos2:.6f}")
 ok = ok and rel2 < 0.06 and cos2 > 0.999
 
+# ---- EXACT LAYER STREAM: full-FP4 rows over a host-resident base.
+# This is the production exact-fallback descriptor geometry. Materialize every
+# actually routed FP4 row before the layer computes, then require both output
+# parity with an all-FP4 reference and zero base-cache misses. The pool holds
+# one complete layer here; the persistence suite separately forces per-layer
+# eviction with a pool much smaller than the model-wide routed union.
+c13len, s13len = st["planes13"].shape[1], st["sc13"].shape[1]
+c2len, s2len = st["planes2"].shape[1], st["sc2"].shape[1]
+base_slot_bytes = c13len + s13len + c2len + s2len
+fp4_slot_bytes = fp13.shape[1] + s13len + fp2.shape[1] + s2len
+btier = moe_w2_delta.DeltaTier(
+    1, E, dev,
+    w13_bytes=c13len + s13len,
+    w2_bytes=c2len + s2len,
+    pool_gb=E * base_slot_bytes / 2**30,
+    tag="base-exact-test",
+)
+btier.miss_count = torch.zeros(1, dtype=torch.int32, device=dev)
+btier.add_layer_host_sections(
+    0, (st["planes13"], st["sc13"]), (st["planes2"], st["sc2"]))
+exact_tier = moe_w2_delta.DeltaTier(
+    1, E, dev,
+    w13_bytes=fp13.shape[1] + s13len,
+    w2_bytes=fp2.shape[1] + s2len,
+    pool_gb=E * fp4_slot_bytes / 2**30,
+    tag="fp4-exact-test",
+)
+exact_tier.add_layer_host_sections(
+    0, (fp13, st["sc13"]), (fp2, st["sc2"]))
+moe_w2_delta._BASE_TIER = btier
+moe_w2_delta._TIER = exact_tier
+moe_w2_cubit._LAYERS[0] = dict(
+    N13=2 * I, K13=H, N2=H, K2=I, E=E, base=True, tl_idx=0,
+    off_s13=c13len, off_c2=c13len + s13len,
+    off_s2=c13len + s13len + c2len,
+    off4_s13=fp13.shape[1],
+    off4_c2=fp13.shape[1] + s13len,
+    off4_s2=fp13.shape[1] + s13len + fp2.shape[1],
+    activation="silu",
+    swiglu_limit=SWIGLU_LIMIT if SWIGLU_LIMIT > 0 else None,
+    swiglu_alpha=1.0, swiglu_beta=0.0,
+)
+routed = torch.unique(topk_ids).long()
+fetched = exact_tier.ensure_resident(0, routed)
+assert fetched == routed.numel()
+got_exact = moe_w2_cubit._moe_w2_forward(x, topk_w, topk_ids, 0)
+torch.cuda.synchronize()
+assert int(btier.miss_count.item()) == 0
+ref_exact = torch.zeros(T, H, device=dev)
+for t in range(T):
+    for j in range(TOPK):
+        e = int(topk_ids[t, j])
+        w13d = dequant_fp4(w13_pack[e], s13[e])
+        c13 = a_deq[t] @ w13d.T
+        act = activate(c13)
+        act_deq = moe_w2_cubit.a32_dequant_ref(
+            act.to(torch.bfloat16).unsqueeze(0), gemm=2)
+        w2d = dequant_fp4(w2_pack[e], s2[e])
+        ref_exact[t] += float(topk_w[t, j]) * (act_deq[0] @ w2d.T)
+rel_exact = (
+    (got_exact.float() - ref_exact).abs().max().item()
+    / ref_exact.abs().max().item()
+)
+cos_exact = torch.nn.functional.cosine_similarity(
+    got_exact.float().flatten(), ref_exact.flatten(), dim=0).item()
+print(f"EXACT full-FP4 ({routed.numel()} routed, {fetched} fetched): "
+      f"max_rel={rel_exact:.3e} cos={cos_exact:.6f} misses=0")
+ok = ok and rel_exact < 0.06 and cos_exact > 0.999
+exact_tier.close()
+btier.close()
+moe_w2_delta._BASE_TIER = None
+moe_w2_delta._TIER = tier
+moe_w2_cubit._LAYERS[0] = st
+
 # ---- SPLIT FP4 (VLLM_MOE_W2_DELTA_SPLIT): the delta slots hold RADIX-5
 # QUINTAL planes and moe_w4q_mm reads them alongside the resident base.
 # Reference: TRUE e2m1 (the quintal split is bit-exact — no merge).
