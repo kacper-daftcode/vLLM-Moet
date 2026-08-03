@@ -235,10 +235,15 @@ L()
 def emit_reduce_store(slot_base):
     sb = f"+{hex(slot_base)}" if slot_base else ""
     L(f"    // slot = tid{sb}")
+    # Non-pow2 NTHR tail-pass guard — same fix as gen_moe_w2.py (see the
+    # comment there): clamp OOB slots for safe reads, kill OOB stores.
+    overflow = slot_base + min(NTHR, 256) > 256
     if slot_base:
         L(f"    IADD3 R19, PT, PT, R80, {hex(slot_base)}, RZ ;")
     else:
         L("    MOV R19, R80 ;")
+    if overflow:
+        L("    LOP3.LUT R19, R19, 0xff, RZ, 0xc0, !PT ; // clamp OOB slot (reads)")
     L("    LOP3.LUT R2, R19, 0x7f, RZ, 0xc0, !PT ;")
     L("    SHF.R.U32.HI R3, RZ, 0x7, R19 ;")
     L("    IMAD R4, R3, 0x200, RZ ;")
@@ -265,6 +270,9 @@ def emit_reduce_store(slot_base):
     L("    ISETP.EQ.AND P1, PT, R25, RZ, P1 ;")
     if NTHR > 256:
         L("    ISETP.LT.U32.AND P1, PT, R19, 0x100, P1 ;")
+    if overflow:
+        L(f"    ISETP.LT.U32.AND P1, PT, R80, {hex(256 - slot_base)}, P1 ; "
+          "// kill OOB stores")
     L("    IMAD R14, R22, R78, RZ ;")
     L("    IMAD R14, R26, 0x2, R14 ;")
     L("    MOV R15, RZ ;")
