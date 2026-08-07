@@ -45,8 +45,8 @@ def extract(path, names):
     return {n: getattr(mod, n) for n in names}
 
 
-SU = "/root/workspace/vllm-v0.24.0/vllm/v1/attention/backends/mla/sparse_utils.py"
-IX = "/root/workspace/vllm-v0.24.0/vllm/v1/attention/backends/mla/indexer.py"
+SU = "/workspace/vllm-v0.24.0/vllm/v1/attention/backends/mla/sparse_utils.py"
+IX = "/workspace/vllm-v0.24.0/vllm/v1/attention/backends/mla/indexer.py"
 
 conv = extract(SU, ["_convert_req_index_to_global_index_kernel"])[
     "_convert_req_index_to_global_index_kernel"

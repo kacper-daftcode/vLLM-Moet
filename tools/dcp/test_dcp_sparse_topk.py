@@ -27,7 +27,7 @@ sys.modules["vllm.distributed.parallel_state"] = pkg_p
 
 spec = importlib.util.spec_from_file_location(
     "dcp_sparse_topk",
-    "/root/workspace/vllm-v0.24.0/vllm/v1/attention/ops/dcp_sparse_topk.py",
+    "/workspace/vllm-v0.24.0/vllm/v1/attention/ops/dcp_sparse_topk.py",
 )
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)

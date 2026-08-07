@@ -406,7 +406,7 @@ def quality(base, model, log=print, *, profile, runs=200, concurrency=2,
     import sys as _sys
 
     tool = tool or os.environ.get(
-        "LLM_BENCH", "/root/workspace/llm-inference-bench/llm_decode_bench.py")
+        "LLM_BENCH", "/workspace/llm-inference-bench/llm_decode_bench.py")
     if not os.path.exists(tool):
         raise RuntimeError(
             f"quality probe needs llm-inference-bench (looked at {tool}; "

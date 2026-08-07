@@ -3,7 +3,7 @@
 # across a store re-open (boot-from-pack), and the tiered arena must stay
 # correct under eviction pressure and batch overflow. Run inside the
 # serving image:
-#   docker run --rm --gpus '"device=7"' -v /root/workspace/vllm-v0.24.0:/vllm-024 \
+#   docker run --rm --gpus '"device=7"' -v /workspace/vllm-v0.24.0:/vllm-024 \
 #     -v /workspace/moet-serve:/serve --entrypoint python3 \
 #     vllm-moet-sm120:v024-dev /serve/test_store_backends.py
 import os

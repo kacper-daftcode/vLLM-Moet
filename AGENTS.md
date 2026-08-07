@@ -27,8 +27,10 @@ WILL be erased by somebody's next regeneration.
 | **vLLM-Moet** (this one, public) | `/workspace/vllm-moet` | `main` | publication: generated patch, kernels + cubins, bench system, docs |
 | **vllm fork clone** | `/workspace/vllm-v0.24.0` | `moet-v0.24.0` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm`, `origin` = `vllm-project/vllm` |
 
-`/root/workspace` is a symlink to `/workspace`. Upstream-PR branches and
-experiments live in worktrees off the same clone
+`/root/workspace` used to be a symlink to `/workspace`; it was **removed
+2026-08-07** (IDE workspace scans followed it into 4.3 TB and choked the
+sessions). Always use `/workspace` paths directly. Upstream-PR branches
+and experiments live in worktrees off the same clone
 (`git -C /workspace/vllm-v0.24.0 worktree list`).
 
 `moet-v0.24.0` is the ship lineage: everything committed there is meant to

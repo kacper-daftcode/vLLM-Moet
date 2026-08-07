@@ -36,5 +36,5 @@ planes_cache:
 log_dir: /root/logs/bench
 
 # external eval tool for the quality suite (git SHA recorded in results)
-quality_tool: /root/workspace/llm-inference-bench/llm_decode_bench.py
+quality_tool: /workspace/llm-inference-bench/llm_decode_bench.py
 quality_tool_sha256: f73a630b3fda58a9bfdbe3dd5caee65410f43314680c24d43c0358eec5ea46f1
