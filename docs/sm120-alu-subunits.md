@@ -51,6 +51,48 @@ Three classes emerge:
 The cap is visible even without contention: a single warp of any class with
 8-way ILP runs at 2.13 cyc/instr (≈0.47/cyc).
 
+## Three-class mixes beat the pair table; budget the B-port share
+
+Real decode streams mix all three classes, and the measured ceilings sit
+**above** a pairwise interpolation:
+
+| stream (single warp-stream, 16 warps) | class shares A:S:B | instr/cyc/sched |
+|---|---|---|
+| 2:1 B-heavy (3INST-GEMV profile) | 33:0:67 | 0.576 |
+| projected MUL1-decode GEMV (probe `ucb2`) | 56:19:25 | **0.694** |
+| nvcc wave K1 (masks on SGXT, packing on IMAD) | ~50:~21:29 | 0.65 |
+
+Two working rules from kernels built against this map (sessions [G]/[J]):
+
+- **Budget the LOP3+PRMT share of the stream to ≤ ~33%**, not just the
+  total op count. A hand kernel with 11% fewer instructions but 57% of
+  them on port B measured *slower* than nvcc's stream at 29%.
+- Moves that shift pair-packing work from PRMT (B) to IMAD/HADD2 (A) are
+  real wins; `HADD2.H1H1A Rd, w, w` (h0 = lo+hi, bit-exact for fp16 adds)
+  replaces a PRMT in every lo+hi fold of the 3INST decode.
+
+## Tensor pipe: accumulator width is free; QMMA halves instructions, not rate
+
+Saturated rates, 16 warps, same probe pattern (session [J]):
+
+| form | cyc/instr/warp |
+|---|---:|
+| HMMA.16816.F16 | 63.83 |
+| **HMMA.16816.F32** | **63.83** |
+| QMMA.16832.F32.E4M3.E4M3 | 63.83 |
+| HMMA.F32 \| QMMA.F32 mixed on a scheduler | 63.90 / 61.33 |
+
+FP32 accumulation is **not** half-rate on this part (unlike GeForce-class
+silicon), and HMMA/QMMA remain one throughput domain. QMMA's only value is
+2× k-depth per instruction — it halves the tensor *instruction count*, not
+the cycle cost. Before designing for it, check the tensor budget against
+the ALU floor of your mix: at M=8 the decode/extraction ALU work dominates
+the GEMV classes measured here (tensor ≈ 50-60% of the ALU floor with
+HMMA.F32, ≈ 25-30% with QMMA), so the halving does not move wall time.
+Note the numerics: e4m3 on **both** QMMA operands measured a 3.7e-2
+rel-RMS band on the real delta streams — a class change versus the
+lossless fp16 decode path, to be re-certified before any use.
+
 ## Mix sets the ceiling; arrangement does not
 
 - A 2:1 B:A stream (the profile of the 3INST-decode GEMV) measures
@@ -104,3 +146,18 @@ build ×3, synthetic + real-pack gates, A/B cold-rotation benches ×2). The
 `SGXT.U32` imm-width encoding used by rule 3 was missing from the ISA table
 and shipped from the same ground truth (blackwell-isa `4e8a589`, cubit
 `dd97d6e`).
+
+Session [J] 2026-08-08: tensor-form rates (HMMA.F16/.F32, QMMA.F32, mixed),
+the `ucb2` three-class mix ceiling, and the e4m3 delta-band measurement on
+real packs; same probe harness, anchors reproduce [T]/[H] to 0.05 cyc/instr.
+Session [G] 2026-08-08: the ≤33% B-port budget rule and the
+`HADD2.H1H1A` pack replacement, validated on the K1-cb0 port (full parity
+matrix, 1.20× vs the nvcc wave kernel measured under the same contract).
+
+Measurement hygiene on this box: the bench GPUs run with a reduced power
+limit (300 W vs the 600 W default) — sustained loads throttle SM clocks
+below the lock after a few tens of milliseconds, while the canonical
+500-iteration burst protocol holds the locked clock. Certified numbers
+reproduce to 0.01 µs under that protocol; profiler (ncu) replay runs in a
+different clock regime and is used for attribution only, never for wall
+time.
