@@ -60,9 +60,20 @@ Real decode streams mix all three classes, and the measured ceilings sit
 |---|---|---|
 | 2:1 B-heavy (3INST-GEMV profile) | 33:0:67 | 0.576 |
 | projected MUL1-decode GEMV (probe `ucb2`) | 56:19:25 | **0.694** |
+| MUL1 3-bit down-delta GEMV (probe `ucb3`) | 48:36:17 | **0.745** |
 | nvcc wave K1 (masks on SGXT, packing on IMAD) | ~50:~21:29 | 0.65 |
+| nvcc wave up-delta cb2, on-silicon issued rate | ~55:~20:25 | **0.74** |
 
-Two working rules from kernels built against this map (sessions [G]/[J]):
+**Probe ceilings are lower bounds, not walls.** The probe streams repeat
+the hand kernel's *phase order* (extraction block, then decode block, …).
+nvcc schedules the same op census fully interleaved across tiles and
+sustains 0.74 issued/sched on silicon where the phase-ordered probe of
+the same census caps at 0.694 — consistent with the integration-window
+measurements below (16-op single-class runs already pay a few percent).
+Use the probe number to size the floor of *your* emission order; do not
+treat it as the silicon's limit for the mix.
+
+Working rules from kernels built against this map (sessions [G]/[J]/[F]):
 
 - **Budget the LOP3+PRMT share of the stream to ≤ ~33%**, not just the
   total op count. A hand kernel with 11% fewer instructions but 57% of
@@ -70,6 +81,9 @@ Two working rules from kernels built against this map (sessions [G]/[J]):
 - Moves that shift pair-packing work from PRMT (B) to IMAD/HADD2 (A) are
   real wins; `HADD2.H1H1A Rd, w, w` (h0 = lo+hi, bit-exact for fp16 adds)
   replaces a PRMT in every lo+hi fold of the 3INST decode.
+- The budget is two-sided: in an A-heavy stream, moving pack work *onto*
+  IMAD measures worse (probe `ucb2b`: 0.660 vs 0.694 with the pack on
+  PRMT) — recompute the mix after every composition change.
 
 ## Tensor pipe: accumulator width is free; QMMA halves instructions, not rate
 
@@ -109,6 +123,18 @@ stays binding) — all failed to move wall time, exactly as the integration
 window predicts. That kernel runs at ~92% of its mix ceiling: **it sits at
 the ALU floor of its fixed instruction mix.**
 
+Fifth confirmation on the cb2 (MUL1) ports, with the mechanism isolated
+(session [F]): two parity-green rearrangements of the up-delta port both
+measured *worse* than the phase-ordered emission — a SHFL prefetched one
+tile ahead (+0.6 µs) and nvcc-style producer/consumer interleave of the
+next tile's extraction into the current tile's decode (+2.0 µs). The
+mechanism is **not** the exec-unit mix: SASS issue is in-order, so a
+scoreboard *wait* placed mid-stream stalls the whole warp even though
+independent instructions follow it. Keep barrier waits at the head of a
+tile/phase, where the warp has nothing else to issue anyway; nvcc can
+afford its deep interleave only because ptxas hoists the *producers*
+(loads) many slices ahead, so its waits never block.
+
 ## Design rules for new kernels
 
 1. **Budget the mix before writing any SASS.** Count port-B ops
@@ -137,6 +163,19 @@ the ALU floor of its fixed instruction mix.**
    saturation shows up as `math_pipe_throttle` warp stalls and sub-40%
    per-pipe utilization simultaneously. Measure with the probe pattern
    above when in doubt.
+8. **Keep scoreboard waits at the head of a tile/phase.** Issue is
+   in-order: a barrier wait in the middle of a stream blocks the warp
+   even when independent work follows it. Move waits earlier only
+   together with their producers; prefetching a producer without moving
+   its consumer's wait later just shifts the stall (measured on the
+   ucb2 port: SHFL-prefetch +0.6 µs, full interleave +2.0 µs, both
+   parity-green and reverted).
+9. **Baseline against the same card and harness, and check the rotation
+   against L2.** ncu-solo durations are a different regime (nvcc wave
+   up-delta: 31.0 µs ncu-solo vs 28.0 µs wall on the same card; down:
+   19.3 vs 17.5). Rotation sets must exceed L2 in *sum*: 25 MB/set × 4
+   sets = 101 MB still fits the 126 MB L2 and measures hot — the cb2
+   contract needs SETS ≥ 8 (the 1-bpw K1 stream needs SETS ≥ 24).
 
 ## Provenance
 
@@ -153,6 +192,17 @@ real packs; same probe harness, anchors reproduce [T]/[H] to 0.05 cyc/instr.
 Session [G] 2026-08-08: the ≤33% B-port budget rule and the
 `HADD2.H1H1A` pack replacement, validated on the K1-cb0 port (full parity
 matrix, 1.20× vs the nvcc wave kernel measured under the same contract).
+
+Session [F] 2026-08-08/09: the `ucb3` down-delta mix ceiling, the
+probe-order caveat (nvcc wave sustains 0.74 issued/sched on a census the
+phase-ordered probe caps at 0.694), rules 8–9, and the two-sided budget
+note (`ucb2b`), from the two cb2 (MUL1) unified ports — up-delta
+`exl3_wave_ucb2` (M=1 at parity with the nvcc wave measured under the
+same contract, with 16% fewer instructions; M=8-native at 0.144× the
+per-token cost of the M=1-only wave) and down-delta `exl3_wave_k3cb2`
+(0.91× solo; M=8-native at 0.152× per token), both with full parity
+matrices on synthetic and real delta packs. Same probe harness; `ucb2`
+anchor reproduces [J] to 0.01 cyc/instr.
 
 Measurement hygiene on this box: the bench GPUs run with a reduced power
 limit (300 W vs the 600 W default) — sustained loads throttle SM clocks
