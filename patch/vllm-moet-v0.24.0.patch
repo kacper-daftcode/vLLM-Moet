@@ -1488,6 +1488,785 @@ index 000000000..cfa92d323
 +ast.parse(CORE.read_text())
 +print("SYNTAX-OK python")
 +print("PATCH-FLASHINFER-DONE")
+diff --git a/tools/pp_proto_exl3.py b/tools/pp_proto_exl3.py
+new file mode 100644
+index 000000000..5110f6ebd
+--- /dev/null
++++ b/tools/pp_proto_exl3.py
+@@ -0,0 +1,239 @@
++#!/usr/bin/env python3
++"""Inter-host PP prototype: DS4-Flash split into two pipeline stages
++(layers 0-21 + embed | layers 22-42 + head), activations over real TCP
++with an injectable WAN RTT, ROUTED EXPERTS SERVED BY THE EXL3 PACK
++(Exl3BaseTier / exl3_mgemm); attention, dense, shared expert and gate run
++on the official reference implementation (tilelang kernels).
++
++This is the mechanics/physics prototype for the "serve-from-RAM + PP
++between hosts" design (EXL3_BASE_TIER_FEASIBILITY.md, Inter-host PP
++section) — NOT a performance build (python layer loop, no cudagraphs,
++no speculation): per-token time decomposes into stage compute + link,
++and the link term is what we are validating.
++
++Usage:
++  # stage 1 first (listens):
++  CUDA_VISIBLE_DEVICES=2 python3 pp_proto.py --stage 1 --port 29777 --rtt-ms 46.6
++  # then stage 0 (connects, drives, prints text + timing):
++  CUDA_VISIBLE_DEVICES=0 python3 pp_proto.py --stage 0 --peer 127.0.0.1:29777 \
++      --rtt-ms 46.6 --new-tokens 48
++"""
++import argparse
++import importlib.util
++import json
++import os
++import pickle
++import socket
++import struct as pystruct
++import sys
++import time
++
++import torch
++
++AB_DIR = "/root/workspace/exl3-ab"
++sys.path.insert(0, AB_DIR)
++import capture_hidden as CH  # patched official impl (sparse_attn, helpers)
++
++M = CH.M
++PACK = "/root/workspace/moet-serve/exl3-packs-ds4"
++CKPT = CH.CKPT
++SPLIT = 22
++N_LAYERS = 43
++
++spec = importlib.util.spec_from_file_location(
++    "moe_w2_exl3",
++    "/root/workspace/vllm-wt-exl3-base/vllm/model_executor/layers/"
++    "quantization/utils/moe_w2_exl3.py")
++X3 = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(X3)
++
++
++# ------------------------------------------------------------ tcp helpers
++
++def send_msg(sock, obj, one_way_s):
++    data = pickle.dumps(obj, protocol=4)
++    if one_way_s > 0:
++        time.sleep(one_way_s)
++    sock.sendall(pystruct.pack("<Q", len(data)) + data)
++
++
++def recv_msg(sock):
++    hdr = b""
++    while len(hdr) < 8:
++        c = sock.recv(8 - len(hdr))
++        if not c:
++            raise ConnectionError("peer closed")
++        hdr += c
++    (n,) = pystruct.unpack("<Q", hdr)
++    buf = bytearray()
++    while len(buf) < n:
++        c = sock.recv(min(1 << 20, n - len(buf)))
++        if not c:
++            raise ConnectionError("peer closed")
++        buf += c
++    return pickle.loads(bytes(buf))
++
++
++# ------------------------------------------------------- model per stage
++
++def build_stage(stage, dev):
++    cfg = json.load(open(os.path.join(CKPT, "inference", "config.json")))
++    margs = M.ModelArgs(**cfg, max_batch_size=1, max_seq_len=4096)
++    torch.set_default_dtype(torch.bfloat16)
++    model = M.Transformer(margs)
++    loaded, _, missing = CH.load_checkpoint(model)
++    assert not missing, missing
++    lo, hi = (0, SPLIT) if stage == 0 else (SPLIT, N_LAYERS)
++
++    # EXL3 tier replaces the routed-expert loop; drop the FP4 expert
++    # modules BEFORE moving layers to GPU (they would not fit).
++    tier = X3.Exl3BaseTier(PACK, layers=range(lo, hi), device=dev)
++    for li in range(lo, hi):
++        ffn = model.layers[li].ffn
++        ffn.experts = torch.nn.ModuleList([None] * margs.n_routed_experts)
++        ffn._exl3_li = li
++
++    def moe_forward(self, x, input_ids):
++        shape = x.size()
++        xf = x.view(-1, self.dim)
++        weights, indices = self.gate(xf, input_ids.flatten())
++        y = tier.forward_topk(self._exl3_li, xf, indices.long(),
++                              weights.float())
++        y = y + self.shared_experts(xf).float()
++        return y.type_as(x).view(shape)
++
++    import types as _t
++    for li in range(lo, hi):
++        model.layers[li].ffn.forward = _t.MethodType(moe_forward,
++                                                     model.layers[li].ffn)
++
++    t0 = time.time()
++    if stage == 0:
++        model.embed.to(dev)
++    for li in range(lo, hi):
++        model.layers[li].to(dev)
++    if stage == 1:
++        model.norm.to(dev)
++        model.head.to(dev)
++        for p in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
++            getattr(model, p).data = getattr(model, p).data.to(dev)
++    print(f"[stage{stage}] layers {lo}-{hi-1} on {dev} "
++          f"({time.time()-t0:.0f}s; exl3 {tier.total_bytes()/2**30:.1f} GiB)",
++          flush=True)
++    return model, margs, (lo, hi)
++
++
++def run_layers(model, h, ids, start_pos, lo, hi, dev):
++    with torch.device(dev):
++        for li in range(lo, hi):
++            h = model.layers[li](h, start_pos, ids)
++    return h
++
++
++# --------------------------------------------------------------- stages
++
++@torch.inference_mode()
++def stage0(args):
++    dev = "cuda:0"
++    model, margs, (lo, hi) = build_stage(0, dev)
++    from transformers import AutoTokenizer
++    tok = AutoTokenizer.from_pretrained(CKPT)
++    prompt = args.prompt
++    ids = tok.encode(prompt, add_special_tokens=False)
++    print(f"[stage0] prompt: {len(ids)} tokens", flush=True)
++
++    host, port = args.peer.split(":")
++    sock = socket.create_connection((host, int(port)))
++    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    ow = args.rtt_ms / 2000.0
++
++    def fwd(token_ids, start_pos):
++        t = torch.tensor([token_ids], dtype=torch.long, device=dev)
++        with torch.device(dev):
++            h = model.embed(t)
++            h = h.unsqueeze(2).repeat(1, 1, model.hc_mult, 1)
++        h = run_layers(model, h, t, start_pos, lo, hi, dev)
++        torch.cuda.synchronize()
++        return h
++
++    def pack_h(h):
++        # bf16 has no numpy dtype: ship the raw bits (exact roundtrip)
++        return h.contiguous().view(torch.uint16).cpu().numpy()
++
++    # prefill
++    t0 = time.time()
++    h = fwd(ids, 0)
++    send_msg(sock, {"h": pack_h(h), "ids": ids, "start_pos": 0}, ow)
++    r = recv_msg(sock)
++    cur = r["token"]
++    prefill_s = time.time() - t0
++    out_ids = [cur]
++
++    # decode
++    lat, comp = [], []
++    for i in range(args.new_tokens - 1):
++        t0 = time.time()
++        h = fwd([cur], len(ids) + i)
++        tc = time.time() - t0
++        send_msg(sock, {"h": pack_h(h), "ids": [cur],
++                        "start_pos": len(ids) + i}, ow)
++        r = recv_msg(sock)
++        cur = r["token"]
++        out_ids.append(cur)
++        lat.append(time.time() - t0)
++        comp.append(tc + r["comp_s"])
++    send_msg(sock, {"stop": True}, ow)
++
++    text = tok.decode(out_ids)
++    n = len(lat)
++    print(f"\n[stage0] prefill {prefill_s:.1f}s; decode {n} tok:"
++          f" mean {sum(lat)/n*1000:.0f} ms/tok = {n/sum(lat):.2f} tok/s"
++          f" (compute {sum(comp)/n*1000:.0f} ms, link+ser "
++          f"{(sum(lat)-sum(comp))/n*1000:.0f} ms; injected RTT {args.rtt_ms} ms)")
++    print(f"[stage0] TEXT: {text!r}")
++
++
++@torch.inference_mode()
++def stage1(args):
++    dev = "cuda:0"
++    model, margs, (lo, hi) = build_stage(1, dev)
++    srv = socket.create_server(("0.0.0.0", args.port))
++    print(f"[stage1] listening :{args.port}", flush=True)
++    sock, addr = srv.accept()
++    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
++    print(f"[stage1] peer {addr}", flush=True)
++    ow = args.rtt_ms / 2000.0
++
++    while True:
++        msg = recv_msg(sock)
++        if msg.get("stop"):
++            break
++        t0 = time.time()
++        h = torch.from_numpy(msg["h"]).view(torch.bfloat16).to(dev)
++        t = torch.tensor([msg["ids"]], dtype=torch.long, device=dev)
++        h = run_layers(model, h, t, msg["start_pos"], lo, hi, dev)
++        with torch.device(dev):
++            logits = model.head(h, model.hc_head_fn, model.hc_head_scale,
++                                model.hc_head_base, model.norm)
++        token = int(logits[:, -1].argmax(-1)[0]) if logits.dim() == 3 \
++            else int(logits.argmax(-1)[-1])
++        torch.cuda.synchronize()
++        send_msg(sock, {"token": token, "comp_s": time.time() - t0}, ow)
++    print("[stage1] done", flush=True)
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument("--stage", type=int, required=True)
++    ap.add_argument("--peer", default="127.0.0.1:29777")
++    ap.add_argument("--port", type=int, default=29777)
++    ap.add_argument("--rtt-ms", type=float, default=0.0)
++    ap.add_argument("--new-tokens", type=int, default=48)
++    ap.add_argument("--prompt", default="The capital of Poland is Warsaw. "
++                    "The boiling point of water at sea level is")
++    args = ap.parse_args()
++    (stage0 if args.stage == 0 else stage1)(args)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_moe_w2_exl3.py b/tools/test_moe_w2_exl3.py
+new file mode 100644
+index 000000000..e5c99efea
+--- /dev/null
++++ b/tools/test_moe_w2_exl3.py
+@@ -0,0 +1,192 @@
++#!/usr/bin/env python3
++"""Parity/dispatch-semantics test for moe_w2_exl3.Exl3BaseTier (host-side,
++no vLLM imports; run: CUDA_VISIBLE_DEVICES=<g> python3 tools/test_moe_w2_exl3.py).
++
++Uses REAL inputs end to end: captured hidden states, REAL router (gate
++weight+bias from the checkpoint, sqrtsoftplus + noaux_tc selection,
++route_scale 1.5), the built EXL3 pack, and FP4-dequant reference weights.
++
++Stages:
++  1. no-mask: EXL3 block vs pack-reconstructed manual composition
++     (kernel exactness) and vs FP4 reference (quality band).
++  2. partial FP4 mask: additive split — exl3(masked) + fp4(torch on the
++     masked experts) must equal the mixed-composition reference.
++  3. all-masked token contributes zero from the EXL3 side.
++"""
++import os
++import sys
++import importlib.util
++
++import numpy as np
++import torch
++import torch.nn.functional as F
++
++WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++AB_DIR = "/root/workspace/exl3-ab"
++PACK = "/root/workspace/moet-serve/exl3-packs-ds4"
++CAP = f"{AB_DIR}/capture"
++DEV = "cuda:0"
++LI = 21
++LIMIT = 10.0
++M = 32
++
++sys.path.insert(0, AB_DIR)
++import exl3_ab as AB  # noqa: E402
++from bootstrap_exl3 import load_exl3_quantize  # noqa: E402
++
++Q = load_exl3_quantize()
++
++spec = importlib.util.spec_from_file_location(
++    "moe_w2_exl3",
++    f"{WT}/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py")
++X3 = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(X3)
++
++# moe_w2_planes is import-clean (os + torch only) -> load it standalone too,
++# to exercise the v2 FP4 pool-slot inverse packers + dequant that
++# moe_w2_cubit._exl3_fp4_apply uses.
++_spec_pl = importlib.util.spec_from_file_location(
++    "moe_w2_planes",
++    f"{WT}/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py")
++PL = importlib.util.module_from_spec(_spec_pl)
++_spec_pl.loader.exec_module(PL)
++
++FAILS = []
++
++
++def check(name, ok, detail=""):
++    print(f"  {'PASS' if ok else 'FAIL'}  {name}  {detail}")
++    if not ok:
++        FAILS.append(name)
++
++
++def real_routing(x):
++    """sqrtsoftplus + noaux_tc bias selection, route_scale 1.5 (model.py Gate)."""
++    gw = torch.from_numpy(np.asarray(AB.load_raw(f"layers.{LI}.ffn.gate.weight"))
++                          .view(np.uint16)).view(torch.bfloat16) \
++        .view(256, 4096).to(DEV).float()
++    gb = torch.from_numpy(np.asarray(AB.load_raw(f"layers.{LI}.ffn.gate.bias"))
++                          .view(np.float32).copy()).view(256).to(DEV)
++    scores = F.softplus(x @ gw.T).sqrt()
++    idx = (scores + gb).topk(6, dim=-1)[1]
++    w = scores.gather(1, idx)
++    w = w / w.sum(dim=-1, keepdim=True) * 1.5
++    return idx.long(), w.float()
++
++
++def fp4_expert(ei):
++    return tuple(torch.from_numpy(AB.dequant_codes(
++        AB.unpack(AB.load_raw(f"layers.{LI}.ffn.experts.{ei}.{p}.weight")),
++        AB.load_raw(f"layers.{LI}.ffn.experts.{ei}.{p}.scale"))).to(DEV)
++        for p in ("w1", "w3", "w2"))
++
++
++def block_torch(x, ids, wts, weight_fn, mask=None):
++    """Reference block: weight_fn(ei) -> (w1, w3, w2) fp32 [out,in]."""
++    y = torch.zeros(x.shape[0], 4096, dtype=torch.float, device=DEV)
++    cache = {}
++    for t in range(x.shape[0]):
++        for j in range(ids.shape[1]):
++            if mask is not None and bool(mask[t, j]):
++                continue
++            ei = int(ids[t, j])
++            if ei not in cache:
++                cache[ei] = weight_fn(ei)
++            w1, w3, w2 = cache[ei]
++            g = (x[t] @ w1.T).clamp(max=LIMIT)
++            u = (x[t] @ w3.T).clamp(min=-LIMIT, max=LIMIT)
++            y[t] += wts[t, j] * ((F.silu(g) * u) @ w2.T)
++    return y
++
++
++def pack_expert(tier, ei):
++    def rec(proj, kb, in_f, out_f):
++        tr = tier._store[f"l{LI}.e{ei}.{proj}.k{kb}.trellis"]
++        suh = tier._store[f"l{LI}.e{ei}.{proj}.k{kb}.suh"]
++        svh = tier._store[f"l{LI}.e{ei}.{proj}.k{kb}.svh"]
++        w = torch.empty(in_f, out_f, dtype=torch.half, device=DEV)
++        tier.ext.reconstruct(w, tr, kb, False, False)
++        w = Q.preapply_had_l(w.float(), Q.had_k)
++        w *= suh.float().unsqueeze(1)
++        w = Q.preapply_had_r(w, Q.had_n)
++        w *= svh.float().unsqueeze(0)
++        return w.T.contiguous()  # -> [out, in]
++    return (rec("w1", tier.w13_k, 4096, 2048),
++            rec("w3", tier.w13_k, 4096, 2048),
++            rec("w2", tier.w2_k, 2048, 4096))
++
++
++def rel(a, b):
++    return ((a - b).square().mean().sqrt() / b.square().mean().sqrt()).item()
++
++
++def main():
++    torch.manual_seed(29)
++    x = torch.load(f"{CAP}/x_layer{LI:02d}.pt")[-M:].to(DEV).float()
++    ids, wts = real_routing(x)
++    used = ids.unique().numel()
++    print(f"real routing: {M} tokens -> {used} distinct experts")
++
++    tier = X3.Exl3BaseTier(PACK, layers=[LI], device=DEV)
++    print(f"tier resident: {tier.total_bytes()/2**30:.2f} GiB (layer {LI})")
++
++    # 1. no mask
++    y_x3 = tier.forward_topk(LI, x, ids, wts)
++    y_man = block_torch(x, ids, wts, lambda e: pack_expert(tier, e))
++    y_fp4 = block_torch(x, ids, wts, fp4_expert)
++    e_exact = rel(y_x3, y_man)
++    e_qual = rel(y_x3, y_fp4)
++    check("kernel exactness vs pack reconstruction", e_exact < 0.01,
++          f"rel-err {e_exact:.4f}")
++    check("quality vs FP4 reference in expected band", 0.10 < e_qual < 0.30,
++          f"rel-err {e_qual:.4f}")
++
++    # 2. partial mask: 2 random slots per token served by "FP4 tier"
++    mask = torch.zeros(M, 6, dtype=torch.bool, device=DEV)
++    for t in range(M):
++        mask[t, torch.randperm(6)[:2]] = True
++    y_base = tier.forward_topk(LI, x, ids, wts, fp4_mask=mask)
++    y_fp4part = block_torch(x, ids, wts, fp4_expert, mask=~mask)
++    y_hybrid = y_base + y_fp4part
++    y_refmix = (block_torch(x, ids, wts, lambda e: pack_expert(tier, e), mask=mask)
++                + y_fp4part)
++    e_split = rel(y_hybrid, y_refmix)
++    check("masked split additivity", e_split < 0.01, f"rel-err {e_split:.4f}")
++    e_hq = rel(y_hybrid, y_fp4)
++    check("hybrid (2/6 FP4) improves on pure base", e_hq < e_qual,
++          f"{e_qual:.4f} -> {e_hq:.4f}")
++
++    # 3. fully masked token
++    mask_all = torch.zeros(M, 6, dtype=torch.bool, device=DEV)
++    mask_all[0, :] = True
++    y0 = tier.forward_topk(LI, x, ids, wts, fp4_mask=mask_all)
++    check("fully-masked token yields zero", float(y0[0].abs().max()) == 0.0)
++
++    # 4. v2 FP4 pool-slot inverse packers + dequant (moe_w2_cubit
++    # ._exl3_fp4_apply primitives). Decisive + self-contained: exact
++    # fragment-major round-trip and dequant == direct e2m1 * 2^(e8m0-127).
++    torch.manual_seed(4)
++    for (Nn, Kk) in ((4096, 4096), (4096, 2048)):
++        nib = torch.randint(0, 16, (Nn, Kk), dtype=torch.uint8, device=DEV)
++        sc = torch.randint(100, 156, (Nn, Kk // 32), dtype=torch.uint8,
++                           device=DEV)
++        plane = PL.pack_fp4_fragment_major(nib)
++        scpl = PL.pack_scales(sc)
++        nib_rt = PL.unpack_fp4_fragment_major(plane, Nn, Kk)
++        sc_rt = PL.unpack_scales(scpl, Nn, Kk)
++        check(f"fragment-major nibble round-trip [{Nn}x{Kk}]",
++              bool((nib_rt == nib).all()))
++        check(f"scale round-trip [{Nn}x{Kk}]", bool((sc_rt == sc).all()))
++        w_slot = PL.dequant_fp4_expert(plane, scpl, Nn, Kk)
++        vals = PL._E2M1_VALS.to(DEV)[nib.long()]
++        scale = torch.exp2(sc.float() - 127.0).repeat_interleave(32, dim=1)
++        e_form = rel(w_slot, (vals * scale).float())
++        check(f"slot dequant == direct formula [{Nn}x{Kk}]", e_form < 1e-6,
++              f"rel-err {e_form:.2e}")
++
++    print("\n" + ("ALL PASS" if not FAILS else f"FAILURES: {FAILS}"))
++    sys.exit(1 if FAILS else 0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/test_moe_w2_exl3_delta.py b/tools/test_moe_w2_exl3_delta.py
+new file mode 100644
+index 000000000..0c85b5dd5
+--- /dev/null
++++ b/tools/test_moe_w2_exl3_delta.py
+@@ -0,0 +1,330 @@
++#!/usr/bin/env python3
++"""Parity test for the Δ-pool dispatch (P6, [M] 2026-07-30): Exl3BaseTier.
++forward_topk_dual over a synthetic pool built from the REAL delta pack.
++
++Self-contained (the legacy test_moe_w2_exl3.py depends on the lost exl3-ab
++scripts): checkpoint FP4 dequant, real router, base pack, delta pack, and
++the exllamav3 ext via internal/exl3-sr-poc/exl3_import (mounted at /poc).
++
++Run inside the PoC-style container:
++  python3 /wt/tools/test_moe_w2_exl3_delta.py
++
++Stages:
++  1. dual-stream kernel exactness: forward_topk_dual vs torch reference
++     (reconstruct + Hadamards) on base+Δ weights, pooled pairs only.
++  2. additive split: forward_topk(base, masked) + dual(Δ-pairs) equals the
++     mixed reference block.
++  3. no pooled pair -> dual contributes exactly zero (negative-skip safety).
++  4. quality ladder: err(hybrid 2/6 Δ) < err(base-only); err(all-Δ) matches
++     the pack's block validation band (~0.06-0.11 vs FP4).
++"""
++import json
++import os
++import sys
++
++import torch
++import torch.nn.functional as F
++
++sys.path.insert(0, "/poc")
++from exl3_import import load_exl3  # noqa: E402
++from sr_poc import dequant_fp4, load_ckpt_tensor  # noqa: E402
++
++WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++import importlib.util  # noqa: E402
++spec = importlib.util.spec_from_file_location(
++    "moe_w2_exl3",
++    f"{WT}/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py")
++X3 = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(X3)
++
++Q, EXT = load_exl3()
++
++BASEPACK = "/basepack"
++DELTAPACK = "/delta-pack"
++DEV = "cuda:0"
++LI = 21
++LIMIT = 10.0
++M = 32
++FAILS = []
++
++
++def check(name, ok, detail=""):
++    print(f"  {'PASS' if ok else 'FAIL'}  {name}  {detail}")
++    if not ok:
++        FAILS.append(name)
++
++
++def rel(a, b):
++    return ((a - b).square().mean().sqrt()
++            / b.square().mean().sqrt().clamp_min(1e-12)).item()
++
++
++def real_routing(x):
++    gw = load_ckpt_tensor(f"layers.{LI}.ffn.gate.weight").to(DEV).float()
++    gb = load_ckpt_tensor(f"layers.{LI}.ffn.gate.bias").to(DEV).float()
++    scores = F.softplus(x @ gw.T).sqrt()
++    idx = (scores + gb).topk(6, dim=-1)[1]
++    w = scores.gather(1, idx)
++    w = w / w.sum(dim=-1, keepdim=True) * 1.5
++    return idx.long(), w.float()
++
++
++def fp4_expert(ei):
++    out = []
++    for p in ("w1", "w3", "w2"):
++        w = load_ckpt_tensor(f"layers.{LI}.ffn.experts.{ei}.{p}.weight")
++        s = load_ckpt_tensor(f"layers.{LI}.ffn.experts.{ei}.{p}.scale")
++        out.append(dequant_fp4(w, s))          # [out, in] f32
++    return tuple(out)
++
++
++def dereg(w_inner, suh, svh):
++    w = Q.preapply_had_l(w_inner.float(), Q.had_k)
++    w = w * suh.float().unsqueeze(1)
++    w = Q.preapply_had_r(w, Q.had_n)
++    return w * svh.float().unsqueeze(0)
++
++
++def pack_expert(tier, ei):
++    def rec(proj, kb, in_f, out_f):
++        tr = tier._store[f"l{LI}.e{ei}.{proj}.k{kb}.trellis"]
++        suh = tier._store[f"l{LI}.e{ei}.{proj}.k{kb}.suh"]
++        svh = tier._store[f"l{LI}.e{ei}.{proj}.k{kb}.svh"]
++        w = torch.empty(in_f, out_f, dtype=torch.half, device=DEV)
++        tier.ext.reconstruct(w, tr, kb, False, False)
++        return dereg(w, suh, svh).T.contiguous()          # [out, in]
++    return (rec("w1", tier.w13_k, 4096, 2048),
++            rec("w3", tier.w13_k, 4096, 2048),
++            rec("w2", tier.w2_k, 2048, 4096))
++
++
++def delta_expert_from_row(row, geom):
++    def part(proj, kdim, ndim):
++        dk = geom["dk13"] if proj in ("g", "u") else geom["dk2"]
++        otr, osuh, osvh = geom["offs"][proj]
++        trb = (kdim // 16) * (ndim // 16) * dk * 32
++        tr = row[otr:otr + trb].view(torch.int16) \
++            .view(kdim // 16, ndim // 16, 16 * dk).contiguous()
++        suh = row[osuh:osuh + kdim * 2].view(torch.half)
++        svh = row[osvh:osvh + ndim * 2].view(torch.half)
++        w = torch.empty(kdim, ndim, dtype=torch.half, device=DEV)
++        EXT.reconstruct(w, tr, dk, False, True)   # pack v3 delta = MUL1
++        return dereg(w, suh, svh).T.contiguous()          # [out, in]
++    return (part("g", 4096, 2048), part("u", 4096, 2048),
++            part("d", 2048, 4096))
++
++
++def block_torch(x, ids, wts, weight_fn, mask=None):
++    y = torch.zeros(x.shape[0], 4096, dtype=torch.float, device=DEV)
++    cache = {}
++    for t in range(x.shape[0]):
++        for j in range(ids.shape[1]):
++            if mask is not None and not bool(mask[t, j]):
++                continue
++            ei = int(ids[t, j])
++            if ei not in cache:
++                cache[ei] = weight_fn(ei)
++            w1, w3, w2 = cache[ei]
++            g = (x[t] @ w1.T).clamp(max=LIMIT)
++            u = (x[t] @ w3.T).clamp(min=-LIMIT, max=LIMIT)
++            y[t] += wts[t, j] * ((F.silu(g) * u) @ w2.T)
++    return y
++
++
++def main():
++    torch.manual_seed(29)
++    torch.set_grad_enabled(False)
++    x = torch.load(f"/capture/x_layer{LI:02d}.pt",
++                   map_location="cpu", weights_only=False)[-M:].to(DEV).float()
++    ids, wts = real_routing(x)
++    used = ids.unique()
++    print(f"real routing: {M} tokens -> {used.numel()} distinct experts")
++
++    with open(f"{DELTAPACK}/exl3-delta-l{LI:02d}.manifest.json") as f:
++        man = json.load(f)
++    dk13 = int(man.get("kd13", man["kd"]))
++    dk2 = int(man.get("kd2", man["kd"]))
++    base_w2k = int(man.get("base_w2k", 2))
++    tier = X3.Exl3BaseTier(BASEPACK, layers=[LI], device=DEV,
++                           w2_k=base_w2k)
++    geom = X3.delta_slot_geom(dk13, dk2)
++    print(f"tier {tier.total_bytes()/2**30:.2f} GiB; Δ slot "
++          f"{geom['slot_bytes']/2**20:.2f} MiB (dk13={dk13} dk2={dk2} "
++          f"base_w2k={base_w2k})")
++
++    # synthetic pool: every ROUTED expert gets a slot (worst case coverage)
++    from safetensors import safe_open
++    slot_row = torch.full((256,), -1, dtype=torch.int32, device=DEV)
++    rows = []
++    with safe_open(f"{DELTAPACK}/exl3-delta-l{LI:02d}.safetensors",
++                   "pt") as f:
++        for si, e in enumerate(used.tolist()):
++            parts = []
++            for proj in ("w1", "w3"):
++                for part in ("trellis", "suh", "svh"):
++                    parts.append(f.get_tensor(f"e{e}.{proj}.dk{dk13}.{part}")
++                                 .contiguous().view(torch.uint8).view(-1))
++            for part in ("trellis", "suh", "svh"):
++                parts.append(f.get_tensor(f"e{e}.w2.dk{dk2}.{part}")
++                             .contiguous().view(torch.uint8).view(-1))
++            rows.append(torch.cat(parts).to(DEV))
++            slot_row[e] = si
++    pool = torch.stack(rows)
++    assert pool.shape[1] == geom["slot_bytes"]
++    tabs = X3.delta_ptr_tables(pool.data_ptr(), geom["slot_bytes"],
++                               slot_row, geom)
++
++    def bd_expert(ei):
++        b = pack_expert(tier, ei)
++        d = delta_expert_from_row(pool[int(slot_row[ei])], geom)
++        return tuple(bb + dd for bb, dd in zip(b, d))
++
++    # 1. dual-stream exactness on pooled pairs (2/6 per token)
++    dmask = torch.zeros(M, 6, dtype=torch.bool, device=DEV)
++    for t in range(M):
++        dmask[t, torch.randperm(6)[:2]] = True
++    y_dual = tier.forward_topk_dual(LI, x, ids, wts, dmask, tabs, dk13=dk13, dk2=dk2)
++    y_ref = block_torch(x, ids, wts, bd_expert, mask=dmask)
++    e1 = rel(y_dual, y_ref)
++    check("dual-stream exactness vs torch base+Δ reference", e1 < 0.01,
++          f"rel-err {e1:.4f}")
++
++    # 2. additive split: base(masked) + dual == mixed reference
++    y_base = tier.forward_topk(LI, x, ids, wts, fp4_mask=dmask)
++    y_mix_ref = (block_torch(x, ids, wts,
++                             lambda e: pack_expert(tier, e), mask=~dmask)
++                 + y_ref)
++    e2 = rel(y_base + y_dual, y_mix_ref)
++    check("hybrid split additivity (base + Δ-pairs)", e2 < 0.01,
++          f"rel-err {e2:.4f}")
++
++    # 3. no pooled pair -> exact zero
++    none = torch.zeros(M, 6, dtype=torch.bool, device=DEV)
++    y0 = tier.forward_topk_dual(LI, x, ids, wts, none, tabs, dk13=dk13, dk2=dk2)
++    check("no-Δ token contributes exactly zero",
++          float(y0.abs().max()) == 0.0)
++
++    # 3b. unified 6-call pass == split path (base masked + dual) and ref
++    y_uni = tier.forward_topk_unified(LI, x, ids, wts, dmask, tabs, dk13=dk13, dk2=dk2)
++    e_uni_split = rel(y_uni, y_base + y_dual)
++    e_uni_ref = rel(y_uni, y_mix_ref)
++    check("unified pass == split path", e_uni_split < 0.002,
++          f"rel-err {e_uni_split:.5f}")
++    check("unified pass vs torch mixed reference", e_uni_ref < 0.01,
++          f"rel-err {e_uni_ref:.4f}")
++    y_uni0 = tier.forward_topk_unified(LI, x, ids, wts, none, tabs, dk13=dk13, dk2=dk2)
++    e_uni0 = rel(y_uni0, tier.forward_topk(LI, x, ids, wts))
++    check("unified with empty pool == pure base", e_uni0 < 0.002,
++          f"rel-err {e_uni0:.5f}")
++
++    # 4. quality ladder vs FP4 exact
++    y_fp4 = block_torch(x, ids, wts, fp4_expert,
++                        mask=torch.ones_like(dmask))
++    e_base = rel(tier.forward_topk(LI, x, ids, wts), y_fp4)
++    e_hyb = rel(y_base + y_dual, y_fp4)
++    all_m = torch.ones_like(dmask)
++    y_all = tier.forward_topk_dual(LI, x, ids, wts, all_m, tabs, dk13=dk13, dk2=dk2)
++    e_all = rel(y_all, y_fp4)
++    check("hybrid (2/6 Δ) improves on pure base", e_hyb < e_base,
++          f"{e_base:.4f} -> {e_hyb:.4f}")
++    check("all-Δ error in pack validation band", 0.02 < e_all < 0.13,
++          f"rel-err {e_all:.4f} (block validations 0.023-0.107)")
++
++    # 5. decode-wave path (M=1): the whole layer in five flat launches, every
++    #    active expert served base+Δ == forward_topk_dual with all-True dmask
++    #    (the serving decode route for integration 2.3/2.5, [B] 2026-08-05).
++    x1 = x[-1:]
++    ids1, wts1 = ids[-1:], wts[-1:]
++    allm1 = torch.ones(1, 6, dtype=torch.bool, device=DEV)
++    y_wave = tier.forward_topk_wave(LI, x1, ids1, wts1, tabs)
++    y_dual1 = tier.forward_topk_dual(LI, x1, ids1, wts1, allm1, tabs,
++                                     dk13=dk13, dk2=dk2)
++    y_ref1 = block_torch(x1, ids1, wts1, bd_expert, mask=allm1)
++    check("decode-wave output finite", bool(torch.isfinite(y_wave).all()))
++    e_wd = rel(y_wave, y_dual1)
++    e_wr = rel(y_wave, y_ref1)
++    check("decode-wave vs mgemm-dual (all-Δ, M=1)", e_wd < 0.006,
++          f"rel-err {e_wd:.5f}")
++    check("decode-wave vs torch base+Δ reference (M=1)", e_wr < 0.01,
++          f"rel-err {e_wr:.4f}")
++
++    # 6. decode-wave with a PARTIAL pool (masked Δ): pooled pairs base+Δ,
++    #    non-pooled base-only == forward_topk_unified on the same dmask (the
++    #    real serving case — only a subset of a token's experts are pooled).
++    dmw = torch.zeros(1, 6, dtype=torch.bool, device=DEV)
++    dmw[0, torch.randperm(6)[:2]] = True
++    y_wm = tier.forward_topk_wave(LI, x1, ids1, wts1, tabs, dmask=dmw)
++    y_um = tier.forward_topk_unified(LI, x1, ids1, wts1, dmw, tabs,
++                                     dk13=dk13, dk2=dk2)
++    y_rm = (block_torch(x1, ids1, wts1, bd_expert, mask=dmw)
++            + block_torch(x1, ids1, wts1,
++                          lambda e: pack_expert(tier, e), mask=~dmw))
++    check("decode-wave (masked 2/6) finite", bool(torch.isfinite(y_wm).all()))
++    e_wmu = rel(y_wm, y_um)
++    e_wmr = rel(y_wm, y_rm)
++    check("decode-wave (masked) vs mgemm-unified", e_wmu < 0.006,
++          f"rel-err {e_wmu:.5f}")
++    check("decode-wave (masked) vs torch mixed ref", e_wmr < 0.01,
++          f"rel-err {e_wmr:.4f}")
++    none1 = torch.zeros(1, 6, dtype=torch.bool, device=DEV)
++    y_w0 = tier.forward_topk_wave(LI, x1, ids1, wts1, tabs, dmask=none1)
++    e_w0 = rel(y_w0, tier.forward_topk(LI, x1, ids1, wts1))
++    check("decode-wave (empty pool) == pure base", e_w0 < 0.006,
++          f"rel-err {e_w0:.5f}")
++
++    # 7. decode-wave FAST path (persistent ptab stack, glue fix [V] 08-05):
++    #    dtabs=None serves off init_ptabs' [18, E] table — base rows static,
++    #    Δ rows + the baked zero-svh mask refreshed at pool-MUTATION time via
++    #    the delta tier's mutate hook. Same pointer arithmetic as the legacy
++    #    per-step compose -> repeat-band equality (wave's fp32 atomics leave
++    #    run-to-run noise ~1e-7; 1e-5 bar is decisive vs the 1e-3 kernel band).
++    class _FtierShim:  # minimal DeltaTier surface init_ptabs touches
++        pass
++    shim = _FtierShim()
++    shim.pool = pool
++    shim.slot_bytes = geom["slot_bytes"]
++    shim.slot_table = torch.full((LI + 1, 256), -1, dtype=torch.int32,
++                                 device=DEV)
++    shim.slot_table[LI] = slot_row
++    shim.mutate_hooks = []
++    tier.init_ptabs(shim, geom, [(LI, LI)])
++    check("ptab init registered a mutate hook", len(shim.mutate_hooks) == 1)
++    y_fast = tier.forward_topk_wave(LI, x1, ids1, wts1)
++    y_leg = tier.forward_topk_wave(LI, x1, ids1, wts1, tabs,
++                                   dmask=(slot_row[ids1] >= 0))
++    e_f1 = rel(y_fast, y_leg)
++    check("wave FAST (ptab, full pool) == legacy compose", e_f1 < 1e-5,
++          f"rel-err {e_f1:.2e}")
++    # partial pool: evict half the routed experts, refresh via the hook —
++    # the fast path must flip them to base-only exactly like a live dmask
++    ev = used[::2]
++    shim.slot_table[LI, ev] = -1
++    for h in shim.mutate_hooks:
++        h()
++    dmp = shim.slot_table[LI][ids1] >= 0
++    y_fast2 = tier.forward_topk_wave(LI, x1, ids1, wts1)
++    y_leg2 = tier.forward_topk_wave(LI, x1, ids1, wts1, tabs, dmask=dmp)
++    e_f2 = rel(y_fast2, y_leg2)
++    check("wave FAST (ptab, partial pool via hook) == legacy compose",
++          e_f2 < 1e-5, f"rel-err {e_f2:.2e}")
++    y_rm2 = (block_torch(x1, ids1, wts1, bd_expert, mask=dmp)
++             + block_torch(x1, ids1, wts1,
++                           lambda e: pack_expert(tier, e), mask=~dmp))
++    e_f3 = rel(y_fast2, y_rm2)
++    check("wave FAST (partial) vs torch mixed ref", e_f3 < 0.01,
++          f"rel-err {e_f3:.4f}")
++    # empty pool: everything base-only == pure base forward
++    shim.slot_table[LI] = -1
++    for h in shim.mutate_hooks:
++        h()
++    y_fast0 = tier.forward_topk_wave(LI, x1, ids1, wts1)
++    e_f0 = rel(y_fast0, tier.forward_topk(LI, x1, ids1, wts1))
++    check("wave FAST (empty pool) == pure base", e_f0 < 0.006,
++          f"rel-err {e_f0:.5f}")
++
++    print("\n" + ("ALL PASS" if not FAILS else f"FAILURES: {FAILS}"))
++    sys.exit(1 if FAILS else 0)
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
 index 6da3ec717..c84958ac0 100644
 --- a/vllm/compilation/breakable_cudagraph.py
@@ -2807,10 +3586,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..e509f8cb2
+index 000000000..48b501b8f
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,2743 @@
+@@ -0,0 +1,3734 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -2981,6 +3760,119 @@ index 000000000..e509f8cb2
 +_TOPP = float(os.getenv("VLLM_MOE_W2_TOPP", "0"))
 +_TOPP_MIN = max(1, int(os.getenv("VLLM_MOE_W2_TOPP_MIN", "2")))
 +_TOPP_RENORM = os.getenv("VLLM_MOE_W2_TOPP_RENORM", "1") == "1"
++
++# ---- EXL3 trellis base tier (VLLM_MOE_W2_EXL3_BASE=1) --------------------
++# v1 (2026-07-29): the RESIDENT base tier is served from an EXL3 pack
++# (exl3-ab/build_exl3_pack.py; w13@K2 + w2@K{1,2,3} per expert) through
++# exllamav3's grouped trellis GEMM instead of the 2-bit scalar planes —
++# moe_w2_exl3.Exl3BaseTier holds per-layer pointer tables over the pack
++# tensors and computes the full routed block (parity 0.0007 vs pack
++# reconstruction, block error 0.26-0.30 vs FP4 at 2.01 bpw on real
++# routing — EXL3_BASE_TIER_FEASIBILITY.md Phase 2). The 2-bit planes are
++# NOT built in this mode (the ~65 GiB tier replaces them and both would
++# not fit), the checkpoint expert bytes are never staged (loader-skip,
++# same mechanism as boot-from-pack) and no FP4 planes are packed.
++#
++# v1 support envelope, REFUSED fail-closed at load otherwise:
++#   resident TP1 only (no base cache, no FP4 need-pool, no gate) and
++#   eager only (--enforce-eager; the per-token dispatch loop is host
++#   code — cudagraph capture would bake a single replayed token set).
++# v2 items (not here): FP4 need-pool interplay via forward_topk's
++# fp4_mask (dispatch semantics already parity-proven), gate, TP via
++# exl3_mgemm's min/max_index, cudagraph/fused path.
++#   VLLM_MOE_W2_EXL3_BASE  1 = serve the base tier from the EXL3 pack
++#   VLLM_MOE_W2_EXL3_PACK  pack dir (exl3-l{li:02d}.safetensors files)
++#   VLLM_MOE_W2_EXL3_W2K   down-proj K variant 1|2|3 (default 2; also
++#                          read by Exl3BaseTier when unset there)
++#   VLLM_MOE_W2_EXL3_REPO  exllamav3 checkout for the JIT ext (consumed
++#                          by moe_w2_exl3._load_ext)
++_EXL3_BASE = os.getenv("VLLM_MOE_W2_EXL3_BASE", "0") == "1"
++_EXL3_PACK = os.getenv("VLLM_MOE_W2_EXL3_PACK", "/serve-tau/exl3-packs-ds4")
++_EXL3_W2K = int(os.getenv("VLLM_MOE_W2_EXL3_W2K", "2"))
++# layer_key -> (Exl3BaseTier holding that one layer, pack layer index)
++_EXL3_TIERS: dict[int, tuple] = {}
++_exl3_config_checked = False
++# v2 FP4 need-pool slot geometry (DS4 TP1 is uniform across layers): byte
++# offsets of the [fp4_13|sc13|fp4_2|sc2] sections + matrix shapes, set once by
++# _exl3_stage_fp4 and read by _exl3_fp4_apply. None until the pool is staged.
++_EXL3_FP4_GEOM: dict | None = None
++# v2 FP4 apply weight cache: dequantized bf16 expert weights keyed by
++# (layer_key, expert). The FP4 weights of a given expert are INVARIANT (the
++# checkpoint's FP4; pool eviction only moves WHERE they live, never the
++# values), so this cache is correctness-safe with NO slot invalidation. It
++# turns the eager apply from "re-dequant the resident set every token" into a
++# one-time-per-expert cost, so decode speed approaches the base's. Bounded
++# LRU (insertion-ordered dict): N x (w13 32 + w2 16 MiB bf16) = N x 48 MiB.
++_EXL3_FP4_WCACHE: dict = {}
++_EXL3_FP4_WCACHE_MAX = int(os.getenv("VLLM_MOE_W2_EXL3_FP4_CACHE", "96"))
++# v2-perf: serve the FP4-resident experts through the production moe_w4_mm
++# cubin (reads the 4-bit pool slots directly, fp8-a32 activations, ~2 launches
++# /layer) instead of the eager torch dequant+GEMM apply. Off by default (the
++# torch path is the validated fallback); VALIDATE=1 runs both and logs the
++# rel-err on the first layers to certify the cubin path against the torch one.
++_EXL3_FP4_CUBIN = os.getenv("VLLM_MOE_W2_EXL3_FP4_CUBIN", "0") == "1"
++_EXL3_FP4_VALIDATE = os.getenv("VLLM_MOE_W2_EXL3_FP4_VALIDATE", "0") == "1"
++_exl3_fp4_val_n = 0
++# v2-perf Stage B: allow cudagraph capture of the EXL3 decode (the only lever
++# that breaks the eager per-layer launch wall). Requires the capture-safe
++# forward: base served for ALL experts with FP4-resident ones zeroed via
++# masked weights (fixed shape, no compaction/sync) + the cubin FP4 apply
++# (kernel-based). Implies the cubin apply. Off by default (eager path).
++_EXL3_CUDAGRAPH = os.getenv("VLLM_MOE_W2_EXL3_CUDAGRAPH", "0") == "1"
++if _EXL3_CUDAGRAPH:
++    _EXL3_FP4_CUBIN = True   # the torch apply's per-expert loop is not capturable
++# ---- Δ-pool mode (P6, [M] 2026-07-30): the need-pool holds EXL3 residual
++# DELTA slots (pack v3: exl3-delta-l*.safetensors, independent per-expert
++# residual tensors over the base pack; built by internal/exl3-sr-poc/
++# build_delta_pack.py) instead of FP4 planes. The DeltaTier/gate/replay
++# machinery is unchanged (slots are opaque bytes); the apply computes the
++# full block for pool-resident experts with base+Δ summed PRE-activation
++# (Exl3BaseTier.forward_topk_dual — weight-level additivity, capture-safe).
++# Slot = 6.03 MiB vs 12.75 FP4 -> ~2.1x more pool coverage per GiB, and the
++# checkpoint experts are loader-skipped like v1 (no ~138 GiB FP4 host pin;
++# the Δ host store pins ~65 GB instead).
++_EXL3_DELTA_PACK = os.getenv("VLLM_MOE_W2_EXL3_DELTA_PACK", "")
++# P6-perf: serve base+Δ in ONE unified pass (6 mgemm/token) instead of
++# masked-base + dual (9, with duplicated base g/u work). Algebraically
++# identical (parity-tested); flag kept for A/B fallback.
++_EXL3_DELTA_UNIFIED = os.getenv("VLLM_MOE_W2_EXL3_DELTA_UNIFIED",
++                                "1") == "1"
++# Track 2.5 (2026-08-05, [B]): serve the M=1 decode step from the flat
++# exl3_decode_wave kernel instead of the six mgemm barrier-trains (2.0x
++# decode uplift, sonda 3.0 -> af76cdd). Same base/base+Δ block as the
++# unified path (parity 9.8e-4 vs forward_topk_unified on real packs); a
++# drop-in inside the capture-safe unified branch, gated to M=1 and the
++# pack-v3 serving pair (base 2,2,1 -> w2_k=1; Δ 2,2,3 -> dk13=2,dk2=3) the
++# kernel hardcodes. Falls back to unified when M>1 or the config differs.
++_EXL3_WAVE = os.getenv("VLLM_MOE_W2_EXL3_WAVE", "0") == "1"
++_exl3_wave_seen: list = []   # one-shot activation-log sentinel
++_EXL3_DELTA_GEOM: dict | None = None
++
++# 9b step-1 h_l capture ([P] 2026-08-03, default-off): mirrors the gate's
++# VLLM_MOE_W2_GATE_HCAP_DIR knob — when set, the EXL3 forward copies each
++# layer's MoE input row into this persistent [n_layers, H] buffer
++# (in-graph, fixed shapes). Consumers: moe_w2_gate.hcap_store via the
++# runner. Measurement-only; the disabled path adds one falsy check.
++_HCAP_ON = bool(os.getenv("VLLM_MOE_W2_GATE_HCAP_DIR", ""))
++_HCAP_BUF: torch.Tensor | None = None
++
++
++def _hcap_buf(layer_key: int, x: torch.Tensor) -> torch.Tensor:
++    global _HCAP_BUF
++    if _HCAP_BUF is None:
++        n_layers = max(k for k in _EXL3_TIERS) + 1 if _EXL3_TIERS else 64
++        _HCAP_BUF = torch.zeros(n_layers, x.shape[-1], dtype=torch.half,
++                                device=x.device)
++    return _HCAP_BUF[layer_key]
++
++
++def hcap_snapshot() -> torch.Tensor | None:
++    """Decision-time clone of the h_l buffer (runner-side, eager)."""
++    return _HCAP_BUF.clone() if _HCAP_BUF is not None else None
++_EXL3_DELTA_VALIDATE = os.getenv("VLLM_MOE_W2_EXL3_DELTA_VALIDATE",
++                                 "0") == "1"
++_exl3_delta_val_n = 0
++_exl3_delta_abi_checked = False
 +
 +# ---- activation-scale group size per GEMM (the a32 kernel format) --------
 +# The _a32 kernels read f32 A scales at PER-32 stride; quantizing with a
@@ -3466,7 +4358,35 @@ index 000000000..e509f8cb2
 +    K13, K2 = K13h * 2, K2h * 2
 +    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
 +    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
-+    if moe_w2_delta.base_enabled():
++    if _EXL3_BASE:
++        # EXL3 resident base: the pack replaces the checkpoint experts
++        # entirely, so v1 (no FP4 pool) never needs their bytes staged —
++        # probe config + pack coverage here (fail-closed at CREATE) and
++        # fall through to the shared loader-skip stubbing below.
++        # _exl3_build_layer registers the tier from the pack at
++        # process_weights_after_loading time.
++        _exl3_check_config()
++        lidx = _exl3_pack_index(layer, key)
++        if moe_w2_delta.enabled():
++            if _EXL3_DELTA_PACK:
++                # Δ-pool (P6): the pool stages from the DELTA PACK on disk,
++                # never from checkpoint experts — loader-skip like v1 (fall
++                # through to the shared stubbing below). Probe the layer's
++                # delta file at CREATE so a partial pack refuses early.
++                dpath = os.path.join(_EXL3_DELTA_PACK,
++                                     f"exl3-delta-l{lidx:02d}.safetensors")
++                if not os.path.exists(dpath):
++                    raise ValueError(
++                        f"moe_w2 EXL3 Δ-pool: delta pack layer file missing: "
++                        f"{dpath}")
++            else:
++                # v2 FP4 need-pool: there is NO pre-built FP4 pack on disk, so
++                # the pool's host store is staged from the checkpoint mxfp4
++                # experts in _exl3_build_layer. Keep them host-staged (do NOT
++                # loader-skip); STREAM_BUILD still triggers the per-layer
++                # build as its experts land, so peak staging stays ~one layer.
++                return False
++    elif moe_w2_delta.base_enabled():
 +        # host-resident: the pack store serves the base (and the FP4
 +        # need-pool when configured) — probe the sidecars.
 +        n_keys = _layer_cutoff() + 1
@@ -3694,6 +4614,333 @@ index 000000000..e509f8cb2
 +    return True
 +
 +
++def _exl3_check_config() -> None:
++    """EXL3 v1 support envelope — refuse incompatible configs fail-closed
++    at LOAD time with an actionable message instead of serving a mixed
++    tier stack the dispatch has no branch for (the FP4/base-cache/gate
++    machinery keys off the 2-bit slot tables this mode never builds)."""
++    global _exl3_config_checked
++    if _exl3_config_checked:
++        return
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_delta, moe_w2_gate)
++    problems = []
++    # v2 (2026-07-29): the FP4 need-pool (DELTA_GB>0) and the confidence gate
++    # (GATE=1) are now SUPPORTED over the EXL3 base — _exl3_forward composes
++    # them additively (EXL3 serves the base experts, FP4-resident experts are
++    # masked out and added from the pool; the gate/runner replay loop is
++    # format-agnostic). Still refused fail-closed:
++    #  - the 2-bit base CACHE: the resident EXL3 trellis tier IS the base, and
++    #    both would not fit; the FP4 pool here promotes from its own pinned
++    #    host store staged from the checkpoint (no 2-bit base tier).
++    #  - split-quintal FP4 (DELTA_SPLIT): the eager torch apply reconstructs
++    #    FULL e2m1 nibble planes; the radix-5 quintal refinement is only
++    #    decodable against a resident 2-bit base slot the w4q kernel reads.
++    if moe_w2_delta.base_enabled():
++        problems.append("2-bit base cache active (unset "
++                        "VLLM_MOE_W2_BASE_CACHE_GB; the EXL3 tier is the "
++                        "resident base)")
++    if moe_w2_delta.split_enabled():
++        problems.append("split-FP4 active (unset VLLM_MOE_W2_DELTA_SPLIT; "
++                        "EXL3 v2 serves the full-FP4 need-pool only)")
++    try:
++        from vllm.distributed.parallel_state import (
++            get_tensor_model_parallel_world_size)
++        tp = get_tensor_model_parallel_world_size()
++        if tp > 1:
++            problems.append(f"TP world size {tp} > 1")
++    except Exception:  # noqa: BLE001
++        # offline tools without a distributed context; the per-rank shape
++        # assert in _exl3_build_layer still catches TP-sharded experts.
++        pass
++    if not _EXL3_CUDAGRAPH:
++        try:
++            from vllm.config import get_current_vllm_config
++            if not get_current_vllm_config().model_config.enforce_eager:
++                problems.append("cudagraphs enabled (serve with "
++                                "--enforce-eager, or set "
++                                "VLLM_MOE_W2_EXL3_CUDAGRAPH=1 for the "
++                                "capturable path)")
++        except Exception:  # noqa: BLE001
++            # no current config (offline tools); the capture assert in
++            # _exl3_forward remains the hard backstop.
++            pass
++    if problems:
++        raise ValueError(
++            "VLLM_MOE_W2_EXL3_BASE supports resident TP1, eager, with an "
++            "optional full-FP4 need-pool + gate (no 2-bit base cache, no "
++            "split-FP4, no TP, --enforce-eager); refused: "
++            + "; ".join(problems))
++    if not os.path.isdir(_EXL3_PACK):
++        raise ValueError(
++            f"VLLM_MOE_W2_EXL3_BASE=1 but pack dir {_EXL3_PACK!r} does "
++            "not exist (set VLLM_MOE_W2_EXL3_PACK)")
++    _exl3_config_checked = True
++
++
++def _exl3_pack_index(layer, layer_key: int) -> int:
++    """Pack file index for this layer, VERIFIED — pack files are keyed by
++    the ABSOLUTE transformer layer index (build_exl3_pack.py writes
++    exl3-l{li:02d} with manifest["layer"] == li). The transformer index is
++    parsed from the layer NAME (never guessed from creation order); on
++    DS4-Flash all 43 layers are MoE (first_k_dense_replace unset), so it
++    coincides with layer_key (the is_w2_layer creation counter) and v1
++    asserts that coincidence: a divergence means a dense-offset model this
++    mode was never validated on — refuse rather than silently serve."""
++    name = getattr(layer, "layer_name", "")
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_planes_cache as _pc)
++    lidx = _pc.layer_idx_from_name(name)
++    if lidx is None:
++        raise ValueError(
++            f"moe_w2 EXL3: cannot parse a transformer layer index from "
++            f"layer name {name!r}")
++    if not (0 <= lidx < _layer_cutoff()):
++        raise ValueError(
++            f"moe_w2 EXL3: layer index {lidx} (from {name!r}) outside the "
++            f"main stack [0, {_layer_cutoff()})")
++    if lidx != layer_key:
++        raise ValueError(
++            f"moe_w2 EXL3 v1: layer_key {layer_key} != transformer layer "
++            f"index {lidx} (from {name!r}) — dense-offset MoE stacks are "
++            "not validated with the EXL3 pack mapping; refusing")
++    path = os.path.join(_EXL3_PACK, f"exl3-l{lidx:02d}.safetensors")
++    if not os.path.exists(path):
++        raise ValueError(f"moe_w2 EXL3: pack layer file missing: {path}")
++    return lidx
++
++
++def _exl3_stage_fp4(layer, layer_key: int, dev, E: int,
++                    N13: int, K13: int, N2: int, K2: int) -> None:
++    """v2: stage this layer's FP4 need-pool host sections from the checkpoint
++    mxfp4 experts and register the FP4 delta tier. The EXL3 trellis tier is
++    the RESIDENT base (no 2-bit base cache), so — unlike the FP4-over-base
++    case — the FP4 slots must carry their OWN block-32 scales:
++    [fp4_13|sc13|fp4_2|sc2]. Requires the checkpoint experts host-staged
++    (plan_pack_skip returns False when the pool is on)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
++        mxfp4_to_nibbles, pack_fp4_fragment_major, pack_scales)
++    w13 = layer.w13_weight.data          # [E, 2I, H/2] u8 (cpu)
++    s13 = layer.w13_weight_scale.data    # [E, 2I, H/32] u8
++    w2 = layer.w2_weight.data            # [E, H, I/2] u8
++    s2 = layer.w2_weight_scale.data      # [E, H, I/32] u8
++    c13, sc13b = N13 * K13 // 2, N13 * K13 // 32
++    c2, sc2b = N2 * K2 // 2, N2 * K2 // 32
++    ftier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
++                                  w13_bytes=c13 + sc13b, w2_bytes=c2 + sc2b)
++    if ftier is None:  # enabled() is True here, so this should not happen
++        raise RuntimeError("moe_w2 EXL3 v2: FP4 tier requested but get_tier "
++                           "returned None (VLLM_MOE_W2_DELTA_GB=0?)")
++    fp13 = torch.empty(E, c13, dtype=torch.uint8, device=dev)
++    fsc13 = torch.empty(E, sc13b, dtype=torch.uint8, device=dev)
++    fp2 = torch.empty(E, c2, dtype=torch.uint8, device=dev)
++    fsc2 = torch.empty(E, sc2b, dtype=torch.uint8, device=dev)
++    chunk = 32
++    for e0 in range(0, E, chunk):
++        e1 = min(e0 + chunk, E)
++        wg = w13[e0:e1].to(dev, non_blocking=True)
++        sg = s13[e0:e1].to(dev, non_blocking=True)
++        for i in range(e1 - e0):
++            fp13[e0 + i] = pack_fp4_fragment_major(mxfp4_to_nibbles(wg[i]))
++            fsc13[e0 + i] = pack_scales(sg[i])
++        wg = w2[e0:e1].to(dev, non_blocking=True)
++        sg = s2[e0:e1].to(dev, non_blocking=True)
++        for i in range(e1 - e0):
++            fp2[e0 + i] = pack_fp4_fragment_major(mxfp4_to_nibbles(wg[i]))
++            fsc2[e0 + i] = pack_scales(sg[i])
++    ftier.add_layer_host_sections(layer_key, (fp13, fsc13), (fp2, fsc2))
++    del fp13, fsc13, fp2, fsc2
++    global _EXL3_FP4_GEOM
++    _EXL3_FP4_GEOM = dict(
++        N13=N13, K13=K13, N2=N2, K2=K2,
++        off_s13=c13, off_c2=c13 + sc13b, off_s2=c13 + sc13b + c2,
++        slot_bytes=c13 + sc13b + c2 + sc2b)
++    if layer_key == 0:
++        logger.info(
++            "moe_w2 EXL3 v2: FP4 need-pool staging from checkpoint "
++            "(own-scale slots %.2f MiB [fp4_13|sc13|fp4_2|sc2]; policy=need)",
++            (c13 + sc13b + c2 + sc2b) / 2**20)
++
++
++def _exl3_stage_delta(layer_key: int, lidx: int, dev, E: int) -> None:
++    """P6 ([M] 2026-07-30): stage this layer's Δ-pool host sections from the
++    delta pack. Slot layout = moe_w2_exl3.delta_slot_geom (w13 section |
++    w2 section, opaque u8 for the tier). Verifies the pack's ABI binding
++    (delta manifest -> base pack SHA256) by hashing ONE base layer file per
++    boot (full-pack hashing costs minutes; one file is a spot check of the
++    same build)."""
++    import hashlib
++    import json as _json
++    from safetensors import safe_open
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_exl3 import (
++        delta_slot_geom)
++    global _EXL3_DELTA_GEOM, _exl3_delta_abi_checked
++    path = os.path.join(_EXL3_DELTA_PACK,
++                        f"exl3-delta-l{lidx:02d}.safetensors")
++    with open(os.path.join(
++            _EXL3_DELTA_PACK,
++            f"exl3-delta-l{lidx:02d}.manifest.json")) as f:
++        man = _json.load(f)
++    dk = int(man["kd"])
++    # per-projection delta K ([P] 2026-08-02, the (2,2,1)+Δ(2,2,3) track):
++    # legacy manifests carry only "kd" (uniform); new ones add kd13/kd2 +
++    # base_w2k. Legacy defaults reproduce the old behavior exactly.
++    kd13 = int(man.get("kd13", dk))
++    kd2 = int(man.get("kd2", dk))
++    base_w2k = int(man.get("base_w2k", 2))
++    base_cb = man.get("base_codebook", man.get("codebook", "3inst"))
++    delta_cb = man.get("delta_codebook", "mul1")
++    if base_cb != "3inst" or delta_cb != "mul1":
++        raise ValueError(
++            f"moe_w2 EXL3 Δ-pool: pack codebooks base={base_cb!r} / "
++            f"delta={delta_cb!r} unsupported (dispatch expects 3INST base "
++            "+ MUL1 delta — the pack-v3 build convention)")
++    if base_w2k != _EXL3_W2K:
++        raise ValueError(
++            "moe_w2 EXL3 Δ-pool: delta pack binds to the "
++            f"w2@k{base_w2k} base (manifest base_variant="
++            f"{man.get('base_variant')!r}), but serving W2K={_EXL3_W2K} — "
++            "rebuild the delta pack for this mix or fix the W2K env")
++    if not _exl3_delta_abi_checked:
++        base_file = os.path.join(_EXL3_PACK, man["base_pack"])
++        h = hashlib.sha256()
++        with open(base_file, "rb") as bf:
++            while True:
++                b = bf.read(1 << 24)
++                if not b:
++                    break
++                h.update(b)
++        if h.hexdigest() != man["base_pack_sha256"]:
++            raise ValueError(
++                "moe_w2 EXL3 Δ-pool ABI violation: delta layer "
++                f"{lidx} binds to base {man['base_pack']} sha256 "
++                f"{man['base_pack_sha256'][:16]}… but the served base pack "
++                f"file hashes to {h.hexdigest()[:16]}…")
++        _exl3_delta_abi_checked = True
++    geom = delta_slot_geom(kd13, kd2)
++    geom["mults"] = (0, 0x83DCD12D)   # MUL1 delta stream (pack v3)
++    ftier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
++                                  w13_bytes=geom["sec13"],
++                                  w2_bytes=geom["sec2"])
++    if ftier is None:
++        raise RuntimeError("moe_w2 EXL3 Δ-pool: tier requested but get_tier "
++                           "returned None (VLLM_MOE_W2_DELTA_GB=0?)")
++    rows13 = torch.empty(E, geom["sec13"], dtype=torch.uint8, device=dev)
++    rows2 = torch.empty(E, geom["sec2"], dtype=torch.uint8, device=dev)
++    with safe_open(path, "pt") as f:
++        for e in range(E):
++            parts = []
++            for proj in ("w1", "w3"):
++                for part in ("trellis", "suh", "svh"):
++                    t = f.get_tensor(f"e{e}.{proj}.dk{kd13}.{part}")
++                    parts.append(t.contiguous().view(torch.uint8).view(-1))
++            row = torch.cat(parts)
++            if row.numel() != geom["sec13"]:
++                raise ValueError(
++                    f"moe_w2 EXL3 Δ-pool: e{e} w13 section is "
++                    f"{row.numel()} B, expected {geom['sec13']} (layer "
++                    f"{lidx}; wrong pack geometry?)")
++            rows13[e] = row.to(dev, non_blocking=True)
++            parts = [f.get_tensor(f"e{e}.w2.dk{kd2}.{part}")
++                     .contiguous().view(torch.uint8).view(-1)
++                     for part in ("trellis", "suh", "svh")]
++            row = torch.cat(parts)
++            if row.numel() != geom["sec2"]:
++                raise ValueError(
++                    f"moe_w2 EXL3 Δ-pool: e{e} w2 section is {row.numel()} "
++                    f"B, expected {geom['sec2']} (layer {lidx})")
++            rows2[e] = row.to(dev, non_blocking=True)
++    ftier.add_layer_host_sections(layer_key, (rows13,), (rows2,))
++    del rows13, rows2
++    _EXL3_DELTA_GEOM = geom
++    if layer_key == 0:
++        logger.info(
++            "moe_w2 EXL3 Δ-pool: staging from delta pack %s (dk13=%d "
++            "dk2=%d, base w2@k%d, slot %.2f MiB [w13:tr|suh|svh x2 | "
++            "w2:tr|suh|svh]; base ABI sha %s… verified; policy=need)",
++            _EXL3_DELTA_PACK, kd13, kd2, base_w2k,
++            geom["slot_bytes"] / 2**20, man["base_pack_sha256"][:12])
++
++
++def _exl3_build_layer(layer, layer_key: int) -> None:
++    """EXL3-mode replacement for the plane build: load this layer's pack
++    tensors GPU-resident and register the tier keyed by layer_key. No
++    2-bit planes, no planes cache, no _LAYERS row — the EXL3 forward branch
++    never reads them (and the ~65 GiB tier would not fit next to resident
++    planes). v1 loader-skips the checkpoint experts entirely; v2 (FP4 pool
++    on) keeps them staged and packs the pool's FP4 host sections first
++    (_exl3_stage_fp4). The checkpoint params end as 0-byte stubs either way."""
++    contract = _layer_contract(layer)
++    _exl3_check_config()
++    lidx = _exl3_pack_index(layer, layer_key)
++    dev = torch.device("cuda", torch.cuda.current_device())
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    pool_on = moe_w2_delta.enabled()
++    skipped = getattr(layer, "_moe_w2_pack_skip", False)
++    if skipped:
++        # loader-skip (plan_pack_skip): params are already 0-byte stubs
++        E, N13, K13, N2, K2 = layer._moe_w2_shapes
++        param_names = ()
++    else:
++        # staged path (v2 pool on, or plan_pack_skip missed): read shapes
++        # from the CPU-staged params, then stub them (after FP4 staging)
++        w13 = layer.w13_weight.data          # [E, 2I, H/2] u8 (cpu)
++        w2 = layer.w2_weight.data            # [E, H, I/2] u8
++        E, N13, _ = w13.shape
++        _, N2, _ = w2.shape
++        K13, K2 = N2, N13 // 2               # H, I (mxfp4 layout)
++        param_names = ("w13_weight", "w13_weight_scale", "w2_weight",
++                       "w2_weight_scale")
++    if (E, N13, K13, N2, K2) != (256, 4096, 4096, 4096, 2048):
++        raise ValueError(
++            "moe_w2 EXL3 serves the DS4 TP1 pack geometry only "
++            "(E=256, H=4096, I=2048); this layer has "
++            f"E={E}, N13={N13}, K13={K13}, N2={N2}, K2={K2} "
++            "(TP-sharded or non-DS4 experts)")
++    if pool_on and _EXL3_DELTA_PACK:
++        # P6 Δ-pool: staged from the delta pack on disk; the checkpoint
++        # experts are loader-skipped (v1-style) — nothing FP4 to stage.
++        _exl3_stage_delta(layer_key, lidx, dev, E)
++    elif pool_on:
++        if skipped:
++            raise RuntimeError(
++                "moe_w2 EXL3 v2: FP4 pool enabled but layer was loader-"
++                "skipped — no checkpoint experts to stage the pool from "
++                "(plan_pack_skip must return False when the pool is on)")
++        _exl3_stage_fp4(layer, layer_key, dev, E, N13, K13, N2, K2)
++        if _EXL3_FP4_CUBIN:
++            # the moe_w4_mm cubin is not loaded on the EXL3 path (which uses
++            # exl3_mgemm); load + verify it for the v2-perf FP4 apply.
++            if not _ensure_ready():
++                raise RuntimeError("moe_w2 EXL3 v2 cubin apply: moe_w2 "
++                                   "cubins unavailable")
++            for _kk in (K13, K2):
++                if ("w4", _kk) not in _fns:
++                    raise RuntimeError(
++                        f"moe_w2 EXL3 v2 cubin apply: moe_w4_mm_k{_kk}_a32."
++                        f"cubin not loaded (VLLM_MOE_W2_CUBIT_DIR={_DIR})")
++    from vllm.model_executor.layers.quantization.utils.moe_w2_exl3 import (
++        Exl3BaseTier)
++    limit = contract["swiglu_limit"]
++    tier = Exl3BaseTier(
++        _EXL3_PACK, layers=[lidx], device=str(dev),
++        w13_k=2, w2_k=_EXL3_W2K, num_experts=E, hidden=K13, inter=K2,
++        act_limit=float(limit) if limit is not None else float("inf"))
++    _EXL3_TIERS[layer_key] = (tier, lidx)
++    stub = torch.empty(0, dtype=torch.uint8, device=dev)
++    for name in param_names:
++        layer.register_parameter(
++            name, torch.nn.Parameter(stub, requires_grad=False))
++    logger.info(
++        "moe_w2 EXL3 base: layer_key %d <- pack layer %d "
++        "(w13_k=2, w2_k=%d, %.2f GiB resident, %d/%d layers loaded%s)",
++        layer_key, lidx, tier.w2_k, tier.total_bytes() / 2**30,
++        len(_EXL3_TIERS), _layer_cutoff(),
++        ", +FP4 need-pool" if pool_on else "")
++
++
 +def build_layer_planes(layer, layer_key: int) -> None:
 +    """Quantize one FusedMoE layer's experts to 2-bit planes (GPU, chunked).
 +
@@ -3701,6 +4948,9 @@ index 000000000..e509f8cb2
 +    builds fragment-major code planes + scale planes on the GPU, then
 +    replaces the originals with empty stubs.
 +    """
++    if _EXL3_BASE:
++        _exl3_build_layer(layer, layer_key)
++        return
 +    _layer_contract(layer)
 +    if not _ensure_ready():
 +        raise RuntimeError("moe_w2 cubins missing or failed to load")
@@ -5049,6 +6299,518 @@ index 000000000..e509f8cb2
 +                                 stream, argv, None), "launch")
 +
 +
++@triton.jit
++def _desc_build_kernel_exl3fp4(
++    eids_ptr, npost_ptr, fslot_ptr, d_ptr,
++    a1b, as1b, c13b, a2b, as2b, c2b,
++    fpoolb, fslot_bytes, off4_s13, off4_c2, off4_s2,
++    a1_rb, as1_rb, c13_rb, a2_rb, as2_rb, c2_rb,
++    n_experts, pairs, cap6, mblock,
++    BLOCK: tl.constexpr,
++):
++    """v2-perf: TWO w4 desc tables ([0]=w13, [1]=w2) for the FP4 need-pool
++    OVER an EXL3 base. Base experts are served by the trellis tier (not
++    here), so a pair that is NOT FP4-resident gets m=0 (moe_w4_mm early-EXITs)
++    -- no base/miss handling. Slots carry their own scales
++    ([fp4_13|sc13|fp4_2|sc2]) read via off4_* (same as the base-cache kernel's
++    w4 arm)."""
++    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = p < pairs
++    e = tl.load(eids_ptr + p, mask=mask, other=0).to(tl.int64)
++    e = tl.minimum(tl.maximum(e, 0), n_experts - 1)
++    fslot = tl.load(fslot_ptr + e, mask=mask, other=-1).to(tl.int64)
++    npost = tl.load(npost_ptr).to(tl.int64)
++    live = p < npost // mblock
++    m4 = tl.where(live & (fslot >= 0), mblock, 0).to(tl.int64)
++    base = p.to(tl.int64) * mblock
++    fs = fpoolb + tl.maximum(fslot, 0) * fslot_bytes
++    a1 = a1b + base * a1_rb
++    as1 = as1b + base * as1_rb
++    c13 = c13b + base * c13_rb
++    a2 = a2b + base * a2_rb
++    as2 = as2b + base * as2_rb
++    c2 = c2b + base * c2_rb
++    for gi in tl.static_range(2):
++        d = d_ptr + gi * cap6 + p * 6
++        if gi == 0:
++            b, s, a, as_, c, m = fs, fs + off4_s13, a1, as1, c13, m4
++        else:
++            b, s, a, as_, c, m = fs + off4_c2, fs + off4_s2, a2, as2, c2, m4
++        tl.store(d + 0, a, mask=mask)
++        tl.store(d + 1, as_, mask=mask)
++        tl.store(d + 2, b, mask=mask)
++        tl.store(d + 3, s, mask=mask)
++        tl.store(d + 4, c, mask=mask)
++        tl.store(d + 5, m, mask=mask)
++
++
++def _exl3_fp4_apply_cubin(
++    ftier,
++    layer_key: int,
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    act_limit: float,
++) -> torch.Tensor:
++    """v2-perf: FP4 need-pool contribution via the production moe_w4_mm cubin.
++    Reads the 4-bit pool slots directly (fp8-a32 activations, ~2 kernel
++    launches/layer) instead of the torch dequant. Non-resident pairs get m=0
++    (served by the EXL3 base). Returns [T, H] in x's dtype. Uses the ORIGINAL
++    (unmasked) topk — the desc kernel selects FP4-resident experts via
++    slot_table; the deterministic unpermute zeroes the non-resident rows."""
++    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
++        moe_align_block_size,
++    )
++    g = _EXL3_FP4_GEOM
++    N13, K13, N2, K2 = g["N13"], g["K13"], g["N2"], g["K2"]
++    off4_s13, off4_c2, off4_s2 = g["off_s13"], g["off_c2"], g["off_s2"]
++    T, H = x.shape
++    top_k = topk_ids.shape[1]
++    E = ftier.E
++    dev = x.device
++    stream = ctypes.c_void_p(torch.cuda.current_stream(dev).cuda_stream)
++    mblock = _BLOCK
++    sorted_ids, expert_blocks, num_post = moe_align_block_size(
++        topk_ids, mblock, E)
++    slots = sorted_ids.numel()
++    pairs = slots // mblock
++    ws = _workspaces(slots, T, dev, inter=K2, hidden=K13, n_experts=E)
++    xq = ws["xq"]
++    pad_row = xq.shape[0] - 1
++    _quant_a32(x, xq[:T], ws["xs"][:T], _G1)
++    valid = sorted_ids < T * top_k
++    rows = torch.where(valid, sorted_ids // top_k,
++                       torch.full_like(sorted_ids, pad_row))
++    torch.index_select(xq.view(torch.uint8), 0, rows,
++                       out=ws["a1"][:slots].view(torch.uint8))
++    torch.index_select(ws["xs"], 0, rows, out=ws["as1"][:slots])
++    d = ws["desc"]
++    cap = d.shape[1]
++    slot_row = ftier.slot_table[layer_key]
++    _desc_build_kernel_exl3fp4[(triton.cdiv(pairs, 256),)](
++        expert_blocks, num_post, slot_row, d,
++        ws["a1"].data_ptr(), ws["as1"].data_ptr(), ws["c13"].data_ptr(),
++        ws["a2"].data_ptr(), ws["as2"].data_ptr(), ws["c2"].data_ptr(),
++        ftier.pool.data_ptr(), ftier.slot_bytes, off4_s13, off4_c2, off4_s2,
++        K13, (K13 // 32) * 4, 4 * K2, K2, (K2 // 32) * 4, 2 * K13,
++        E, pairs, cap * 6, mblock, BLOCK=256)
++    _launch("w4", K13, d[0], N13, pairs, stream)
++    act = ws["act"][:slots]
++    _silu_and_mul_clamp_fp32(act, ws["c13"][:slots], act_limit)
++    _quant_a32(act, ws["a2"][:slots], ws["as2"][:slots], _G2)
++    _launch("w4", K2, d[1], N2, pairs, stream)
++    # only FP4-resident pairs contribute; the rest hold stale c2 rows -> mask
++    e_pair = expert_blocks.to(torch.long).clamp_(0, E - 1)
++    resident = (slot_row[e_pair] >= 0)
++    miss_rows = resident.repeat_interleave(mblock)[:slots]
++    n_routes = T * top_k
++    inverse = ws["inv_sorted"][:n_routes]
++    _invert_sorted_ids_kernel[(triton.cdiv(slots, 256),)](
++        sorted_ids, inverse, slots, n_routes, BLOCK=256)
++    out = torch.empty((T, H), dtype=x.dtype, device=dev)
++    _deterministic_unpermute_kernel[(T, triton.cdiv(H, 256))](
++        ws["c2"], topk_weights, inverse, miss_rows, out, H,
++        ws["c2"].stride(0), topk_weights.stride(0), topk_weights.stride(1),
++        out.stride(0), TOP_K=top_k, HAS_ROW_MASK=True, BLOCK_H=256,
++        num_warps=4)
++    return out
++
++
++def _exl3_fp4_apply(
++    ftier,
++    layer_key: int,
++    x: torch.Tensor,
++    topk_ids: torch.Tensor,
++    topk_weights: torch.Tensor,
++    fp4_mask: torch.Tensor,
++    act_limit: float,
++) -> torch.Tensor:
++    """Exact FP4 contribution for the experts masked OUT of the EXL3 base
++    (i.e. resident in the need-pool). Eager, correctness-first (v2): dequant
++    each masked expert's weights from its pool slot ([fp4_13|sc13|fp4_2|sc2])
++    in torch and run the SwiGLU expert, mirroring Exl3BaseTier.forward_topk's
++    per-token loop and clamps EXACTLY (parity oracle: tools/test_moe_w2_exl3.py
++    block_torch(fp4_expert)). Perf (batched dispatch / cubin) is v2-perf, the
++    next backlog item; this path is the correctness plumbing. Returns [m, H]
++    f32; base-served (t, j) contribute nothing here (they came from EXL3)."""
++    import torch.nn.functional as F
++    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
++        dequant_fp4_expert)
++    g = _EXL3_FP4_GEOM
++    assert g is not None, "moe_w2 EXL3 v2: FP4 slot geometry not staged"
++    N13, K13, N2, K2 = g["N13"], g["K13"], g["N2"], g["K2"]
++    off_s13, off_c2, off_s2 = g["off_s13"], g["off_c2"], g["off_s2"]
++    inter = K2                          # w1/w3 output rows (I); w13 = [2I, H]
++    hidden = K13                        # H
++    dev = x.device
++    slot_row = ftier.slot_table[layer_key]        # [E] int32 (-1 = base tier)
++    pool = ftier.pool                             # [n_slots, slot_bytes] u8
++    xf = x.float()
++    y = torch.zeros(xf.shape[0], hidden, dtype=torch.float, device=dev)
++    # SYNC-LIGHT: collect every masked (token, slot) hit with ONE nonzero, sort
++    # by expert so each expert's hits are contiguous, and read the unique expert
++    # list + counts with a single tolist pair — instead of a per-expert
++    # `.nonzero()`/`int(slot)` (each a CPU<->GPU sync -> pipeline stall x 43
++    # layers x re-forwards, the measured v2 bottleneck). Still: dequant each
++    # expert once (LRU cache), apply batched over its tokens, free per expert.
++    tok_all, j_all = fp4_mask.nonzero(as_tuple=True)   # [P] (the one sync to size P)
++    if tok_all.numel() == 0:
++        return y
++    experts = topk_ids[tok_all, j_all]                 # [P] expert ids
++    order = torch.argsort(experts)                     # group hits by expert (GPU)
++    experts = experts[order]
++    tok_all = tok_all[order]
++    wsel = topk_weights[tok_all, j_all[order]].float()
++    uniq, counts = torch.unique_consecutive(experts, return_counts=True)
++    uniq_l = uniq.tolist()
++    counts_l = counts.tolist()
++    slots_l = None                                     # filled lazily on a cache miss
++    off = 0
++    for i, (e, c) in enumerate(zip(uniq_l, counts_l)):
++        ti = tok_all[off:off + c]
++        ws = wsel[off:off + c]
++        off += c
++        key = (layer_key, e)
++        w = _EXL3_FP4_WCACHE.get(key)
++        if w is None:
++            if slots_l is None:
++                slots_l = slot_row[uniq].tolist()      # one sync for all misses
++            row = pool[slots_l[i]]
++            w13 = dequant_fp4_expert(row[:off_s13], row[off_s13:off_c2],
++                                     N13, K13).to(torch.bfloat16)
++            w2 = dequant_fp4_expert(row[off_c2:off_s2], row[off_s2:],
++                                    N2, K2).to(torch.bfloat16)
++            w = (w13[:inter].contiguous(), w13[inter:].contiguous(), w2)
++            _EXL3_FP4_WCACHE[key] = w
++            if len(_EXL3_FP4_WCACHE) > _EXL3_FP4_WCACHE_MAX:
++                _EXL3_FP4_WCACHE.pop(next(iter(_EXL3_FP4_WCACHE)))  # evict oldest
++        else:
++            _EXL3_FP4_WCACHE.pop(key)                  # LRU touch: move to newest
++            _EXL3_FP4_WCACHE[key] = w
++        w1b, w3b, w2b = w
++        # mirror forward_topk: 16-bit GEMMs, f32 activation clamp/silu
++        xt = xf[ti].to(torch.bfloat16)                 # [c, H]
++        g = (xt @ w1b.t()).float().clamp(max=act_limit)
++        u = (xt @ w3b.t()).float().clamp(min=-act_limit, max=act_limit)
++        contrib = (F.silu(g) * u).to(torch.bfloat16) @ w2b.t()   # [c, H] bf16
++        y.index_add_(0, ti, ws.unsqueeze(1) * contrib.float())
++    return y
++
++
++def _exl3_fp4_validate(ftier, layer_key, x, ids, wts, fp4_mask, act_limit,
++                       y_cubin) -> None:
++    """Certify the cubin FP4 apply against the torch apply (the validated
++    oracle) on the first few live forwards. A non-zero rel-err is EXPECTED
++    (the cubin path uses fp8-a32 activations, the torch path bf16), so this
++    is a band check (~0.02-0.06), not bit-equality."""
++    global _exl3_fp4_val_n
++    if _exl3_fp4_val_n >= 60:
++        return
++    _exl3_fp4_val_n += 1
++    y_torch = _exl3_fp4_apply(ftier, layer_key, x, ids, wts, fp4_mask,
++                              act_limit)
++    yc = y_cubin.float()
++    num = (yc - y_torch).square().mean().sqrt()
++    den = y_torch.square().mean().sqrt().clamp_min(1e-8)
++    logger.info("moe_w2 EXL3 v2 FP4-apply VALIDATE layer %d: rel-err %.4f "
++                "(cubin fp8-a32 vs torch bf16; band ~0.02-0.06)",
++                layer_key, float(num / den))
++
++
++def _exl3_delta_apply(tier, lidx: int, ftier, layer_key: int,
++                      x: torch.Tensor, topk_ids: torch.Tensor,
++                      topk_weights: torch.Tensor,
++                      dmask: torch.Tensor) -> torch.Tensor:
++    """Δ-pool contribution: full base+Δ block for pool-resident pairs via
++    Exl3BaseTier.forward_topk_dual (per-projection second mgemm over slot
++    pointer tables). Capture-safe (pointer tables are elementwise int64
++    arithmetic on slot_table; fixed shapes; no syncs)."""
++    from vllm.model_executor.layers.quantization.utils.moe_w2_exl3 import (
++        delta_ptr_tables)
++    g = _EXL3_DELTA_GEOM
++    assert g is not None, "moe_w2 EXL3 Δ-pool: geometry not staged"
++    tabs = delta_ptr_tables(ftier.pool.data_ptr(), ftier.slot_bytes,
++                            ftier.slot_table[layer_key], g)
++    return tier.forward_topk_dual(lidx, x, topk_ids, topk_weights, dmask,
++                                  tabs, dk13=g["dk13"], dk2=g["dk2"],
++                                  dmults=g["mults"])
++
++
++_HAD128 = None
++
++
++def _exl3_had128(dev):
++    global _HAD128
++    if _HAD128 is None or _HAD128.device != dev:
++        h = torch.ones(1, 1, dtype=torch.float64, device=dev)
++        b = torch.tensor([[1., 1.], [1., -1.]], dtype=torch.float64,
++                         device=dev)
++        for _ in range(7):
++            h = torch.kron(b, h)
++        _HAD128 = (h / 128.0 ** 0.5).float()
++    return _HAD128
++
++
++def _exl3_delta_validate(tier, lidx: int, ftier, layer_key: int,
++                         x: torch.Tensor, ids: torch.Tensor,
++                         wts: torch.Tensor, dmask: torch.Tensor,
++                         y_dual: torch.Tensor) -> None:
++    """Certify the dual-stream mgemm apply against a torch reference:
++    dequantize base+Δ weights (ext.reconstruct + blockwise 128-Hadamards +
++    suh/svh) for each pooled pair and run the SwiGLU block in fp32. Band
++    check ~0.02 (fp16 mgemm chain vs fp32 torch)."""
++    global _exl3_delta_val_n
++    if _exl3_delta_val_n >= 12 or not bool(dmask.any()):
++        return
++    _exl3_delta_val_n += 1
++    import torch.nn.functional as F
++    g = _EXL3_DELTA_GEOM
++    dev = x.device
++    H128 = _exl3_had128(dev)
++
++    def dereg(w_inner, suh, svh):
++        kdim, ndim = w_inner.shape
++        w = w_inner.float()
++        w = (H128 @ w.view(kdim // 128, 128, ndim)).reshape(kdim, ndim)
++        w = w * suh.float().unsqueeze(1)
++        w = (w.view(kdim, ndim // 128, 128) @ H128).reshape(kdim, ndim)
++        return w * svh.float().unsqueeze(0)
++
++    def dq(trellis, suh, svh, K, mul1=False):
++        kdim, ndim = trellis.shape[0] * 16, trellis.shape[1] * 16
++        w = torch.empty(kdim, ndim, dtype=torch.half, device=dev)
++        tier.ext.reconstruct(w, trellis.contiguous(), K, False, mul1)
++        return dereg(w, suh, svh)
++
++    def slot_part(row, proj, kdim, ndim):
++        dkp = g["dk2"] if proj == "d" else g["dk13"]
++        otr, osuh, osvh = g["offs"][proj]
++        trb = kdim // 16 * (ndim // 16) * dkp * 32
++        tr = row[otr:otr + trb].view(torch.int16) \
++            .view(kdim // 16, ndim // 16, 16 * dkp)
++        suh = row[osuh:osuh + kdim * 2].view(torch.half)
++        svh = row[osvh:osvh + ndim * 2].view(torch.half)
++        return dq(tr, suh, svh, dkp, mul1=True)  # pack v3 delta = MUL1
++
++    slot_row = ftier.slot_table[layer_key]
++    tok, jj = dmask.nonzero(as_tuple=True)
++    y_ref = torch.zeros_like(y_dual)
++    Hd, Id = tier.H, tier.I
++    for t_i, j_i in zip(tok.tolist(), jj.tolist()):
++        e = int(ids[t_i, j_i])
++        base = {p: dq(tier._store[f"l{lidx}.e{e}.{p}.k{k}.trellis"],
++                      tier._store[f"l{lidx}.e{e}.{p}.k{k}.suh"],
++                      tier._store[f"l{lidx}.e{e}.{p}.k{k}.svh"], k)
++                for p, k in (("w1", tier.w13_k), ("w3", tier.w13_k),
++                             ("w2", tier.w2_k))}
++        row = ftier.pool[int(slot_row[e])]
++        d1 = slot_part(row, "g", Hd, Id)
++        d3 = slot_part(row, "u", Hd, Id)
++        d2 = slot_part(row, "d", Id, Hd)
++        xt = x[t_i].float()
++        gg = (xt @ (base["w1"] + d1)).clamp(max=tier.act_limit)
++        uu = (xt @ (base["w3"] + d3)).clamp(min=-tier.act_limit,
++                                            max=tier.act_limit)
++        y_ref[t_i] += float(wts[t_i, j_i]) * ((F.silu(gg) * uu)
++                                              @ (base["w2"] + d2))
++    num = (y_dual.float() - y_ref).square().mean().sqrt()
++    den = y_ref.square().mean().sqrt().clamp_min(1e-8)
++    logger.info("moe_w2 EXL3 Δ-pool VALIDATE layer %d: rel-err %.4f "
++                "(dual mgemm fp16 vs torch fp32 reference; band ~0.02)",
++                layer_key, float(num / den))
++
++
++def _exl3_prefill_ensure_ok(x: torch.Tensor) -> bool:
++    """True when this call may run the synchronous prefill-ensure fetch:
++    an ensure-enabled, prefill-sized call on a REAL batch.
++
++    Dummy batches must never promote:
++    - the load-time KV-PROFILING forward would fill the pool from the
++      dummy prompt's junk routing and (on the eager arm) retain dequant
++      state, inflating the measured peak -> KV planning goes negative
++      (the v2 boot regression that forced PREFILL_FP4=0);
++    - cudagraph warmup/capture must not bake the host-side fetch.
++    Both run with forward_context.attn_metadata=None, which is the same
++    profile-run marker the MLA/mamba layers key on. Outside any forward
++    context (tools/tests) ensure stays allowed."""
++    if not (_PREFILL_FP4 and _PREFILL_FP4_ENSURE):
++        return False
++    if x.shape[0] <= _PREFILL_T:
++        return False
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        from vllm.forward_context import get_forward_context
++        if get_forward_context().attn_metadata is None:
++            return False
++    except (ImportError, AssertionError):
++        pass
++    return True
++
++
++_exl3_ptab_ready: list = []   # one-shot init sentinel (glue fix [V] 08-05)
++
++
++def _exl3_ensure_ptabs(ftier) -> None:
++    """One-time wiring of the decode-wave persistent pointer tables: build
++    each EXL3 tier's ptab stack (base rows static, Δ rows from the CURRENT
++    slot_table) and register the refresh on the delta tier's mutate hooks.
++    Runs on the first eager forward through the wave route (vLLM's profile/
++    dummy run precedes any capture); a capture asserting here means that
++    ordering broke."""
++    if _exl3_ptab_ready:
++        return
++    assert not torch.cuda.is_current_stream_capturing(), \
++        "moe_w2 EXL3 ptab init reached capture before any eager forward"
++    g = _EXL3_DELTA_GEOM
++    assert g is not None, "moe_w2 EXL3 ptab init: geometry not staged"
++    by_tier: dict[int, tuple] = {}
++    for lk, (tier, li) in _EXL3_TIERS.items():
++        by_tier.setdefault(id(tier), (tier, []))[1].append((lk, li))
++    for tier, pairs in by_tier.values():
++        tier.init_ptabs(ftier, g, pairs)
++    logger.info("moe_w2 EXL3 decode-wave ptab stack ready "
++                "(%d tier(s), %d layers, refresh-on-mutation)",
++                len(by_tier), len(_EXL3_TIERS))
++    _exl3_ptab_ready.append(1)
++
++
++def _exl3_forward(
++    x: torch.Tensor,
++    topk_weights: torch.Tensor,
++    topk_ids: torch.Tensor,
++    layer_key: int,
++) -> torch.Tensor:
++    """EXL3 base tier forward: the full routed-expert block from the pack
++    via exl3_mgemm (per-token grouped dispatch, weighted reduction
++    in-kernel). Mirrors the plane path's return contract exactly:
++    routed-only [T, H] in x's dtype (shared experts are orchestrated by
++    the MoE runner outside, same as every non-modular apply); _apply_topp
++    runs first like the plane path so the env knob keeps its semantics.
++
++    v2 (FP4 need-pool on): experts currently resident in the pool
++    (slot_table >= 0) are MASKED out of the EXL3 call and their exact FP4
++    contribution is added back — plane replacement, additive over experts
++    (parity-proven split additivity 0.0006). The confidence gate + the
++    runner's promote->replay loop drive residency between forwards, all
++    format-agnostic; this forward only reads slot_table and marks `seen`."""
++    if not _EXL3_CUDAGRAPH:
++        # eager path: a capture would bake one token set into the host loop.
++        assert not torch.cuda.is_current_stream_capturing(), (
++            "moe_w2 EXL3 base is eager-only; serve with --enforce-eager or "
++            "VLLM_MOE_W2_EXL3_CUDAGRAPH=1 for the capturable path")
++    topk_weights, topk_ids = _apply_topp(topk_weights, topk_ids)
++    tier, lidx = _EXL3_TIERS[layer_key]
++    if _HCAP_ON:
++        # 9b step-1 (telemetry-only, default-off): in-graph copy of this
++        # layer's MoE input (the residual-stream h_l the offline probes
++        # train on). Fixed-shape copy into a persistent buffer — the
++        # mark_seen idiom; the runner snapshots it at DECISION time on
++        # dumped steps (pre-FP-loop, so replays never overwrite the
++        # signal the gate actually saw). Row 0 only (C=1 decode; spec
++        # verify rows are a step-2 concern).
++        _hcap_buf(layer_key, x).copy_(x[0], non_blocking=True)
++    ids = topk_ids.long()
++    wts = topk_weights.float()
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    ftier = moe_w2_delta._TIER
++    if ftier is None:
++        # v1 path: bare EXL3 base, no need-pool / gate
++        return tier.forward_topk(lidx, x, ids, wts).to(x.dtype)
++    # record this step's routed experts so the gate's force_promote sees the
++    # scatter (the background manager never promotes under `need`).
++    moe_w2_delta.mark_seen(ftier.seen[layer_key], ids.view(-1))
++    if moe_w2_delta.STEP_W:
++        # P10: routing-weight scatter for cap-bound promotion ordering
++        moe_w2_delta.mark_seen_w(ftier.seen_w[layer_key], ids.view(-1),
++                                 wts.view(-1))
++    # v2 prefill-ensure (both arms): make the chunk's routed set FP4-resident
++    # BEFORE the slot_table read so THIS chunk already serves them at FP4
++    # (the 2-bit prefill idiom). Real eager prefills only — never the
++    # KV-profiling dummy run or capture (see _exl3_prefill_ensure_ok).
++    if _exl3_prefill_ensure_ok(x):
++        ftier.ensure_resident(layer_key, ids.view(-1))
++    # Track 2.5 decode wave, graph AND eager (glue fix [V] 08-05): M=1 decode
++    # via the flat wave kernel over the PERSISTENT ptab stack — no per-step
++    # slot_table read, Δ ptr tables, dmask or cats (the base-only zero-svh
++    # mask for non-pooled experts is baked into the ptab at pool-MUTATION
++    # time by the delta tier's mutate hook). Same base/base+Δ block as
++    # forward_topk_unified; capture-safe, no host syncs, one gather/layer.
++    if (_EXL3_WAVE and x.shape[0] == 1 and _EXL3_W2K == 1
++            and _EXL3_DELTA_PACK and _EXL3_DELTA_GEOM is not None
++            and _EXL3_DELTA_GEOM["dk13"] == 2
++            and _EXL3_DELTA_GEOM["dk2"] == 3
++            and (_EXL3_DELTA_UNIFIED or not _EXL3_CUDAGRAPH)):
++        _exl3_ensure_ptabs(ftier)
++        if not _exl3_wave_seen:
++            logger.info("moe_w2 EXL3 decode-wave route ACTIVE "
++                        "(%sM=1, base 2,2,1 cb0 + Δ 2,2,3 cb2, ptab)",
++                        "" if _EXL3_CUDAGRAPH else "eager, ")
++            _exl3_wave_seen.append(1)
++        return tier.forward_topk_wave(lidx, x, ids, wts).to(x.dtype)
++    slot_row = ftier.slot_table[layer_key]        # [E] int32 (-1 = base tier)
++    fp4_mask = slot_row[ids] >= 0                 # [m, k] bool
++    if _EXL3_CUDAGRAPH:
++        # CAPTURE-SAFE (Stage B): fixed-shape, sync-free. Serve the base for
++        # ALL experts but zero the pool-resident ones via masked weights (not
++        # shape compaction); add the pool-resident experts via the kernel
++        # apply (Δ dual-stream mgemm in Δ-pool mode, moe_w4_mm cubin in FP4
++        # mode). The gate's out-of-graph replay re-runs this captured graph
++        # after promotions, exactly like the 2-bit path.
++        if _EXL3_DELTA_PACK and _EXL3_DELTA_UNIFIED:
++            # P6-perf: one unified pass serves base AND Δ (6 mgemm/token).
++            from vllm.model_executor.layers.quantization.utils \
++                .moe_w2_exl3 import delta_ptr_tables
++            g = _EXL3_DELTA_GEOM
++            tabs = delta_ptr_tables(ftier.pool.data_ptr(), ftier.slot_bytes,
++                                    ftier.slot_table[layer_key], g)
++            y = tier.forward_topk_unified(lidx, x, ids, wts, fp4_mask,
++                                          tabs, dk13=g["dk13"],
++                                          dk2=g["dk2"], dmults=g["mults"])
++            return y.to(x.dtype)
++        wts_base = wts.masked_fill(fp4_mask, 0.0)
++        y = tier.forward_topk(lidx, x, ids, wts_base)
++        if _EXL3_DELTA_PACK:
++            yd = _exl3_delta_apply(tier, lidx, ftier, layer_key, x, ids,
++                                   wts, fp4_mask)
++            if (_EXL3_DELTA_VALIDATE
++                    and not torch.cuda.is_current_stream_capturing()
++                    and bool(fp4_mask.any())):
++                _exl3_delta_validate(tier, lidx, ftier, layer_key, x, ids,
++                                     wts, fp4_mask, yd)
++            y = y + yd.float()
++        else:
++            y = y + _exl3_fp4_apply_cubin(
++                ftier, layer_key, x, ids, wts, tier.act_limit).float()
++        return y.to(x.dtype)
++    # ---- eager path (v2): compaction + optional cubin/torch apply ----
++    # (prefill-ensure already ran above; the eager decode-wave mirror is the
++    # hoisted ptab branch before the fp4_mask read)
++    y = tier.forward_topk(lidx, x, ids, wts, fp4_mask=fp4_mask)
++    if _EXL3_DELTA_PACK:
++        if bool(fp4_mask.any()):
++            yd = _exl3_delta_apply(tier, lidx, ftier, layer_key, x, ids,
++                                   wts, fp4_mask)
++            if _EXL3_DELTA_VALIDATE:
++                _exl3_delta_validate(tier, lidx, ftier, layer_key, x, ids,
++                                     wts, fp4_mask, yd)
++            y = y + yd.float()
++    elif _EXL3_FP4_CUBIN:
++        # v2-perf: FP4-resident experts via the moe_w4_mm cubin (base already
++        # served by forward_topk with fp4_mask). Non-resident pairs contribute
++        # zero (m=0 in the desc); no per-expert torch dequant/sync.
++        yfp4 = _exl3_fp4_apply_cubin(ftier, layer_key, x, ids, wts,
++                                     tier.act_limit)
++        if _EXL3_FP4_VALIDATE and bool(fp4_mask.any()):
++            _exl3_fp4_validate(ftier, layer_key, x, ids, wts, fp4_mask,
++                               tier.act_limit, yfp4)
++        y = y + yfp4.float()
++    elif bool(fp4_mask.any()):
++        y = y + _exl3_fp4_apply(ftier, layer_key, x, ids, wts, fp4_mask,
++                                tier.act_limit)
++    return y.to(x.dtype)
++
++
 +def _moe_w2_forward(
 +    x: torch.Tensor,
 +    topk_weights: torch.Tensor,
@@ -5066,6 +6828,9 @@ index 000000000..e509f8cb2
 +    topk_ids: torch.Tensor,
 +    layer_key: int,
 +) -> torch.Tensor:
++    if _EXL3_BASE:
++        return _exl3_forward(x, topk_weights, topk_ids, layer_key)
++
 +    from vllm.model_executor.layers.fused_moe.moe_align_block_size import (
 +        moe_align_block_size,
 +    )
@@ -5545,9 +7310,14 @@ index 000000000..e509f8cb2
 +def shutdown() -> None:
 +    """Release model-owned registries/workspaces while retaining cubin modules."""
 +    global _n_created, _skip_logged, _stream_logged
-+    global _cutoff_cache, _resident_fit_checked
++    global _cutoff_cache, _resident_fit_checked, _exl3_config_checked
++    global _EXL3_FP4_GEOM
 +    _LAYERS.clear()
 +    _WS.clear()
++    _EXL3_TIERS.clear()
++    _EXL3_FP4_GEOM = None
++    _EXL3_FP4_WCACHE.clear()
++    _exl3_config_checked = False
 +    _n_created = 0
 +    _skip_logged = False
 +    _stream_logged = False
@@ -5556,10 +7326,10 @@ index 000000000..e509f8cb2
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..68451bfb5
+index 000000000..b78d65142
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2393 @@
+@@ -0,0 +1,2511 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -5647,6 +7417,17 @@ index 000000000..68451bfb5
 +_TRACE = int(os.getenv("VLLM_MOE_W2_DELTA_TRACE", "0"))
 +_TRACE_EVERY = max(int(os.getenv("VLLM_MOE_W2_DELTA_TRACE_EVERY", "64")), 1)
 +_DUMP_PATH = os.getenv("VLLM_MOE_W2_DELTA_DUMP", "")
++
++# P11 fire-stall decomposition (2026-08-01, measurement-only, default-off):
++# with VLLM_MOE_W2_GATE_FIRE_TIMING=1 each force_promote call records its
++# wall-clock phase breakdown here (ms): snap (seen snapshot incl. the
++# wait-for-forward cross-stream sync), select (candidate ranking + slot
++# taking), read (host-store row staging), h2d (pool copies + the single
++# event sync), map (slot-table writes). The gate's dump_step attaches the
++# runner-assembled record to the fired step's JSONL row. Each call rebinds
++# a fresh dict, so a consumer holding the previous reference is safe.
++_FIRE_TIMING = os.getenv("VLLM_MOE_W2_GATE_FIRE_TIMING", "0") == "1"
++LAST_FORCE_TIMING: dict | None = None
 +
 +# Routing-trace capture for offline policy study (gated, off by default): record
 +# each tick's seen (layer,expert) frame and periodically write a .npy of
@@ -5804,6 +7585,13 @@ index 000000000..68451bfb5
 +                                     dtype=torch.int32, device=dev)
 +        self._mirror = torch.full((n_layers, n_experts), -1,
 +                                  dtype=torch.int32)
++        # Post-mutation hooks: called (host-side, eager) after any batch of
++        # slot_table writes commits or rolls back, so consumers keeping
++        # derived views of the mapping (the EXL3 decode-wave ptab stack)
++        # refresh at MUTATION time instead of every step. All mutation flows
++        # run in eager host code (gate promote loop, prefill ensure,
++        # prefetch, manager tick) — never inside a capture/replay.
++        self.mutate_hooks: list = []
 +        # slot -> (layer, expert, last_seen_tick) as three flat CPU tensors;
 +        # layer -1 = free. Tensor form keeps the eviction/refresh paths fully
 +        # vectorized: the old list-of-tuples cost three O(n_slots) python
@@ -5828,6 +7616,18 @@ index 000000000..68451bfb5
 +        self._accum_reset = False
 +        self._seen_host = torch.zeros_like(self.seen, device="cpu",
 +                                           pin_memory=True)
++        # P10 (VLLM_MOE_W2_DELTA_RANK=step_w): per-(layer,expert) max routing
++        # weight of the current seen window, scattered in-graph next to
++        # `seen` (amax reduce, fixed shapes). Read only by force_promote's
++        # candidate ranking on CAP-BOUND fires — measured motivation: 62.5%
++        # of natural fires hit the 64 cap and flip at 21.7% (vs 13.8%
++        # uncapped), so WHICH experts enter the cap matters. Allocated
++        # unconditionally (2x n_layers*n_experts fp32 = trivial); written
++        # only when the mode is armed.
++        self.seen_w = torch.zeros(n_layers, n_experts, dtype=torch.float32,
++                                  device=dev)
++        self._seen_w_host = torch.zeros_like(self.seen_w, device="cpu",
++                                             pin_memory=True)
 +        # Host store behind a backend interface: classic pinned/pageable
 +        # tensors (default), or an on-disk pack file with the kernel page
 +        # cache as the RAM tier (VLLM_MOE_W2_STORE_DIR) — see moe_w2_store.
@@ -6557,6 +8357,7 @@ index 000000000..68451bfb5
 +                    # pairing ends the whole take (later pairs only worse).
 +                    if len(out) >= len(admission_keys) or \
 +                            not (admission_keys[len(out)] > vk):
++                        self._fire_mutate_hooks()
 +                        return out
 +                vli = int(self._owner_li[s])
 +                vei = int(self._owner_ei[s])
@@ -6571,12 +8372,22 @@ index 000000000..68451bfb5
 +                        self._tick - int(self._owner_tick[s]))
 +                taken.add(s)
 +                out.append(s)
++        self._fire_mutate_hooks()
 +        return out
 +
 +    def _take_slot(self, seen_set=None):
 +        """Single-slot wrapper (kept for the unit tests / external callers)."""
 +        slots = self._take_slots_batch(1)
 +        return slots[0] if slots else None
++
++    def _fire_mutate_hooks(self) -> None:
++        """Notify derived-view consumers after slot_table writes. Idempotent
++        and cheap (the EXL3 ptab refresh is ~14 small kernels vectorized over
++        layers); fired from every mutation flow INCLUDING eviction-only and
++        rollback paths, so a consumer can never observe a stale mapping via
++        a later graph replay."""
++        for hook in self.mutate_hooks:
++            hook()
 +
 +    def _promote(self, li, ei, slot):
 +        try:
@@ -6605,6 +8416,7 @@ index 000000000..68451bfb5
 +            self._owner_tick[slot] = 0
 +            if slot not in self._free:
 +                self._free.append(slot)
++            self._fire_mutate_hooks()
 +            raise
 +        self._mirror[li, ei] = slot
 +        self._own(slot, li, ei)
@@ -6613,6 +8425,7 @@ index 000000000..68451bfb5
 +        if _TRACE >= 2:
 +            logger.info("[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
 +                        self._tag, li, ei, slot, self._tick)
++        self._fire_mutate_hooks()
 +
 +    def _promote_batch(self, candidates) -> int:
 +        """Manager safe-point promotion with one store batch and one sync."""
@@ -6645,6 +8458,7 @@ index 000000000..68451bfb5
 +                self._owner_tick[slot] = 0
 +                if slot not in self._free:
 +                    self._free.append(slot)
++            self._fire_mutate_hooks()
 +            raise
 +        for (li, ei), slot in plan:
 +            self._mirror[li, ei] = slot
@@ -6655,6 +8469,7 @@ index 000000000..68451bfb5
 +                logger.info(
 +                    "[%s] promote L%-2d E%-3d  slot %-4d (tick %d)",
 +                    self._tag, li, ei, slot, self._tick)
++        self._fire_mutate_hooks()
 +        return len(plan)
 +
 +    # ---- confidence-gated re-forward (directive 2 / Step B) --------------
@@ -6845,6 +8660,7 @@ index 000000000..68451bfb5
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +            self._kpi_prefetched += len(plan)
++        self._fire_mutate_hooks()
 +        return len(plan)
 +
 +    def force_promote(self, layers=None, max_promote=None,
@@ -6881,6 +8697,19 @@ index 000000000..68451bfb5
 +        Returns:
 +            number of experts newly promoted to FP4.
 +        """
++        _ft = None
++        if _FIRE_TIMING:
++            global LAST_FORCE_TIMING
++            _ft = {"snap": 0.0, "select": 0.0, "read": 0.0, "h2d": 0.0,
++                   "map": 0.0, "n": 0, "cand": 0}
++            LAST_FORCE_TIMING = _ft
++            _ft_t = time.perf_counter()
++
++            def _ft_mark(key: str) -> None:
++                nonlocal _ft_t
++                now = time.perf_counter()
++                _ft[key] = round((now - _ft_t) * 1e3, 3)
++                _ft_t = now
 +        if len(self._store) == 0:
 +            return 0
 +        # snapshot the forward's routed-expert scatter. The side stream must
@@ -6892,10 +8721,14 @@ index 000000000..68451bfb5
 +            with torch.cuda.stream(self._stream):
 +                self._stream.wait_stream(main)
 +                self._seen_host.copy_(self.seen, non_blocking=True)
++                if STEP_W:
++                    self._seen_w_host.copy_(self.seen_w, non_blocking=True)
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
 +            seen = self._seen_host.nonzero()
++        if _ft is not None:
++            _ft_mark("snap")
 +        if seen.numel() == 0:
 +            return 0
 +        # Bound the working set to RECENT steps: `seen` otherwise accumulates
@@ -6906,6 +8739,10 @@ index 000000000..68451bfb5
 +        # H2D). Zeroing after the snapshot is the manager's own idiom; a flag
 +        # lost to the in-flight scatter race only delays a lazy promotion.
 +        self.seen.zero_()
++        if STEP_W:
++            # same window discipline as `seen`: the weights belong to the
++            # snapshot just taken; amax would otherwise blend windows.
++            self.seen_w.zero_()
 +        layer_filter = set(layers) if layers is not None else None
 +        with self._lock:
 +            li_idx, ei_idx = seen[:, 0], seen[:, 1]
@@ -6940,11 +8777,20 @@ index 000000000..68451bfb5
 +                return 0
 +            # capped promote prioritizes the most-NEEDED experts under the gate-driven
 +            # policy (repeat offenders first); hottest-first otherwise.
++            # P10 (step_w): THIS window's max routing weight primary, the
++            # policy rank only as tie-break — under a binding cap the fired
++            # token's heaviest experts enter first.
 +            if len(cand) > 1:
 +                ca = torch.tensor(cand)
 +                rank = self._need if self._policy == "need" else self._freq
-+                order = torch.argsort(rank[ca[:, 0], ca[:, 1]], descending=True)
++                key = rank[ca[:, 0], ca[:, 1]].double()
++                if STEP_W:
++                    key = (self._seen_w_host[ca[:, 0], ca[:, 1]].double()
++                           + 1e-9 * key)
++                order = torch.argsort(key, descending=True)
 +                cand = [cand[i] for i in order.tolist()]
++            if _ft is not None:
++                _ft["cand"] = len(cand)
 +            if max_promote is not None:
 +                cand = cand[:max_promote]
 +            # take ALL slots in one vectorized batch (evictions unmap on the
@@ -6975,10 +8821,14 @@ index 000000000..68451bfb5
 +            plan = [((li, ei), slot) for (li, ei), slot in zip(cand, slots)]
 +            if not plan:
 +                return 0
++            if _ft is not None:
++                _ft_mark("select")
 +            # one batched host read (pack-file store: mmap -> pinned stage;
 +            # pinned store: zero-copy views), THEN the H2D copies — all stage
 +            # rows stay valid until the single sync below.
 +            rows = self._store.rows_for([p for p, _ in plan])
++            if _ft is not None:
++                _ft_mark("read")
 +            for ((li, ei), slot), row in zip(plan, rows):
 +                self._own(slot, li, ei)
 +                if pin:
@@ -6989,12 +8839,17 @@ index 000000000..68451bfb5
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
++            if _ft is not None:
++                _ft_mark("h2d")
 +            for (li, ei), slot in plan:
 +                self.slot_table[li, ei] = slot
 +                self._mirror[li, ei] = slot
 +                self._freq[li, ei] += 1.0
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
++            if _ft is not None:
++                _ft_mark("map")
++                _ft["n"] = len(plan)
 +        if len(plan) < len(cand):
 +            if self._policy == "need":
 +                # Opportunistic tier: the shortfall is admission control
@@ -7032,6 +8887,7 @@ index 000000000..68451bfb5
 +        if _TRACE >= 2:
 +            logger.info("[%s] force-promote %d experts (gate)",
 +                        self._tag, len(plan))
++        self._fire_mutate_hooks()
 +        return len(plan)
 +
 +    def ensure_resident(self, layer_key: int, ids: torch.Tensor) -> int:
@@ -7135,6 +8991,7 @@ index 000000000..68451bfb5
 +                    "moe_w2 [%s] prefill ensure deferred %d of %d "
 +                    "candidates (hot half protected)",
 +                    self._tag, len(cand) - len(plan), len(cand))
++        self._fire_mutate_hooks()
 +        return len(plan)
 +
 +    def mark_need_only(self, layers=None) -> int:
@@ -7440,6 +9297,25 @@ index 000000000..68451bfb5
 +        seen_row.index_add_(0, ids, torch.ones_like(ids, dtype=seen_row.dtype))
 +    else:
 +        seen_row.index_fill_(0, ids, 1)
++
++
++# P10: promotion ranking mode. "step_w" (default since the [O] 07-31
++# Faza-1 paired campaign: GPQA r1 == anchor 142/198 exact, p=1, flips
++# 9/9; GSM8K 194/200; self-flip band unchanged; A/B telemetry showed
++# capped-fire precision +1.4pp and fires −12.8%) = THIS window's max
++# routing weight primary, need as tie-break — cap-bound fires promote
++# the experts that carry the most weight for the very token that fired.
++# "need" = the pre-07-31 decayed-recidivism-only ranking (A/B fallback).
++# Constant for the process (read at import; the forward's scatter is
++# compiled/captured against it).
++_RANK_MODE = os.getenv("VLLM_MOE_W2_DELTA_RANK", "step_w")
++STEP_W = _RANK_MODE == "step_w"
++
++
++def mark_seen_w(w_row, ids, weights):
++    """Scatter the window's max routing weight per expert (P10, step_w mode).
++    In-place amax on a persistent buffer, fixed shapes — capture-safe."""
++    w_row.scatter_reduce_(0, ids, weights, reduce="amax", include_self=True)
 +
 +
 +_TIER: DeltaTier | None = None
@@ -7900,7 +9776,19 @@ index 000000000..68451bfb5
 +        # pool would duplicate the base tier's hot set at 2x the read bytes.
 +        # An explicit VLLM_MOE_W2_DELTA_POLICY still wins.
 +        policy = None
-+        if base_enabled():
++        _exl3_base = False
++        try:
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_cubit as _mc)
++            _exl3_base = bool(_mc._EXL3_BASE)
++        except Exception:  # noqa: BLE001 - offline tools without the cubit env
++            _exl3_base = False
++        if base_enabled() or _exl3_base:
++            # EXL3 v2: the resident EXL3 trellis base has NO 2-bit base cache
++            # (base_enabled() is False), but the FP4 need-pool over it is the
++            # same gate-driven QUALITY tier — default to "need" so the
++            # background freq manager never fills it (only the confidence
++            # gate's force_promote does). An explicit env still wins.
 +            policy = os.getenv("VLLM_MOE_W2_DELTA_POLICY", "need")
 +        # Split quintal slots have a DIFFERENT geometry than full-FP4
 +        # slots; a distinct pack tag ("fp4q"; the superseded 2-bit
@@ -7953,12 +9841,510 @@ index 000000000..68451bfb5
 +        raise RuntimeError(
 +            "moe_w2 residency shutdown failed: "
 +            + "; ".join(str(e) for e in errors))
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
+new file mode 100644
+index 000000000..eaac47ba0
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
+@@ -0,0 +1,492 @@
++# SPDX-License-Identifier: Apache-2.0
++"""EXL3 trellis base tier for the moe_w2 stack (vLLM-Moet).
++
++Serves routed-expert GEMMs from EXL3 packs (built by exl3-ab/
++build_exl3_pack.py) via exllamav3's grouped multi-matrix kernel
++`exl3_mgemm` (pointer-table expert indirection, in-kernel weighted
++reduction). Designed to REPLACE the 2-bit scalar base tier while leaving
++the FP4 need-pool, gate and miss machinery untouched: experts currently
++served by the FP4 pool are masked out of the EXL3 call (negative indices
++or compaction) and their contribution is added by the existing moe_w4
++path — the composition is additive per token.
++
++This module is deliberately vLLM-import-free so it can be parity-tested
++standalone (tools/test_moe_w2_exl3.py) and imported by moe_w2_cubit.
++
++Env:
++  VLLM_MOE_W2_EXL3_PACK   pack directory (exl3-l{li:02d}.safetensors)
++  VLLM_MOE_W2_EXL3_REPO   exllamav3 checkout providing the CUDA ext
++                          (default /root/workspace/exllamav3)
++  VLLM_MOE_W2_EXL3_W2K    down-proj K variant: 1|2|3 (default 2)
++"""
++from __future__ import annotations
++
++import importlib
++import os
++import sys
++import types
++
++import torch
++import torch.nn.functional as F
++
++_EXT = None
++
++
++def delta_slot_geom(dk13: int = 2, dk2: int = 2, hidden: int = 4096,
++                    inter: int = 2048) -> dict:
++    """Byte geometry of one Δ-pool slot (pack v3). Layout (u8, contiguous):
++    w13 section [tr1|suh1|svh1|tr3|suh3|svh3] then w2 section
++    [tr2|suh2|svh2]. Trellis bytes = (k/16)*(n/16)*(16*dk words)*2; sidecars
++    are fp16 per-channel vectors. All offsets are 16-byte aligned for DS4
++    dims. Returns dict(dk13, dk2, sec13, sec2, slot_bytes, offs={proj:
++    (tr, suh, svh)}) with offsets relative to the SLOT start.
++
++    Per-projection delta K ([P] 2026-08-02, the 1.67 track's winning
++    allocation is base (2,2,1) + Δ (2,2,3)): the w13 streams and the w2
++    stream may carry different trellis bitrates; dk13 == dk2 reproduces
++    the legacy uniform layout byte-for-byte."""
++    tr13 = (hidden // 16) * (inter // 16) * dk13 * 32
++    tr2 = (inter // 16) * (hidden // 16) * dk2 * 32
++    suh13, svh13 = hidden * 2, inter * 2
++    suh2, svh2 = inter * 2, hidden * 2
++    one13 = tr13 + suh13 + svh13
++    sec13 = 2 * one13
++    sec2 = tr2 + suh2 + svh2
++    offs = {
++        "g": (0, tr13, tr13 + suh13),
++        "u": (one13, one13 + tr13, one13 + tr13 + suh13),
++        "d": (sec13, sec13 + tr2, sec13 + tr2 + suh2),
++    }
++    return dict(dk13=dk13, dk2=dk2, sec13=sec13, sec2=sec2,
++                slot_bytes=sec13 + sec2, offs=offs)
++
++
++def delta_ptr_tables(pool_base: int, slot_bytes: int,
++                     slot_row: torch.Tensor, geom: dict) -> dict:
++    """Per-step Δ pointer tables into the pool: for each projection,
++    int64 [E] tensors (trellis, suh, svh) = pool_base + slot*slot_bytes +
++    section offset. slot -1 (not pooled) is clamped to slot 0 — those
++    entries are never selected (negative-index skip + zero weights in
++    forward_topk_dual) but must still point at mapped memory. Pure
++    elementwise int64 arithmetic: capture-safe."""
++    sp = slot_row.clamp_min(0).to(torch.int64) * slot_bytes + pool_base
++    return {proj: (sp + otr, sp + osuh, sp + osvh)
++            for proj, (otr, osuh, osvh) in geom["offs"].items()}
++
++
++def _load_ext():
++    """Load exllamav3_ext without executing the heavy exllamav3 package
++    __init__ (tokenizers/generators are irrelevant here)."""
++    global _EXT
++    if _EXT is not None:
++        return _EXT
++    repo = os.environ.get("VLLM_MOE_W2_EXL3_REPO",
++                          "/root/workspace/exllamav3")
++    os.environ.setdefault("CUDA_HOME", "/usr/local/cuda")
++    os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ["PATH"]
++    if repo not in sys.path:
++        sys.path.insert(0, repo)
++    for name, path in [("exllamav3", f"{repo}/exllamav3")]:
++        if name not in sys.modules:
++            m = types.ModuleType(name)
++            m.__path__ = [path]
++            m.__package__ = name
++            sys.modules[name] = m
++    ext_mod = importlib.import_module("exllamav3.ext")
++    _EXT = ext_mod.exllamav3_ext
++    return _EXT
++
++
++class Exl3BaseTier:
++    """Resident EXL3 base tier: per-layer pointer tables over pack tensors.
++
++    forward_topk() computes the full routed-expert block for a batch of
++    tokens: y[t] = sum_j w[t,j] * expert_{ids[t,j]}(x[t]), skipping any
++    (t, j) marked in fp4_mask (those are served by the FP4 tier outside).
++    """
++
++    def __init__(self, pack_dir: str, layers, device: str = "cuda:0",
++                 w13_k: int = 2, w2_k: int | None = None,
++                 num_experts: int = 256, hidden: int = 4096,
++                 inter: int = 2048, act_limit: float = 10.0):
++        from safetensors import safe_open
++        self.dev = device
++        self.E = num_experts
++        self.H = hidden
++        self.I = inter
++        self.act_limit = act_limit
++        self.w13_k = w13_k
++        self.w2_k = w2_k or int(os.environ.get("VLLM_MOE_W2_EXL3_W2K", "2"))
++        self.ext = _load_ext()
++        self._store: dict[str, torch.Tensor] = {}
++        self._tables: dict[int, dict] = {}
++        # Resident zero output-hadamard (svh) vectors. Pointing a non-pooled
++        # expert's Δ svh at these zeros its Δ contribution exactly (svh is a
++        # post-decode multiply, hadamard_inner) — base-only fallback for the
++        # decode wave without a kernel-side delta-enable. svh length = the
++        # projection's OUTPUT width: up (g/u) -> I, down (d) -> H.
++        self._zero_svh_up = torch.zeros(self.I, dtype=torch.half, device=device)
++        self._zero_svh_dn = torch.zeros(self.H, dtype=torch.half, device=device)
++        # Persistent decode-wave pointer tables (init_ptabs); None until the
++        # serving fast path is wired (first eager forward, before capture).
++        self._ptab: dict[int, torch.Tensor] | None = None
++
++        for li in layers:
++            path = os.path.join(pack_dir, f"exl3-l{li:02d}.safetensors")
++            keep = {}
++            with safe_open(path, "pt") as f:
++                for ei in range(self.E):
++                    for proj, kb in (("w1", self.w13_k), ("w3", self.w13_k),
++                                     ("w2", self.w2_k)):
++                        for part in ("trellis", "suh", "svh"):
++                            k = f"e{ei}.{proj}.k{kb}.{part}"
++                            keep[k] = f.get_tensor(k).to(device)
++            # layer-prefixed keys: multi-layer tiers must not overwrite the
++            # previous layer's tensors (the pointer tables would dangle)
++            self._store.update({f"l{li}.{k}": v for k, v in keep.items()})
++
++            def tbl(proj, kb, part):
++                return torch.tensor(
++                    [keep[f"e{e}.{proj}.k{kb}.{part}"].data_ptr()
++                     for e in range(self.E)],
++                    dtype=torch.int64, device=device)
++
++            self._tables[li] = {
++                "g": tuple(tbl("w1", self.w13_k, p)
++                           for p in ("trellis", "suh", "svh")),
++                "u": tuple(tbl("w3", self.w13_k, p)
++                           for p in ("trellis", "suh", "svh")),
++                "d": tuple(tbl("w2", self.w2_k, p)
++                           for p in ("trellis", "suh", "svh")),
++            }
++
++    def total_bytes(self) -> int:
++        return sum(t.numel() * t.element_size() for t in self._store.values())
++
++    def _mgemm(self, A, tabs, C, A_had, idx, wts, kb, mults=(0, 0),
++               num_tokens=1):
++        # mults = (mcg_mult, mul1_mult) uint32 codebook selectors: (0, 0) =
++        # 3INST (the base pack); (0, 0x83DCD12D) = MUL1 (the delta pack).
++        self.ext.exl3_mgemm(A, tabs[0], C, tabs[1], A_had, tabs[2], idx, wts,
++                            kb, -1, mults[0], mults[1], -1, -1, 0, num_tokens)
++
++    def _batched(self, li: int, x: torch.Tensor, topk_ids: torch.Tensor,
++                 base_w2_wts: torch.Tensor,
++                 dtabs: dict | None = None, dk13: int = 2, dk2: int = 2,
++                 dmults: tuple = (0, 0x83DCD12D),
++                 delta_w2_wts: torch.Tensor | None = None,
++                 delta_gu_sel: torch.Tensor | None = None) -> torch.Tensor:
++        """Shared batched core: ALL m tokens x k pairs in ONE mgemm per
++        (projection x stream) — 6 calls per LAYER instead of 6 per token
++        (the measured per-call cost is a fixed ~8-16 us barrier train, so
++        the per-token loop was the dominant decode/prefill dispatch cost;
++        see internal/R_EXL3_KERNEL_ANATOMY_2026-08-03.md).
++
++        Slot layout is token-major ([m*k] = m groups of k); the kernel's
++        num_tokens grouped reduction (v1.3.0) sums each group into row t.
++        Pair selection is WEIGHT-side only (zeroed w2 reduction weights),
++        never index-side -1 skips — same reliability rule the dual path
++        established. Capture-safe: fixed shapes, no host syncs.
++
++        base_w2_wts / delta_w2_wts: [m, k] float weights for the base /
++        delta down-proj reduction (already masked by the caller).
++        delta_gu_sel: [m, k] 0/1 gate for the Δ g/u contribution pre-
++        activation (unified semantics); None with dtabs = ungated add
++        (dual semantics)."""
++        t = self._tables[li]
++        m, k = topk_ids.shape
++        bszm = m * k
++        xh = x.half()
++        ids = topk_ids.reshape(1, bszm).contiguous()
++        # .contiguous() is load-bearing: at m == 1 the expand+reshape can
++        # legally return a stride-0 VIEW (one real row aliased k times) and
++        # the kernel indexes A + j*H assuming a dense [bszm, 1, H] layout —
++        # slots j >= 1 would read out of bounds (NaN cascade; measured).
++        A = xh.unsqueeze(1).expand(m, k, self.H) \
++            .reshape(bszm, 1, self.H).contiguous()
++        w_base = base_w2_wts.half().reshape(1, bszm).contiguous()
++
++        Cg = torch.zeros(bszm, 1, self.I, dtype=torch.half, device=self.dev)
++        Cu = torch.zeros(bszm, 1, self.I, dtype=torch.half, device=self.dev)
++        Ah = torch.empty(bszm, 1, self.H, dtype=torch.half, device=self.dev)
++        Ah2 = torch.empty(bszm, 1, self.I, dtype=torch.half, device=self.dev)
++        self._mgemm(A, t["g"], Cg, Ah, ids, None, self.w13_k)
++        self._mgemm(A, t["u"], Cu, Ah, ids, None, self.w13_k)
++
++        if dtabs is not None:
++            Cg2 = torch.zeros_like(Cg)
++            Cu2 = torch.zeros_like(Cu)
++            self._mgemm(A, dtabs["g"], Cg2, Ah, ids, None, dk13, dmults)
++            self._mgemm(A, dtabs["u"], Cu2, Ah, ids, None, dk13, dmults)
++            if delta_gu_sel is not None:
++                sel = delta_gu_sel.half().reshape(bszm, 1, 1)
++                g = Cg.float() + sel * Cg2.float()
++                u = Cu.float() + sel * Cu2.float()
++            else:
++                g = Cg.float() + Cg2.float()
++                u = Cu.float() + Cu2.float()
++        else:
++            g = Cg.float()
++            u = Cu.float()
++        h = (F.silu(g.clamp(max=self.act_limit))
++             * u.clamp(min=-self.act_limit, max=self.act_limit)).half()
++
++        Cd = torch.zeros(bszm, 1, self.H, dtype=torch.float, device=self.dev)
++        self._mgemm(h, t["d"], Cd, Ah2, ids, w_base, self.w2_k,
++                    num_tokens=m)
++        y = Cd[:m, 0]
++        if dtabs is not None:
++            w_d = delta_w2_wts.half().reshape(1, bszm).contiguous()
++            Cd2 = torch.zeros_like(Cd)
++            self._mgemm(h, dtabs["d"], Cd2, Ah2, ids, w_d, dk2, dmults,
++                        num_tokens=m)
++            y = y + Cd2[:m, 0]
++        return y
++
++    @torch.inference_mode()
++    def forward_topk(self, li: int, x: torch.Tensor, topk_ids: torch.Tensor,
++                     topk_weights: torch.Tensor,
++                     fp4_mask: torch.Tensor | None = None) -> torch.Tensor:
++        """x [m, H] (any float dtype); topk_ids [m, k] long; topk_weights
++        [m, k] float; fp4_mask [m, k] bool, True = served by FP4 tier.
++        Returns y [m, H] float32 with masked contributions EXCLUDED
++        (weight-side zeroing at fixed shapes — no compaction, no host
++        syncs, batch-of-tokens in one mgemm per projection)."""
++        wts = topk_weights
++        if fp4_mask is not None:
++            wts = wts.masked_fill(fp4_mask, 0.0)
++        return self._batched(li, x, topk_ids, wts)
++
++    @torch.inference_mode()
++    def forward_topk_unified(self, li: int, x: torch.Tensor,
++                             topk_ids: torch.Tensor,
++                             topk_weights: torch.Tensor,
++                             dmask: torch.Tensor, dtabs: dict,
++                             dk13: int = 2, dk2: int = 2,
++                             dmults: tuple = (0, 0x83DCD12D)) -> torch.Tensor:
++        """P6-perf: ONE pass serving base AND Δ-pool together — 6 mgemm
++        calls per token instead of forward_topk(masked) + forward_topk_dual
++        = 9 (which also computed the base g/u twice for pooled pairs).
++
++        Per token, all k pairs at fixed shapes (capture-safe):
++          g = g_base + dmask*g_delta;  u likewise  (Δ zeroed pre-activation
++          for non-pooled pairs — their slot-0 reads are finite garbage)
++          h = silu(clamp(g)) * clamp(u)
++          y = w2_base(h, weights=w_full) + w2_delta(h, weights=w_masked)
++        Algebraically identical to the split path: pooled pairs get the
++        full (Wb+Δ) block on the upgraded h; non-pooled pairs get the pure
++        base block (delta w2 weight = 0). Batched: 6 mgemm per LAYER."""
++        wts_d = topk_weights.masked_fill(~dmask, 0.0)
++        return self._batched(li, x, topk_ids, topk_weights,
++                             dtabs=dtabs, dk13=dk13, dk2=dk2, dmults=dmults,
++                             delta_w2_wts=wts_d, delta_gu_sel=dmask)
++
++    @torch.inference_mode()
++    def forward_topk_dual(self, li: int, x: torch.Tensor,
++                          topk_ids: torch.Tensor,
++                          topk_weights: torch.Tensor,
++                          dmask: torch.Tensor, dtabs: dict,
++                          dk13: int = 2, dk2: int = 2,
++                          dmults: tuple = (0, 0x83DCD12D)) -> torch.Tensor:
++        """Δ-pool contribution: full expert block y = sum_j w[t,j] *
++        expert_{base+Δ}(x[t]) for the (t, j) pairs where dmask is True
++        (Δ-resident in the pool). Per projection the two trellis streams
++        are summed PRE-activation (weight-level additivity: (Wb+Δ)x =
++        Wb x + Δ x), then the SwiGLU clamp applies to the sum — matching
++        the delta pack's block validation semantics exactly.
++
++        CAPTURE-SAFE: fixed shapes, no compaction, no host syncs. Pair
++        selection is weight-side only: EVERY pair computes base+Δ g/u/h
++        (non-pooled experts read slot-0 Δ bytes via the clamped pointer
++        tables — wrong-but-finite, never unmapped/NaN), and the down-proj
++        reduction weights are zeroed for non-pooled pairs, so their
++        contribution is exactly 0. (Index-side -1 skip is NOT used: the
++        mgemm negative-skip is not reliable mid-array in this fan-out
++        mode — measured, parity test stage 1.)
++
++        dtabs: {"g"|"u"|"d": (trellis_ptrs, suh_ptrs, svh_ptrs)} int64 [E]
++        tables pointing into the pool slots (built by the caller from
++        slot_table + the Δ slot geometry). dmults = (mcg_mult, mul1_mult)
++        codebook selectors for the delta stream (pack v3 quantizes with
++        MUL1; the base pack is 3INST). Batched: 6 mgemm per LAYER.
++        """
++        wts_d = topk_weights.masked_fill(~dmask, 0.0)
++        return self._batched(li, x, topk_ids, wts_d,
++                             dtabs=dtabs, dk13=dk13, dk2=dk2, dmults=dmults,
++                             delta_w2_wts=wts_d, delta_gu_sel=None)
++
++    @torch.inference_mode()
++    def forward_topk_wave(self, li: int, x: torch.Tensor,
++                          topk_ids: torch.Tensor, topk_weights: torch.Tensor,
++                          dtabs: dict | None = None,
++                          dmask: torch.Tensor | None = None) -> torch.Tensor:
++        """Decode path (M=1) via exl3_decode_wave_dual: the whole MoE layer
++        in five flat launches instead of six mgemm barrier-trains (track 3.0
++        wave; sonda verdict 2026-08-05).
++
++        x [1, H]; topk_ids [1, k] long; topk_weights [1, k] float.
++        dmask [1, k] bool selects the Δ-pooled pairs (True = base+Δ). Non-
++        pooled pairs fall back to base-only by pointing their Δ output-
++        hadamard (svh) at a resident zero vector, which zeros the Δ g/u
++        (pre-SwiGLU) and the Δ down contribution exactly — no kernel-side
++        delta-enable needed. dmask=None serves every active expert base+Δ
++        (== forward_topk_dual all-True). Returns y [1, H] float32 =
++        sum_j w[0,j] * expert_{ids[0,j]}(x[0]) with per-pair base/base+Δ.
++
++        The kernel hardcodes the pack-v3 serving pair: base (2,2,1) on cb0
++        (3INST) with a K1 down, Δ (2,2,3) on cb2 (MUL1) with a K3 down — so
++        the tier must be built w13_k=2, w2_k=1 and dtabs must carry dk13=2,
++        dk2=3.
++
++        dtabs=None = the SERVING fast path over the persistent ptab stack
++        (init_ptabs): the six slot-major pointer arrays the kernel expects
++        (ups [gb,ub,gd,ud] -> 4*na; downs [db,dd] -> 2*na) come out of ONE
++        int64 index_select over the per-layer [18, E] table — the Δ rows
++        (incl. the zero-svh mask for non-pooled experts) are maintained at
++        pool-MUTATION time (refresh_ptabs via the delta tier's mutate hook),
++        not per step. The glue anatomy [V] 2026-08-05 measured the per-step
++        compose (13 int64 adds + 15 gathers + 6 cats + wheres per LAYER) at
++        ~2.0 ms/step of ~1 µs launches; the fast path replaces it with one
++        kernel per layer. Values are bit-identical: same pointer arithmetic,
++        moved from per-step to per-mutation.
++
++        dtabs given = legacy per-step compose from the Δ pool tables (dmask
++        semantics as above) — kept for parity tests and non-serving callers.
++        Both paths: capture-safe, no host syncs."""
++        assert x.shape[0] == 1, "decode wave is M=1 only"
++        assert self.w13_k == 2 and self.w2_k == 1, \
++            "wave serves the base (2,2,1) pair (w13_k=2, w2_k=1)"
++        ids = topk_ids[0].to(torch.long)
++        na = int(ids.numel())
++        if dtabs is None:
++            # fast path: one gather over the persistent per-layer ptab.
++            # Row-major [rows, na] flattens to exactly the slot-major
++            # concatenations the kernel wants (see _PTAB_ROWS in init_ptabs).
++            assert self._ptab is not None, \
++                "forward_topk_wave fast path before init_ptabs()"
++            cols = self._ptab[li].index_select(1, ids)   # [18, na]
++            up_tr = cols[0:4].reshape(-1)
++            up_suh = cols[4:8].reshape(-1)
++            up_svh = cols[8:12].reshape(-1)
++            dn_tr = cols[12:14].reshape(-1)
++            dn_suh = cols[14:16].reshape(-1)
++            dn_svh = cols[16:18].reshape(-1)
++        else:
++            t = self._tables[li]
++            g, u, d = t["g"], t["u"], t["d"]
++            dg, du, dd = dtabs["g"], dtabs["u"], dtabs["d"]
++
++            # Δ output-hadamard tables, masked to base-only where not pooled
++            dg_svh, du_svh, dd_svh = dg[2][ids], du[2][ids], dd[2][ids]
++            if dmask is not None:
++                m = dmask[0].to(torch.bool)
++                zu = dg_svh.new_full((), self._zero_svh_up.data_ptr())
++                zd = dd_svh.new_full((), self._zero_svh_dn.data_ptr())
++                dg_svh = torch.where(m, dg_svh, zu)
++                du_svh = torch.where(m, du_svh, zu)
++                dd_svh = torch.where(m, dd_svh, zd)
++
++            # ups slot-major: [base_gate, base_up, delta_gate, delta_up] x na
++            up_tr = torch.cat([g[0][ids], u[0][ids], dg[0][ids], du[0][ids]])
++            up_suh = torch.cat([g[1][ids], u[1][ids], dg[1][ids], du[1][ids]])
++            up_svh = torch.cat([g[2][ids], u[2][ids], dg_svh, du_svh])
++            # downs slot-major: [base_down, delta_down] x na
++            dn_tr = torch.cat([d[0][ids], dd[0][ids]])
++            dn_suh = torch.cat([d[1][ids], dd[1][ids]])
++            dn_svh = torch.cat([d[2][ids], dd_svh])
++
++        xh = x.half().reshape(1, self.H).contiguous()
++        out = torch.zeros(1, self.H, dtype=torch.float, device=self.dev)
++        w = topk_weights[0].to(torch.half).contiguous()
++        a_had = torch.empty(4 * na, self.H, dtype=torch.half, device=self.dev)
++        c_up = torch.empty(4 * na, self.I, dtype=torch.half, device=self.dev)
++        d_in = torch.empty(2 * na, self.I, dtype=torch.half, device=self.dev)
++        c_down = torch.empty(2 * na, self.H, dtype=torch.half, device=self.dev)
++        self.ext.exl3_decode_wave_dual(
++            xh, out, w,
++            up_tr.contiguous(), up_suh.contiguous(), up_svh.contiguous(),
++            dn_tr.contiguous(), dn_suh.contiguous(), dn_svh.contiguous(),
++            a_had, c_up, d_in, c_down,
++            self.act_limit, na)
++        return out
++
++    # ---- persistent decode-wave pointer tables (glue fix [V] 2026-08-05) --
++    # Row layout of the per-layer [18, E] int64 table. Rows are grouped so a
++    # single index_select(1, ids) -> [18, na] yields, via contiguous row-major
++    # slices, exactly the six slot-major arrays exl3_decode_wave_dual takes:
++    #   0-3   up_tr  = [g.tr,  u.tr,  dg.tr,  du.tr ]
++    #   4-7   up_suh = [g.suh, u.suh, dg.suh, du.suh]
++    #   8-11  up_svh = [g.svh, u.svh, dg.svh*, du.svh*]
++    #   12-13 dn_tr  = [d.tr,  dd.tr ]
++    #   14-15 dn_suh = [d.suh, dd.suh]
++    #   16-17 dn_svh = [d.svh, dd.svh*]
++    # (*) Δ svh rows carry the baked base-only mask: a non-pooled expert's
++    # entry points at the resident zero vector instead of the pool — the same
++    # semantics the per-step dmask/torch.where used to apply, moved to
++    # pool-mutation time.
++
++    def init_ptabs(self, ftier, geom: dict, pairs) -> None:
++        """Build the persistent ptab stack and hook refreshes into the delta
++        tier. `pairs` = [(layer_key, li), ...] mapping the delta tier's
++        slot_table rows (layer_key) to this tier's pack layers (li). Base
++        rows are static (resident pack tensors); Δ rows are (re)computed by
++        refresh_ptabs, called once now and then from ftier's mutate hook —
++        pool mutations only ever happen in eager host code (gate promote,
++        prefill ensure, prefetch), never inside a capture/replay, so the
++        captured gather always reads current pointers by address."""
++        assert not torch.cuda.is_current_stream_capturing(), \
++            "init_ptabs during capture (dummy-run should have initialized)"
++        self._ptab_pairs = sorted(pairs)
++        self._ptab_keys = torch.tensor([lk for lk, _ in self._ptab_pairs],
++                                       dtype=torch.long, device=self.dev)
++        L = len(self._ptab_pairs)
++        stack = torch.zeros(L, 18, self.E, dtype=torch.int64, device=self.dev)
++        for ix, (_lk, li) in enumerate(self._ptab_pairs):
++            t = self._tables[li]
++            for row, src in ((0, t["g"][0]), (1, t["u"][0]),
++                             (4, t["g"][1]), (5, t["u"][1]),
++                             (8, t["g"][2]), (9, t["u"][2]),
++                             (12, t["d"][0]), (14, t["d"][1]),
++                             (16, t["d"][2])):
++                stack[ix, row] = src
++        self._ptab_stack = stack
++        self._ptab = {li: stack[ix]
++                      for ix, (_lk, li) in enumerate(self._ptab_pairs)}
++        self._ptab_pool_base = ftier.pool.data_ptr()
++        self._ptab_slot_bytes = int(ftier.slot_bytes)
++        self._ptab_offs = geom["offs"]
++        self._ptab_zu = torch.tensor(self._zero_svh_up.data_ptr(),
++                                     dtype=torch.int64, device=self.dev)
++        self._ptab_zd = torch.tensor(self._zero_svh_dn.data_ptr(),
++                                     dtype=torch.int64, device=self.dev)
++        self.refresh_ptabs(ftier)
++        ftier.mutate_hooks.append(lambda: self.refresh_ptabs(ftier))
++
++    @torch.inference_mode()
++    def refresh_ptabs(self, ftier) -> None:
++        """Recompute the Δ rows of the ptab stack from the CURRENT slot_table
++        — vectorized over all layers (~14 small kernels total per mutation
++        event vs 13 int64 kernels x 43 layers x every step before). Same
++        pointer arithmetic as delta_ptr_tables + the dmask zero-svh bake.
++        inference_mode: the stack is an inference tensor (created inside the
++        runner's inference context) and mutation hooks may fire from host
++        paths outside it (manager tick) — the decorator keeps the in-place
++        row writes legal from any caller."""
++        st = ftier.slot_table.index_select(0, self._ptab_keys)   # [L, E] i32
++        pooled = st >= 0
++        sp = (st.clamp_min(0).to(torch.int64) * self._ptab_slot_bytes
++              + self._ptab_pool_base)
++        offs = self._ptab_offs
++        P = self._ptab_stack
++        (g_tr, g_suh, g_svh) = offs["g"]
++        (u_tr, u_suh, u_svh) = offs["u"]
++        (d_tr, d_suh, d_svh) = offs["d"]
++        P[:, 2] = sp + g_tr
++        P[:, 3] = sp + u_tr
++        P[:, 6] = sp + g_suh
++        P[:, 7] = sp + u_suh
++        P[:, 10] = torch.where(pooled, sp + g_svh, self._ptab_zu)
++        P[:, 11] = torch.where(pooled, sp + u_svh, self._ptab_zu)
++        P[:, 13] = sp + d_tr
++        P[:, 15] = sp + d_suh
++        P[:, 17] = torch.where(pooled, sp + d_svh, self._ptab_zd)
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
-index 000000000..f01adef0d
+index 000000000..37c5d4973
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
-@@ -0,0 +1,342 @@
+@@ -0,0 +1,520 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Confidence-gated FP4 re-forward for the 2-bit MoE path (directive 2 / Step B).
@@ -8019,6 +10405,33 @@ index 000000000..f01adef0d
 +                                measured 200-1400 promotes = ~6 GiB H2D
 +                                per fire = 56->3 tok/s).
 +  VLLM_MOE_W2_GATE_TRACE   0 (default) | 1 log each fire/re-forward.
++  VLLM_MOE_W2_GATE_AUDIT   probability p (default 0 = off): on an armed step
++                           that did NOT fire, force the fire path with prob p
++                           ("audit fire"). The replay's re-decided logits are
++                           used as usual (strictly-better quality), and with
++                           GATE_DUMP set the pre/post argmax comparison yields
++                           UNBIASED live labels for the silent-flip rate
++                           P(argmax changes under promotion | signal > tau) —
++                           the class no logit threshold can see (P5 measured
++                           3.65% @ tau0.60 offline; this measures it live).
++                           [O] 2026-07-31, gate mechanism v2 probe P9.
++  VLLM_MOE_W2_GATE_DUMP    path (default "" = off): append one JSONL row per
++                           FIRED/AUDITED step: worst signal value, per-row
++                           signal, pre/post per-row argmax, flips, promotes,
++                           replays, audit flag. Measurement mode: adds argmax
++                           syncs on fired steps only; leave unset for formal
++                           runs.
++  VLLM_MOE_W2_GATE_FIRE_TIMING  0 (default) | 1: with GATE_DUMP set, the
++                           runner times every promote->replay iteration of a
++                           fired step (host wall clock, explicit GPU syncs at
++                           the phase boundaries) and attaches the per-iteration
++                           breakdown to the step's JSONL row ("timing"):
++                           promote_ms (with the delta tier's snap/select/read/
++                           h2d/map split), n promoted, replay_ms. Measurement
++                           mode for the P11 fire-stall decomposition (plan item
++                           4, 2026-08-01) — the added syncs serialize what the
++                           FP loop already serializes, but leave unset for
++                           formal runs.
 +  VLLM_MOE_W2_GATE_FP_MAX  max promote->replay iterations per fired step
 +                           (default 3). A single replay is only FIRST-order:
 +                           upgraded early layers re-route later layers onto
@@ -8030,7 +10443,10 @@ index 000000000..f01adef0d
 +                           state costs nothing (first check promotes 0).
 +"""
 +
++import json
 +import os
++import random
++import time
 +
 +import torch
 +
@@ -8080,18 +10496,98 @@ index 000000000..f01adef0d
 +# no scalar or fitted combination beat max_prob materially (live labels
 +# 10.9% -> 10.3% fire@recall90), so max_prob stays the only signal here.
 +_SPEC_MASK = os.getenv("VLLM_MOE_W2_GATE_SPEC_MASK", "0") == "1"
++# C>1 aggregation (Faza-3 item 7, [P] 2026-08-03; default = the FROZEN
++# batch-min): VLLM_MOE_W2_GATE_AGG=min fires when ANY row is uncertain
++# (replay cost scales with batch — measured expensive at C>1);
++# =q:<float> fires when the q-quantile of row signals is <= tau, i.e.
++# only when ENOUGH of the batch is uncertain (Gupta-style quantile
++# aggregation). Evaluation knob for batched serving; single-row decode
++# is unaffected (quantile of 1 row == min).
++_AGG = os.getenv("VLLM_MOE_W2_GATE_AGG", "min")
++_AGG_Q = float(_AGG.split(":", 1)[1]) if _AGG.startswith("q:") else 0.0
++# P9 audit + dump (see header). Both default-off; the disabled path adds
++# only falsy checks to the existing decision.
++_AUDIT_P = float(os.getenv("VLLM_MOE_W2_GATE_AUDIT", "0") or "0")
++_DUMP_PATH = os.getenv("VLLM_MOE_W2_GATE_DUMP", "")
++# P11 fire-stall timing (see header). Default-off; requires DUMP for output.
++_FIRE_TIMING = os.getenv("VLLM_MOE_W2_GATE_FIRE_TIMING", "0") == "1"
++
++
++def fire_timing_enabled() -> bool:
++    return _FIRE_TIMING and bool(_DUMP_PATH)
++
++
++# 9b step-1 hidden-state capture ([P] 2026-08-03, default-off): with
++# VLLM_MOE_W2_GATE_HCAP_DIR set (and DUMP on), the runner snapshots the
++# EXL3 forward's per-layer h_l buffer at DECISION time on every dumped
++# (fired/audited) step and hands it here; shards of {steps, h} tensors
++# flush to the dir every _HCAP_FLUSH records. Offline consumers join on
++# the dump JSONL's `step` field. Telemetry-only, never in formal runs.
++_HCAP_DIR = os.getenv("VLLM_MOE_W2_GATE_HCAP_DIR", "")
++_HCAP_FLUSH = int(os.getenv("VLLM_MOE_W2_GATE_HCAP_FLUSH", "256"))
++_hcap_steps: list[int] = []
++_hcap_tensors: list[torch.Tensor] = []
++_hcap_shard = 0
++
++
++def hcap_enabled() -> bool:
++    return bool(_HCAP_DIR) and bool(_DUMP_PATH)
++
++
++def hcap_store(step: int, h: torch.Tensor) -> None:
++    """Queue one decision-time h snapshot ([n_layers, H] half, GPU);
++    moved to CPU here (fired steps only — measurement mode)."""
++    global _hcap_shard
++    try:
++        _hcap_steps.append(int(step))
++        _hcap_tensors.append(h.to("cpu", non_blocking=False))
++        if len(_hcap_steps) >= _HCAP_FLUSH:
++            os.makedirs(_HCAP_DIR, exist_ok=True)
++            path = os.path.join(_HCAP_DIR, f"hcap-{_hcap_shard:05d}.pt")
++            torch.save(dict(steps=list(_hcap_steps),
++                            h=torch.stack(_hcap_tensors)), path)
++            _hcap_shard += 1
++            _hcap_steps.clear()
++            _hcap_tensors.clear()
++    except Exception:  # noqa: BLE001 - observability must not break serving
++        pass
++
++
++def hcap_flush() -> None:
++    """Final partial-shard flush (shutdown/atexit path)."""
++    global _hcap_shard
++    if _HCAP_DIR and _hcap_steps:
++        try:
++            os.makedirs(_HCAP_DIR, exist_ok=True)
++            path = os.path.join(_HCAP_DIR, f"hcap-{_hcap_shard:05d}.pt")
++            torch.save(dict(steps=list(_hcap_steps),
++                            h=torch.stack(_hcap_tensors)), path)
++            _hcap_shard += 1
++            _hcap_steps.clear()
++            _hcap_tensors.clear()
++        except Exception:  # noqa: BLE001
++            pass
 +
 +# observability (cheap; only mutated when the gate is enabled)
 +_n_steps = 0
 +_n_fired = 0
 +_n_reforwarded = 0
 +_n_promoted = 0
++_n_audit = 0
++# last-decision snapshot for dump_step (single-threaded step execution:
++# should_reforward -> [replay loop] -> dump_step, no interleaving)
++_last_worst = float("nan")
++_last_audit = False
++_last_spec = False
++_last_rows: torch.Tensor | None = None
 +
 +
 +def shutdown() -> None:
 +    """Reset mutable gate state between in-process engines."""
 +    global _ENABLED, _tau_dyn, _tau_mtime, _mp_dyn, _mp_mtime
 +    global _n_steps, _n_fired, _n_reforwarded, _n_promoted
++    global _n_audit, _last_worst, _last_audit, _last_spec, _last_rows
++    hcap_flush()
 +    _ENABLED = os.getenv("VLLM_MOE_W2_GATE", "0") == "1"
 +    _tau_dyn = _TAU
 +    _tau_mtime = -1.0
@@ -8101,6 +10597,11 @@ index 000000000..f01adef0d
 +    _n_fired = 0
 +    _n_reforwarded = 0
 +    _n_promoted = 0
++    _n_audit = 0
++    _last_worst = float("nan")
++    _last_audit = False
++    _last_spec = False
++    _last_rows = None
 +
 +
 +def enabled() -> bool:
@@ -8203,7 +10704,8 @@ index 000000000..f01adef0d
 +    softmax: margin = top1_logit - top2_logit == log p1 - log p2 (the softmax
 +    normaliser cancels), and max_prob = exp(top1_logit - logsumexp(logits)).
 +    """
-+    global _n_steps, _n_fired
++    global _n_steps, _n_fired, _n_audit
++    global _last_worst, _last_audit, _last_spec, _last_rows
 +    _n_steps += 1
 +    if logits is None or logits.numel() == 0:
 +        return False
@@ -8224,13 +10726,41 @@ index 000000000..f01adef0d
 +        # all-masked batch (cannot happen: row 0 of each request is always
 +        # reachable) would fall through to no-fire, which is safe.
 +        rows = torch.where(mask, rows, torch.full_like(rows, float("inf")))
-+    worst = rows.min()
-+    fire = bool((worst <= tau).item())
++    if _AGG_Q > 0.0 and rows.numel() > 1:
++        # quantile aggregation for C>1: the decision statistic is the
++        # q-quantile of finite row signals (masked +inf rows excluded by
++        # clamping the quantile index into the finite prefix after sort).
++        srt = rows.sort().values
++        n_fin = torch.isfinite(srt).sum()
++        qi = (n_fin.float() * _AGG_Q).long().clamp(min=0,
++                                                   max=rows.numel() - 1)
++        worst = srt[qi]
++    else:
++        worst = rows.min()
++    # single GPU->CPU sync, same count as the old `(worst <= tau).item()`
++    # (and one FEWER when TRACE is on, which used to float(worst) again)
++    worst_f = float(worst.item())
++    fire = worst_f <= tau
++    audit = False
++    if not fire and _AUDIT_P > 0.0 and random.random() < _AUDIT_P:
++        # P9 audit: force the fire path on a confident step to obtain an
++        # unbiased live label for P(flip | signal > tau). Replay logits
++        # are consumed as usual (strictly-better re-decision).
++        fire = True
++        audit = True
++    _last_worst = worst_f
++    _last_audit = audit
++    _last_spec = spec is not None
++    _last_rows = rows.detach() if _DUMP_PATH else None
 +    if fire:
-+        _n_fired += 1
++        if audit:
++            _n_audit += 1
++        else:
++            _n_fired += 1
 +        if _TRACE:
-+            logger.info("[gate] fire: %s worst=%.3f <= tau=%.3f (step %d)",
-+                        _SIGNAL, float(worst), tau, _n_steps)
++            logger.info("[gate] %s: %s worst=%.3f %s tau=%.3f (step %d)",
++                        "audit" if audit else "fire", _SIGNAL, worst_f,
++                        "> " if audit else "<=", tau, _n_steps)
 +    return fire
 +
 +
@@ -8297,9 +10827,43 @@ index 000000000..f01adef0d
 +    return n
 +
 +
++def dump_enabled() -> bool:
++    return bool(_DUMP_PATH)
++
++
++def dump_step(pre_top1: torch.Tensor, post_top1: torch.Tensor,
++              n_promoted: int, n_replays: int, timing=None) -> None:
++    """Append one JSONL record for a fired/audited step (see header).
++    Measurement-only path: never raises into serving. `pre_top1` /
++    `post_top1` are per-row argmax of the logits before the first and
++    after the last replay; equal tensors (n_replays==0) are still dumped
++    (fires that could not promote are informative). `timing` (P11): the
++    runner's per-iteration stall breakdown, attached verbatim."""
++    if not _DUMP_PATH:
++        return
++    try:
++        pre = pre_top1.tolist()
++        post = post_top1.tolist()
++        rows = _last_rows.tolist() if _last_rows is not None else []
++        rec = dict(
++            t=round(time.time(), 3), step=_n_steps, signal=_SIGNAL,
++            tau=_current_tau(), worst=_last_worst, audit=_last_audit,
++            spec=_last_spec, n_promoted=int(n_promoted),
++            n_replays=int(n_replays), pre=pre, post=post,
++            flips=sum(1 for a, b in zip(pre, post) if a != b),
++            rows=[round(float(v), 6) for v in rows])
++        if timing is not None:
++            rec["timing"] = timing
++        with open(_DUMP_PATH, "a") as f:
++            f.write(json.dumps(rec) + "\n")
++    except Exception:  # noqa: BLE001 - observability must not break serving
++        pass
++
++
 +def stats() -> dict:
 +    return dict(steps=_n_steps, fired=_n_fired, reforwarded=_n_reforwarded,
-+                promoted=_n_promoted, signal=_SIGNAL, tau=_TAU,
++                promoted=_n_promoted, audited=_n_audit, signal=_SIGNAL,
++                tau=_TAU, audit_p=_AUDIT_P,
 +                fire_rate=(_n_fired / _n_steps if _n_steps else 0.0))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py b/vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 new file mode 100644
@@ -8578,10 +11142,10 @@ index 000000000..f9db2751c
 +            f"(top-{_PILOT_K}, n={tot[1]})")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
 new file mode 100644
-index 000000000..d644b6041
+index 000000000..94038d9be
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
-@@ -0,0 +1,404 @@
+@@ -0,0 +1,455 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""2-bit tensor-sym expert planes for the 1-GPU DeepSeek-V4 plan.
@@ -8986,6 +11550,57 @@ index 000000000..d644b6041
 +    vals = levels[codes.long()]
 +    s = torch.exp2(scales.float() - 127.0).repeat_interleave(32, dim=-1)
 +    return vals * s
++
++
++# --- inverse packers: fragment-major FP4 plane / scale plane -> row-major ----
++# Exact inverses of pack_fp4_fragment_major and pack_scales, used by the
++# EXL3 v2 need-pool apply (moe_w2_cubit._exl3_fp4_apply) to reconstruct an
++# FP4 expert's weights from a pinned/pool slot in torch — the eager,
++# correctness-first path (no moe_w4_mm cubin, which is fused into the 2-bit
++# base desc machinery a resident EXL3 base does not build). Round-tripped
++# against the forward packers in tools/test_moe_w2_exl3.py.
++def unpack_fp4_fragment_major(plane: torch.Tensor, N: int, K: int) -> torch.Tensor:
++    """Inverse of pack_fp4_fragment_major: [N*K/2] u8 -> [N, K] u8 e2m1
++    nibbles (0..15). The plane byte stream is [nb, kb, g, t, tile, k32,
++    half, jhalf] with each byte packing two adjacent j (low=even, high=odd);
++    the forward view/permute is codes.view(N//16,2,8,K//64,2,2,4,4)
++    .permute(0,3,2,6,1,4,5,7) over [nb,tile,g,kb,k32,half,t,j]."""
++    assert N % 16 == 0 and K % 64 == 0
++    b = plane.reshape(N // 16, K // 64, 8, 4, 2, 2, 2, 2)  # ..half, jhalf
++    nib = torch.stack((b & 0xF, b >> 4), dim=-1)           # ..jhalf, pair(2)
++    # [nb, kb, g, t, tile, k32, half, j]
++    nib = nib.reshape(N // 16, K // 64, 8, 4, 2, 2, 2, 4)
++    # inverse of permute(0,3,2,6,1,4,5,7) is permute(0,4,2,1,5,6,3,7)
++    nib = nib.permute(0, 4, 2, 1, 5, 6, 3, 7).contiguous()  # [nb,tile,g,kb,k32,half,t,j]
++    return nib.reshape(N, K).to(torch.uint8)
++
++
++def unpack_scales(sc: torch.Tensor, N: int, K: int) -> torch.Tensor:
++    """Inverse of pack_scales: [N*K/32] u8 -> [N, K/32] u8 e8m0."""
++    assert N % 16 == 0
++    KS = K // 32
++    s = sc.reshape(N // 16, KS, 16).transpose(1, 2).contiguous()  # [nb, 16, KS]
++    return s.reshape(N, KS).to(torch.uint8)
++
++
++_E2M1_VALS_F32 = _E2M1_VALS.float()
++
++
++def dequant_fp4_expert(codes_plane: torch.Tensor, sc_plane: torch.Tensor,
++                       N: int, K: int) -> torch.Tensor:
++    """Fragment-major FP4 plane + scale plane for one [N, K] matrix ->
++    row-major f32 weights. True weight = e2m1(nibble) * 2^(e8m0-127) per
++    block-32 (matches nvfp4_to_codes_scales / the moe_w4_mm decode).
++
++    f32 throughout (the e2m1 grid and power-of-two scales are exact in f32),
++    and the block-32 scale is broadcast via a [N, K/32, 32] view instead of
++    repeat_interleave — no [N, K] scale temporary. Peak = 2x the [N, K] f32
++    output, which the caller (moe_w2_cubit._exl3_fp4_apply) frees per expert."""
++    nib = unpack_fp4_fragment_major(codes_plane, N, K).long()
++    vals = _E2M1_VALS_F32.to(codes_plane.device)[nib]                  # [N,K] f32
++    sc = unpack_scales(sc_plane, N, K)                                 # [N,K/32] u8
++    scale = torch.exp2(sc.float() - 127.0)                            # [N,K/32] f32
++    return (vals.view(N, K // 32, 32) * scale.unsqueeze(-1)).view(N, K)
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py b/vllm/model_executor/layers/quantization/utils/moe_w2_planes_cache.py
 new file mode 100644
 index 000000000..7da0e2969
@@ -16807,7 +19422,7 @@ index 4ab45b2ae..35a89634e 100644
 +        " `ptd_token_id` for parallel drafting."
      )
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..98efecb5e 100644
+index 74938a823..4bd28d826 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -17160,7 +19775,7 @@ index 74938a823..98efecb5e 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4651,424 @@ class GPUModelRunner(
+@@ -4395,6 +4651,485 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -17379,6 +19994,25 @@ index 74938a823..98efecb5e 100644
 +                            f": {decision_error}" if decision_error else "")
 +                        fire = False
 +                    fire = _or_tp(fire)
++                    # P9 dump (VLLM_MOE_W2_GATE_DUMP): snapshot the pre-replay
++                    # per-row argmax so the post-loop comparison yields flip
++                    # labels. GPU-side argmax here; the sync happens once in
++                    # dump_step. Disabled => zero extra work.
++                    _dump_pre = None
++                    _gate_promoted_total = 0
++                    if fire and moe_w2_gate.dump_enabled():
++                        _dump_pre = logits.argmax(dim=-1)
++                        if moe_w2_gate.hcap_enabled():
++                            # 9b: decision-time h_l snapshot (pre-FP-loop —
++                            # replays must not overwrite the signal the
++                            # gate saw). Keyed by the gate step counter,
++                            # matching the dump row written below.
++                            from vllm.model_executor.layers.quantization \
++                                .utils import moe_w2_cubit
++                            _h = moe_w2_cubit.hcap_snapshot()
++                            if _h is not None:
++                                moe_w2_gate.hcap_store(
++                                    moe_w2_gate.stats()["steps"], _h)
 +                    if fire:
 +                        # FIXED-POINT fire (2026-07-13): a single replay is
 +                        # only FIRST-order — upgraded early layers re-route
@@ -17407,6 +20041,13 @@ index 74938a823..98efecb5e 100644
 +                                group=_tp.device_group)
 +                            return local, int(t.item())
 +
++                        # P11 fire-stall decomposition (measurement mode,
++                        # VLLM_MOE_W2_GATE_FIRE_TIMING=1 + DUMP): host wall
++                        # clock per promote->replay iteration, explicit syncs
++                        # at the phase boundaries. TP/single-GPU inline path
++                        # only (the PP worker-driven replay is out of scope).
++                        _fire_timing = moe_w2_gate.fire_timing_enabled()
++                        _fire_t = [] if _fire_timing else None
 +                        while _gate_iters < moe_w2_gate.fire_fp_max():
 +                            # Promote this rank's COLD routed experts
 +                            # (per-rank shard side effect, never a per-rank
@@ -17417,6 +20058,13 @@ index 74938a823..98efecb5e 100644
 +                            # 64+64+48 promotions in ONE step = the whole
 +                            # pool cycled per fire, [pinned 204, free 0]
 +                            # refusals, 12% pool hit-rate = pure churn).
++                            if _fire_timing:
++                                # Drain queued work (the decision sync already
++                                # emptied the stream; this catches the dump
++                                # argmax) so promote/replay attribute cleanly.
++                                moe_w2_delta.LAST_FORCE_TIMING = None
++                                torch.cuda.synchronize()
++                                _ft_t0 = time.perf_counter()
 +                            promote_error = None
 +                            try:
 +                                n_promoted = moe_w2_gate.force_promote_step(
@@ -17424,6 +20072,9 @@ index 74938a823..98efecb5e 100644
 +                            except BaseException as e:
 +                                promote_error = e
 +                                n_promoted = 0
++                            if _fire_timing:
++                                _ft_prom_ms = (time.perf_counter()
++                                               - _ft_t0) * 1e3
 +                            if not _and_tp(promote_error is None):
 +                                logger.error(
 +                                    "moe_w2 TP gate promotion failed on at "
@@ -17435,6 +20086,7 @@ index 74938a823..98efecb5e 100644
 +                            if _step_budget is not None:
 +                                _step_budget = max(
 +                                    _step_budget - n_promoted, 0)
++                            _gate_promoted_total += n_promoted
 +                            # Replay only if SOME rank upgraded a cold
 +                            # expert -> the result can actually change; if
 +                            # everything routed was already FP4 the replay
@@ -17444,6 +20096,13 @@ index 74938a823..98efecb5e 100644
 +                            # replays cannot change the result either.
 +                            if not (_or_tp(n_promoted > 0)
 +                                    and moe_w2_gate.reforward_enabled()):
++                                if _fire_timing:
++                                    # terminal pass: promote cost paid, no
++                                    # replay follows (n==0 or budget spent)
++                                    _fire_t.append(dict(
++                                        promote_ms=round(_ft_prom_ms, 3),
++                                        n=int(n_promoted), replay_ms=0.0,
++                                        delta=moe_w2_delta.LAST_FORCE_TIMING))
 +                                break
 +                            _gate_iters += 1
 +                            gate_collective_active = True
@@ -17548,6 +20207,23 @@ index 74938a823..98efecb5e 100644
 +                                moe_w2_delta.gate_validate_base_clean(
 +                                    _gate_miss)
 +                            gate_collective_active = False
++                            if _fire_timing:
++                                torch.cuda.synchronize()
++                                _fire_t.append(dict(
++                                    promote_ms=round(_ft_prom_ms, 3),
++                                    n=int(n_promoted),
++                                    replay_ms=round(
++                                        (time.perf_counter() - _ft_t0) * 1e3
++                                        - _ft_prom_ms, 3),
++                                    delta=moe_w2_delta.LAST_FORCE_TIMING))
++                        if _dump_pre is not None:
++                            # post-loop logits are the final (possibly
++                            # re-decided) step logits; equal pre/post is a
++                            # no-flip label, not skipped.
++                            moe_w2_gate.dump_step(
++                                _dump_pre, logits.argmax(dim=-1),
++                                _gate_promoted_total, _gate_iters,
++                                timing=_fire_t)
 +            except Exception as e:
 +                if gate_collective_active:
 +                    logger.exception(
@@ -17585,7 +20261,7 @@ index 74938a823..98efecb5e 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +5090,119 @@ class GPUModelRunner(
+@@ -4416,6 +5151,119 @@ class GPUModelRunner(
  
          return None
  
@@ -17705,7 +20381,7 @@ index 74938a823..98efecb5e 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +5228,12 @@ class GPUModelRunner(
+@@ -4441,6 +5289,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -17718,7 +20394,7 @@ index 74938a823..98efecb5e 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5398,23 @@ class GPUModelRunner(
+@@ -4605,6 +5459,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -17742,7 +20418,7 @@ index 74938a823..98efecb5e 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5506,35 @@ class GPUModelRunner(
+@@ -4696,13 +5567,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -17783,7 +20459,7 @@ index 74938a823..98efecb5e 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5543,33 @@ class GPUModelRunner(
+@@ -4711,16 +5604,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -17821,7 +20497,7 @@ index 74938a823..98efecb5e 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5580,154 @@ class GPUModelRunner(
+@@ -4731,18 +5641,154 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -17981,7 +20657,7 @@ index 74938a823..98efecb5e 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +6194,39 @@ class GPUModelRunner(
+@@ -5209,6 +6255,39 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -18021,7 +20697,7 @@ index 74938a823..98efecb5e 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +6275,33 @@ class GPUModelRunner(
+@@ -5257,6 +6336,33 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
@@ -18055,7 +20731,7 @@ index 74938a823..98efecb5e 100644
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +7014,8 @@ class GPUModelRunner(
+@@ -5969,7 +7075,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -18065,7 +20741,7 @@ index 74938a823..98efecb5e 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7921,9 @@ class GPUModelRunner(
+@@ -6875,8 +7982,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -18077,7 +20753,7 @@ index 74938a823..98efecb5e 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +7976,8 @@ class GPUModelRunner(
+@@ -6929,7 +8037,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.

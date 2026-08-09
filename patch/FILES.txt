@@ -9,6 +9,9 @@ tests/v1/spec_decode/test_dspark_scheduler.py
 tools/nvfp4_flashinfer_sm120/README.md
 tools/nvfp4_flashinfer_sm120/nvfp4_expand.cuh
 tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
+tools/pp_proto_exl3.py
+tools/test_moe_w2_exl3.py
+tools/test_moe_w2_exl3_delta.py
 vllm/compilation/breakable_cudagraph.py
 vllm/compilation/cuda_graph.py
 vllm/config/speculative.py
@@ -22,6 +25,7 @@ vllm/model_executor/layers/quantization/utils/fp8_utils.py
 vllm/model_executor/layers/quantization/utils/moe_w2_bf12.py
 vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
+vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
 vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 vllm/model_executor/layers/quantization/utils/moe_w2_looka.py
 vllm/model_executor/layers/quantization/utils/moe_w2_planes.py
