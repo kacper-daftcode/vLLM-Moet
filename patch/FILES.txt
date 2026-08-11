@@ -12,6 +12,7 @@ tools/nvfp4_flashinfer_sm120/patch_flashinfer.py
 tools/pp_proto_exl3.py
 tools/test_moe_w2_exl3.py
 tools/test_moe_w2_exl3_delta.py
+tools/test_moe_w2_exl3_m8_maps.py
 vllm/compilation/breakable_cudagraph.py
 vllm/compilation/cuda_graph.py
 vllm/config/speculative.py

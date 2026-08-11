@@ -2267,6 +2267,279 @@ index 000000000..0c85b5dd5
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tools/test_moe_w2_exl3_m8_maps.py b/tools/test_moe_w2_exl3_m8_maps.py
+new file mode 100644
+index 000000000..f9809ad7b
+--- /dev/null
++++ b/tools/test_moe_w2_exl3_m8_maps.py
+@@ -0,0 +1,267 @@
++#!/usr/bin/env python3
++"""Unit tests for moe_w2_exl3.build_m8_groups — the expert-group builder
++of the M=8-native decode-wave route (charter M8 F2 tor B, §2bis).
++
++Pure CPU, no GPU, no CUDA ext, no vLLM imports: the module is loaded
++standalone via importlib (its import graph is os/sys/types/torch only;
++_load_ext only runs from Exl3BaseTier.__init__, never at import).
++
++Run: python3 tools/test_moe_w2_exl3_m8_maps.py
++
++Covers (brief F2):
++  (a) full overlap     8 tokens x same 6 experts -> 1 group, rows 0-7
++  (b) zero overlap     union 48 -> 8 groups, 1 row per expert
++  (c) partial overlap  union 15 -> 3 groups, tail padded with -1 rows
++  (d) T = 2..8         random routing, structural + invariants
++  (e) weights at the right (expert, row)     hand-built expectation
++  (f) -1 exactly where no token              hand-built + structural
++  (g) determinism      two builds bit-identical
++  (h) scatter invariant: sum(weight x token) over all groups == the sum
++      taken directly from topk (random per-expert vectors, fp32)
++  plus: duplicate (t, e) accumulation, non-default cap, T > rows raises.
++"""
++import importlib.util
++import math
++import os
++import sys
++
++import torch
++
++WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++spec = importlib.util.spec_from_file_location(
++    "moe_w2_exl3",
++    f"{WT}/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py")
++X3 = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(X3)
++
++E = 256
++FAILS = []
++NCHECKS = [0]
++
++
++def check(name, ok, detail=""):
++    NCHECKS[0] += 1
++    print(f"  {'PASS' if ok else 'FAIL'}  {name}  {detail}")
++    if not ok:
++        FAILS.append(name)
++
++
++def ref_weight_matrix(ids, wts):
++    """[T, E] half: dedupe-accumulated routing weights straight from topk
++    (fp32 accumulate -> half cast, mirroring the builder's contract)."""
++    T, k = ids.shape
++    W = torch.zeros(T, E, dtype=torch.float32)
++    for t in range(T):
++        for j in range(k):
++            W[t, int(ids[t, j])] += float(wts[t, j])
++    return W.to(torch.half)
++
++
++def group_weight_matrix(groups, T):
++    """[T, E] half reconstructed from the groups' scatter maps. Returns
++    (W, n_dup) where n_dup counts (token, expert) cells written twice —
++    must be 0 (one row per routed pair across ALL groups)."""
++    W = torch.zeros(T, E, dtype=torch.half)
++    seen, dup = set(), 0
++    for experts, rm, rw in groups:
++        for s in range(experts.numel()):
++            for r in range(rm.shape[1]):
++                t = int(rm[s, r])
++                if t < 0:
++                    continue
++                key = (t, int(experts[s]))
++                dup += key in seen
++                seen.add(key)
++                W[t, int(experts[s])] = rw[s, r]
++    return W, dup
++
++
++def structural_problems(groups, T, cap=6, rows=8):
++    """Shape/dtype/packing/partition invariants; returns list of issues."""
++    probs = []
++    real_seq = []          # real experts in group-concatenation order
++    for gi, (experts, rm, rw) in enumerate(groups):
++        if tuple(experts.shape) != (cap,) or experts.dtype != torch.int64:
++            probs.append(f"g{gi}: experts shape/dtype")
++        if tuple(rm.shape) != (cap, rows) or rm.dtype != torch.int32:
++            probs.append(f"g{gi}: row_map shape/dtype")
++        if tuple(rw.shape) != (cap, rows) or rw.dtype != torch.float16:
++            probs.append(f"g{gi}: row_weights shape/dtype")
++        if not ((rm >= -1) & (rm < T)).all():
++            probs.append(f"g{gi}: row_map out of range")
++        if not (rw[rm == -1] == 0).all():
++            probs.append(f"g{gi}: nonzero weight on -1 row")
++        n_real = 0
++        for s in range(cap):
++            row = rm[s].tolist()
++            valid = [v for v in row if v >= 0]
++            if row[:len(valid)] != valid:
++                probs.append(f"g{gi}s{s}: rows not prefix-packed")
++            if sorted(set(valid)) != valid:
++                probs.append(f"g{gi}s{s}: rows not ascending-unique")
++            if valid:
++                real_seq.append(int(experts[s]))
++                n_real += 1
++                if n_real != s + 1:
++                    probs.append(f"g{gi}s{s}: real slot after a pad slot")
++            elif int(experts[s]) != int(experts[0]):
++                probs.append(f"g{gi}s{s}: pad is not group's first expert")
++        if gi < len(groups) - 1 and n_real != cap:
++            probs.append(f"g{gi}: pad before the last group")
++    if len(real_seq) != len(set(real_seq)):
++        probs.append("an expert appears in two groups")
++    if real_seq != sorted(real_seq):
++        probs.append("union not ascending across groups")
++    return probs
++
++
++def scatter_sum(groups, T, F32):
++    """y[t] = sum over groups/slots/rows of weight * f(expert) — the
++    literal semantics of the kernel's per-(token, expert) out scatter,
++    accumulated ACROSS groups like the atomic out contract (§2bis)."""
++    y = torch.zeros(T, F32.shape[1], dtype=torch.float32)
++    for experts, rm, rw in groups:
++        for s in range(experts.numel()):
++            for r in range(rm.shape[1]):
++                t = int(rm[s, r])
++                if t >= 0:
++                    y[t] += float(rw[s, r]) * F32[int(experts[s])]
++    return y
++
++
++def topk_sum(ids, wts, F32):
++    """y[t] = sum_j half(w[t,j]) * f(ids[t,j]) directly from topk (the
++    per-pair half weight matches the builder's cast; fp32 accumulate)."""
++    T, k = ids.shape
++    Wh = ref_weight_matrix(ids, wts).float()
++    return Wh @ F32
++
++
++def run_case(name, ids, wts, cap=6, rows=8):
++    """Structural + partition-count + weight-matrix + scatter invariants
++    common to every case; returns the groups for extra assertions."""
++    T = ids.shape[0]
++    groups = X3.build_m8_groups(ids, wts, cap=cap, rows=rows)
++    union = sorted({int(e) for e in ids.flatten()})
++    check(f"{name}: group count", len(groups) == math.ceil(len(union) / cap),
++          f"groups={len(groups)} union={len(union)} cap={cap}")
++    probs = structural_problems(groups, T, cap=cap, rows=rows)
++    check(f"{name}: structural", not probs, "; ".join(probs[:4]))
++    Wg, dup = group_weight_matrix(groups, T)
++    check(f"{name}: one row per (token, expert)", dup == 0, f"dup={dup}")
++    Wr = ref_weight_matrix(ids, wts)
++    check(f"{name}: weight matrix == topk (exact)", torch.equal(Wg, Wr))
++    F32 = torch.randn(E, 16, dtype=torch.float32,
++                      generator=torch.Generator().manual_seed(7))
++    ys, yt = scatter_sum(groups, T, F32), topk_sum(ids, wts, F32)
++    check(f"{name}: scatter sum == topk sum",
++          torch.allclose(ys, yt, rtol=1e-5, atol=1e-5),
++          f"maxdiff={float((ys - yt).abs().max()):.2e}")
++    return groups
++
++
++def main():
++    g = torch.Generator().manual_seed(20260810)
++
++    # (a) full overlap: 8 tokens x the same 6 experts (unsorted on input)
++    ids = torch.tensor([[11, 3, 200, 7, 99, 42]] * 8, dtype=torch.int64)
++    wts = torch.rand(8, 6, generator=g)
++    groups = run_case("(a) full overlap T=8", ids, wts)
++    ex, rm, _ = groups[0]
++    check("(a) single group, experts sorted",
++          len(groups) == 1 and ex.tolist() == [3, 7, 11, 42, 99, 200])
++    check("(a) every expert rows 0-7",
++          all(rm[s].tolist() == list(range(8)) for s in range(6)))
++
++    # (b) zero overlap: 8 x 6 all-distinct experts -> union 48 -> 8 groups
++    ids = torch.arange(48, dtype=torch.int64).reshape(8, 6) * 5  # spread ids
++    wts = torch.rand(8, 6, generator=g)
++    groups = run_case("(b) zero overlap T=8", ids, wts)
++    check("(b) 8 groups, 1 row per expert",
++          len(groups) == 8 and all((g_[1] >= 0).sum() == 6 for g_ in groups))
++
++    # (c) partial overlap: union 15 -> 3 groups, last padded (3 pad slots)
++    ids = torch.tensor([[0, 1, 2, 3, 4, 5],
++                        [0, 1, 2, 6, 7, 8],
++                        [0, 9, 10, 11, 12, 13],
++                        [0, 1, 5, 9, 14, 13]], dtype=torch.int64)
++    wts = torch.rand(4, 6, generator=g)
++    groups = run_case("(c) partial overlap T=4", ids, wts)
++    ex, rm, rw = groups[-1]
++    check("(c) 3 groups, last has 3 pad slots",
++          len(groups) == 3 and [int(rm[s].max()) for s in range(3, 6)]
++          == [-1, -1, -1])
++    check("(c) pad slots repeat first expert, zero weights",
++          ex[3:].tolist() == [int(ex[0])] * 3 and (rw[3:] == 0).all())
++    check("(c) shared expert 0 has rows = tokens 0-3",
++          groups[0][1][0].tolist() == [0, 1, 2, 3, -1, -1, -1, -1])
++
++    # (d) T = 2..8, random distinct-per-token routing (k=6, E=256)
++    for T in range(2, 9):
++        ids = torch.stack([torch.randperm(E, generator=g)[:6]
++                           for _ in range(T)])
++        wts = torch.rand(T, 6, generator=g)
++        run_case(f"(d) random T={T}", ids, wts)
++
++    # (e)+(f) hand-built: exact row_map / row_weights placement
++    ids = torch.tensor([[5, 9], [9, 5], [7, 5]], dtype=torch.int64)
++    wts = torch.tensor([[.1, .2], [.3, .4], [.5, .6]])
++    groups = run_case("(e) hand T=3 k=2", ids, wts)
++    ex, rm, rw = groups[0]
++    check("(e) union [5, 7, 9] + 3 pads of 5",
++          ex.tolist() == [5, 7, 9, 5, 5, 5])
++    check("(e) row_map exact",
++          rm.tolist() == [[0, 1, 2, -1, -1, -1, -1, -1],
++                          [2, -1, -1, -1, -1, -1, -1, -1],
++                          [0, 1, -1, -1, -1, -1, -1, -1],
++                          [-1] * 8, [-1] * 8, [-1] * 8])
++    want = torch.zeros(6, 8, dtype=torch.half)
++    want[0, :3] = torch.tensor([.1, .4, .6]).half()
++    want[1, 0] = torch.tensor(.5).half()
++    want[2, :2] = torch.tensor([.2, .3]).half()
++    check("(e) row_weights exact at (expert, row)", torch.equal(rw, want))
++    check("(f) -1 exactly where no token",
++          ((rm == -1) == (want == 0)).all())
++
++    # (g) determinism: two independent builds are bit-identical
++    ids = torch.stack([torch.randperm(E, generator=g)[:6] for _ in range(5)])
++    wts = torch.rand(5, 6, generator=g)
++    g1 = X3.build_m8_groups(ids.clone(), wts.clone())
++    g2 = X3.build_m8_groups(ids.clone(), wts.clone())
++    check("(g) determinism", len(g1) == len(g2) and all(
++        torch.equal(a[i], b[i]) for a, b in zip(g1, g2) for i in range(3)))
++
++    # duplicate (t, e) inside one topk row accumulates into ONE row
++    ids = torch.tensor([[4, 4, 8], [8, 2, 2]], dtype=torch.int64)
++    wts = torch.tensor([[.1, .2, .3], [.4, .5, .6]])
++    groups = run_case("dup (t,e) accumulate", ids, wts)
++    ex, rm, rw = groups[0]
++    check("dup: single row, fp32-accumulated weight",
++          ex.tolist()[:3] == [2, 4, 8]
++          and rm[1].tolist() == [0, -1, -1, -1, -1, -1, -1, -1]
++          and rw[1, 0] == torch.tensor(.3, dtype=torch.float32).half()
++          and rw[0, 0] == torch.tensor(1.1, dtype=torch.float32).half())
++
++    # non-default cap partitions the same union into more groups
++    ids = torch.arange(10, dtype=torch.int64).reshape(2, 5)
++    wts = torch.rand(2, 5, generator=g)
++    groups = run_case("cap=4", ids, wts, cap=4)
++    check("cap=4: shapes follow cap",
++          all(tuple(gr[0].shape) == (4,) and tuple(gr[1].shape) == (4, 8)
++              for gr in groups))
++
++    # T > rows must refuse (a token would need a 9th row)
++    try:
++        X3.build_m8_groups(torch.zeros(9, 6, dtype=torch.int64),
++                           torch.rand(9, 6, generator=g))
++        check("T=9 raises", False)
++    except AssertionError:
++        check("T=9 raises", True)
++
++    print(f"\n{NCHECKS[0]} checks, {len(FAILS)} failed"
++          + (f": {FAILS}" if FAILS else " — ALL GREEN"))
++    sys.exit(1 if FAILS else 0)
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
 index 6da3ec717..c84958ac0 100644
 --- a/vllm/compilation/breakable_cudagraph.py
@@ -3586,10 +3859,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..48b501b8f
+index 000000000..6f37201ff
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3734 @@
+@@ -0,0 +1,3801 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -3846,6 +4119,19 @@ index 000000000..48b501b8f
 +# kernel hardcodes. Falls back to unified when M>1 or the config differs.
 +_EXL3_WAVE = os.getenv("VLLM_MOE_W2_EXL3_WAVE", "0") == "1"
 +_exl3_wave_seen: list = []   # one-shot activation-log sentinel
++# M8 charter F2 ([K] 2026-08-09, §2bis): serve M ∈ [2, 8] decode steps on
++# the M=8-native wave kernels — trellis decode ONCE per union expert, HMMA
++# over 8 token rows — instead of falling off the wave to unified/masked
++# (spec-decode exclusion) or the anti-scaling M·k expansion. The union of
++# the step's routed experts is partitioned into fixed groups of 6 and the
++# m8 launcher runs once per group (moe_w2_exl3.build_m8_groups /
++# forward_topk_wave_m8). Same pack-v3 serving-pair gate as _EXL3_WAVE;
++# additionally requires an ext build exposing exl3_decode_wave_dual_m8
++# with its m8 cubins resolved (tier.ext_wave_m8_available(); missing ->
++# fallbacks unchanged). M=1 stays on the M=1 wave route. Default OFF.
++_EXL3_WAVE_M8 = os.getenv("VLLM_MOE_W2_EXL3_WAVE_M8", "0") == "1"
++_exl3_wave_m8_seen: list = []   # one-shot activation-log sentinel
++_exl3_wave_m8g_seen: list = []  # one-shot activation-log sentinel (graph)
 +_EXL3_DELTA_GEOM: dict | None = None
 +
 +# 9b step-1 h_l capture ([P] 2026-08-03, default-off): mirrors the gate's
@@ -6748,6 +7034,60 @@ index 000000000..48b501b8f
 +                        "" if _EXL3_CUDAGRAPH else "eager, ")
 +            _exl3_wave_seen.append(1)
 +        return tier.forward_topk_wave(lidx, x, ids, wts).to(x.dtype)
++    # M8 CAPTURE-SAFE (charter CS [E] 2026-08-10): M ∈ [2, 8] decode on
++    # the M=8-native wave INSIDE cudagraphs — fixed G=T ext calls per
++    # captured size, groups built on device (no host syncs, static
++    # shapes), pointers gathered into persistent buffers, empty groups
++    # exited by the m8g canon guard (~4.5 us). Requires the GUARDED
++    # cubin set (ext_wave_m8_guarded); plain m8 cubins keep the eager
++    # route below only. Pre-capture eager warmups take this same route
++    # (warms the dlopen/cuModuleLoad before capture); the unified path
++    # no longer serves captured T ∈ [2, 8] decode shapes, so the
++    # autotune-inside-capture incident ([K] 01:5x) cannot re-arm — its
++    # prefill/piecewise shapes (T > 8) still warm eagerly as before.
++    if (_EXL3_WAVE_M8 and 2 <= x.shape[0] <= 8 and _EXL3_W2K == 1
++            and _EXL3_DELTA_PACK and _EXL3_DELTA_GEOM is not None
++            and _EXL3_DELTA_GEOM["dk13"] == 2
++            and _EXL3_DELTA_GEOM["dk2"] == 3
++            and _EXL3_CUDAGRAPH
++            and tier.ext_wave_m8_guarded()):
++        _exl3_ensure_ptabs(ftier)
++        y, n_groups = tier.forward_topk_wave_m8_graph(lidx, x, ids, wts)
++        if not _exl3_wave_m8g_seen:
++            logger.info("moe_w2 EXL3 decode-wave-M8 route ACTIVE "
++                        "(graph, fixed groups=%d)", n_groups)
++            _exl3_wave_m8g_seen.append(1)
++        return y.to(x.dtype)
++    # M8 charter F2 ([K] 2026-08-09, §2bis): M ∈ [2, 8] decode on the
++    # M=8-native wave — union of the step's routed experts partitioned
++    # into groups of 6, ext launched once per group, atomic-accumulating
++    # into one zeroed [T, H] fp32 out (forward_topk_wave_m8 owns the
++    # zeroing). Geometry gate == the M=1 wave route (pack-v3 serving
++    # pair over the same ptab stack). The grouping is data-dependent
++    # HOST logic, so this route is EAGER-ONLY — and not merely guarded
++    # against capture: under _EXL3_CUDAGRAPH the pre-capture eager
++    # warmups would take THIS route and starve the unified path of its
++    # first-call autotune, which then fires inside the capture ("GPU
++    # assert: operation not permitted when stream is capturing",
++    # coop_autotune.cu — measured on the F3 boot, 2026-08-10). With
++    # cudagraphs on, T ∈ [2, 8] is served by the capture-safe route
++    # above (guarded cubins) or the capture-safe fallbacks below; an
++    # ext without the m8 launcher (or unresolved cubins) degrades the
++    # same way.
++    if (_EXL3_WAVE_M8 and 2 <= x.shape[0] <= 8 and _EXL3_W2K == 1
++            and _EXL3_DELTA_PACK and _EXL3_DELTA_GEOM is not None
++            and _EXL3_DELTA_GEOM["dk13"] == 2
++            and _EXL3_DELTA_GEOM["dk2"] == 3
++            and not _EXL3_CUDAGRAPH
++            and not torch.cuda.is_current_stream_capturing()
++            and tier.ext_wave_m8_available()):
++        _exl3_ensure_ptabs(ftier)
++        y, n_groups = tier.forward_topk_wave_m8(lidx, x, ids, wts)
++        if not _exl3_wave_m8_seen:
++            logger.info("moe_w2 EXL3 decode-wave-M8 route ACTIVE "
++                        "(groups=%d)", n_groups)
++            _exl3_wave_m8_seen.append(1)
++        return y.to(x.dtype)
 +    slot_row = ftier.slot_table[layer_key]        # [E] int32 (-1 = base tier)
 +    fp4_mask = slot_row[ids] >= 0                 # [m, k] bool
 +    if _EXL3_CUDAGRAPH:
@@ -9843,10 +10183,10 @@ index 000000000..b78d65142
 +            + "; ".join(str(e) for e in errors))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
 new file mode 100644
-index 000000000..eaac47ba0
+index 000000000..f8e41e45b
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
-@@ -0,0 +1,492 @@
+@@ -0,0 +1,826 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""EXL3 trellis base tier for the moe_w2 stack (vLLM-Moet).
 +
@@ -9923,6 +10263,151 @@ index 000000000..eaac47ba0
 +            for proj, (otr, osuh, osvh) in geom["offs"].items()}
 +
 +
++def build_m8_groups(topk_ids: torch.Tensor, topk_weights: torch.Tensor,
++                    cap: int = 6, rows: int = 8) -> list:
++    """Partition one decode step's routed experts into the fixed-size
++    groups the M=8-native decode wave serves (charter M8 §2bis: the m8
++    kernels are FIXED-SHAPE na=6, so the UNION of the step's experts —
++    |U| ∈ [k, T*k] — is split into ceil(|U|/cap) groups and the launcher
++    runs once per group; every union expert is decoded exactly ONCE per
++    step regardless of the partition, which is the whole M8 value).
++
++    topk_ids [T, k] int, topk_weights [T, k] float — any device; the
++    grouping is data-dependent HOST logic (this is an eager-only path),
++    so both are copied to CPU here and the returned tensors live on CPU.
++
++    Returns a list of per-group triples:
++      experts     (cap,)      int64 — pack expert ids feeding the group's
++                  slot pointer columns. Deterministic: the union is
++                  ascending, chunked in order. The last group is padded
++                  to `cap` with REPEATS of the group's first expert
++                  (§2bis: real experts with all rows -1) — a repeated
++                  in-group expert re-reads bytes that are already being
++                  streamed for this group (L2-warm) instead of pulling a
++                  foreign expert's 12.6 MB, and its rows are all -1 so
++                  stage_in zeroes them and out skips them: exactly zero
++                  contribution.
++      row_map     (cap, rows) int32 — [expert-in-group][row] = token
++                  index into x, or -1 (empty row). Rows of an expert are
++                  its routed tokens in ascending token order, packed
++                  from row 0 (T <= rows always holds: a token yields at
++                  most ONE row per expert).
++      row_weights (cap, rows) float16 — the routing weight of (token,
++                  expert); exactly 0.0 where row_map == -1. A duplicate
++                  expert inside one token's topk row (not produced by
++                  real routing, but legal input) accumulates its weights
++                  into the single (expert, token) row in fp32 before the
++                  half cast.
++    """
++    T, k = topk_ids.shape
++    assert T <= rows, f"M8 grouping serves T<={rows} tokens, got {T}"
++    ids = topk_ids.detach().to("cpu", torch.int64)
++    wts = topk_weights.detach().to("cpu", torch.float32)
++    per: dict[int, dict[int, float]] = {}
++    for t in range(T):
++        for j in range(k):
++            e = int(ids[t, j])
++            tw = per.setdefault(e, {})
++            tw[t] = tw.get(t, 0.0) + float(wts[t, j])
++    union = sorted(per)
++    groups = []
++    for g0 in range(0, len(union), cap):
++        chunk = union[g0:g0 + cap]
++        experts = torch.tensor(chunk + [chunk[0]] * (cap - len(chunk)),
++                               dtype=torch.int64)
++        row_map = torch.full((cap, rows), -1, dtype=torch.int32)
++        row_weights = torch.zeros(cap, rows, dtype=torch.float32)
++        for s, e in enumerate(chunk):
++            for r, (t, w) in enumerate(sorted(per[e].items())):
++                row_map[s, r] = t
++                row_weights[s, r] = w
++        groups.append((experts, row_map, row_weights.to(torch.half)))
++    return groups
++
++
++def build_m8_groups_graph(topk_ids: torch.Tensor,
++                          topk_weights: torch.Tensor,
++                          cap: int = 6, rows: int = 8):
++    """Capture-safe (fixed-shape, device-only) builder of the M8 groups —
++    the in-graph counterpart of build_m8_groups (charter CS [E]
++    2026-08-10, F0c: parity 20000/20000 bit-identical with the host
++    builder, including (t,e) duplicates, token overlaps, partial and
++    fully-empty groups).
++
++    G is FIXED at T (union <= 6T, cap 6 => ceil/6 <= T): real groups come
++    first, surplus groups are EMPTY (all row_map -1, experts = repeat of
++    union[0] so slot pointers stay dereferenceable; the m8g canon guard
++    exits those CTAs in the prologue). Rows are PREFIX-PACKED from row 0
++    — the m8g guard's emptiness test reads row 0 only, so this packing
++    is a hard contract, not a convention.
++
++    Everything is sort/cumsum/scatter/where on the input device with
++    static shapes — no host syncs, no data-dependent shapes: legal
++    inside cudagraph capture. Duplicate (t,e) weights accumulate in
++    fp64 -> fp32 -> half, matching the host builder's chain bit-exactly.
++
++    Returns (experts [G, cap] i64, row_map [G, cap, rows] i32,
++    row_weights [G, cap, rows] f16), all on topk_ids.device."""
++    T, k = topk_ids.shape
++    G = T
++    S = G * cap
++    N = T * k
++    dev = topk_ids.device
++
++    flat = topk_ids.reshape(N).to(torch.int64)
++    wts = topk_weights.reshape(N).to(torch.float64)
++
++    svals, sidx = torch.sort(flat, stable=True)
++    first = torch.ones(N, dtype=torch.bool, device=dev)
++    first[1:] = svals[1:] != svals[:-1]
++    rank_sorted = torch.cumsum(first.to(torch.int64), 0) - 1
++    U = rank_sorted[-1] + 1                              # device scalar
++    rank = torch.empty(N, dtype=torch.int64, device=dev)
++    rank[sidx] = rank_sorted
++
++    exp_of_rank = torch.zeros(S, dtype=torch.int64, device=dev)
++    exp_of_rank.scatter_(0, rank_sorted, svals)
++
++    u_ix = torch.arange(S, device=dev)
++    g_first = (u_ix // cap) * cap
++    pad_started = exp_of_rank[torch.clamp(g_first, max=S - 1)]
++    experts = torch.where(u_ix < U, exp_of_rank,
++                          torch.where(g_first < U, pad_started,
++                                      exp_of_rank[0]))
++
++    tok = torch.arange(T, device=dev, dtype=torch.int64)
++    tok_of_el = tok.repeat_interleave(k)
++    cell = rank * rows + tok_of_el
++    w_dense = torch.zeros(S * rows, dtype=torch.float64, device=dev)
++    w_dense.scatter_add_(0, cell, wts)
++    w_dense = w_dense.to(torch.float32).reshape(S, rows)
++    p_dense = torch.zeros(S * rows, dtype=torch.int64, device=dev)
++    p_dense.scatter_(0, cell, torch.ones_like(cell))
++    present = p_dense.reshape(S, rows).to(torch.bool)
++
++    row_idx = torch.cumsum(present.to(torch.int64), 1) - 1
++    row_map = torch.full((S, rows), -1, dtype=torch.int64, device=dev)
++    row_w = torch.zeros(S, rows, dtype=torch.float32, device=dev)
++    tgt = torch.where(present, row_idx, torch.zeros_like(row_idx))
++    src_t = torch.arange(rows, device=dev,
++                         dtype=torch.int64).unsqueeze(0).expand(S, rows)
++    row_map.scatter_(1, tgt, torch.where(present, src_t,
++                                         torch.full_like(src_t, -1)))
++    row_w.scatter_(1, tgt, torch.where(present, w_dense,
++                                       torch.zeros_like(w_dense)))
++    # scatter order among duplicate target 0 is undefined -> repair col 0
++    any_present = present.any(1)
++    first_tok = torch.argmax(present.to(torch.int8), 1)
++    fw = w_dense.gather(1, first_tok.unsqueeze(1)).squeeze(1)
++    row_map[:, 0] = torch.where(any_present, first_tok,
++                                torch.full_like(first_tok, -1))
++    row_w[:, 0] = torch.where(any_present, fw, torch.zeros_like(fw))
++
++    return (experts.reshape(G, cap),
++            row_map.reshape(G, cap, rows).to(torch.int32),
++            row_w.reshape(G, cap, rows).to(torch.half))
++
++
 +def _load_ext():
 +    """Load exllamav3_ext without executing the heavy exllamav3 package
 +    __init__ (tokenizers/generators are irrelevant here)."""
@@ -9979,6 +10464,17 @@ index 000000000..eaac47ba0
 +        # Persistent decode-wave pointer tables (init_ptabs); None until the
 +        # serving fast path is wired (first eager forward, before capture).
 +        self._ptab: dict[int, torch.Tensor] | None = None
++        # M8 decode-wave state (charter M8 §2bis): cached ext-capability
++        # probe and the lazily allocated per-tier work buffers, reused
++        # across groups AND layers — stage_in_m8 zeroes the -1 rows, so
++        # they are never cleared between calls.
++        self._wave_m8_avail: bool | None = None
++        self._m8_bufs: tuple | None = None
++        # capture-safe M8 (charter CS [E] 2026-08-10): guarded-cubin probe
++        # + persistent fixed-shape buffers of the in-graph route (see
++        # forward_topk_wave_m8_graph).
++        self._wave_m8_guarded: bool | None = None
++        self._m8_gbufs: dict | None = None
 +
 +        for li in layers:
 +            path = os.path.join(pack_dir, f"exl3-l{li:02d}.safetensors")
@@ -10258,6 +10754,184 @@ index 000000000..eaac47ba0
 +            a_had, c_up, d_in, c_down,
 +            self.act_limit, na)
 +        return out
++
++    # ---- M=8-native decode wave (charter M8 F2 tor B, [K] 2026-08-09) ----
++
++    def ext_wave_m8_available(self) -> bool:
++        """True when the loaded ext exposes the M=8-native decode-wave
++        launcher AND its loader resolved the m8 cubins (§2bis: lazy
++        cuModuleLoad on first launch; exl3_wave_m8_available() -> bool).
++        An older ext build without the symbol (AttributeError) or a probe
++        that raises degrades to False — the dispatch then keeps the
++        existing fallbacks (the AFRAG env-flag-with-degradation pattern).
++        Cached: env + ext build cannot change within a process."""
++        if self._wave_m8_avail is None:
++            try:
++                self._wave_m8_avail = bool(self.ext.exl3_wave_m8_available())
++            except Exception:
++                self._wave_m8_avail = False
++        return self._wave_m8_avail
++
++    def ext_wave_m8_guarded(self) -> bool:
++        """True when the loader resolved the GUARDED m8 canon set
++        (*_m8g.cubin, empty-group prologue guard, 4-ptr ABI) — the hard
++        prerequisite of the capture-safe route: with fixed G=T groups
++        per captured size, empty groups must cost ~4.5 us (guard exit),
++        not ~100 us (full decode). Same degradation contract as
++        ext_wave_m8_available (old ext / plain cubins -> False)."""
++        if self._wave_m8_guarded is None:
++            try:
++                self._wave_m8_guarded = bool(self.ext.exl3_wave_m8_guarded())
++            except Exception:
++                self._wave_m8_guarded = False
++        return self._wave_m8_guarded
++
++    def _m8_workbufs(self) -> tuple:
++        """Lazy per-tier m8 work buffers (a_had, c_up, d_in, c_down), the
++        §2bis shapes: 24 up / 12 dn slots x 8 rows. Allocated once and
++        reused across groups AND layers WITHOUT clearing — stage_in_m8
++        zeroes the -1 rows itself (§2bis), so stale rows are never read."""
++        if self._m8_bufs is None:
++            self._m8_bufs = (
++                torch.empty(24, 8, self.H, dtype=torch.half, device=self.dev),
++                torch.empty(24, 8, self.I, dtype=torch.half, device=self.dev),
++                torch.empty(12, 8, self.I, dtype=torch.half, device=self.dev),
++                torch.empty(12, 8, self.H, dtype=torch.half, device=self.dev),
++            )
++        return self._m8_bufs
++
++    @torch.inference_mode()
++    def forward_topk_wave_m8(self, li: int, x: torch.Tensor,
++                             topk_ids: torch.Tensor,
++                             topk_weights: torch.Tensor):
++        """Decode step for M ∈ [1, 8] tokens via exl3_decode_wave_dual_m8:
++        the union of the step's routed experts is partitioned into fixed
++        groups of 6 (build_m8_groups) and the m8 launcher runs once per
++        group — each union expert's trellis is decoded ONCE (HMMA over 8
++        token rows), vs the M·k expansion's per-(token, expert) decode.
++
++        x [T, H]; topk_ids [T, k] int; topk_weights [T, k] float. Returns
++        (out [T, H] float32, n_groups). out is allocated AND zeroed here,
++        once per call (= once per layer per step): the ext contract
++        (§2bis) is that the kernel only ever atomic-accumulates into out
++        — accumulation ACROSS groups is how a token collects the sum
++        over all its experts — so callers must not pre-zero or reuse it.
++
++        Serving pair and pointer plumbing are exactly the M=1 wave's:
++        pack-v3 base (2,2,1) cb0 + Δ (2,2,3) cb2 over the persistent
++        ptab stack (init_ptabs must have run) — one index_select over
++        the group's 6 expert columns yields the slot-major 24-up/12-dn
++        pointer arrays (ups [gb,ub,gd,ud] x 6, downs [db,dd] x 6). The
++        Δ zero-svh bake for non-pooled experts rides along unchanged.
++
++        EAGER-ONLY: the grouping is data-dependent host logic (a D2H
++        sync on topk); the dispatch never takes this route during
++        cudagraph capture. Work buffers are per-tier and dirty by design
++        (see _m8_workbufs)."""
++        T = x.shape[0]
++        assert 1 <= T <= 8, "decode wave m8 serves T in [1, 8]"
++        assert self.w13_k == 2 and self.w2_k == 1, \
++            "wave m8 serves the base (2,2,1) pair (w13_k=2, w2_k=1)"
++        assert self._ptab is not None, \
++            "forward_topk_wave_m8 before init_ptabs()"
++        groups = build_m8_groups(topk_ids, topk_weights)
++        xh = x.half().reshape(T, self.H).contiguous()
++        out = torch.zeros(T, self.H, dtype=torch.float, device=self.dev)
++        a_had, c_up, d_in, c_down = self._m8_workbufs()
++        ptab = self._ptab[li]
++        for experts, row_map, row_weights in groups:
++            cols = ptab.index_select(1, experts.to(self.dev))   # [18, 6]
++            self.ext.exl3_decode_wave_dual_m8(
++                xh, out,
++                row_map.to(self.dev).contiguous(),
++                row_weights.to(self.dev).contiguous(),
++                cols[0:4].reshape(-1).contiguous(),
++                cols[4:8].reshape(-1).contiguous(),
++                cols[8:12].reshape(-1).contiguous(),
++                cols[12:14].reshape(-1).contiguous(),
++                cols[14:16].reshape(-1).contiguous(),
++                cols[16:18].reshape(-1).contiguous(),
++                a_had, c_up, d_in, c_down,
++                self.act_limit, 6)
++        return out, len(groups)
++
++    def _m8_graph_bufs(self) -> dict:
++        """Persistent buffers of the capture-safe M8 route: the ext call
++        args must live at STABLE addresses (kernel launch params are
++        frozen into the captured graph), so the in-graph builder/gather
++        WRITE into these each step and the ext reads them by address —
++        the init_ptabs idiom extended to the per-step M8 state.
++        cols layout (G, 18, 6) row-major: for group g the six slot-major
++        pointer arrays the ext takes are CONTIGUOUS row-slices
++        (cols[g,0:4] flat = 24 up_tr, [4:8] suh, [8:12] svh, [12:14]
++        dn_tr, [14:16] dn_suh, [16:18] dn_svh) — zero per-call copies."""
++        if self._m8_gbufs is None:
++            self._m8_gbufs = {
++                "rmap": torch.full((8, 6, 8), -1, dtype=torch.int32,
++                                   device=self.dev),
++                "rw": torch.zeros(8, 6, 8, dtype=torch.half,
++                                  device=self.dev),
++                "cols": torch.zeros(8, 18, 6, dtype=torch.int64,
++                                    device=self.dev),
++                "out": torch.zeros(8, self.H, dtype=torch.float,
++                                   device=self.dev),
++                "xh": torch.zeros(8, self.H, dtype=torch.half,
++                                  device=self.dev),
++            }
++        return self._m8_gbufs
++
++    @torch.inference_mode()
++    def forward_topk_wave_m8_graph(self, li: int, x: torch.Tensor,
++                                   topk_ids: torch.Tensor,
++                                   topk_weights: torch.Tensor):
++        """Capture-safe decode step for T in [2, 8] tokens on the
++        M=8-native wave (charter CS [E] 2026-08-10): fixed G = T ext
++        calls per step, groups built ON DEVICE (build_m8_groups_graph —
++        no host syncs, static shapes), pointers gathered from the
++        persistent ptab into persistent per-group buffers. Surplus
++        groups are empty (all rows -1): the m8g canon guard exits them
++        at ~4.5 us/canon, stage kernels write/skip zeros. Requires
++        ext_wave_m8_guarded().
++
++        Legal both inside cudagraph capture and eager (the eager route
++        forward_topk_wave_m8 stays preferred outside graphs: its host
++        builder emits only the real groups)."""
++        T = x.shape[0]
++        assert 2 <= T <= 8, "graph wave m8 serves T in [2, 8]"
++        assert self.w13_k == 2 and self.w2_k == 1, \
++            "wave m8 serves the base (2,2,1) pair (w13_k=2, w2_k=1)"
++        assert self._ptab is not None, \
++            "forward_topk_wave_m8_graph before init_ptabs()"
++        bufs = self._m8_graph_bufs()
++        a_had, c_up, d_in, c_down = self._m8_workbufs()
++        ptab = self._ptab[li]
++
++        experts, rmap, rw = build_m8_groups_graph(topk_ids, topk_weights)
++        bufs["rmap"][:T].copy_(rmap)
++        bufs["rw"][:T].copy_(rw)
++        # (18, T*6) -> (T, 18, 6) into the persistent slot-major buffer
++        cols_all = ptab.index_select(1, experts.reshape(-1))
++        bufs["cols"][:T].copy_(cols_all.view(18, T, 6).permute(1, 0, 2))
++        xh = bufs["xh"][:T]
++        xh.copy_(x.reshape(T, self.H))
++        out = bufs["out"][:T]
++        out.zero_()
++
++        for g in range(T):
++            cg = bufs["cols"][g]
++            self.ext.exl3_decode_wave_dual_m8(
++                xh, out,
++                bufs["rmap"][g],
++                bufs["rw"][g],
++                cg[0:4].reshape(-1),
++                cg[4:8].reshape(-1),
++                cg[8:12].reshape(-1),
++                cg[12:14].reshape(-1),
++                cg[14:16].reshape(-1),
++                cg[16:18].reshape(-1),
++                a_had, c_up, d_in, c_down,
++                self.act_limit, 6)
++        return out, T
 +
 +    # ---- persistent decode-wave pointer tables (glue fix [V] 2026-08-05) --
 +    # Row layout of the per-layer [18, E] int64 table. Rows are grouped so a
