@@ -1,0 +1,1709 @@
+// exl3_wave_uni_k2cb0 — unified-warp GEMV K2-cb0 M<=8 (GENERATED, 100% FROZEN)
+// WNT=2 COLS=32 GROUPS=64 M=8 PIPE=0; B w rejestrach, smem 32768B redukcja.
+.entry exl3_wave_uni_k2cb0
+    .reg R0-R63
+    .bar B0-B0
+    .param u64 d_tr
+    .param u64 d_a
+    .param u64 d_c
+    .shared .align 16 smem[32768]
+
+    // ---- prolog (frozen: W4=UR4, W5=tid, W0=ctaid, W1=LDC, W2=plane-base) ----
+    [B------:R-:W4:-:S01] LDCU.64 UR4, c[0x0][0x358] ;
+    [B------:R-:W5:-:S01] S2R R7, SR_TID.X ;
+    [B------:R-:W0:-:S01] S2R R4, SR_CTAID.X ;  // item (R4 ZYWY do store)
+    [B------:R-:W1:-:S01] LDC.64 R12, c[0x0][0x380] ;  // d_tr
+    [B-----5:R-:W-:-:S06] SHF.R.U32.HI R5, RZ, 0x5, R7 ;  // warp (B5: tid)
+    [B------:R-:W-:-:S06] LOP3.LUT R7, R7, 0x1f, RZ, 0xc0, !PT ;  // lane (WAR z SHF ok: odczyt na issue)
+    [B0-----:R-:W-:-:S06] SHF.R.U32.HI R3, RZ, 0x6, R4 ;  // slot = item/GROUPS (B0: ctaid)
+    [B------:R-:W-:-:S06] LOP3.LUT R9, R4, 0x3f, RZ, 0xc0, !PT ;  // group = item%GROUPS
+    [B------:R-:W-:-:S06] SHF.L.U32 R0, R3, 0x3, RZ ;  // slot*8
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R12, R0, 0x1, R12 ;  // B1: d_tr gotowe
+    [B----4-:R-:W2:-:S01] LDG.E.64 R12, desc[UR4][R12.64] ;  // plane base (B4: UR4)
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R8, RZ, 0x1, R7 ;  // w = word-in-tile = lane>>1 (permutacja [U])
+    [B------:R-:W-:-:S06] LOP3.LUT R0, R7, 0x1, RZ, 0xc0, !PT ;  // lane&1
+    [B------:R-:W-:-:S06] ISETP.EQ.AND P6, PT, R0, RZ, PT ;  // P6: lane PARZYSTY (funnel)
+    [B------:R-:W-:-:S06] ISETP.LT.AND P2, PT, R7, 0x4, PT ;  // lane<4
+    [B------:R-:W-:-:S06] LOP3.LUT R34, R7, 0x3, RZ, 0xc0, !PT ;  // cq = lane&3
+    [B------:R-:W-:-:S06] IADD3 R24, PT, PT, R7, 0x1f, RZ ;  // lane+31
+    [B------:R-:W-:-:S06] LOP3.LUT R24, R24, 0x1f, RZ, 0xc0, !PT ;  // R24 = src SHFL.IDX = (lane-1)&31
+    [B------:R-:W-:-:S06] IMAD R0, R5, 0x8000, RZ ;  // ks0*SLICE_STRIDE
+    [B------:R-:W-:-:S06] IMAD R0, R9, 0x20, R0 ;  // + group*COLS
+    [B------:R-:W-:-:S06] IADD3 R0, PT, PT, R0, R8, RZ ;  // + w
+    [B------:R-:W-:-:S06] SHF.L.U32 R0, R0, 0x2, RZ ;
+    [B--2---:R-:W-:-:S06] IMAD.WIDE.U32 R12, R0, 0x1, R12 ;  // R12:R13 = bp b lane'a (B2: base)
+    [B------:R-:W1:-:S01] LDC.64 R14, c[0x0][0x388] ;  // d_a (W1 reuse — B1 skonsumowana)
+    [B------:R-:W-:-:S06] IMAD R0, R3, 0x10000, RZ ;  // slot*8*4096*2
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R1, RZ, 0x2, R7 ;  // r = lane>>2 (wiersz tokenu)
+    [B------:R-:W-:-:S06] IMAD R0, R1, 0x2000, R0 ;  // + row*4096*2
+    [B------:R-:W-:-:S06] IMAD R1, R5, 0x80, RZ ;  // warp*128 (half2) — hoist bazy A [U]
+    [B------:R-:W-:-:S06] IADD3 R1, PT, PT, R1, R34, RZ ;  // + cq
+    [B------:R-:W-:-:S06] SHF.L.U32 R1, R1, 0x2, RZ ;
+    [B------:R-:W-:-:S06] IADD3 R0, PT, PT, R0, R1, RZ ;
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R14, R0, 0x1, R14 ;  // R14:R15 = &A2[a_col] lane'a (B1: d_a); LDG per slice z imm i*32
+    [B------:R-:W-:-:S02] MOV R6, 0x3d45aa4 ;
+    [B------:R-:W-:-:S02] MOV R33, 0x3b603b60 ;
+    // hoist [U]: zera A-fragmentu raz (R41/R43 = wiersze 8-15, nigdy
+    // nie nadpisywane; M=1: R40/R42 dla lane>=4 nigdy nie ladowane)
+    [B------:R-:W-:-:S02] MOV R41, RZ ;  // Afrag[1]=0 (wiersze 8-15)
+    [B------:R-:W-:-:S02] MOV R43, RZ ;  // Afrag[3]=0
+    // ---- M8-ASTAGE: baza frag + prezero ping-pong (R4 = item
+    //  SKONSUMOWANY w prologu; epilog przeliczy CTAID z S2R [D]).
+    //  Frag-slot 16 B/lane {a01, 0, a23, 0}; zera bajtow 4-7/12-15
+    //  zyja przez caly kernel (LDGSTS pisze tylko 0-3/8-11).
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R1, RZ, 0x2, R7 ;  // r = lane>>2 (R1 scratch po bazie A)
+    [B------:R-:W-:-:S02] MOV R40, RZ ;  // quad zer do prezero STS (R41/R43 juz zero)
+    [B------:R-:W-:-:S02] MOV R42, RZ ;
+    [B------:R-:W-:-:S06] IMAD R4, R5, 0x400, RZ ;  // R4 := warp*1024 (2 regiony x 512 B)
+    [B------:R-:W-:-:S06] IMAD R4, R1, 0x40, R4 ;  // + r*64
+    [B------:R-:W-:-:S06] IMAD R4, R34, 0x10, R4 ;  // + cq*16
+    [B------:R-:W-:-:S06] IADD3 R4, PT, PT, R4, 0x4000, RZ ;  // + A_OFF -> R4 = baza frag/dst (smem@0x4000)
+    [B------:R3:W-:-:S01] STS.128 [R4+0x0], R40 ;  // prezero region 0
+    [B------:R3:W-:-:S01] STS.128 [R4+0x200], R40 ;  // prezero region 1
+    [B---3--:R-:W-:-:S02] MOV R17, RZ ;  // drain rb STS (wzorzec [D])
+    [B------:R-:W1:-:S01] LDS R40, [R4+0x0] ;  // dummy: LSU-order STS->LDGSTS region 0
+    [B-1----:R-:W1:-:S01] LDS R42, [R4+0x200] ;  // dummy region 1 (chain W1)
+    [B-1----:R-:W-:-:S01] MOV R44, RZ ;
+    [B------:R-:W-:-:S01] MOV R45, RZ ;
+    [B------:R-:W-:-:S01] MOV R46, RZ ;
+    [B------:R-:W-:-:S01] MOV R47, RZ ;
+    [B------:R-:W-:-:S01] MOV R48, RZ ;
+    [B------:R-:W-:-:S01] MOV R49, RZ ;
+    [B------:R-:W-:-:S01] MOV R50, RZ ;
+    [B------:R-:W-:-:S01] MOV R51, RZ ;
+    [B------:R-:W-:-:S01] MOV R52, RZ ;
+    [B------:R-:W-:-:S01] MOV R53, RZ ;
+    [B------:R-:W-:-:S01] MOV R54, RZ ;
+    [B------:R-:W-:-:S01] MOV R55, RZ ;
+    [B------:R-:W-:-:S01] MOV R56, RZ ;
+    [B------:R-:W-:-:S01] MOV R57, RZ ;
+    [B------:R-:W-:-:S01] MOV R58, RZ ;
+    [B------:R-:W-:-:S01] MOV R59, RZ ;
+
+    // ---- preload plane-LDG tiles 0..2 (ring-4 prefetch depth-3) ----
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x0] ;  // slowo tile j=0 -> W2 PRELOAD
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x40] ;  // slowo tile j=1 -> W3 PRELOAD
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0x2000] ;  // slowo tile j=2 -> W4 PRELOAD
+
+    // ======== k-slice i=0 ========
+    // -- blok j=0 (slice 0, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0x2040] ;  // slowo tile j=3 -> W5 PREFETCH
+    [B------:R-:W0:-:S01] LDG.E R40, desc[UR4][R14.64+0x0] ;  // A2 slice 0
+    [B------:R-:W1:-:S01] LDG.E R42, desc[UR4][R14.64+0x10] ;
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(0): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B01----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0x20] ;  // piece a01 slice 1 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0x30] ;  // piece a23 slice 1 -> W0
+    // -- blok j=1 (slice 0, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x4000] ;  // slowo tile j=4 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(1): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=1 ========
+    // -- blok j=2 (slice 1, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x4040] ;  // slowo tile j=5 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 1 (region 1; B0/B1: pieces(1))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(2): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0x40] ;  // piece a01 slice 2 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0x50] ;  // piece a23 slice 2 -> W0
+    // -- blok j=3 (slice 1, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0x6000] ;  // slowo tile j=6 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(3): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=2 ========
+    // -- blok j=4 (slice 2, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0x6040] ;  // slowo tile j=7 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 2 (region 0; B0/B1: pieces(2))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(4): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0x60] ;  // piece a01 slice 3 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0x70] ;  // piece a23 slice 3 -> W0
+    // -- blok j=5 (slice 2, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x8000] ;  // slowo tile j=8 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(5): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=3 ========
+    // -- blok j=6 (slice 3, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x8040] ;  // slowo tile j=9 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 3 (region 1; B0/B1: pieces(3))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(6): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0x80] ;  // piece a01 slice 4 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0x90] ;  // piece a23 slice 4 -> W0
+    // -- blok j=7 (slice 3, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0xa000] ;  // slowo tile j=10 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(7): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=4 ========
+    // -- blok j=8 (slice 4, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0xa040] ;  // slowo tile j=11 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 4 (region 0; B0/B1: pieces(4))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(8): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0xa0] ;  // piece a01 slice 5 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0xb0] ;  // piece a23 slice 5 -> W0
+    // -- blok j=9 (slice 4, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0xc000] ;  // slowo tile j=12 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(9): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=5 ========
+    // -- blok j=10 (slice 5, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0xc040] ;  // slowo tile j=13 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 5 (region 1; B0/B1: pieces(5))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(10): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0xc0] ;  // piece a01 slice 6 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0xd0] ;  // piece a23 slice 6 -> W0
+    // -- blok j=11 (slice 5, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0xe000] ;  // slowo tile j=14 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(11): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=6 ========
+    // -- blok j=12 (slice 6, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0xe040] ;  // slowo tile j=15 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 6 (region 0; B0/B1: pieces(6))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(12): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0xe0] ;  // piece a01 slice 7 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0xf0] ;  // piece a23 slice 7 -> W0
+    // -- blok j=13 (slice 6, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x10000] ;  // slowo tile j=16 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(13): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=7 ========
+    // -- blok j=14 (slice 7, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x10040] ;  // slowo tile j=17 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 7 (region 1; B0/B1: pieces(7))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(14): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0x100] ;  // piece a01 slice 8 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0x110] ;  // piece a23 slice 8 -> W0
+    // -- blok j=15 (slice 7, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0x12000] ;  // slowo tile j=18 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(15): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=8 ========
+    // -- blok j=16 (slice 8, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0x12040] ;  // slowo tile j=19 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 8 (region 0; B0/B1: pieces(8))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(16): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0x120] ;  // piece a01 slice 9 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0x130] ;  // piece a23 slice 9 -> W0
+    // -- blok j=17 (slice 8, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x14000] ;  // slowo tile j=20 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(17): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=9 ========
+    // -- blok j=18 (slice 9, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x14040] ;  // slowo tile j=21 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 9 (region 1; B0/B1: pieces(9))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(18): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0x140] ;  // piece a01 slice 10 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0x150] ;  // piece a23 slice 10 -> W0
+    // -- blok j=19 (slice 9, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0x16000] ;  // slowo tile j=22 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(19): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=10 ========
+    // -- blok j=20 (slice 10, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0x16040] ;  // slowo tile j=23 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 10 (region 0; B0/B1: pieces(10))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(20): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0x160] ;  // piece a01 slice 11 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0x170] ;  // piece a23 slice 11 -> W0
+    // -- blok j=21 (slice 10, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x18000] ;  // slowo tile j=24 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(21): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=11 ========
+    // -- blok j=22 (slice 11, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x18040] ;  // slowo tile j=25 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 11 (region 1; B0/B1: pieces(11))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(22): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0x180] ;  // piece a01 slice 12 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0x190] ;  // piece a23 slice 12 -> W0
+    // -- blok j=23 (slice 11, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0x1a000] ;  // slowo tile j=26 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(23): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=12 ========
+    // -- blok j=24 (slice 12, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0x1a040] ;  // slowo tile j=27 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 12 (region 0; B0/B1: pieces(12))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(24): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0x1a0] ;  // piece a01 slice 13 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0x1b0] ;  // piece a23 slice 13 -> W0
+    // -- blok j=25 (slice 12, t=1)
+    [B------:R-:W2:-:S01] LDG.E R27, desc[UR4][R12.64+0x1c000] ;  // slowo tile j=28 -> W2 PREFETCH
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(25): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=13 ========
+    // -- blok j=26 (slice 13, t=0)
+    [B------:R-:W3:-:S01] LDG.E R1, desc[UR4][R12.64+0x1c040] ;  // slowo tile j=29 -> W3 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 13 (region 1; B0/B1: pieces(13))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(26): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x0], desc[UR4][R14.64+0x1c0] ;  // piece a01 slice 14 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x8], desc[UR4][R14.64+0x1d0] ;  // piece a23 slice 14 -> W0
+    // -- blok j=27 (slice 13, t=1)
+    [B------:R-:W4:-:S01] LDG.E R2, desc[UR4][R12.64+0x1e000] ;  // slowo tile j=30 -> W4 PREFETCH
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(27): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=14 ========
+    // -- blok j=28 (slice 14, t=0)
+    [B------:R-:W5:-:S01] LDG.E R3, desc[UR4][R12.64+0x1e040] ;  // slowo tile j=31 -> W5 PREFETCH
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x0] ;  // A-frag slice 14 (region 0; B0/B1: pieces(14))
+    [B--2---:R-:W2:-:S01] SHFL.IDX PT, R10, R27, R24, 0x1f ;  // A(28): a-slowo lane (p-1)&31 (B2: LDG; W2: SHFL, #21)
+    [B--2---:R-:W-:-:S01] @P6 PRMT R25, R27, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R27 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R27, R20, 0x7632, R21 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R27 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R27, R16, 0x7632, R17 ;  // hi -> ring[0] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R27 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R4+0x200], desc[UR4][R14.64+0x1e0] ;  // piece a01 slice 15 -> W1
+    [B------:R-:W0:-:S01] LDGSTS.E [R4+0x208], desc[UR4][R14.64+0x1f0] ;  // piece a23 slice 15 -> W0
+    // -- blok j=29 (slice 14, t=1)
+    [B---3--:R-:W3:-:S01] SHFL.IDX PT, R10, R1, R24, 0x1f ;  // A(29): a-slowo lane (p-1)&31 (B3: LDG; W3: SHFL, #21)
+    [B---3--:R-:W-:-:S01] @P6 PRMT R25, R1, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R1 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R1, R0, 0x7632, R5 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R1 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R1, R28, 0x7632, R29 ;  // hi -> ring[1] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R1 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=15 ========
+    // -- blok j=30 (slice 15, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R40, [R4+0x200] ;  // A-frag slice 15 (region 1; B0/B1: pieces(15))
+    [B----4-:R-:W4:-:S01] SHFL.IDX PT, R10, R2, R24, 0x1f ;  // A(30): a-slowo lane (p-1)&31 (B4: LDG; W4: SHFL, #21)
+    [B----4-:R-:W-:-:S01] @P6 PRMT R25, R2, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R2 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R23, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R23
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R19, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R18, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R17, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R16, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R22, R22, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R23, R23, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R20, R20, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R21, R21, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R19, R19, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R22, R22, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R23, R23, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R20, R20, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R21, R21, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R18, R18, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R19, R19, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R16, R16, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R17, R17, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R22, 0x5410, R23 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R22, 0x7632, R23 ;
+    [B------:R-:W-:-:S01] PRMT R26, R20, 0x5410, R21 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R2, R20, 0x7632, R21 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R2 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R18, 0x5410, R19 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R18, 0x7632, R19 ;
+    [B------:R-:W-:-:S01] PRMT R26, R16, 0x5410, R17 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R2, R16, 0x7632, R17 ;  // hi -> ring[2] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R2 ;  // hd w0w1
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R48, R40, R38, R48 ;  // HMMA2 n8-15 (B0/B1: A-LDG) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R44, R40, R36, R44 ;  // HMMA1 n0-7
+    // -- blok j=31 (slice 15, t=1)
+    [B-----5:R-:W5:-:S01] SHFL.IDX PT, R10, R3, R24, 0x1f ;  // A(31): a-slowo lane (p-1)&31 (B5: LDG; W5: SHFL, #21)
+    [B-----5:R-:W-:-:S01] @P6 PRMT R25, R3, 0x5432, R10 ;  // funnel p even: {b_hi16,a_lo16}
+    [B------:R-:W-:-:S06] @!P6 MOV R25, R3 ;  // p odd: wlasne slowo
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R8, RZ, 0x2, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R9, RZ, 0x4, R25 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R11, RZ, 0x6, R25 ;
+    [B------:R-:W-:-:S03] LOP3.LUT R34, R25, 0xffff, RZ, 0xc0, !PT ;  // w7 -> R34
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R8, 0xffff, RZ, 0xc0, !PT ;  // w6
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R9, 0xffff, RZ, 0xc0, !PT ;  // w5
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R11, 0xffff, RZ, 0xc0, !PT ;  // w4
+    [B------:R-:W-:-:S01] PRMT R31, R25, 0x7721, RZ ;  // w3
+    [B------:R-:W-:-:S01] PRMT R30, R8, 0x7721, RZ ;  // w2
+    [B------:R-:W-:-:S01] PRMT R29, R9, 0x7721, RZ ;  // w1
+    [B------:R-:W-:-:S01] PRMT R28, R11, 0x7721, RZ ;  // w0
+    [B------:R-:W-:-:S01] IMAD R7, R7, 0x5517c72, R6 ;  // LCG w6
+    [B------:R-:W-:-:S01] IMAD R34, R34, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R0, R0, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R5, R5, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R30, R30, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R31, R31, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] IMAD R28, R28, 0x5517c72, R6 ;  // LCG w0
+    [B------:R-:W-:-:S01] IMAD R29, R29, 0x5517c72, R6 ;
+    [B------:R-:W-:-:S01] LOP3.LUT R7, R7, 0x8fff8fff, R33, 0x6a, !PT ;  // (v&mask)^magic
+    [B------:R-:W-:-:S01] LOP3.LUT R34, R34, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R0, R0, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R5, R5, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R30, R30, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R31, R31, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R28, R28, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] LOP3.LUT R29, R29, 0x8fff8fff, R33, 0x6a, !PT ;
+    [B------:R-:W-:-:S01] PRMT R32, R7, 0x5410, R34 ;  // lo pary w6w7
+    [B------:R-:W-:-:S01] PRMT R35, R7, 0x7632, R34 ;
+    [B------:R-:W-:-:S01] PRMT R26, R0, 0x5410, R5 ;  // lo pary w4w5
+    [B------:R-:W-:-:S04] PRMT R3, R0, 0x7632, R5 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R39, R32, R35 ;  // hd w6w7
+    [B------:R-:W-:-:S01] HADD2 R38, R26, R3 ;  // hd w4w5
+    [B------:R-:W-:-:S01] PRMT R32, R30, 0x5410, R31 ;  // lo pary w2w3
+    [B------:R-:W-:-:S01] PRMT R35, R30, 0x7632, R31 ;
+    [B------:R-:W-:-:S01] PRMT R26, R28, 0x5410, R29 ;  // lo pary w0w1
+    [B------:R-:W-:-:S04] PRMT R3, R28, 0x7632, R29 ;  // hi -> ring[3] (temp)
+    [B------:R-:W-:-:S02] HADD2 R37, R32, R35 ;  // hd w2w3
+    [B------:R-:W-:-:S01] HADD2 R36, R26, R3 ;  // hd w0w1
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R56, R40, R38, R56 ;  // HMMA2 n8-15 (B0/B1: A-LDG)
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R52, R40, R36, R52 ;  // HMMA1 n0-7
+
+    // ======== fold C-reg(fp32) -> sh_red[warp][row<8][col] (FROZEN) ========
+    // R5/R7/R34 = bank_odd (petla) -> tid/warp/cq PRZELICZONE z S2R [D]
+    [B------:R-:W1:-:S01] S2R R20, SR_TID.X ;  // tid (W1 reuse — B1 skonsumowana)
+    [B-1----:R-:W-:-:S06] SHF.R.U32.HI R21, RZ, 0x5, R20 ;  // warp (B1: S2R)
+    [B------:R-:W-:-:S06] LOP3.LUT R0, R20, 0x3, RZ, 0xc0, !PT ;  // cq = tid&3 (lane&3)
+    // sh_red[(warp*M + r)*COLS + t*16 + f*8 + 2cq] = ch(t,f)[0], [+1]=[1]
+    [B------:R-:W-:-:S06] IMAD R2, R21, 0x400, RZ ;  // warp*M*COLS*4
+    [B------:R-:W-:-:S06] LOP3.LUT R1, R20, 0x1f, RZ, 0xc0, !PT ;  // lane
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R1, RZ, 0x2, R1 ;  // r = lane>>2
+    [B------:R-:W-:-:S06] IMAD R2, R1, 0x80, R2 ;  // + r*COLS*4
+    [B------:R-:W-:-:S06] SHF.L.U32 R3, R0, 0x3, RZ ;  // 2cq*4
+    [B------:R-:W-:-:S06] IADD3 R2, PT, PT, R2, R3, RZ ;
+    [B------:R3:W-:-:S04] STS.64 [R2+0x0], R44 ;  // t=0 f=0
+    [B------:R3:W-:-:S04] STS.64 [R2+0x20], R48 ;  // t=0 f=1
+    [B------:R3:W-:-:S04] STS.64 [R2+0x40], R52 ;  // t=1 f=0
+    [B------:R3:W-:-:S04] STS.64 [R2+0x60], R56 ;  // t=1 f=1
+    [B---3--:R-:W-:-:S02] MOV R0, RZ ;  // drain read-bariery STS przed BAR (handoff §3)
+    [B------:R-:W-:Y:S06] BAR.SYNC.DEFER_BLOCKING 0x0 ;  // footgun #13: ZAWSZE Y:S06
+
+    // ======== redukcja: M*COLS=256 wynikow, tid<256 sumuje 16 warpow (FROZEN) ========
+    [B------:R-:W-:-:S08] ISETP.LT.AND P1, PT, R20, 0x100, PT ;  // P1: tid<M*COLS (R20=S2R; dystans do @P1 >=15)
+    [B------:R-:W-:-:S06] SHF.L.U32 R23, R20, 0x2, RZ ;  // (row*COLS+col)*4 = tid*4
+    [B------:R-:W-:-:S06] MOV R22, RZ ;  // suma fp32
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x0] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0xc00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1000] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1c00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2000] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2c00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3000] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3c00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    // c_out = d_c + slot*8*4096 + row*4096 + group*COLS*2 + col*2 — R4 zywy
+    [B------:R-:W2:-:S01] S2R R4, SR_CTAID.X ;  // item ODTWORZONY (R4 = baza frag w petli; W2 wolna po ringu)
+    [B------:R-:W5:-:S01] LDC.64 R16, c[0x0][0x390] ;  // d_c (W5 reuse — B5 skonsumowana)
+    [B--2---:R-:W-:-:S06] SHF.R.U32.HI R18, RZ, 0x6, R4 ;  // slot (R4 z S2R — B2)
+    [B------:R-:W-:-:S06] LOP3.LUT R19, R4, 0x3f, RZ, 0xc0, !PT ;  // group
+    [B------:R-:W-:-:S06] IMAD R0, R18, 0x8000, RZ ;  // slot*8*2048*2
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R21, RZ, 0x5, R20 ;  // row = tid/COLS
+    [B------:R-:W-:-:S06] IMAD R0, R21, 0x1000, R0 ;  // + row*2048*2
+    [B------:R-:W-:-:S06] IMAD R0, R19, 0x40, R0 ;  // + group*COLS*2
+    [B------:R-:W-:-:S06] LOP3.LUT R21, R20, 0x1f, RZ, 0xc0, !PT ;  // col = tid%COLS
+    [B------:R-:W-:-:S06] SHF.L.U32 R21, R21, 0x1, RZ ;  // col*2
+    [B------:R-:W-:-:S06] IADD3 R0, PT, PT, R0, R21, RZ ;
+    [B-----5:R-:W-:-:S06] IMAD.WIDE.U32 R16, R0, 0x1, R16 ;  // B5: d_c gotowe
+    [B------:R-:W4:-:S06] F2F.F16.F32 R22, R22 ;  // fp32->fp16 (W4 reuse; variable latency)
+    [B----4-:R3:W-:-:S01] @P1 STG.E.U16 desc[UR4][R16.64], R22 ;  // B4: F2F; R3 read-bar
+    [B---3--:R-:W-:-:S02] MOV R0, RZ ;  // drain read-bariery STG przed EXIT
+    [B------:R-:W-:-:S05] EXIT ;
+    [B------:R-:W-:-:S05] BRA 0x0 ;
+.endentry

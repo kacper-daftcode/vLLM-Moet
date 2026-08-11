@@ -1,0 +1,978 @@
+// exl3_wave_dn3 — unified-warp GEMV down-delta K3-cb2 M=1 (GENERATED, 100% FROZEN) + [E] m8g guard pustej grupy
+// [E] port unified v3: WNT=2 COLS=32 GROUPS=128 grid=768; LDGSTS slice-ring depth-2 (B1-B3); A-pad LDS.128; smem 40960B.
+.entry exl3_wave_dn3
+    .reg R0-R63
+    .bar B0-B0
+    .param u64 d_tr
+    .param u64 d_a
+    .param u64 d_c
+    .param u64 d_rmap
+    .shared .align 16 smem[40960]
+
+    // ---- prolog (frozen: W4=UR4, W5=tid, W0=ctaid, W1=LDC, W2=base) ----
+    // ---- [E] m8g guard (F1 capture-safe): CTA konczy, gdy
+    // row_map[expert][0] == -1 (KONTRAKT: wiersze prefix-packed od 0 —
+    // gwarantowane przez build_m8_groups i device-builder). d_rmap =
+    // 4. param; quad R60-63 wolny (census). Blok samodomkniety.
+    [B------:R-:W4:-:S01] LDCU.64 UR4, c[0x0][0x358] ;
+    [B------:R-:W0:-:S01] S2R R2, SR_CTAID.X ;
+    [B------:R-:W1:-:S01] LDC.64 R20, c[0x0][0x398] ;  // d_rmap
+    [B0-----:R-:W-:-:S06] SHF.R.U32.HI R2, RZ, 0x7, R2 ;  // slot = expert
+    [B------:R-:W-:-:S06] SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, R2, 0x1, R20 ;
+    [B----4-:R-:W2:-:S01] LDG.E.64 R24, desc[UR4][R20.64] ;  // row_map[e][0:2]
+    [B--2---:R-:W-:-:S06] IADD3 R24, PT, PT, R24, 0x1, RZ ;  // -1 -> 0
+    [B------:R-:W-:-:S08] ISETP.EQ.AND P0, PT, R24, RZ, PT ;
+    [B------:R-:W-:-:S06] MOV R24, RZ ;  // dystans ISETP->@P0 >=15 cykli
+    [B------:R-:W-:-:S06] MOV R24, RZ ;  // (wzorzec kanonu: predykat late)
+    [B------:R-:W-:-:S05] @P0 EXIT ;  // ekspert pusty: caly CTA konczy
+    [B------:R-:W4:-:S01] LDCU.64 UR4, c[0x0][0x358] ;
+    [B------:R-:W5:-:S01] S2R R7, SR_TID.X ;  // tid (R7 -> bias 0x6400 po prologu)
+    [B------:R-:W0:-:S01] S2R R0, SR_CTAID.X ;  // item
+    [B------:R-:W1:-:S01] LDC.64 R12, c[0x0][0x380] ;  // d_tr
+    [B-----5:R-:W-:-:S06] SHF.R.U32.HI R5, RZ, 0x5, R7 ;  // warp (B5: tid; R5 -> k_inv po prologu)
+    [B------:R-:W-:-:S06] LOP3.LUT R9, R7, 0x1f, RZ, 0xc0, !PT ;  // lane -> R9 (scratch)
+    [B0-----:R-:W-:-:S06] SHF.R.U32.HI R3, RZ, 0x7, R0 ;  // slot = item>>7 (B0: ctaid)
+    [B------:R-:W-:-:S06] LOP3.LUT R8, R0, 0x7f, RZ, 0xc0, !PT ;  // group = item&127
+    [B------:R-:W-:-:S06] SHF.L.U32 R1, R3, 0x3, RZ ;  // slot*8
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R12, R1, 0x1, R12 ;  // B1: d_tr gotowe
+    [B----4-:R-:W2:-:S01] LDG.E.64 R12, desc[UR4][R12.64] ;  // plane base (B4: UR4)
+    // ---- per-lane stale okien (oracle: b1=(8p+257)*3, b2=b1+21) ----
+    [B------:R-:W-:-:S06] IMAD R10, R9, 0x18, RZ ;  // 24*lane
+    [B------:R-:W-:-:S06] ISETP.LT.AND P4, PT, R9, 0x18, PT ;  // P4: lane<24 (korekta src LDGSTS; #22: konsumpcja >=13 cyk)
+    [B------:R-:W-:-:S06] IADD3 R11, PT, PT, R10, 0x2f3, RZ ;  // b1-16 = 24L+755
+    [B------:R-:W-:-:S06] IADD3 R10, PT, PT, R10, 0x318, RZ ;  // b2 = 24L+792
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R11, RZ, 0x5, R11 ;  // i0 = (b1-16)>>5
+    [B------:R-:W-:-:S06] ISETP.GE.AND P3, PT, R11, 0x18, PT ;  // i0 >= 24? (WCZESNIE — #22)
+    [B------:R-:W-:-:S06] IADD3 R15, PT, PT, R10, -0x1, RZ ;  // b2-1
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R15, RZ, 0x5, R15 ;  // i2 = (b2-1)>>5
+    [B------:R-:W-:-:S06] IMAD R4, R10, -0x1, RZ ;  // -b2
+    [B------:R-:W-:-:S06] LOP3.LUT R4, R4, 0x1f, RZ, 0xc0, !PT ;  // s2 = (-b2)&31 (zawsze {0,8,16,24})
+    [B------:R-:W-:-:S06] IADD3 R19, PT, PT, R4, 0xc, RZ ;  // s2+12 (shift f2)
+    [B------:R-:W-:-:S06] IADD3 R2, PT, PT, R15, -0x18, RZ ;  // src_b = i2-24 (i2 zawsze w [24,47])
+    [B------:R-:W-:-:S06] @P3 IADD3 R11, PT, PT, R11, -0x18, RZ ;  // src_a = i0 mod 24 (@P3 po >=42 cyk — #22)
+    // baza globalna slice'ow: plane + (warp*8*6144 + group*48 + lane*2)*4
+    // lane'y 24-31: lane*2-16 (dup slow 32..47 — LDGSTS bez predykacji)
+    [B------:R-:W-:-:S06] IMAD R0, R5, 0xc000, RZ ;  // ks0*SLICE_STRIDE = warp*49152 slow
+    [B------:R-:W-:-:S06] IMAD R0, R8, 0x30, R0 ;  // + group*48
+    [B------:R-:W-:-:S06] IMAD R0, R9, 0x2, R0 ;  // + lane*2 (LDGSTS.E.64 = 2 slowa/lane)
+    [B------:R-:W-:-:S06] @!P4 IADD3 R0, PT, PT, R0, -0x10, RZ ;  // lane>=24: -16 slow (dup; P4 z ISETP >=13 cyk — #22)
+    [B------:R-:W-:-:S06] SHF.L.U32 R0, R0, 0x2, RZ ;  // slowa -> bajty
+    [B------:R-:W-:-:S02] MOV R45, 0x6000 ;  // tymczasowo: +1 slice
+    [B--2---:R-:W-:-:S06] IMAD.WIDE.U32 R12, R0, 0x1, R12 ;  // R12:13 = baza mod3=0 (slice 0; B2: plane base)
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R46, R45, 0x1, R12 ;  // R46:47 = baza mod3=1 (slice 1)
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R48, R45, 0x1, R46 ;  // R48:49 = baza mod3=2 (slice 2)
+    [B------:R-:W-:-:S02] MOV R45, 0x12000 ;  // advance = 3 slice'y (+73728 B)
+    // bazy smem-ringu: RING_OFF(0x8000) + warp*512 + ...
+    // KOLEJNOSC: LDS-a z R11(src_a) PRZED nadpisaniem R11 baza LDS-b!
+    [B------:R-:W-:-:S06] IMAD R0, R5, 0x200, RZ ;  // warp*512
+    [B------:R-:W-:-:S06] IADD3 R0, PT, PT, R0, 0x8000, RZ ;  // + RING_OFF
+    [B------:R-:W-:-:S06] SHF.L.U32 R1, R11, 0x2, RZ ;  // src_a*4 (R11=src_a)
+    [B------:R-:W-:-:S06] IADD3 R1, PT, PT, R1, R0, RZ ;  // R1 = baza LDS-a
+    [B------:R-:W-:-:S06] SHF.L.U32 R11, R2, 0x2, RZ ;  // src_b*4 (R2=src_b)
+    [B------:R-:W-:-:S06] IADD3 R11, PT, PT, R11, R0, RZ ;  // R11 = baza LDS-b
+    [B------:R-:W-:-:S06] SHF.L.U32 R10, R9, 0x3, RZ ;  // lane*8 (lane>=24 -> [192,256) = pad slotu naturalnie)
+    [B------:R-:W-:-:S06] IADD3 R10, PT, PT, R10, R0, RZ ;  // R10 = LDGSTS dst
+    // ---- adres globalny A (LDC d_a PRZED preloadami — W1 konsumowane
+    // zanim ring uzbroi bariery) ----
+    [B------:R-:W1:-:S01] LDC.64 R14, c[0x0][0x388] ;  // d_a -> PARA R14:15 (R15 NIETYKALNE do konsumpcji — LDC pisze POZNO!)
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R18, RZ, 0x2, R9 ;  // r|i = lane>>2 (R18! — R15 = hi(d_a), kolizja par = fault 700)
+    [B------:R-:W-:-:S06] LOP3.LUT R16, R9, 0x3, RZ, 0xc0, !PT ;  // cq = lane&3
+    // M=8: baza pieces per lane = d_a + slot*32768 + r*4096 +
+    //      warp*32*... UWAGA: kolumny per warp: + warp*CHUNK*32
+    [B------:R-:W-:-:S06] IMAD R17, R3, 0x8000, RZ ;  // slot*32768
+    [B------:R-:W-:-:S06] IMAD R17, R18, 0x1000, R17 ;  // + r*4096 (wiersz tokenu)
+    [B------:R-:W-:-:S06] IMAD R17, R5, 0x100, R17 ;  // + warp*256 (kolumny)
+    [B------:R-:W-:-:S06] IMAD R17, R16, 0x4, R17 ;  // + cq*4 (bajty a01)
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R50, R17, 0x1, R14 ;  // R50:51 = baza pieces (STABILNA — LDGSTS czyta pozno!)
+    // ---- preload ringu NAJPIERW (transfery leca ROWNOLEGLE ze
+    // stagingiem A — glowa CTA bez serializacji) ----
+    [B------:R-:W2:-:S01] LDGSTS.E.64 [R10+0x0], desc[UR4][R12.64] ;  // stage slice 0 -> slot 0 (W2, baza mod3=0) PRELOAD
+    [B------:R-:W3:-:S01] LDGSTS.E.64 [R10+0x100], desc[UR4][R46.64] ;  // stage slice 1 -> slot 1 (W3, baza mod3=1) PRELOAD
+    // ---- M=8: baza frag/dst + PREZERO ping-pong (wzorzec [J]) ----
+    // frag-slot 16 B/lane {a01, 0, a23, 0}; zera bajtow 4-7/12-15
+    // zyja przez caly kernel (LDGSTS pisze tylko 0-3/8-11)
+    [B------:R-:W-:-:S06] IMAD R14, R5, 0x400, RZ ;  // warp*1024
+    [B------:R-:W-:-:S06] IMAD R14, R18, 0x40, R14 ;  // + r*64
+    [B------:R-:W-:-:S06] IMAD R14, R16, 0x10, R14 ;  // + cq*16
+    [B------:R-:W-:-:S06] IADD3 R14, PT, PT, R14, 0x4000, RZ ;  // R14 = baza frag/dst (LDS.128 + LDGSTS-dst; +imm region*512)
+    [B------:R-:W-:-:S02] MOV R32, RZ ;  // quad zer do prezero STS
+    [B------:R-:W-:-:S02] MOV R33, RZ ;
+    [B------:R-:W-:-:S02] MOV R34, RZ ;
+    [B------:R-:W-:-:S02] MOV R35, RZ ;
+    [B------:R3:W-:-:S01] STS.128 [R14+0x0], R32 ;  // prezero region 0
+    [B------:R3:W-:-:S01] STS.128 [R14+0x200], R32 ;  // prezero region 1
+    [B---3--:R-:W-:-:S02] MOV R17, RZ ;  // drain rb STS (wzorzec [D])
+    [B------:R-:W1:-:S01] LDS R32, [R14+0x0] ;  // dummy: LSU-order STS->LDGSTS region 0
+    [B-1----:R-:W1:-:S01] LDS R34, [R14+0x200] ;  // dummy region 1 (chain W1)
+    [B-1----:R-:W-:-:S02] MOV R17, RZ ;  // konsumpcja fence W1
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x0], desc[UR4][R50.64+0x0] ;  // piece a01 slice 0 -> region 0 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x8], desc[UR4][R50.64+0x10] ;  // piece a23 slice 0 (W0)
+    // ---- stale dekodu MUL1 (R5/R7 skonsumowane: warp/tid martwe) ----
+    [B------:R-:W-:-:S02] MOV R6, 0x01010101 ;  // IDP ones
+    [B------:R-:W-:-:S02] MOV R7, 0x6400 ;  // bias bytesum (tid martwy)
+    [B------:R-:W-:-:S02] MOV R5, 0x1eee1eee ;  // k_inv h2 (warp martwy)
+    [B------:R-:W-:-:S02] MOV R44, 0xc931c931 ;  // k_bias h2
+    [B------:R-:W-:-:S01] MOV R28, RZ ;
+    [B------:R-:W-:-:S01] MOV R29, RZ ;
+    [B------:R-:W-:-:S01] MOV R30, RZ ;
+    [B------:R-:W-:-:S01] MOV R31, RZ ;
+    [B------:R-:W-:-:S01] MOV R32, RZ ;
+    [B------:R-:W-:-:S01] MOV R33, RZ ;
+    [B------:R-:W-:-:S01] MOV R34, RZ ;
+    [B------:R-:W-:-:S01] MOV R35, RZ ;
+    [B------:R-:W-:-:S01] MOV R36, RZ ;
+    [B------:R-:W-:-:S01] MOV R37, RZ ;
+    [B------:R-:W-:-:S01] MOV R38, RZ ;
+    [B------:R-:W-:-:S01] MOV R39, RZ ;
+    [B------:R-:W-:-:S01] MOV R40, RZ ;
+    [B------:R-:W-:-:S01] MOV R41, RZ ;
+    [B------:R-:W-:-:S01] MOV R42, RZ ;
+    [B------:R-:W-:-:S01] MOV R43, RZ ;
+
+    // ---- prime: para LDS tile'a 0 (czeka slot 0 ringu) ----
+    [B--2---:R-:W4:-:S01] LDS R2, [R11+0x0] ;  // b-slowo tile j=0 (B2: slot 0)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x0] ;  // a-slowo tile j=0
+
+    // ======== k-slice i=0 ========
+    // -- tile j=0 (slice 0, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x0] ;  // A-frag slice 0: region 0 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x60] ;  // b-slowo tile j=1
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x60] ;  // a-slowo tile j=1
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x200], desc[UR4][R50.64+0x20] ;  // piece a01 slice 1 -> region 1 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x208], desc[UR4][R50.64+0x30] ;  // piece a23 slice 1 (W0)
+    // -- tile j=1 (slice 0, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B---3--:R-:W4:-:S01] LDS R2, [R11+0x100] ;  // b-slowo tile j=2 (B3: slot 1)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x100] ;  // a-slowo tile j=2
+    [B------:R-:W2:-:S04] LDGSTS.E.64 [R10+0x0], desc[UR4][R48.64] ;  // stage slice 2 -> slot 0 (W2, baza mod3=2)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=1 ========
+    // -- tile j=2 (slice 1, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x200] ;  // A-frag slice 1: region 1 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x160] ;  // b-slowo tile j=3
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x160] ;  // a-slowo tile j=3
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x0], desc[UR4][R50.64+0x40] ;  // piece a01 slice 2 -> region 0 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x8], desc[UR4][R50.64+0x50] ;  // piece a23 slice 2 (W0)
+    // -- tile j=3 (slice 1, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B--2---:R-:W4:-:S01] LDS R2, [R11+0x0] ;  // b-slowo tile j=4 (B2: slot 0)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x0] ;  // a-slowo tile j=4
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R12, R45, 0x1, R12 ;  // advance bazy mod3=0 +73728 B (3 slice'y; poprzednie uzycie skonsumowane wait'em slotu)
+    [B------:R-:W3:-:S01] LDGSTS.E.64 [R10+0x100], desc[UR4][R12.64] ;  // stage slice 3 -> slot 1 (W3, baza mod3=0)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=2 ========
+    // -- tile j=4 (slice 2, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x0] ;  // A-frag slice 2: region 0 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x60] ;  // b-slowo tile j=5
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x60] ;  // a-slowo tile j=5
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x200], desc[UR4][R50.64+0x60] ;  // piece a01 slice 3 -> region 1 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x208], desc[UR4][R50.64+0x70] ;  // piece a23 slice 3 (W0)
+    // -- tile j=5 (slice 2, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B---3--:R-:W4:-:S01] LDS R2, [R11+0x100] ;  // b-slowo tile j=6 (B3: slot 1)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x100] ;  // a-slowo tile j=6
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R46, R45, 0x1, R46 ;  // advance bazy mod3=1 +73728 B (3 slice'y; poprzednie uzycie skonsumowane wait'em slotu)
+    [B------:R-:W2:-:S01] LDGSTS.E.64 [R10+0x0], desc[UR4][R46.64] ;  // stage slice 4 -> slot 0 (W2, baza mod3=1)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=3 ========
+    // -- tile j=6 (slice 3, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x200] ;  // A-frag slice 3: region 1 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x160] ;  // b-slowo tile j=7
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x160] ;  // a-slowo tile j=7
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x0], desc[UR4][R50.64+0x80] ;  // piece a01 slice 4 -> region 0 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x8], desc[UR4][R50.64+0x90] ;  // piece a23 slice 4 (W0)
+    // -- tile j=7 (slice 3, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B--2---:R-:W4:-:S01] LDS R2, [R11+0x0] ;  // b-slowo tile j=8 (B2: slot 0)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x0] ;  // a-slowo tile j=8
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R48, R45, 0x1, R48 ;  // advance bazy mod3=2 +73728 B (3 slice'y; poprzednie uzycie skonsumowane wait'em slotu)
+    [B------:R-:W3:-:S01] LDGSTS.E.64 [R10+0x100], desc[UR4][R48.64] ;  // stage slice 5 -> slot 1 (W3, baza mod3=2)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=4 ========
+    // -- tile j=8 (slice 4, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x0] ;  // A-frag slice 4: region 0 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x60] ;  // b-slowo tile j=9
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x60] ;  // a-slowo tile j=9
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x200], desc[UR4][R50.64+0xa0] ;  // piece a01 slice 5 -> region 1 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x208], desc[UR4][R50.64+0xb0] ;  // piece a23 slice 5 (W0)
+    // -- tile j=9 (slice 4, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B---3--:R-:W4:-:S01] LDS R2, [R11+0x100] ;  // b-slowo tile j=10 (B3: slot 1)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x100] ;  // a-slowo tile j=10
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R12, R45, 0x1, R12 ;  // advance bazy mod3=0 +73728 B (3 slice'y; poprzednie uzycie skonsumowane wait'em slotu)
+    [B------:R-:W2:-:S01] LDGSTS.E.64 [R10+0x0], desc[UR4][R12.64] ;  // stage slice 6 -> slot 0 (W2, baza mod3=0)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=5 ========
+    // -- tile j=10 (slice 5, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x200] ;  // A-frag slice 5: region 1 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x160] ;  // b-slowo tile j=11
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x160] ;  // a-slowo tile j=11
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x0], desc[UR4][R50.64+0xc0] ;  // piece a01 slice 6 -> region 0 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x8], desc[UR4][R50.64+0xd0] ;  // piece a23 slice 6 (W0)
+    // -- tile j=11 (slice 5, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B--2---:R-:W4:-:S01] LDS R2, [R11+0x0] ;  // b-slowo tile j=12 (B2: slot 0)
+    [B------:R-:W5:-:S01] LDS R3, [R1+0x0] ;  // a-slowo tile j=12
+    [B------:R-:W-:-:S06] IMAD.WIDE.U32 R46, R45, 0x1, R46 ;  // advance bazy mod3=1 +73728 B (3 slice'y; poprzednie uzycie skonsumowane wait'em slotu)
+    [B------:R-:W3:-:S01] LDGSTS.E.64 [R10+0x100], desc[UR4][R46.64] ;  // stage slice 7 -> slot 1 (W3, baza mod3=1)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=6 ========
+    // -- tile j=12 (slice 6, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x0] ;  // A-frag slice 6: region 0 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x60] ;  // b-slowo tile j=13
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x60] ;  // a-slowo tile j=13
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    [B------:R-:W1:-:S01] LDGSTS.E [R14+0x200], desc[UR4][R50.64+0xe0] ;  // piece a01 slice 7 -> region 1 (W1)
+    [B------:R-:W0:-:S01] LDGSTS.E [R14+0x208], desc[UR4][R50.64+0xf0] ;  // piece a23 slice 7 (W0)
+    // -- tile j=13 (slice 6, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B---3--:R-:W4:-:S01] LDS R2, [R11+0x100] ;  // b-slowo tile j=14 (B3: slot 1)
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x100] ;  // a-slowo tile j=14
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== k-slice i=7 ========
+    // -- tile j=14 (slice 7, t=0)
+    [B01----:R-:W0:-:S01] LDS.128 R24, [R14+0x200] ;  // A-frag slice 7: region 1 (B0/B1: pieces)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S01] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W4:-:S01] LDS R2, [R11+0x160] ;  // b-slowo tile j=15
+    [B------:R-:W5:-:S05] LDS R3, [R1+0x160] ;  // a-slowo tile j=15
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B0-----:R-:W-:-:S07] HMMA.16816.F32 R32, R24, R22, R32 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=0
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R28, R24, R20, R28 ;  // HMMA1 n0-7
+    // -- tile j=15 (slice 7, t=1)
+    [B----45:R-:W-:-:S01] SHF.R.U64 R8, R2, R4, R3 ;  // f1 = (a:b)>>s2 (B4/B5: para LDS)
+    [B------:R-:W-:-:S07] SHF.R.U64 R9, R2, R19, R3 ;  // f2 = (a:b)>>(s2+12)
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R8 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R8 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R8, 0x10 ;  // w7 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w6
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w5
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w4
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R23, R16, 0x5410, R15 ;  // pack w6w7 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R22, R18, 0x5410, R17 ;  // pack w4w5 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R23, R23, R5, R44 ;  // hd w6w7 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R22, R22, R5, R44 ;  // hd w4w5 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R16, RZ, 0x3, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R17, RZ, 0x6, R9 ;
+    [B------:R-:W-:-:S01] SHF.R.U32.HI R18, RZ, 0x9, R9 ;
+    [B------:R-:W-:-:S03] SGXT.U32 R15, R9, 0x10 ;  // w3 (funnel-direct)
+    [B------:R-:W-:-:S01] SGXT.U32 R16, R16, 0x10 ;  // w2
+    [B------:R-:W-:-:S01] SGXT.U32 R17, R17, 0x10 ;  // w1
+    [B------:R-:W-:-:S01] SGXT.U32 R18, R18, 0x10 ;  // w0
+    [B------:R-:W-:-:S03] IMAD R15, R15, 0x83dcd12d, RZ ;  // v = w*MUL1
+    [B------:R-:W-:-:S01] IMAD R16, R16, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R17, R17, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S01] IMAD R18, R18, 0x83dcd12d, RZ ;
+    [B------:R-:W-:-:S03] IDP.4A.U8.U8 R15, R15, R6, R7 ;  // s = bytesum(v)+0x6400
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R16, R16, R6, R7 ;
+    [B------:R-:W-:-:S01] IDP.4A.U8.U8 R17, R17, R6, R7 ;
+    [B------:R-:W-:-:S04] IDP.4A.U8.U8 R18, R18, R6, R7 ;
+    [B------:R-:W-:-:S02] PRMT R21, R16, 0x5410, R15 ;  // pack w2w3 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S04] PRMT R20, R18, 0x5410, R17 ;  // pack w0w1 = {lo16 ev, lo16 od}
+    [B------:R-:W-:-:S02] HFMA2 R21, R21, R5, R44 ;  // hd w2w3 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S01] HFMA2 R20, R20, R5, R44 ;  // hd w0w1 = h2*k_inv + k_bias
+    [B------:R-:W-:-:S07] HMMA.16816.F32 R40, R24, R22, R40 ;  // HMMA2 n8-15 (B0: A-LDS.128) t=1
+    [B------:R-:W-:-:S06] HMMA.16816.F32 R36, R24, R20, R36 ;  // HMMA1 n0-7
+
+    // ======== fold C-reg(fp32) -> sh_red[warp][r][col] (FROZEN) ========
+    // R5/R7 zajete w petli -> tid/warp/cq PRZELICZONE z S2R [D]
+    [B------:R-:W1:-:S01] S2R R20, SR_TID.X ;  // tid (W1 reuse)
+    [B-1----:R-:W-:-:S06] SHF.R.U32.HI R21, RZ, 0x5, R20 ;  // warp (B1: S2R)
+    [B------:R-:W-:-:S06] LOP3.LUT R0, R20, 0x3, RZ, 0xc0, !PT ;  // cq = tid&3
+    [B------:R-:W-:-:S06] IMAD R2, R21, 0x400, RZ ;  // warp*1024
+    [B------:R-:W-:-:S06] LOP3.LUT R3, R20, 0x1f, RZ, 0xc0, !PT ;  // lane
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R3, RZ, 0x2, R3 ;  // r = lane>>2 (wiersz tokenu)
+    [B------:R-:W-:-:S06] IMAD R2, R3, 0x80, R2 ;  // + r*128
+    [B------:R-:W-:-:S06] SHF.L.U32 R3, R0, 0x3, RZ ;  // 2cq*4
+    [B------:R-:W-:-:S06] IADD3 R2, PT, PT, R2, R3, RZ ;
+    [B------:R3:W-:-:S04] STS.64 [R2+0x0], R28 ;  // t=0 f=0
+    [B------:R3:W-:-:S04] STS.64 [R2+0x20], R32 ;  // t=0 f=1
+    [B------:R3:W-:-:S04] STS.64 [R2+0x40], R36 ;  // t=1 f=0
+    [B------:R3:W-:-:S04] STS.64 [R2+0x60], R40 ;  // t=1 f=1
+    [B------:R-:W-:-:S06] ISETP.GT.AND P3, PT, R21, 0x7, PT ;  // P3: warp > 7 (early-exit po BAR)
+    [B---3--:R-:W-:-:S02] MOV R0, RZ ;  // drain read-bariery STS przed BAR
+    [B------:R-:W-:Y:S06] BAR.SYNC.DEFER_BLOCKING 0x0 ;  // footgun #13: ZAWSZE Y:S06
+    [B------:R-:W-:-:S05] @P3 EXIT ;  // warpy 1..15: fold oddany, redukcja = warp 0
+
+    // ======== redukcja: 256 wynikow, tid<256 sumuje 16 warpow (FROZEN) ========
+    [B------:R-:W-:-:S08] ISETP.LT.AND P1, PT, R20, 0x100, PT ;  // P1: tid<32 (dystans do @P1 >=15)
+    [B------:R-:W-:-:S06] SHF.L.U32 R23, R20, 0x2, RZ ;  // col*4 = tid*4
+    [B------:R-:W-:-:S06] MOV R22, RZ ;  // suma fp32
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x0] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0xc00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1000] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x1c00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2000] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x2c00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3000] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3400] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3800] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    [B------:R-:W0:-:S02] @P1 LDS R24, [R23+0x3c00] ;
+    [B0-----:R-:W-:-:S04] @P1 FADD R22, R22, R24 ;
+    // c_out = d_c + slot*65536 + r*8192 + group*64 + c*2 (item z S2R)
+    [B------:R-:W5:-:S01] S2R R18, SR_CTAID.X ;  // item (W5 reuse)
+    [B------:R-:W4:-:S01] LDC.64 R16, c[0x0][0x390] ;  // d_c (W4 reuse)
+    [B-----5:R-:W-:-:S06] SHF.R.U32.HI R19, RZ, 0x7, R18 ;  // slot (B5: S2R)
+    [B------:R-:W-:-:S06] LOP3.LUT R18, R18, 0x7f, RZ, 0xc0, !PT ;  // group
+    [B------:R-:W-:-:S06] IMAD R0, R19, 0x10000, RZ ;  // slot*65536
+    [B------:R-:W-:-:S06] IMAD R0, R18, 0x40, R0 ;  // + group*64
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R21, RZ, 0x5, R20 ;  // r = tid>>5 (tid<256)
+    [B------:R-:W-:-:S06] IMAD R0, R21, 0x2000, R0 ;  // + r*8192
+    [B------:R-:W-:-:S06] LOP3.LUT R21, R20, 0x1f, RZ, 0xc0, !PT ;  // c = tid&31
+    [B------:R-:W-:-:S06] SHF.L.U32 R21, R21, 0x1, RZ ;  // c*2
+    [B------:R-:W-:-:S06] IADD3 R0, PT, PT, R0, R21, RZ ;
+    [B----4-:R-:W-:-:S06] IMAD.WIDE.U32 R16, R0, 0x1, R16 ;  // B4: d_c gotowe
+    [B------:R-:W4:-:S06] F2F.F16.F32 R22, R22 ;  // fp32->fp16 (variable latency)
+    [B----4-:R3:W-:-:S01] @P1 STG.E.U16 desc[UR4][R16.64], R22 ;  // B4: F2F; R3 read-bar
+    [B---3--:R-:W-:-:S02] MOV R0, RZ ;  // drain przed EXIT
+    [B------:R-:W-:-:S05] EXIT ;
+    [B------:R-:W-:-:S05] BRA 0x0 ;
+.endentry
