@@ -157,6 +157,43 @@ by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, determi
 | `moe_w4_mm_k6144_a32.cubin` | `moe_w4_mm_k6144_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
 | `moe_w4_mm_k7168_a32.cubin` | `moe_w4_mm_k7168_a32.sass` | `moe_w4_mm` | FP4 delta GEMM, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
 | `moe_w4_mm_k8192_a32.cubin` | `moe_w4_mm_k8192_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=8192** (dense wo_b — dense‑FP4 PoC, pairs=1 desc) |
+| `moe_w4_mm_k3584_a32.cubin` | `moe_w4_mm_k3584_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=3584** (latent gate‑up — **Kimi‑K3 native**), **NWARP=7** |
+| `moe_w4_mm_k384_a32.cubin` | `moe_w4_mm_k384_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=384** (w2 @ inter 3072 TP8 — **Kimi‑K3 native**), **NWARP=3** |
+| `moe_w4_mm_k768_a32.cubin` | `moe_w4_mm_k768_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=768** (w2 @ inter 3072 **TP4** — Kimi‑K3), **NWARP=3** |
+
+### Kimi‑K3 TP4 set (2026‑07‑31, session N) — K=768 family
+
+K3 under **TP4** shards the w2 contraction to **K=768** (w13 stays K=3584;
+per‑rank geometry `1536,3584,3584,768` — the glue's N13/2 == K2 invariant
+holds natively). Full `_a32` family shipped: `moe_w2_mm_k768_a32`,
+`moe_w2_mm_mc4_k768_a32`, `moe_w2_mm_mc4afrag_k768_a32`,
+`moe_w4_mm_k768_a32`. NWARP=3 (KSLICE=256; same non‑pow2 NTHR=96 class as
+k384 — generator tail‑pass fix applies). Validated on RTX 5090: op‑level
+worst_rel ≤3.5e‑3 deterministic (w2 MC1/MC4, w4), AFRAG bit‑exact vs mc4
+0/48; existing k3584 cubins re‑checked at the TP4 w13 shape N=1536 (PASS).
+Serving needs `VLLM_MOE_W2_KS=...,3584,384,768` and TP4‑sharded packs
+(`k3_build_packs.py --tp 4`).
+
+### Kimi‑K3 native set (2026‑07‑29, session K) — kills the +52% padding tax
+
+K3's native per‑rank TP8 geometry is `N13=768, K13=3584, N2=3584, K2=384`
+(vs the bring‑up packs zero‑padded to `1024,4096,4096,512`). The full `_a32`
+family ships for both new Ks: `moe_w2_mm_k{3584,384}_a32`,
+`moe_w2_mm_mc4_k{3584,384}_a32`, `moe_w2_mm_mc4afrag_k{3584,384}_a32`,
+`moe_w4_mm_k{3584,384}_a32`. **These are the first non‑pow2 split‑K
+geometries** (K=3584 → 28 k128 blocks → NWARP=7; K=384 → NWARP=3): the
+generators' epilogue slot‑pass loop (`range(0,256,NTHR)`) previously
+over‑ranged past the 256 reduce slots on the tail pass (OOB smem reads +
+stores into the next n‑block's columns) — fixed in `gen_moe_w2.py` /
+`gen_moe_w4.py` by an unconditional slot clamp (`AND 0xff`) + a tid store
+guard on overflowing passes only; pow2 regens stay **byte‑identical**
+(verified k512 w2+w4). Validation: op‑level checks at both native shapes
+(`moe_w2_check`/`moe_w4_check` worst_rel ≤3.8e‑3, deterministic; AFRAG
+bit‑exact vs mc4 0/96) + real‑weight K3 parity at native geometry
+(`kimi-k3-analysis/k3_parity_native.py`: silu 1.743e‑02/0.999926, SiTU
+2.453e‑02/0.999839, exact‑FP4 1.976e‑02/0.999928 — identical to the padded
+run) + full‑model golden battery vs B300 (bit‑identical PASS). Serving
+needs `VLLM_MOE_W2_KS=7168,6144,4096,2048,1024,512,3584,384`.
 
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
