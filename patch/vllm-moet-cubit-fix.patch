@@ -1,4 +1,3 @@
-diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 --- a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 @@ -33,6 +33,8 @@
@@ -54,7 +53,7 @@ diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vll
          _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
                          sc13, cached["fp2"].view(E, -1), sc2)
      _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
-@@ -1631,7 +1653,25 @@
+@@ -1631,7 +1652,25 @@
              return
          # GPU-resident: materialize the planes from the planes cache
          # (probed at create time; a miss here means the cache dir changed
@@ -81,7 +80,7 @@ diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vll
          if not _consume_planes_cache(
                  layer, layer_key, dev, E, N13, K13, N2, K2):
              raise RuntimeError(
-@@ -1666,6 +1706,22 @@
+@@ -1666,6 +1705,22 @@
      # above: the cache serves GPU-RESIDENT plane configs (planes must be
      # materialized), the pack store serves host-resident tiers (planes
      # never materialize).
@@ -104,10 +103,11 @@ diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vll
      if _consume_planes_cache(layer, layer_key, dev, E, N13, K13, N2, K2):
          return
      from vllm.model_executor.layers.quantization.utils import (
-@@ -3782,6 +3838,84 @@
+@@ -3782,6 +3837,84 @@
      return enabled() and _ensure_ready()
  
  
++
 +# ===== Parallel deferred-build queue =========================================
 +def _moe_w2_build_dispatch(layer, key):
 +    """Dispatch a single layer to its 2-bit builder by checkpoint format.
@@ -188,7 +188,7 @@ diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vll
  def shutdown() -> None:
      """Release model-owned registries/workspaces while retaining cubin modules."""
      global _n_created, _skip_logged, _stream_logged
-@@ -3798,4 +3932,7 @@
+@@ -3798,4 +3931,7 @@
      _stream_logged = False
      _cutoff_cache = None
      _resident_fit_checked = False
