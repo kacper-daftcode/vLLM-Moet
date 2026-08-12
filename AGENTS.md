@@ -25,7 +25,7 @@ WILL be erased by somebody's next regeneration.
 | repo | path | branch | role |
 |---|---|---|---|
 | **vLLM-Moet** (this one, public) | `/workspace/vllm-moet` | `main` | publication: generated patch, kernels + cubins, bench system, docs |
-| **vllm fork clone** | `/workspace/vllm-v0.24.0` | `moet-v0.24.0` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm`, `origin` = `vllm-project/vllm` |
+| **vllm fork clone** | `/workspace/vllm-v0.24.0` | `moet-v0.24.0` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm-tmp` (standalone — the old GitHub fork `kacper-daftcode/vllm` was deleted, replaced 2026-08-10), `origin` = `vllm-project/vllm` |
 
 `/root/workspace` used to be a symlink to `/workspace`; it was **removed
 2026-08-07** (IDE workspace scans followed it into 4.3 TB and choked the
