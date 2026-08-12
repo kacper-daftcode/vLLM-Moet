@@ -1,0 +1,198 @@
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
+--- a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
+@@ -33,6 +33,8 @@
+ import ctypes
+ import functools
+ import os
++import gc
++import concurrent.futures as _cf
+ 
+ import torch
+ 
+@@ -151,6 +153,15 @@
+ _LAYERS: dict[int, dict] = {}
+ _WS: dict = {}                  # shared workspaces, sized lazily
+ 
++# Deferred-build queue for the outer loader loop: planes-cache-hit layers
++# are enqueued here and built by build_layer_planes_batch in parallel.
++_BATCH_SIZE = int(os.getenv("VLLM_MOE_W2_BUILD_BATCH_SIZE", "12"))
++_BATCH_PENDING: list = []
++_BATCH_EXPECTED = 0
++# Keys owned by an active parallel batch: builders consume them directly
++# instead of re-queueing (prevents recursive re-fire during batch workers).
++_BATCH_ASSIGNED: set = set()
++
+ # ---- adaptive expert top-p (VLLM_MOE_W2_TOPP, colibri's --topp) ----------
+ # Keep each token's routed experts only up to cumulative router weight p:
+ # the tail of the top-k carries little output mass but full fetch/compute
+@@ -1572,15 +1583,25 @@
+     if not planes_cache.enabled() or lidx is None:
+         return False
+     tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++    # The delta pack already holds this layer's FP4 planes (persistent
++    # quant cache); add_layer on the store will no-op. Skip reading
++    # fp13/fp2 from the planes cache -- that 1.25 GiB/layer read is waste
++    # on every warm boot (~55 GiB over 44 layers).
++    delta_present = False
++    if tier is not None:
++        from vllm.model_executor.layers.quantization.utils.moe_w2_store import (
++            pack_has_layer)
++        delta_present = pack_has_layer(
++            "delta", layer_key, _layer_cutoff() + 1, E, tier.slot_bytes)
+     cached = planes_cache.try_load(lidx, planes_cache.expected_sizes(
+-        E, N13, K13, N2, K2, want_fp4=tier is not None))
++        E, N13, K13, N2, K2, want_fp4=tier is not None and not delta_present))
+     if cached is None:
+         return False
+     planes13 = cached["planes13"].view(E, -1).to(dev)
+     sc13 = cached["sc13"].view(E, -1).to(dev)
+     planes2 = cached["planes2"].view(E, -1).to(dev)
+     sc2 = cached["sc2"].view(E, -1).to(dev)
+-    if tier is not None:
++    if tier is not None and not delta_present:
+         _stage_fp4_host(tier, layer_key, cached["fp13"].view(E, -1),
+                         sc13, cached["fp2"].view(E, -1), sc2)
+     _finish_layer(layer, layer_key, dev, planes13, sc13, planes2,
+@@ -1631,7 +1653,25 @@
+             return
+         # GPU-resident: materialize the planes from the planes cache
+         # (probed at create time; a miss here means the cache dir changed
+-        # under a live load).
++        # under a live load). Cache-hit layers defer to the parallel batch
++        # so the 44 planes-cache reads run concurrently instead of
++        # one-at-a-time (queue_deferred_build fires build_layer_planes_batch).
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_planes_cache as _pc2)
++        lidx = _pc2.layer_idx_from_name(getattr(layer, "layer_name", ""))
++        if _pc2.enabled() and lidx is not None and _pc2.cache_has_layer(
++                lidx, _pc2.expected_sizes(
++                    E, N13, K13, N2, K2, want_fp4=False)):
++            if layer_key in _BATCH_ASSIGNED:
++                if not _consume_planes_cache(
++                        layer, layer_key, dev, E, N13, K13, N2, K2):
++                    raise RuntimeError(
++                        f"moe_w2: layer {layer_key} lacked planes-cache "
++                        "files under an assigned parallel batch; restart "
++                        "after checking VLLM_MOE_W2_PLANES_CACHE")
++                return
++            queue_deferred_build(layer, layer_key, _layer_cutoff() + 1)
++            return
+         if not _consume_planes_cache(
+                 layer, layer_key, dev, E, N13, K13, N2, K2):
+             raise RuntimeError(
+@@ -1666,6 +1706,22 @@
+     # above: the cache serves GPU-RESIDENT plane configs (planes must be
+     # materialized), the pack store serves host-resident tiers (planes
+     # never materialize).
++    from vllm.model_executor.layers.quantization.utils import (
++        moe_w2_planes_cache as _pc2)
++    lidx = _pc2.layer_idx_from_name(getattr(layer, "layer_name", ""))
++    if _pc2.enabled() and lidx is not None and _pc2.cache_has_layer(
++            lidx, _pc2.expected_sizes(
++                E, N13, K13, N2, K2, want_fp4=False)):
++        if layer_key in _BATCH_ASSIGNED:
++            if not _consume_planes_cache(
++                    layer, layer_key, dev, E, N13, K13, N2, K2):
++                raise RuntimeError(
++                    f"moe_w2: layer {layer_key} lacked planes-cache "
++                    "files under an assigned parallel batch; restart "
++                    "after checking VLLM_MOE_W2_PLANES_CACHE")
++            return
++        queue_deferred_build(layer, layer_key, _layer_cutoff() + 1)
++        return
+     if _consume_planes_cache(layer, layer_key, dev, E, N13, K13, N2, K2):
+         return
+     from vllm.model_executor.layers.quantization.utils import (
+@@ -3782,6 +3838,84 @@
+     return enabled() and _ensure_ready()
+ 
+ 
++# ===== Parallel deferred-build queue =========================================
++def _moe_w2_build_dispatch(layer, key):
++    """Dispatch a single layer to its 2-bit builder by checkpoint format.
++
++    NVFP4 (modelopt) layers carry scale_2 and pack as u8+e4m3+e4m3.
++    FP8 block-quant layers carry weight_scale_inv and pack from fp8.
++    Everything else (mxfp4) uses the default mxfp4 path.
++    """
++    if hasattr(layer, "w13_weight_scale_2"):
++        return build_layer_planes_nvfp4(layer, key)
++    if hasattr(layer, "w13_weight_scale_inv"):
++        return build_layer_planes_fp8(layer, key)
++    return build_layer_planes(layer, key)
++
++
++def build_layer_planes_batch(layers):
++    """Build a batch of W2 layers in parallel (planes-cache HIT path).
++
++    Each worker owns a disjoint layer-key space: _finish_layer/_LAYERS[]
++    writes are key-exclusive, planes-cache store() is a background thread,
++    and FP4 delta staging is serialized through _STAGE_LOCK.
++
++    Returns the number of layers actually built (cache-hit layers are
++    no-ops but still consume their key).
++    """
++    if not layers:
++        return 0
++    with _cf.ThreadPoolExecutor(
++            max_workers=int(os.getenv("VLLM_MOE_W2_BUILD_WORKERS", "4")),
++            thread_name_prefix="moe-w2-build") as pool:
++        futures = [pool.submit(_moe_w2_build_dispatch, layer, key)
++                   for layer, key in layers]
++        built = 0
++        for fut in _cf.as_completed(futures):
++            fut.result()  # propagate builder errors immediately
++            built += 1
++    # Flush all worker staging buffers before releasing memory.
++    torch.cuda.synchronize()
++    torch.cuda.empty_cache()
++    return built
++
++
++def queue_deferred_build(layer, key: int, expected_total: int) -> None:
++    """Queue a layer for the parallel builder and fire in chunks.
++
++    Returns immediately if the layer was already built (stream-build or
++    pack-skip), leaving the caller to only record the key. Otherwise the
++    layer is appended to the batch. Full batches fire the parallel builder
++    with memory recovery between layers; the final batch builds serially
++    to avoid staging peak overlap.
++    """
++    global _BATCH_EXPECTED
++    if key in _LAYERS or key in _BATCH_PENDING or key in _BATCH_ASSIGNED:
++        return
++    if not expected_total:
++        return
++    _BATCH_EXPECTED = max(_BATCH_EXPECTED, expected_total)
++    _BATCH_PENDING.append((layer, key))
++    # Tolerate 1-2 pack-skip layers that never queue
++    is_final = len(_LAYERS) + len(_BATCH_PENDING) >= expected_total - 2
++    if len(_BATCH_PENDING) >= _BATCH_SIZE or is_final:
++        batch = [(l, k) for l, k in _BATCH_PENDING]
++        _BATCH_PENDING.clear()
++        _BATCH_ASSIGNED.update(k for _, k in batch)
++        try:
++            if is_final and len(batch) < _BATCH_SIZE:
++                # Final/short batch: serial to avoid staging peak overlap
++                for layer, key in batch:
++                    _moe_w2_build_dispatch(layer, key)
++                    gc.collect()
++                    torch.cuda.empty_cache()
++            else:
++                build_layer_planes_batch(batch)
++        finally:
++            _BATCH_ASSIGNED.difference_update(k for _, k in batch)
++
++
+ def shutdown() -> None:
+     """Release model-owned registries/workspaces while retaining cubin modules."""
+     global _n_created, _skip_logged, _stream_logged
+@@ -3798,4 +3932,7 @@
+     _stream_logged = False
+     _cutoff_cache = None
+     _resident_fit_checked = False
++    _BATCH_PENDING.clear()
++    _BATCH_ASSIGNED.clear()
++    _BATCH_EXPECTED = 0
+     ready.cache_clear()
