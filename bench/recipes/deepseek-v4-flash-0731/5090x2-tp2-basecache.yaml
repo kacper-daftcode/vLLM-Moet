@@ -1,0 +1,83 @@
+id: deepseek-v4-flash-0731/5090x2-tp2-basecache
+model: DeepSeek-V4-Flash-0731
+served_name: deepseek-v4-flash
+summary: "2x RTX 5090 TP2 - host-resident base, GPU expert cache, 128k window (0731, no spec)"
+
+requires:
+  gpus: 2
+  vram_gb: 32
+  host_ram_gb: 96
+
+context: 131072
+load_timeout_s: 3600
+
+# 0731 MIGRATION (2026-08-12) of deepseek-v4-flash/5090x2-tp2-basecache.
+# HONEST STATUS: this is the best-effort PERF cell on this hardware, not
+# a certified native-parity one. Resident planes need 36.4 GiB/rank and
+# cannot fit a 32 GB card, so the base lives in host RAM and the GPU is
+# an expert cache; on the old revision this cell measured GSM8K 95.0
+# (-2 pp = base-coverage ceiling) with GPQA NT at parity edge (ns). The
+# native-parity option on 2x 5090 remains the exact layer-stream lane
+# (deepseek-v4-flash/5090x2-exact: parity certified, 131k, ~4.8 tok/s).
+#
+# Changes vs the old cell:
+#   - spec: MTP-1 -> NONE, forced by a runner split (measured 2026-08-12):
+#     DSpark is V2-model-runner-only (config/vllm.py forces V2 for
+#     method=dspark) while the base-cache mandatory replay loop is
+#     V1-only - moe_w2_cubit._layer_contract fails closed on
+#     BASE_CACHE_GB under V2 ("a pool miss would be a silent quality
+#     corruption"). Until the replay loop is ported to V2, host-resident
+#     cells serve no-spec. (The old spec-drift finding stands anyway:
+#     streamed-base cells amplify verify-batch KV noise.)
+#   - window: 32k -> 131072 TARGET (boot-validate). MLA KV at 131k is
+#     ~1-2 GiB/rank - the VRAM at util 0.95 (30.4 GiB) holds base 14 +
+#     delta 1 + dense/drafter ~5 + KV with margin. Spare VRAM should go
+#     to BASE_CACHE_GB (coverage is the quality/throughput KPI here):
+#     14 -> 16 -> 18 is the tuning axis, watch the [base] replay KPI.
+#   - persistent packs (STORE_DIR) added: later boots skip the requant.
+# Quality on 0731 TO BE measured by the runner (paired vs 0731 anchors).
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}/planes-ds4-tp2"
+  VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs-ds4"
+  VLLM_MOE_W2_BASE_CACHE_GB: "14"
+  VLLM_MOE_W2_DELTA_GB: "1"
+  VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "64"
+  VLLM_MOE_W2_FORCE_POOL: "1"
+  VLLM_MOE_W2_REPLAY_MODE: "approximate"
+  VLLM_MOE_W2_GATE_SPEC_MASK: "1"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.95
+  - --max-num-batched-tokens 512
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 8
+
+suite_params:
+  decode:
+    runs: 7
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [6000, 90000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2"]
+  axes:
+    - kind: env
+      name: VLLM_MOE_W2_BASE_CACHE_GB
+      values: ["14", "16", "18"]

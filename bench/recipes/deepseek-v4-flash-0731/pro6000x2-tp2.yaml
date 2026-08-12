@@ -1,0 +1,86 @@
+id: deepseek-v4-flash-0731/pro6000x2-tp2
+model: DeepSeek-V4-Flash-0731
+served_name: deepseek-v4-flash
+summary: "2x RTX PRO 6000 TP2 - native-parity target at the 128k window (0731 + DSpark)"
+
+requires:
+  gpus: 2
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 2400
+
+# 0731 MIGRATION (2026-08-12) of the proven max-quality geometry. The
+# pre-0731 family (bench/recipes/deepseek-v4-flash/) pins the superseded
+# preview revision 6976c7ff whose MTP head does not exist on 0731 (boot
+# KeyError model.layers.43.mtp_block.*): 0731 ships the DSpark speculative
+# module instead (config: dspark_block_size 5, target_layer_ids [40,41,42],
+# markov_rank 256; num_speculative_tokens 1..7).
+#
+# Geometry is carried 1:1 from deepseek-v4-flash/pro6000x2-tp2-maxq, the
+# only cell boot-proven at the full 131k window with the gate uncapped
+# (delta 34 GiB quintal SPLIT = 2692 slots >= the k=2 fire floor
+# 43L x top-6 x (1+2) x 1.7 x 2 seqs; tau 0.60 re-certified GREEN on the
+# old revision at this exact window). DSpark k=2 keeps the verify batch
+# T=3/seq of the MTP-2 anchor arithmetic, so the fire floor transfers
+# unchanged. Raising k raises the floor by (1+k)/3: k=3 needs ~45 GiB
+# SPLIT (fits this card pair), k=7 needs ~91 GiB (does not) - only move
+# k with the pool.
+#
+# Quality on 0731 is TO BE measured by the runner against the 0731 anchors
+# below (manual anchors landed 2026-08-12, commit 0572785; revision itself
+# measured accuracy-neutral, GPQA reasoning ~2x longer). The old-revision
+# record of this geometry: GSM8K 191/200 vs 194 (p=0.25), GPQA NT 145/198
+# vs 147 (p=0.84), 149.6 tok/s C=1 at tau 0.60.
+#
+# DISK, first boot: the planes cache key includes the split mode
+# (fp4_split="w4q"), so a plane tree built non-split CANNOT be reused
+# here - the first split boot quantizes from scratch and writes its own
+# tree (~100 GiB/rank planes + ~45 GiB/rank delta packs; transients on
+# top). Point {planes_cache} at a filesystem with >=300 GiB free or the
+# load dies mid-write with ENOSPC (measured 2026-08-12 on a 94%-full
+# store volume).
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}/planes-ds4-tp2"
+  VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs-ds4"
+  VLLM_MOE_W2_DELTA_GB: "34"
+  VLLM_MOE_W2_DELTA_SPLIT: "1"
+  VLLM_MOE_W2_GATE: "1"
+  VLLM_MOE_W2_GATE_TAU: "0.60"
+  VLLM_MOE_W2_GATE_MAX_PROMOTE: "0"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 2
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.92
+  - --max-num-batched-tokens 4096
+  - --max-num-seqs 2
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --speculative-config {"method":"dspark","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  gsm8k:
+    concurrency: 2
+    baseline: ds4-flash/native-tp2-gsm8k-c2-0731
+  gpqa:
+    concurrency: 2
+    baseline: ds4-flash/native-tp2-gpqa-nt-0731
+  batch_decode:
+    concurrency: [1, 2]
+  needle:
+    sizes_words: [8000, 90000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2", "needle.all_pass"]
+  axes: []

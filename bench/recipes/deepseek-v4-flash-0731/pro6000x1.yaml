@@ -1,0 +1,79 @@
+id: deepseek-v4-flash-0731/pro6000x1
+model: DeepSeek-V4-Flash-0731
+served_name: deepseek-v4-flash
+summary: "1x RTX PRO 6000 - unified config at the 128k window (0731, no spec)"
+
+requires:
+  gpus: 1
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 2400
+
+# 0731 MIGRATION (2026-08-12) of deepseek-v4-flash/pro6000x1, the single
+# unified 1-card config (user directive 2026-07-30: one config, max perf
+# at native-grade quality). Gate stays OFF as before (uncapped fire floor
+# cannot sit next to 72.7 GiB of resident planes); the delta need-pool
+# with PROMOTE 16 measured native parity on the old revision (GPQA NT
+# 139/198 vs 140 p=1.0, GSM8K 194/200).
+#
+# NO SPECULATIVE CONFIG - measured blocker, not an oversight. 0731 has no
+# MTP head (KeyError model.layers.43.mtp_block.*); its DSpark drafter is
+# 3 full MoE layers (n_mtp_layers 3, 256 experts each) which get_model
+# loads unstreamed at FP8 - a ~19 GiB allocation peak before any
+# quantization. Next to 72.7 GiB resident planes + 12.7 GiB dense the
+# card is over budget at ANY delta size: two boot attempts 2026-08-12
+# OOM'd inside load_dspark_model (94.20 GiB in use / 1 GiB alloc at
+# delta 5.5; 94.39 / 2 GiB at delta 4.5 - the drafter just got further).
+# Spec on one PRO 6000 realistically needs the slimmer EXL3 base
+# (~54 GiB, where DSpark k=7 serves today) or a fork-side streamed +
+# quantized drafter load; both are outside this cell.
+#
+# Window: 32k -> 131072. Boot-proven on the old revision (audit [B]:
+# needle PASS at 130,535 prompt tokens, 56.6 tok/s C=1 at this window).
+# KV is pinned to 4 GiB explicitly (~2.1 GiB needed at 131k MLA fp8, the
+# rest margin) - the same footprint as the 2026-08-12 t-scalar-1x 0731
+# boot (94.9/95.0 GiB, healthy).
+# Quality on 0731 TO BE measured by the runner (C=1 geometry has no 0731
+# anchors yet - the committed 0731 anchors are C=2; measure or anchor
+# before any parity claim).
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_PLANES_CACHE: "{planes_cache}/planes-ds4-tp1"
+  VLLM_MOE_W2_STORE_DIR: "{planes_cache}/packs-ds4"
+  VLLM_MOE_W2_DELTA_GB: "5.5"
+  VLLM_MOE_W2_DELTA_PROMOTE: "16"
+  VLLM_MOE_W2_DELTA_SPLIT: "0"
+  VLLM_MOE_W2_GATE: "0"
+  VLLM_MOE_W2_FORCE_POOL: "1"
+  VLLM_MOE_W2_FORCE_RESIDENT: "1"
+  VLLM_MOE_W2_PREFILL_FP4: "ensure"
+  VLLM_MOE_W2_PREFILL_T: "16"
+
+serve_args:
+  - --trust-remote-code
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --kv-cache-memory-bytes 4294967296
+  - --gpu-memory-utilization 0.97
+  - --max-num-batched-tokens 256
+  - --max-num-seqs 1
+  - --tokenizer-mode deepseek_v4
+  - --no-scheduler-reserve-full-isl
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+warmup:
+  decode_requests: 4
+
+suite_params:
+  batch_decode:
+    concurrency: [1]
+  needle:
+    sizes_words: [8000, 90000]
+    depth: 0.5
+
+tuning:
+  objective: decode.median_tok_s
+  constraints: ["arithmetic.score>=2", "needle.all_pass"]
+  axes: []

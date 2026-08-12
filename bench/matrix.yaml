@@ -87,3 +87,16 @@ entries:
   - recipe: deepseek-v4-flash/pro6000x2-tp2-maxq
     blocking: false
     quality: true
+
+  # DS4-Flash-0731 migration (2026-08-12): DSpark replaces the MTP head
+  # that the superseded preview revision carried; 128k-window targets.
+  # Non-blocking until a release carries their runner-bound results.
+  - recipe: deepseek-v4-flash-0731/pro6000x2-tp2
+    blocking: false
+    quality: true
+  - recipe: deepseek-v4-flash-0731/pro6000x1
+    blocking: false
+  - recipe: deepseek-v4-flash-0731/5090x4-tp4
+    blocking: false
+  - recipe: deepseek-v4-flash-0731/5090x2-tp2-basecache
+    blocking: false
