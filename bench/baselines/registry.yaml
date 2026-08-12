@@ -154,3 +154,46 @@ baselines:
     measured: 2026-07-30
     provenance: live
     anchors: "70.71% (140/198)"
+  # ---------------------------------------------------------------------------
+  # [T] 2026-08-12 — cross-revision closure. The strict anchors above are on
+  # DeepSeek-V4-Flash @ 6976c7ff (preview); serving + the 2-bit candidate run on
+  # DeepSeek-V4-Flash-0731 @ 9e165c30. Re-measured native (stock FP4,
+  # VLLM_MOE_W2=0, TP2) on 0731 to close the note. Result: revision is
+  # accuracy-neutral (GSM8K 191 vs 194 p=0.375 ns; GPQA 147 == 147 p=1.0), and
+  # the 2-bit candidate matches native ON 0731 (both p=1.0). The GPQA "token
+  # inflation" in the strict verdict is mostly the revision (0731 reasons ~2x
+  # longer: 810 vs 422 tok), not quantization. These two are MANUAL measurements
+  # (llm_decode_bench direct, no runner harness_invocation binding) -> strict:false
+  # (documented reference; do NOT use to gate schema-2 runs). Serve args = the
+  # pro6000x2-tp2-native recipe MINUS --speculative-config: the recipe's
+  # deepseek_mtp k=2 head is absent on 0731 (ships DSpark; boot KeyError
+  # model.layers.43.mtp_block.main_norm.weight) and greedy accuracy is
+  # speculation-invariant.
+  ds4-flash/native-tp2-gsm8k-c2-0731:
+    file: ds4-flash/native-tp2-gsm8k-c2-0731.json
+    artifact_sha256: b0515731eb9be89f082e09cb86f9ae01dc409fdb8173f45c1f3f525f679521b5
+    checkpoint: DeepSeek-V4-Flash-0731
+    model: DeepSeek-V4-Flash-0731
+    model_revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+    context: 131072
+    strict: false
+    protocol: {profile: gsm8k, runs: 200, concurrency: 2, max_tokens: 6000, request_overrides: {}}
+    mode: "non-think, greedy, conc 2, max_tokens 6000, no-spec (0731 native)"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-08-12
+    provenance: live
+    anchors: "95.5% (191/200), tokens avg 121; vs 6976c7ff 194/200 McNemar p=0.375 ns; vs 2-bit candidate p=1.0 (flips 2/3)"
+  ds4-flash/native-tp2-gpqa-nt-0731:
+    file: ds4-flash/native-tp2-gpqa-nt-0731.json
+    artifact_sha256: 3ed8a9946266ecab45872b20160d1f27b3f3337ab67649b2536c1315e88ba12a
+    checkpoint: DeepSeek-V4-Flash-0731
+    model: DeepSeek-V4-Flash-0731
+    model_revision: 9e165c30e2704aec5d9d593cce3eebd58bbef1cb
+    context: 131072
+    strict: false
+    protocol: {profile: gpqa-diamond, runs: 198, concurrency: 2, max_tokens: 30000, request_overrides: {}}
+    mode: "non-think, greedy, conc 2, max_tokens 30000, no-spec (0731 native)"
+    hardware: 2x RTX PRO 6000 (TP2)
+    measured: 2026-08-12
+    provenance: live
+    anchors: "74.24% (147/198), tokens avg 810; == 6976c7ff 147/198 McNemar p=1.0 (flips 19/19); vs 2-bit candidate p=1.0 (flips 13/12); 0731 reasons ~2x longer (810 vs 422 tok)"
