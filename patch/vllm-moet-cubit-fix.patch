@@ -123,6 +123,42 @@
 +    return build_layer_planes(layer, key)
 +
 +
++def _batch_cache_hit(layer, key):
++    """True if this layer's planes are already fully present in the cache.
++
++    Mirrors _consume_planes_cache's hit test without reading plane bytes:
++    meta match + every required part at its exact expected size.  Returns
++    False on any uncertainty so the caller falls back to the serial build.
++    """
++    try:
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_planes_cache as _pc)
++        lidx = _pc.layer_idx_from_name(getattr(layer, "layer_name", ""))
++        if not _pc.enabled() or lidx is None:
++            return False
++        if getattr(layer, "_moe_w2_shapes", None) is None:
++            w13 = layer.w13_weight.data
++            w2 = layer.w2_weight.data
++            E, N13, _ = w13.shape
++            _, N2, _ = w2.shape
++            K13, K2 = N2, N13 // 2
++        else:
++            E, N13, K13, N2, K2 = layer._moe_w2_shapes
++        dev = torch.device("cuda")
++        tier = _fp4_tier_for_build(E, dev, N13 * K13, N2 * K2)
++        delta_present = False
++        if tier is not None:
++            from vllm.model_executor.layers.quantization.utils.moe_w2_store import (
++                pack_has_layer)
++            delta_present = pack_has_layer(
++                "delta", key, _layer_cutoff() + 1, E, tier.slot_bytes)
++        want_fp4 = tier is not None and not delta_present
++        sizes = _pc.expected_sizes(E, N13, K13, N2, K2, want_fp4=want_fp4)
++        return _pc.cache_has_layer(lidx, sizes)
++    except Exception:  # noqa: BLE001 - probe only, serial fallback still works
++        return False
++
++
 +def build_layer_planes_batch(layers):
 +    """Build a batch of W2 layers in parallel (planes-cache HIT path).
 +
@@ -135,6 +171,14 @@
 +    """
 +    if not layers:
 +        return 0
++    all_hit = all(_batch_cache_hit(layer, key) for layer, key in layers)
++    if not all_hit:
++        import gc
++        for layer, key in layers:
++            _moe_w2_build_dispatch(layer, key)
++            gc.collect()
++            torch.cuda.empty_cache()
++        return len(layers)
 +    with _cf.ThreadPoolExecutor(
 +            max_workers=int(os.getenv("VLLM_MOE_W2_BUILD_WORKERS", "4")),
 +            thread_name_prefix="moe-w2-build") as pool:
