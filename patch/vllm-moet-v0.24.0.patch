@@ -3362,10 +3362,113 @@ index d51a2dd31..92f7c18fa 100644
                  return UnquantizedLinearMethod()
              return None
 diff --git a/vllm/model_executor/layers/quantization/mxfp4.py b/vllm/model_executor/layers/quantization/mxfp4.py
-index 1b2a8a74b..e025de965 100644
+index 1b2a8a74b..52508a737 100644
 --- a/vllm/model_executor/layers/quantization/mxfp4.py
 +++ b/vllm/model_executor/layers/quantization/mxfp4.py
-@@ -491,7 +491,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -472,6 +472,102 @@ class GptOssMxfp4MoEMethod(FusedMoEMethodBase):
+         )
+ 
+ 
++# ---- streamed draft-expert load (DSpark heads) ----------------------------
++# A separate draft model (DSpark head) re-creates FULL MoE decoder layers
++# NEXT TO the fully-loaded target model. The stock create path allocates
++# every draft layer's packed-mxfp4 expert params on the GPU up front
++# (~3.2 GiB x n_draft_layers at TP1 on DS4-Flash-0731) before a single
++# checkpoint byte is read — measured as the difference between a booting
++# drafter and an OOM on tight cards (2x OOM on a 96 GiB card with resident
++# planes; a 32 GiB card cannot host the up-front staging next to serving
++# allocations at all). Stream instead: stage the big expert params in host
++# RAM at create time, count each layer's expected (expert, shard) loads
++# exactly (no checkpoint-ordering assumption, mirroring moe_w2_cubit's
++# stream build), and finalize the layer the moment its LAST expert tensor
++# lands — H2D move + the method's own process_weights_after_loading — then
++# drop the staging in place. Peak transient = one draft layer in flight;
++# the loaded bytes and the kernel-format conversion are byte-identical to
++# the old path (same copies, same ops, same order within a layer).
++
++
++def _use_draft_expert_streaming(moe: FusedMoEConfig) -> bool:
++    """Streamed staging applies to DSpark draft heads only (model tag set by
++    load_dspark_model); the backbone keeps its stock path. Dummy loads never
++    run weight loaders, so CPU staging would never finalize — skip them."""
++    from vllm.compilation import backends as _cb
++
++    if getattr(_cb, "model_tag", "backbone") != "dspark_head":
++        return False
++    if moe.has_bias:
++        # Expert bias tensors are outside the four counted params; a DSpark
++        # DSV4 layout has none. Fall back to the stock path if one shows up.
++        return False
++    try:
++        from vllm.config import get_current_vllm_config
++
++        load_format = get_current_vllm_config().load_config.load_format
++    except Exception:  # noqa: BLE001 - no current config: offline tooling
++        return False
++    return load_format != "dummy"
++
++
++class _DraftExpertStreamLoader:
++    """Per-param weight_loader wrapper: counts SUCCESSFUL (expert, shard)
++    loads into a CPU-staged draft expert param and finalizes the layer when
++    every big param is complete. A load arriving after the finalize would be
++    silent data loss (load_weights' params_dict still references the staged
++    originals) — fail loudly instead."""
++
++    def __init__(self, method, layer, pname, inner):
++        self._method = method
++        self._layer = layer
++        self._pname = pname
++        self._inner = inner
++
++    def __call__(self, param, loaded_weight, *args, **kwargs):
++        ret = self._inner(param, loaded_weight, *args, **kwargs)
++        ok = (ret is True) if kwargs.get("return_success") else True
++        if not ok:
++            return ret
++        pending = self._layer._draft_stream_pending
++        if pending.get(self._pname, 0) <= 0:
++            raise RuntimeError(
++                f"mxfp4 draft stream-load: {self._pname} shard arrived after "
++                f"layer {getattr(self._layer, 'layer_name', '')!r} was "
++                "finalized — more (expert, shard) tensors than expected"
++            )
++        pending[self._pname] -= 1
++        if all(v == 0 for v in pending.values()):
++            _finalize_draft_stream_layer(self._method, self._layer)
++        return ret
++
++
++def _finalize_draft_stream_layer(method, layer) -> None:
++    """Run the layer's stock post-load processing mid-load, then drop the
++    staging IN PLACE on the ORIGINAL Parameter objects (load_weights'
++    params_dict, built once up front, keeps them alive otherwise)."""
++    from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
++
++    originals = layer._draft_stream_params
++    if not moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
++        # Native path (deepgemm fp8xfp4 et al.): the conversion expects the
++        # params on the target device — the H2D copy of this one layer IS
++        # the placement (the packed weights stay resident as-is).
++        device = layer._draft_stream_device
++        for p in originals:
++            if p.data.device.type == "cpu":
++                p.data = p.data.to(device)
++    # else: W2 plane build streams its own 32-expert H2D chunks off the CPU
++    # staging (moving the whole layer first would only re-add the transient).
++    method.process_weights_after_loading(layer)
++    for p in originals:
++        p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
++    logger.debug(
++        "mxfp4 draft stream-load: layer %r finalized during load",
++        getattr(layer, "layer_name", ""),
++    )
++
++
+ class Mxfp4MoEMethod(FusedMoEMethodBase):
+     """MXFP4 MoE quantization method."""
+ 
+@@ -491,7 +587,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
  
      @property
      def supports_eplb(self) -> bool:
@@ -3375,7 +3478,58 @@ index 1b2a8a74b..e025de965 100644
  
      @property
      def skip_forward_padding(self) -> bool:
-@@ -617,6 +618,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -543,6 +640,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+         self.intermediate_size = intermediate_size_per_partition
+         self.hidden_size = hidden_size
+ 
++        # Streamed draft-expert load (DSpark heads): stage the four big
++        # expert params in host RAM instead of on the GPU up front, and
++        # finalize each layer as its last expert tensor loads. The backbone
++        # keeps its stock path (stage_device=None = ambient target device).
++        stream_draft = _use_draft_expert_streaming(self.moe)
++        stage_device = None
++        if stream_draft:
++            # The ambient device (the loader's target) is where the layer
++            # lands at finalize time; capture it before overriding.
++            layer._draft_stream_device = torch.empty(0).device
++            stage_device = "cpu"
++
+         # Fused gate_up_proj (column parallel)
+         w13_weight = torch.nn.Parameter(
+             torch.zeros(
+@@ -550,6 +659,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                 2 * intermediate_size_per_partition,
+                 hidden_size // 2,
+                 dtype=weight_dtype,
++                device=stage_device,
+             ),
+             requires_grad=False,
+         )
+@@ -562,6 +672,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                 2 * intermediate_size_per_partition,
+                 hidden_size // mxfp4_block,
+                 dtype=scale_dtype,
++                device=stage_device,
+             ),
+             requires_grad=False,
+         )
+@@ -576,6 +687,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                 hidden_size,
+                 intermediate_size_per_partition // 2,
+                 dtype=weight_dtype,
++                device=stage_device,
+             ),
+             requires_grad=False,
+         )
+@@ -588,6 +700,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+                 hidden_size,
+                 intermediate_size_per_partition // mxfp4_block,
+                 dtype=scale_dtype,
++                device=stage_device,
+             ),
+             requires_grad=False,
+         )
+@@ -617,6 +730,60 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
              layer.register_parameter("w2_bias", w2_bias)
              set_weight_attrs(w2_bias, extra_weight_attrs)
@@ -3396,13 +3550,57 @@ index 1b2a8a74b..e025de965 100644
 +                set_weight_attrs(newp, attrs)
 +                if pname.endswith("_scale"):
 +                    newp.quant_method = "block"
++
++        if stream_draft:
++            self._arm_draft_expert_streaming(layer)
++
++    def _arm_draft_expert_streaming(self, layer: RoutedExperts) -> None:
++        """Wrap the four big params' weight loaders with exact (expert,
++        shard) counting; the layer finalizes on its last load. Expected per
++        param: w13-side shards land twice per expert (w1, w3), w2-side once.
++        Bails back to on-device staging on an unexpected layout."""
++        big = ("w13_weight", "w13_weight_scale", "w2_weight", "w2_weight_scale")
++        params = tuple(getattr(layer, pname, None) for pname in big)
++        if any(
++            p is None or getattr(p, "weight_loader", None) is None for p in params
++        ):
++            # Not the expected mxfp4 layout: restore the stock on-device
++            # staging so the post-load pass behaves exactly as before.
++            for p in params:
++                if p is not None and p.data.device.type == "cpu":
++                    p.data = p.data.to(layer._draft_stream_device)
++            return
++        num_experts = layer.w13_weight.shape[0]
++        layer._draft_stream_pending = {
++            "w13_weight": 2 * num_experts,
++            "w13_weight_scale": 2 * num_experts,
++            "w2_weight": num_experts,
++            "w2_weight_scale": num_experts,
++        }
++        layer._draft_stream_params = params
++        for pname, p in zip(big, params):
++            p.weight_loader = _DraftExpertStreamLoader(
++                self, layer, pname, p.weight_loader
++            )
++        logger.info_once(
++            "mxfp4 DRAFT-STREAM armed: draft expert staging is host-side and "
++            "each draft layer finalizes as its last expert tensor loads "
++            "(peak transient = one draft layer in flight)"
++        )
  
      def _setup_kernel(
          self,
-@@ -722,6 +740,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -722,6 +889,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer):
++        # Streamed draft layers are finalized during load (per layer, as the
++        # last expert tensor lands); the model-wide post-load pass must not
++        # process them twice.
++        if getattr(layer, "_already_called_process_weights_after_loading", False):
++            return
++        layer._already_called_process_weights_after_loading = True
++
 +        # VLLM_MOE_W2: build 2-bit tensor-sym planes; skip Marlin/other backends.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
@@ -3415,7 +3613,7 @@ index 1b2a8a74b..e025de965 100644
          w13 = layer.w13_weight
          w2 = layer.w2_weight
          w13_scale = layer.w13_weight_scale
-@@ -779,6 +806,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
+@@ -779,6 +962,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -3859,10 +4057,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..6f37201ff
+index 000000000..a255ed0c9
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3801 @@
+@@ -0,0 +1,3793 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -4525,28 +4723,20 @@ index 000000000..6f37201ff
 +                "VLLM_MOE_W2 kernels use BF16 intermediates and currently "
 +                f"require model dtype bfloat16, got {cfg.model_config.dtype}")
 +        if cfg.use_v2_model_runner:
-+            # V2 integration (2026-08-01, the DSpark runner): the V2 GPU
-+            # model runner carries the manager safe-point + step_end hooks
-+            # only. That is the complete contract for RESIDENT/delta-only
-+            # serving (a pool miss is served from the resident planes —
-+            # correct base quality, no replay needed). The base-cache
-+            # mandatory replay loops and the confidence-gate re-forwards
-+            # are V1-runner code and are NOT ported: fail closed on any
-+            # config that needs them.
-+            from vllm.model_executor.layers.quantization.utils import (
-+                moe_w2_delta)
-+            if moe_w2_delta.base_enabled():
-+                raise ValueError(
-+                    "VLLM_MOE_W2 base cache (VLLM_MOE_W2_BASE_CACHE_GB) is "
-+                    "not integrated with Model Runner V2: the mandatory "
-+                    "base replay loop is absent — a pool miss would be a "
-+                    "silent quality corruption. Serve base-cache configs "
-+                    "on the V1 runner.")
-+            # The confidence gate is integrated with V2 (2026-08-02): the
-+            # runner's _moe_w2_gate_reforward ports the V1 inline TP path
-+            # (decision consensus + fixed-point promote->re-forward before
-+            # sampling). Only the PP broadcast leg is V1-only, and PP is
-+            # refused below anyway.
++            # V2 integration: safe-point + step_end hooks (2026-08-01, the
++            # DSpark runner), confidence gate _moe_w2_gate_reforward
++            # (2026-08-02, decision consensus + fixed-point
++            # promote->re-forward before sampling), and the MANDATORY
++            # base-cache replay loop + gate base repair
++            # (_moe_w2_base_replay, 2026-08-12 port of the V1 inline TP
++            # path) — base-cache configs (VLLM_MOE_W2_BASE_CACHE_GB) now
++            # serve on V2 with the same fail-closed miss semantics as V1.
++            # Draft passes (DSpark) are not replayed on a miss: a draft's
++            # zeroed contribution costs acceptance only (rejection sampling
++            # keeps the output distribution exact) and its seen-marks feed
++            # the background promoter. V1-only leftovers: the PP broadcast
++            # legs (PP is refused below) and the opt-in draft-affinity
++            # prefetch (VLLM_MOE_W2_PREFETCH).
 +            if cfg.parallel_config.pipeline_parallel_size > 1:
 +                raise ValueError(
 +                    "VLLM_MOE_W2 on Model Runner V2 does not support "
@@ -18160,7 +18350,7 @@ index 6b750fe7e..167ad6851 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2ddc5..5177fa273 100644
+index 30ca2ddc5..4b53e6e0b 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -43,10 +43,18 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -18190,12 +18380,71 @@ index 30ca2ddc5..5177fa273 100644
  from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
      set_eagle3_aux_hidden_state_layers,
  )
-@@ -186,13 +195,24 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -116,6 +125,50 @@ from vllm.v1.worker.utils import KVBlockZeroer
+ logger = init_logger(__name__)
+ 
+ 
++def _moe_w2_promote_consensus(
++    tier,
++    tp_group,
++    local_miss: int,
++    *,
++    pin: bool,
++    where: str,
++) -> None:
++    """Complete local base-cache I/O on every TP rank before replay.
++
++    Port of the V1 runner's helper (gpu_model_runner.py): every rank must
++    finish its own pack I/O before any rank re-enters the collective
++    replay, and an I/O fault on ANY rank must abort ALL ranks — returning
++    zero-contribution logits is silent model corruption.
++    """
++    error = None
++    if local_miss > 0:
++        try:
++            tier.force_promote(max_promote=None, pin=pin)
++        except BaseException as e:  # preserve consensus after local I/O fault
++            error = e
++    if tp_group.world_size > 1:
++        ok = torch.tensor(
++            [0 if error is not None else 1],
++            dtype=torch.int32,
++            device=tier.dev,
++        )
++        torch.distributed.all_reduce(
++            ok,
++            op=torch.distributed.ReduceOp.MIN,
++            group=tp_group.device_group,
++        )
++        all_ok = bool(ok.item())
++    else:
++        all_ok = error is None
++    if not all_ok:
++        message = (
++            f"moe_w2 mandatory base-cache promotion failed before {where}; "
++            "refusing to replay or return zero-contribution logits")
++        if error is not None:
++            raise RuntimeError(message) from error
++        raise RuntimeError(message + " (failure occurred on a peer TP rank)")
++
++
+ class GPUModelRunner(LoRAModelRunnerMixin):
+     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+         self.vllm_config = vllm_config
+@@ -186,13 +239,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
  
          # Speculative decoding.
          self.speculator = None
 +        # first-fire INFO for the moe_w2 V2 confidence gate (then DEBUG)
 +        self._moe_w2_v2_gate_fired = False
++        # first gate-base repair of the process is INFO (pool-sizing signal)
++        self._moe_w2_gate_repair_seen = False
++        # True while a gate replay collective is in flight: a failure then
++        # is fatal (fail-open would ship zeroed expert contributions)
++        self._moe_w2_gate_collective = False
++        # True while gpu/warmup.py drives synthetic batches: the mandatory
++        # base replay and the gate must not chase garbage routing
++        self._moe_w2_warmup_active = False
 +        self._dspark_padbucket = False
 +        self._dspark_dyn_sd_table: list[tuple[int, int, int]] | None = None
 +        self._pad_q: int | None = None
@@ -18216,7 +18465,7 @@ index 30ca2ddc5..5177fa273 100644
                  # Drafting may require auxiliary hidden states from target model outputs
                  self.use_aux_hidden_state_outputs = True
                  if self.use_pp:
-@@ -469,6 +489,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -469,6 +541,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cudagraph_mode,
              decode_query_len=self.decode_query_len,
              lora_capture_cases=self.lora_capture_cases,
@@ -18228,7 +18477,7 @@ index 30ca2ddc5..5177fa273 100644
          )
          if self.speculator is not None:
              self.speculator.init_cudagraph_manager(cudagraph_mode)
-@@ -602,7 +627,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -602,7 +679,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -18239,7 +18488,7 @@ index 30ca2ddc5..5177fa273 100644
              self.speculator.propose(
                  input_batch=input_batch,
                  attn_metadata=attn_metadata,
-@@ -685,6 +712,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -685,6 +764,77 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          # NOTE(woosuk): It is TBD whether we keep this API or not.
          return 0
  
@@ -18317,7 +18566,7 @@ index 30ca2ddc5..5177fa273 100644
      @torch.inference_mode()
      def capture_model(self) -> int:
          assert self.cudagraph_manager is not None
-@@ -717,6 +815,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -717,6 +867,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              )
              if self.speculator is not None:
                  self.speculator.capture(attn_states)
@@ -18325,7 +18574,7 @@ index 30ca2ddc5..5177fa273 100644
  
          end_time = time.perf_counter()
          end_free_gpu_memory = torch.cuda.mem_get_info()[0]
-@@ -895,6 +994,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -895,6 +1046,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  idx_mapping, total_num_logits, cu_num_logits, max_expand_len
              )
  
@@ -18346,7 +18595,7 @@ index 30ca2ddc5..5177fa273 100644
          # Get query_start_loc.
          # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
          num_reqs_padded = batch_desc.num_reqs or num_reqs
-@@ -960,7 +1073,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -960,7 +1125,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              cu_num_logits,
              total_num_logits,
              self.model_state.num_new_sampled_tokens_per_step,
@@ -18364,7 +18613,7 @@ index 30ca2ddc5..5177fa273 100644
  
          # CPU upper bound on seq_lens; padded entries left at zero.
          num_computed_tokens_np = self.req_states.num_computed_tokens_np[idx_mapping_np]
-@@ -991,6 +1114,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -991,6 +1166,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              num_draft_tokens_per_req=num_draft_tokens_per_req,
              query_start_loc=query_start_loc,
              query_start_loc_np=query_start_loc_np,
@@ -18372,10 +18621,149 @@ index 30ca2ddc5..5177fa273 100644
              seq_lens=seq_lens,
              seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
              dcp_local_seq_lens=dcp_local_seq_lens,
-@@ -1034,6 +1158,158 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1034,6 +1210,337 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          )
          return block_tables, slot_mappings
  
++    def _moe_w2_replay_forward(
++        self,
++        state: "ExecuteModelState",
++        input_batch: InputBatch,
++    ):
++        """Re-run this step's forward from the graph input buffers.
++
++        The moe_w2 replay primitive: the mandatory base-cache replay, the
++        confidence-gate re-forward and the gate base repair all re-execute
++        the SAME step (the FULL graph's input buffers still hold this
++        step's tokens at the safe point where they run).
++        """
++        batch_desc = state.batch_desc
++        if batch_desc is not None and batch_desc.cg_mode == CUDAGraphMode.FULL:
++            assert self.cudagraph_manager is not None
++            return self.cudagraph_manager.run_fullgraph(batch_desc)
++        model_inputs = state.model_inputs
++        assert model_inputs is not None
++        batch_descriptor = BatchDescriptor(
++            num_tokens=input_batch.num_tokens_after_padding,
++            has_lora=self.lora_config is not None,
++            num_active_loras=(
++                batch_desc.num_active_loras
++                if batch_desc is not None else 0),
++        )
++        with set_forward_context(
++            state.attn_metadata,
++            self.vllm_config,
++            num_tokens=input_batch.num_tokens_after_padding,
++            cudagraph_runtime_mode=(
++                batch_desc.cg_mode if batch_desc is not None
++                else CUDAGraphMode.NONE),
++            num_tokens_across_dp=state.num_tokens_across_dp,
++            batch_descriptor=batch_descriptor,
++            slot_mapping=state.slot_mappings_by_layer,
++        ):
++            if (batch_desc is not None
++                    and batch_desc.cg_mode == CUDAGraphMode.PIECEWISE):
++                assert self.cudagraph_manager is not None
++                return self.cudagraph_manager.run_pw_graph(
++                    self.model, model_inputs)
++            return self.model(**model_inputs)
++
++    def _moe_w2_base_replay(
++        self,
++        state: "ExecuteModelState",
++        input_batch: InputBatch,
++        hidden_states: torch.Tensor,
++        aux_hidden_states: list[torch.Tensor] | None,
++    ) -> tuple[torch.Tensor, list[torch.Tensor] | None]:
++        """moe_w2 MANDATORY base-cache replay — V2 port of the V1 inline
++        TP path (gpu_model_runner.py).
++
++        With VLLM_MOE_W2_BASE_CACHE_GB the 2-bit base is host-resident and
++        the GPU pool may MISS routed experts — the desc kernel zeroed their
++        contributions and bumped the tier's in-graph miss counter (the
++        counter is zeroed at every forward's start, so it always reflects
++        the LAST pass). Fetch the missing experts synchronously on every
++        rank (consensus) and replay the step to a bounded FIXED POINT:
++        corrected early layers can re-route later layers onto experts the
++        first pass never fetched. Runs BEFORE the optional confidence gate,
++        mirroring the V1 order. Unlike the gate this is NOT fail-safe: any
++        failure is fatal, because returning zero-contribution hidden
++        states is silent model corruption.
++
++        Speculative drafts (DSpark) run AFTER this safe point; a draft
++        pass's misses zero contributions inside the DRAFT only (bounded
++        acceptance cost, exact output distribution via rejection sampling)
++        and its `seen` marks feed the background promoter — no draft
++        replay is attempted here.
++        """
++        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++        _btier = moe_w2_delta._BASE_TIER
++        if (_btier is None or hidden_states is None
++                or self.is_pooling_model):
++            return hidden_states, aux_hidden_states
++        try:
++            from vllm.distributed.parallel_state import get_tp_group
++            _w2d = moe_w2_delta
++            _tp = get_tp_group()
++            # open this step's pin scope: slots touched by any pass below
++            # are ineligible for eviction until the next step_begin
++            _btier.step_begin()
++
++            def _max_miss_tp(local: int) -> int:
++                if _tp.world_size <= 1:
++                    return local
++                t = torch.tensor([local], device=_btier.dev)
++                torch.distributed.all_reduce(
++                    t, op=torch.distributed.ReduceOp.MAX,
++                    group=_tp.device_group)
++                return int(t.item())
++
++            _miss = int(_btier.miss_count.item())
++            _max_miss = _max_miss_tp(_miss)
++            # Fetch this rank's missing experts whenever it has any (they
++            # join the pool for future steps); replay only when the worst
++            # rank exceeds the tolerance — the same reduced max on every
++            # rank keeps the collective replay in lockstep. Every TP rank
++            # participates in the consensus even at zero local misses.
++            _moe_w2_promote_consensus(
++                _btier,
++                _tp,
++                _miss,
++                pin=_w2d.fp_continue(0, _max_miss),
++                where="V2 TP base replay",
++            )
++            # KPI: per-step replay rate + missing pairs — the pool-sizing
++            # signal.
++            _btier.kpi_step(_max_miss, _max_miss > _w2d.base_miss_tol())
++            _replays = 0
++            while _w2d.fp_continue(_replays, _max_miss):
++                _replays += 1
++                model_output = self._moe_w2_replay_forward(
++                    state, input_batch)
++                if self.use_aux_hidden_state_outputs:
++                    hidden_states, aux_hidden_states = model_output
++                else:
++                    hidden_states = model_output
++                _miss = int(_btier.miss_count.item())
++                _max_miss = _max_miss_tp(_miss)
++                _moe_w2_promote_consensus(
++                    _btier,
++                    _tp,
++                    _miss,
++                    pin=_w2d.fp_continue(_replays, _max_miss),
++                    where="V2 TP base fixed-point replay",
++                )
++            _w2d.fp_validate_complete(_max_miss)
++            if _replays:
++                _btier.kpi_fp(_replays, _max_miss)
++            return hidden_states, aux_hidden_states
++        except Exception as e:
++            logger.exception(
++                "moe_w2 mandatory base-cache replay failed (V2 runner)")
++            raise RuntimeError(
++                "mandatory moe_w2 base-cache replay failed; refusing "
++                "zero-contribution hidden states") from e
++
 +    def _moe_w2_gate_reforward(
 +        self,
 +        state: "ExecuteModelState",
@@ -18450,6 +18838,21 @@ index 30ca2ddc5..5177fa273 100644
 +            if not _or_tp(fire):
 +                return hidden_states, aux_hidden_states
 +
++            from vllm.model_executor.layers.quantization.utils import (
++                moe_w2_delta)
++            _gate_btier = moe_w2_delta._BASE_TIER
++
++            def _base_miss_tp() -> tuple[int, int]:
++                """(this rank's, worst rank's) base misses."""
++                local = int(_gate_btier.miss_count.item())
++                if _tp.world_size <= 1:
++                    return local, local
++                t = torch.tensor([local], device=_gate_btier.dev)
++                torch.distributed.all_reduce(
++                    t, op=torch.distributed.ReduceOp.MAX,
++                    group=_tp.device_group)
++                return local, int(t.item())
++
 +            _iters = 0
 +            _budget = moe_w2_gate.step_promote_budget()
 +            while _iters < moe_w2_gate.fire_fp_max():
@@ -18473,46 +18876,64 @@ index 30ca2ddc5..5177fa273 100644
 +                    break
 +                _iters += 1
 +
-+                batch_desc = state.batch_desc
-+                if batch_desc is not None and (
-+                        batch_desc.cg_mode == CUDAGraphMode.FULL):
-+                    assert self.cudagraph_manager is not None
-+                    model_output = self.cudagraph_manager.run_fullgraph(
-+                        batch_desc)
-+                else:
-+                    model_inputs = state.model_inputs
-+                    assert model_inputs is not None
-+                    batch_descriptor = BatchDescriptor(
-+                        num_tokens=input_batch.num_tokens_after_padding,
-+                        has_lora=self.lora_config is not None,
-+                        num_active_loras=(
-+                            batch_desc.num_active_loras
-+                            if batch_desc is not None else 0),
-+                    )
-+                    with set_forward_context(
-+                        state.attn_metadata,
-+                        self.vllm_config,
-+                        num_tokens=input_batch.num_tokens_after_padding,
-+                        cudagraph_runtime_mode=(
-+                            batch_desc.cg_mode if batch_desc is not None
-+                            else CUDAGraphMode.NONE),
-+                        num_tokens_across_dp=state.num_tokens_across_dp,
-+                        batch_descriptor=batch_descriptor,
-+                        slot_mapping=state.slot_mappings_by_layer,
-+                    ):
-+                        if (batch_desc is not None
-+                                and batch_desc.cg_mode
-+                                == CUDAGraphMode.PIECEWISE):
-+                            assert self.cudagraph_manager is not None
-+                            model_output = self.cudagraph_manager.run_pw_graph(
-+                                self.model, model_inputs)
-+                        else:
-+                            model_output = self.model(**model_inputs)
++                # From here to the end of the base repair the replay is a
++                # COLLECTIVE: a failure after entry must terminate the
++                # worker (fail-open would return logits with silently
++                # zeroed expert contributions on some rank).
++                self._moe_w2_gate_collective = True
++                model_output = self._moe_w2_replay_forward(
++                    state, input_batch)
 +
 +                if self.use_aux_hidden_state_outputs:
 +                    hidden_states, aux_hidden_states = model_output
 +                else:
 +                    hidden_states = model_output
++
++                # The gate loop runs AFTER the mandatory base replay. Its
++                # changed early-layer numerics can route a later layer onto
++                # a new, non-resident base expert; the descriptor zeroed
++                # that contribution. Repair the same way the base loop
++                # repairs its own second-order misses: fetch the pairs,
++                # replay, re-read — under the shared policy
++                # (moe_w2_delta.gate_repair_continue). Only the residue
++                # left when that policy stops is fail-open, and strict
++                # refuses it in gate_validate_base_clean.
++                if _gate_btier is not None:
++                    _gate_miss_local, _gate_miss = _base_miss_tp()
++                    _gate_repairs = 0
++                    while moe_w2_delta.gate_repair_continue(
++                            _gate_repairs, _gate_miss):
++                        _moe_w2_promote_consensus(
++                            _gate_btier,
++                            _tp,
++                            _gate_miss_local,
++                            pin=True,
++                            where="V2 gate base repair",
++                        )
++                        _gate_repairs += 1
++                        model_output = self._moe_w2_replay_forward(
++                            state, input_batch)
++                        if self.use_aux_hidden_state_outputs:
++                            hidden_states, aux_hidden_states = model_output
++                        else:
++                            hidden_states = model_output
++                        _gate_miss_local, _gate_miss = _base_miss_tp()
++                    if _gate_repairs:
++                        _gate_btier.kpi_gate_repair(_gate_repairs)
++                        if not self._moe_w2_gate_repair_seen:
++                            self._moe_w2_gate_repair_seen = True
++                            logger.info(
++                                "moe_w2 V2 gate base repair engaged: %d "
++                                "pass(es), %d missing pairs left (later "
++                                "repairs at DEBUG)", _gate_repairs,
++                                _gate_miss)
++                        else:
++                            logger.debug(
++                                "moe_w2 V2 gate base repair: %d pass(es), "
++                                "%d missing pairs left", _gate_repairs,
++                                _gate_miss)
++                    moe_w2_delta.gate_validate_base_clean(_gate_miss)
++                self._moe_w2_gate_collective = False
 +
 +            if _iters and not self._moe_w2_v2_gate_fired:
 +                self._moe_w2_v2_gate_fired = True
@@ -18523,7 +18944,14 @@ index 30ca2ddc5..5177fa273 100644
 +                logger.debug("moe_w2 V2 gate: %d re-forward pass(es)",
 +                             _iters)
 +            return hidden_states, aux_hidden_states
-+        except Exception:  # noqa: BLE001 - never crash serving
++        except Exception as e:  # noqa: BLE001 - fail-safe BEFORE collective
++            if self._moe_w2_gate_collective:
++                self._moe_w2_gate_collective = False
++                logger.exception(
++                    "moe_w2 V2 gate failed during a replay collective")
++                raise RuntimeError(
++                    "moe_w2 V2 gate replay failed after collective entry; "
++                    "worker must terminate") from e
 +            logger.exception("moe_w2 V2 gate re-forward failed; keeping "
 +                             "the first forward's hidden states")
 +            return hidden_states, aux_hidden_states
@@ -18531,7 +18959,7 @@ index 30ca2ddc5..5177fa273 100644
      def sample(
          self,
          hidden_states: torch.Tensor,
-@@ -1064,6 +1340,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1064,6 +1571,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  input_batch,
                  # Draft logits are needed for probabilistic rejection sampling.
                  self.speculator.draft_logits,
@@ -18541,7 +18969,7 @@ index 30ca2ddc5..5177fa273 100644
              )
  
          return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
-@@ -1107,6 +1386,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1107,6 +1617,19 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          is_profile: bool = False,
      ) -> ModelRunnerOutput | IntermediateTensors | None:
          if not dummy_run:
@@ -18561,7 +18989,7 @@ index 30ca2ddc5..5177fa273 100644
              # Update the request states.
              self.update_pp_decode_requests()
              self.finish_requests(scheduler_output)
-@@ -1125,6 +1417,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1125,6 +1648,30 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          max_query_len = max(scheduler_output.num_scheduled_tokens.values())
          uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
  
@@ -18592,7 +19020,7 @@ index 30ca2ddc5..5177fa273 100644
          num_active_loras = 0
          if self.lora_config:
              req_ids = list(scheduler_output.num_scheduled_tokens.keys())
-@@ -1160,6 +1476,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1160,6 +1707,23 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              # Prepare all the inputs and copy to the input buffers.
              input_batch = self.prepare_inputs(scheduler_output, batch_desc)
              block_tables, slot_mappings = self.prepare_attn(input_batch)
@@ -18616,7 +19044,7 @@ index 30ca2ddc5..5177fa273 100644
  
              if self.lora_config:
                  # Activate LoRA adapters.
-@@ -1252,6 +1585,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1252,6 +1816,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
              del intermediate_tensors
  
@@ -18632,7 +19060,7 @@ index 30ca2ddc5..5177fa273 100644
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              # Use explicit cudagraph replay for FULL mode.
-@@ -1307,6 +1649,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1307,6 +1880,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              output_intermediate_tensors = model_output
  
          finished_req_ids = scheduler_output.finished_req_ids
@@ -18645,7 +19073,7 @@ index 30ca2ddc5..5177fa273 100644
          self.execute_model_state = ExecuteModelState(
              input_batch=input_batch,
              attn_metadata=attn_metadata,
-@@ -1314,6 +1662,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1314,6 +1893,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              hidden_states=hidden_states,
              aux_hidden_states=aux_hidden_states,
              finished_req_ids=finished_req_ids,
@@ -18657,30 +19085,46 @@ index 30ca2ddc5..5177fa273 100644
          )
  
          if not self.is_last_pp_rank:
-@@ -1336,8 +1689,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1336,8 +1920,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          hidden_states = self.execute_model_state.hidden_states
          aux_hidden_states = self.execute_model_state.aux_hidden_states
          finished_req_ids = self.execute_model_state.finished_req_ids
-+        # moe_w2 confidence gate (V2 port, TP/single-GPU inline path): decide
-+        # on this step's logits and, on fire, promote+re-forward at FP4 before
-+        # sampling — the refreshed hidden states feed the sampler AND the
-+        # speculator (drafts verify against the FP4-refined target).
-+        # Gate off = strictly no side effects: the state reference must be
++        # moe_w2 replay block (V2 port, TP/single-GPU inline path), in the
++        # V1 runner's order:
++        #   1. MANDATORY base-cache replay (VLLM_MOE_W2_BASE_CACHE_GB): the
++        #      forward may have zeroed missed routed experts — fetch and
++        #      replay to the bounded fixed point; failure is fatal.
++        #   2. OPTIONAL confidence gate: decide on this step's logits and,
++        #      on fire, promote+re-forward at FP4 — the refreshed hidden
++        #      states feed the sampler AND the speculator (drafts verify
++        #      against the FP4-refined target).
++        # Both off = strictly no side effects: the state reference must be
 +        # dropped exactly as before the port (keeping it alive through
 +        # sampling shifts allocator reuse and flips greedy near-ties).
-+        _gate_on = moe_w2_gate is not None and moe_w2_gate.enabled()
-+        _gate_replay_state = self.execute_model_state if _gate_on else None
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_delta as _w2d_step)
++        _gate_on = (moe_w2_gate is not None and moe_w2_gate.enabled()
++                    and not self._moe_w2_warmup_active)
++        _base_on = (_w2d_step._BASE_TIER is not None
++                    and not self._moe_w2_warmup_active)
++        _w2_replay_state = (self.execute_model_state
++                            if (_gate_on or _base_on) else None)
          self.execute_model_state = None
  
++        if _base_on and hidden_states is not None:
++            hidden_states, aux_hidden_states = self._moe_w2_base_replay(
++                _w2_replay_state, input_batch, hidden_states,
++                aux_hidden_states)
++
 +        if _gate_on and hidden_states is not None:
 +            hidden_states, aux_hidden_states = self._moe_w2_gate_reforward(
-+                _gate_replay_state, input_batch, hidden_states,
++                _w2_replay_state, input_batch, hidden_states,
 +                aux_hidden_states)
 +
          if not self.is_last_pp_rank:
              # Non-last PP rank: hidden_states is None because this rank produced
              # IntermediateTensors instead of final hidden states. Receive the
-@@ -1424,7 +1791,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1424,7 +2038,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              sampler_output.sampled_token_ids,
              num_sampled,
              num_rejected,
@@ -18693,7 +19137,7 @@ index 30ca2ddc5..5177fa273 100644
          )
  
          if self.speculator is not None:
-@@ -1436,7 +1807,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1436,7 +2054,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -18704,7 +19148,7 @@ index 30ca2ddc5..5177fa273 100644
              draft_tokens = self.speculator.propose(
                  input_batch,
                  attn_metadata,
-@@ -1451,16 +1824,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1451,16 +2071,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  self.sampler.sampling_states.seeds.gpu,
                  mm_inputs=mm_inputs,
              )
@@ -18752,7 +19196,7 @@ index 30ca2ddc5..5177fa273 100644
          # Post-step KV connector related operations.
          kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
          model_runner_output.kv_connector_output = kv_connector_output
-@@ -1576,3 +1978,11 @@ class ExecuteModelState(NamedTuple):
+@@ -1576,3 +2225,11 @@ class ExecuteModelState(NamedTuple):
      hidden_states: torch.Tensor | None
      aux_hidden_states: list[torch.Tensor] | None
      finished_req_ids: set[str]
@@ -20095,6 +20539,47 @@ index 4ab45b2ae..35a89634e 100644
 +        " `mask_token_id`, `dspark_noise_token_id`, `pard_token`, or"
 +        " `ptd_token_id` for parallel drafting."
      )
+diff --git a/vllm/v1/worker/gpu/warmup.py b/vllm/v1/worker/gpu/warmup.py
+index 3192b9aea..3b5cc9a82 100644
+--- a/vllm/v1/worker/gpu/warmup.py
++++ b/vllm/v1/worker/gpu/warmup.py
+@@ -137,6 +137,10 @@ def run_mixed_prefill_decode_warmup(
+ 
+     context = mixed_step_context or nullcontext()
+     model_runner.kv_connector.set_disabled(True)
++    # moe_w2: synthetic warmup batches route garbage tokens; the mandatory
++    # base-cache replay (and the gate) must not chase their misses — a
++    # warmup's routed union has no fixed point in a real pool.
++    model_runner._moe_w2_warmup_active = True
+     try:
+         worker_execute_model(decode_prefill_output)
+         worker_sample_tokens(None)
+@@ -145,6 +149,7 @@ def run_mixed_prefill_decode_warmup(
+             worker_sample_tokens(None)
+         worker_execute_model(cleanup_output)
+     finally:
++        model_runner._moe_w2_warmup_active = False
+         model_runner.kv_connector.set_disabled(False)
+     return True
+ 
+@@ -228,6 +233,10 @@ def warmup_kernels(
+ 
+     # Disable KV connector for warmup run.
+     model_runner.kv_connector.set_disabled(True)
++    # moe_w2: see run_mixed_prefill_decode_warmup — replay/gate must not
++    # chase synthetic warmup routing. Cleared with the connector re-enable
++    # below (a warmup exception fails the boot, so no stale-flag risk).
++    model_runner._moe_w2_warmup_active = True
+     worker_execute_model(prefill_output)
+ 
+     if not model_runner.is_pooling_model:
+@@ -280,5 +289,6 @@ def warmup_kernels(
+     cleanup_output = SchedulerOutput.make_empty()
+     cleanup_output.finished_req_ids = set(req_ids)
+     worker_execute_model(cleanup_output)
++    model_runner._moe_w2_warmup_active = False
+     model_runner.kv_connector.set_disabled(False)
+     torch.accelerator.synchronize()
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
 index 74938a823..4bd28d826 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
