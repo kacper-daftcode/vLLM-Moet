@@ -1,0 +1,55 @@
+{
+  "schema_version": "ds4-w2-frozen-rc-cold-restage-v1",
+  "artifact": {
+    "official_vllm_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "origin_main_cutoff": "94be3aa3d7a8b82c7fc9687990a7edb6035f69f3",
+    "wrapper_commit": "0a73c2bcf262ba0aa53560d6290ad2af350e34fc",
+    "source_patch_sha256": "241ba984b1c56f5dc7adbc8d7f519d60b5746024bf7dfeb875e3546a668e79a7",
+    "image_id": "sha256:fc6e1244d60855fe45ccc0236daaaa722abcb8d354200eb92aca104bd954d3f2"
+  },
+  "restage": {
+    "checkpoint_shards_completed": 46,
+    "checkpoint_shards_total": 46,
+    "expert_pack_layers": 43,
+    "checkpoint_shard_loading_seconds": 203,
+    "container_start_to_ready_seconds": 340,
+    "base_cache_gb": 8,
+    "delta_cache_gb": 6,
+    "fp4_split_enabled": false
+  },
+  "cold_restage_trace": {
+    "samples": 218,
+    "window_seconds": 220.7,
+    "min_mem_available_bytes": 103726841856,
+    "max_cgroup_current_bytes": 22386843648,
+    "max_cgroup_peak_bytes": 22386843648,
+    "min_cgroup_hard_headroom_bytes": 84987338752,
+    "min_memory_high_headroom_bytes": 80692371456,
+    "max_cgroup_anon_bytes": 12597563392,
+    "max_cgroup_file_bytes": 11680821248,
+    "max_cgroup_file_mapped_bytes": 4062646272,
+    "max_cgroup_swap_bytes": 0,
+    "max_psi_full_avg10": 0.54,
+    "memory_high_event_delta": 0,
+    "memory_max_event_delta": 0,
+    "oom_event_delta": 0,
+    "oom_kill_event_delta": 0,
+    "host_swap_in_page_delta": 0,
+    "host_swap_out_page_delta": 0,
+    "host_oom_kill_delta": 0,
+    "trace": "frozen-rc-memory-trace.tsv"
+  },
+  "lifecycle": {
+    "controller_exit_status": 0,
+    "evaluation_container_absent_after_cleanup": true,
+    "production_pack_fingerprint_unchanged": true,
+    "immutable_seed_pack_fingerprint_unchanged": true,
+    "production_services_active": true,
+    "production_health_codes": [
+      200,
+      200
+    ],
+    "disposable_store_removed": true
+  },
+  "evidence_boundary": "The trace covers the exact frozen release candidate from container start through completion of all checkpoint shards. Later quality and context activity is summarized separately and is not included in these cold-restage maxima."
+}

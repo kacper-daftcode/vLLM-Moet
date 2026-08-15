@@ -1,0 +1,36 @@
+{
+  "cgroup": {
+    "anon": 517853184,
+    "current": 555704320,
+    "events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_group_kill": 0,
+      "oom_kill": 0,
+      "sock_throttled": 0
+    },
+    "file": 94208,
+    "file_mapped": 0,
+    "high_available": null,
+    "known": true,
+    "limited": true,
+    "max_available": 1591779328,
+    "swap_current": 0,
+    "swap_limit": 0,
+    "version": 2
+  },
+  "checksum": 11796480,
+  "file_bytes": 536871000,
+  "probe": "checkpoint-next-shard-retry",
+  "provenance": {
+    "captured_at": "2026-07-12T03:16:55.533013+00:00",
+    "image": "vllm-moet-sm120:v024-w2union-241ba984b1c5",
+    "image_id": "sha256:fc6e1244d60855fe45ccc0236daaaa722abcb8d354200eb92aca104bd954d3f2",
+    "kernel": "7.0.0-14-generic"
+  },
+  "resident_after_live_mapping_dontneed": 536870912,
+  "resident_after_next_shard_retry": 0,
+  "resident_before_first_dontneed": 536875008
+}

@@ -1,0 +1,268 @@
+{
+  "schema_version": "ds4-w2-eval-v1",
+  "run_label": "p1-final-55d30bb9-nomtp-32k-s44",
+  "status": "complete",
+  "started_at_utc": "2026-07-11T22:22:57.174769Z",
+  "completed_at_utc": "2026-07-11T22:30:33.087884Z",
+  "inputs": {
+    "expected_count": 40,
+    "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
+  },
+  "eval": {
+    "max_tokens": 700,
+    "order": "reasoning-coding-interleaved-fixed",
+    "retry_count": 0,
+    "seed": 44,
+    "temperature": 0.6,
+    "timeout_seconds": 300,
+    "top_p": 0.95
+  },
+  "harness": {
+    "files": {
+      "eval_rig.py": "1d338ab4b1279238c5b0f7ce0e91694b16ac1883da428fd2a59cd17030ced11b",
+      "harness.py": "62240f57a4b27d4bc10aa7083fd32542a21797aea1d1aaac586cc827e4fe0e25",
+      "rescore_robust.py": "64ea40dc76c1e7a742c5b612eb604f2a262746aa8f0aaeaf0e148b22e192d434"
+    },
+    "python": "3.11.15 (main, Apr  7 2026, 20:41:15) [Clang 22.1.1 ]"
+  },
+  "prewarm": {
+    "cases": 10,
+    "enabled": true,
+    "max_tokens": 150,
+    "receipts_sha256": "f832cca3346094be00650267899a1890c5c40e961fd64d60b203238c1a2c9db8",
+    "receipts_sha256_scope": "published_sanitized_jsonl",
+    "retry_count": 0,
+    "seed": 20260711,
+    "status": "passed",
+    "suite_version": "ds4-w2-prewarm-v4",
+    "temperature": 0.0,
+    "top_p": 1.0
+  },
+  "server": {
+    "served_model": "deepseek-v4-flash-w2",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+    "image_id": "sha256:7385d21d26b665884e97a97dc67a100db328ed7b00b634e4d18f8aedd9f29eab",
+    "image_source_patch_label": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+    "runtime": {
+      "base_cache_gb": 8,
+      "delta_gb": 6,
+      "delta_policy": "lru",
+      "gate_tau": 0.75,
+      "gpu_memory_utilization": 0.95,
+      "kv_cache_dtype": "fp8",
+      "max_model_len": 32768,
+      "speculative_tokens": 0
+    },
+    "w2_environment": {
+      "VLLM_MOE_W2": "1",
+      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
+      "VLLM_MOE_W2_CACHE_CONTROL": "required",
+      "VLLM_MOE_W2_DELTA_GB": "6",
+      "VLLM_MOE_W2_DELTA_POLICY": "lru",
+      "VLLM_MOE_W2_DELTA_TRACE": "1",
+      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
+      "VLLM_MOE_W2_GATE": "1",
+      "VLLM_MOE_W2_GATE_TAU": "0.75",
+      "VLLM_MOE_W2_KPI_EVERY": "64",
+      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
+      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24",
+      "VLLM_MOE_W2_POOL_HEAT": "0",
+      "VLLM_MOE_W2_PREFETCH": "0"
+    }
+  },
+  "pool_gate": {
+    "baseline_snapshot": null,
+    "checks": [
+      {
+        "metric": "fp4_tick",
+        "observed": 99862,
+        "operator": ">=",
+        "passed": true,
+        "threshold": 1
+      },
+      {
+        "metric": "fp4_occupancy",
+        "observed": 1.0,
+        "operator": ">=",
+        "passed": true,
+        "threshold": 1.0
+      },
+      {
+        "metric": "fp4_total_evicted",
+        "observed": 176899,
+        "operator": ">=",
+        "passed": true,
+        "threshold": 1
+      },
+      {
+        "metric": "base_unrestored_experts",
+        "observed": 0,
+        "operator": "<=",
+        "passed": true,
+        "threshold": 0
+      }
+    ],
+    "configured": true,
+    "deferred_checks": [
+      "fp4_total_evicted_delta"
+    ],
+    "passed": true,
+    "policy": {
+      "max_base_cumulative_replay_pct": null,
+      "max_base_fp_residue_steps": null,
+      "max_base_replay_pct": null,
+      "max_base_unrestored_experts": 0,
+      "max_gate_fire_rate": null,
+      "min_fp4_cached": null,
+      "min_fp4_occupancy": 1.0,
+      "min_fp4_tick": 1,
+      "min_fp4_total_evicted": 1,
+      "min_fp4_total_evicted_delta": 16,
+      "min_fp4_total_promoted": null,
+      "min_gate_fire_rate": null,
+      "min_gate_steps": null
+    },
+    "policy_sha256": "1afb9b0d96d05c9d7a374dff88c94c76a3e854c8d046fb8ef1783275ad3f5630",
+    "post_eval": {
+      "baseline_snapshot": {
+        "base_cumulative_replay_pct": 98.3,
+        "base_cumulative_steps": 6848,
+        "base_fp_residue_steps": 60,
+        "base_replay_pct": 93.8,
+        "base_replay_steps": 64,
+        "base_unrestored_experts": 0,
+        "captured_at_utc": "2026-07-11T22:23:34.486912Z",
+        "fp4_cached": 481,
+        "fp4_expert_hit_pct": 23.8,
+        "fp4_occupancy": 1.0,
+        "fp4_slots": 481,
+        "fp4_tick": 99862,
+        "fp4_token_hit_pct": 29.0,
+        "fp4_total_evicted": 176899,
+        "fp4_total_promoted": 177380,
+        "fp4_window_evicted": 224,
+        "fp4_window_promoted": 224,
+        "gate_fire_rate": null,
+        "gate_fired": null,
+        "gate_steps": null
+      },
+      "checks": [
+        {
+          "metric": "fp4_tick",
+          "observed": 124875,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 1
+        },
+        {
+          "metric": "fp4_occupancy",
+          "observed": 1.0,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 1.0
+        },
+        {
+          "metric": "fp4_total_evicted",
+          "observed": 252012,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 1
+        },
+        {
+          "metric": "fp4_total_evicted_delta",
+          "observed": 75113,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 16
+        },
+        {
+          "metric": "base_unrestored_experts",
+          "observed": 0,
+          "operator": "<=",
+          "passed": true,
+          "threshold": 0
+        }
+      ],
+      "configured": true,
+      "deferred_checks": [],
+      "passed": true,
+      "policy": {
+        "max_base_cumulative_replay_pct": null,
+        "max_base_fp_residue_steps": null,
+        "max_base_replay_pct": null,
+        "max_base_unrestored_experts": 0,
+        "max_gate_fire_rate": null,
+        "min_fp4_cached": null,
+        "min_fp4_occupancy": 1.0,
+        "min_fp4_tick": 1,
+        "min_fp4_total_evicted": 1,
+        "min_fp4_total_evicted_delta": 16,
+        "min_fp4_total_promoted": null,
+        "min_gate_fire_rate": null,
+        "min_gate_steps": null
+      },
+      "snapshot": {
+        "base_cumulative_replay_pct": 98.4,
+        "base_cumulative_steps": 9856,
+        "base_fp_residue_steps": 63,
+        "base_replay_pct": 98.4,
+        "base_replay_steps": 64,
+        "base_unrestored_experts": 0,
+        "captured_at_utc": "2026-07-11T22:30:33.085133Z",
+        "fp4_cached": 481,
+        "fp4_expert_hit_pct": 37.6,
+        "fp4_occupancy": 1.0,
+        "fp4_slots": 481,
+        "fp4_tick": 124875,
+        "fp4_token_hit_pct": 37.8,
+        "fp4_total_evicted": 252012,
+        "fp4_total_promoted": 252493,
+        "fp4_window_evicted": 161,
+        "fp4_window_promoted": 161,
+        "gate_fire_rate": null,
+        "gate_fired": null,
+        "gate_steps": null
+      }
+    },
+    "snapshot": {
+      "base_cumulative_replay_pct": 98.3,
+      "base_cumulative_steps": 6848,
+      "base_fp_residue_steps": 60,
+      "base_replay_pct": 93.8,
+      "base_replay_steps": 64,
+      "base_unrestored_experts": 0,
+      "captured_at_utc": "2026-07-11T22:23:34.486912Z",
+      "fp4_cached": 481,
+      "fp4_expert_hit_pct": 23.8,
+      "fp4_occupancy": 1.0,
+      "fp4_slots": 481,
+      "fp4_tick": 99862,
+      "fp4_token_hit_pct": 29.0,
+      "fp4_total_evicted": 176899,
+      "fp4_total_promoted": 177380,
+      "fp4_window_evicted": 224,
+      "fp4_window_promoted": 224,
+      "gate_fire_rate": null,
+      "gate_fired": null,
+      "gate_steps": null
+    },
+    "status": "passed"
+  },
+  "summary": {
+    "clean": 40,
+    "coding_clean": 20,
+    "lenient": 40,
+    "n": 40,
+    "reasoning_clean": 20,
+    "sinks": 0
+  },
+  "quality_comparable": true,
+  "error": null,
+  "artifacts": {
+    "manifest": "seed44.manifest.json",
+    "raw_jsonl": "seed44.raw.jsonl",
+    "warmup_jsonl": "seed44.warmup.jsonl"
+  },
+  "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and response IDs are retained only in private source receipts. The public run label is descriptive."
+}

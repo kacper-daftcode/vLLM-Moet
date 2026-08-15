@@ -1,0 +1,306 @@
+{
+  "artifacts": {
+    "manifest": "seed42.manifest.json",
+    "raw_jsonl": "seed42.raw.jsonl",
+    "raw_sha256": "db5b50a8ed30dd68f61431cae477cf65902768d400b4f7d20fc75790c5abc2b6",
+    "warmup_jsonl": "seed42.warmup.jsonl",
+    "warmup_sha256": "c0f30b140c53006c5d2041f7e3f75f7dc977bd8980c059aec745c7ea559a909b"
+  },
+  "completed_at_utc": "2026-07-12T02:09:10.166138Z",
+  "error": null,
+  "eval": {
+    "max_tokens": 700,
+    "order": "reasoning-coding-interleaved-fixed",
+    "retry_count": 0,
+    "seed": 42,
+    "temperature": 0.6,
+    "timeout_seconds": 300,
+    "top_p": 0.95
+  },
+  "harness": {
+    "argv": [
+      "tools/ds4_eval/eval_rig.py",
+      "--items",
+      "tools/ds4_eval/items.json",
+      "--server-provenance",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/server.json",
+      "--pool-gate-policy",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/pool-gate-policy-quality.json",
+      "--pool-command-json",
+      "private pool-log command omitted",
+      "--output-dir",
+      "evidence/2026-07-12-integration/final/p2-integration-41d7b2f-128k-r1/quality-seed42",
+      "--run-label",
+      "p2-integration-41d7b2f-128k-r1-s42",
+      "--url",
+      "private evaluation endpoint omitted",
+      "--model",
+      "deepseek-v4-flash-w2",
+      "--mode",
+      "warm",
+      "--eval-seed",
+      "42",
+      "--eval-temperature",
+      "0.6",
+      "--eval-top-p",
+      "0.95",
+      "--eval-max-tokens",
+      "700",
+      "--eval-timeout",
+      "300",
+      "--expected-count",
+      "40",
+      "--pool-kpi-timeout",
+      "30"
+    ],
+    "files": {
+      "eval_rig.py": "1d338ab4b1279238c5b0f7ce0e91694b16ac1883da428fd2a59cd17030ced11b",
+      "harness.py": "62240f57a4b27d4bc10aa7083fd32542a21797aea1d1aaac586cc827e4fe0e25",
+      "rescore_robust.py": "64ea40dc76c1e7a742c5b612eb604f2a262746aa8f0aaeaf0e148b22e192d434"
+    },
+    "python": "3.11.15 (main, Apr  7 2026, 20:41:15) [Clang 22.1.1 ]"
+  },
+  "inputs": {
+    "expected_count": 40,
+    "items_path": "tools/ds4_eval/items.json",
+    "items_sha256": "7ad04cd43ab750de7b9f4e90c786aac58fecde0007b9d894086128196d91b968"
+  },
+  "pool_gate": {
+    "baseline_snapshot": null,
+    "checks": [
+      {
+        "metric": "fp4_tick",
+        "observed": 49952,
+        "operator": ">=",
+        "passed": true,
+        "threshold": 1
+      },
+      {
+        "metric": "fp4_occupancy",
+        "observed": 1.0,
+        "operator": ">=",
+        "passed": true,
+        "threshold": 1.0
+      },
+      {
+        "metric": "fp4_total_evicted",
+        "observed": 211,
+        "operator": ">=",
+        "passed": true,
+        "threshold": 1
+      },
+      {
+        "metric": "base_unrestored_experts",
+        "observed": 0,
+        "operator": "<=",
+        "passed": true,
+        "threshold": 0
+      }
+    ],
+    "configured": true,
+    "deferred_checks": [
+      "fp4_total_evicted_delta"
+    ],
+    "passed": true,
+    "policy": {
+      "max_base_cumulative_replay_pct": null,
+      "max_base_fp_residue_steps": null,
+      "max_base_replay_pct": null,
+      "max_base_unrestored_experts": 0,
+      "max_gate_fire_rate": null,
+      "min_fp4_cached": null,
+      "min_fp4_occupancy": 1.0,
+      "min_fp4_tick": 1,
+      "min_fp4_total_evicted": 1,
+      "min_fp4_total_evicted_delta": 16,
+      "min_fp4_total_promoted": null,
+      "min_gate_fire_rate": null,
+      "min_gate_steps": null
+    },
+    "policy_sha256": "1afb9b0d96d05c9d7a374dff88c94c76a3e854c8d046fb8ef1783275ad3f5630",
+    "post_eval": {
+      "baseline_snapshot": {
+        "base_cumulative_replay_pct": 90.6,
+        "base_cumulative_steps": 64,
+        "base_fp_residue_steps": 57,
+        "base_replay_pct": 90.6,
+        "base_replay_steps": 64,
+        "base_unrestored_experts": 0,
+        "captured_at_utc": "2026-07-12T02:02:33.768130Z",
+        "fp4_cached": 481,
+        "fp4_expert_hit_pct": 15.6,
+        "fp4_occupancy": 1.0,
+        "fp4_slots": 481,
+        "fp4_tick": 49952,
+        "fp4_token_hit_pct": 19.5,
+        "fp4_total_evicted": 211,
+        "fp4_total_promoted": 692,
+        "fp4_window_evicted": 211,
+        "fp4_window_promoted": 600,
+        "gate_fire_rate": null,
+        "gate_fired": null,
+        "gate_steps": null
+      },
+      "checks": [
+        {
+          "metric": "fp4_tick",
+          "observed": 52960,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 1
+        },
+        {
+          "metric": "fp4_occupancy",
+          "observed": 1.0,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 1.0
+        },
+        {
+          "metric": "fp4_total_evicted",
+          "observed": 42971,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 1
+        },
+        {
+          "metric": "fp4_total_evicted_delta",
+          "observed": 42760,
+          "operator": ">=",
+          "passed": true,
+          "threshold": 16
+        },
+        {
+          "metric": "base_unrestored_experts",
+          "observed": 0,
+          "operator": "<=",
+          "passed": true,
+          "threshold": 0
+        }
+      ],
+      "configured": true,
+      "deferred_checks": [],
+      "passed": true,
+      "policy": {
+        "max_base_cumulative_replay_pct": null,
+        "max_base_fp_residue_steps": null,
+        "max_base_replay_pct": null,
+        "max_base_unrestored_experts": 0,
+        "max_gate_fire_rate": null,
+        "min_fp4_cached": null,
+        "min_fp4_occupancy": 1.0,
+        "min_fp4_tick": 1,
+        "min_fp4_total_evicted": 1,
+        "min_fp4_total_evicted_delta": 16,
+        "min_fp4_total_promoted": null,
+        "min_gate_fire_rate": null,
+        "min_gate_steps": null
+      },
+      "snapshot": {
+        "base_cumulative_replay_pct": 98.3,
+        "base_cumulative_steps": 3008,
+        "base_fp_residue_steps": 63,
+        "base_replay_pct": 98.4,
+        "base_replay_steps": 64,
+        "base_unrestored_experts": 0,
+        "captured_at_utc": "2026-07-12T02:09:10.165112Z",
+        "fp4_cached": 481,
+        "fp4_expert_hit_pct": 22.1,
+        "fp4_occupancy": 1.0,
+        "fp4_slots": 481,
+        "fp4_tick": 52960,
+        "fp4_token_hit_pct": 22.8,
+        "fp4_total_evicted": 42971,
+        "fp4_total_promoted": 43452,
+        "fp4_window_evicted": 760,
+        "fp4_window_promoted": 760,
+        "gate_fire_rate": null,
+        "gate_fired": null,
+        "gate_steps": null
+      }
+    },
+    "snapshot": {
+      "base_cumulative_replay_pct": 90.6,
+      "base_cumulative_steps": 64,
+      "base_fp_residue_steps": 57,
+      "base_replay_pct": 90.6,
+      "base_replay_steps": 64,
+      "base_unrestored_experts": 0,
+      "captured_at_utc": "2026-07-12T02:02:33.768130Z",
+      "fp4_cached": 481,
+      "fp4_expert_hit_pct": 15.6,
+      "fp4_occupancy": 1.0,
+      "fp4_slots": 481,
+      "fp4_tick": 49952,
+      "fp4_token_hit_pct": 19.5,
+      "fp4_total_evicted": 211,
+      "fp4_total_promoted": 692,
+      "fp4_window_evicted": 211,
+      "fp4_window_promoted": 600,
+      "gate_fire_rate": null,
+      "gate_fired": null,
+      "gate_steps": null
+    },
+    "status": "passed"
+  },
+  "prewarm": {
+    "cases": 10,
+    "enabled": true,
+    "max_tokens": 150,
+    "receipts_sha256": "c0f30b140c53006c5d2041f7e3f75f7dc977bd8980c059aec745c7ea559a909b",
+    "retry_count": 0,
+    "seed": 20260711,
+    "status": "passed",
+    "suite_version": "ds4-w2-prewarm-v4",
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "receipts_sha256_scope": "published_sanitized_jsonl"
+  },
+  "quality_comparable": true,
+  "run_label": "p2-integration-41d7b2f-128k-r1-s42",
+  "schema_version": "ds4-w2-eval-v1",
+  "server": {
+    "served_model": "deepseek-v4-flash-w2",
+    "source_commit": "ee0da84ab9e04ac7610e28580af62c365e898389",
+    "source_patch_sha256": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "image_id": "sha256:66abc2f145244e03ff0f0fcca088be813ad311f2963c62b281e4bb888ac605e9",
+    "image_source_patch_label": "41d7b2f96ca3b966cac1b7ed5cff37bc03c27c616ed254aca961cc75a9ffe31d",
+    "runtime": {
+      "max_model_len": 131072,
+      "base_cache_gb": 8,
+      "delta_gb": 6,
+      "delta_policy": "lru",
+      "gate_tau": 0.75,
+      "kv_cache_dtype": "fp8",
+      "speculative_tokens": 0,
+      "gpu_memory_utilization": 0.95
+    },
+    "w2_environment": {
+      "VLLM_MOE_W2": "1",
+      "VLLM_MOE_W2_GATE_TAU": "0.75",
+      "VLLM_MOE_W2_DELTA_TRACE": "1",
+      "VLLM_MOE_W2_DELTA_POLICY": "lru",
+      "VLLM_MOE_W2_POOL_HEAT": "0",
+      "VLLM_MOE_W2_MIN_CGROUP_HEADROOM_GB": "1",
+      "VLLM_MOE_W2_BASE_CACHE_GB": "8",
+      "VLLM_MOE_W2_DELTA_GB": "6",
+      "VLLM_MOE_W2_GATE": "1",
+      "VLLM_MOE_W2_DELTA_TRACE_EVERY": "64",
+      "VLLM_MOE_W2_CACHE_CONTROL": "required",
+      "VLLM_MOE_W2_PREFETCH": "0",
+      "VLLM_MOE_W2_KPI_EVERY": "64",
+      "VLLM_MOE_W2_MIN_MEM_AVAILABLE_GB": "24"
+    }
+  },
+  "started_at_utc": "2026-07-12T02:02:02.006071Z",
+  "status": "complete",
+  "summary": {
+    "clean": 40,
+    "coding_clean": 20,
+    "lenient": 40,
+    "n": 40,
+    "reasoning_clean": 20,
+    "sinks": 0
+  },
+  "sanitization_note": "Host topology, opaque runtime IDs, host-specific paths, checkpoint and pack fingerprints, launcher identity, and response IDs are retained only in private source receipts. The public run label is descriptive."
+}

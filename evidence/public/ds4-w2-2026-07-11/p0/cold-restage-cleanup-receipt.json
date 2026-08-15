@@ -1,0 +1,10 @@
+{
+  "schema": "w2-guarded-cleanup-receipt-v1",
+  "controller_result": "success",
+  "cleanup_exit_code": 0,
+  "evaluation_container_absent_after": true,
+  "stopped_services_expected_count": 2,
+  "stopped_services_active_after_count": 2,
+  "production_pack_fingerprint_unchanged": true,
+  "verification_note": "Derived from retained private controller, pack-fingerprint, and service receipts; topology-specific identifiers and hashes are intentionally omitted from this public artifact."
+}
