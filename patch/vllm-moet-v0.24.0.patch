@@ -18350,7 +18350,7 @@ index 6b750fe7e..167ad6851 100644
          # last sampled token in addition to all draft tokens.
          BLOCK_SIZE=triton.next_power_of_2(
 diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
-index 30ca2ddc5..4b53e6e0b 100644
+index 30ca2ddc5..483851c6f 100644
 --- a/vllm/v1/worker/gpu/model_runner.py
 +++ b/vllm/v1/worker/gpu/model_runner.py
 @@ -43,10 +43,18 @@ from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -19060,32 +19060,42 @@ index 30ca2ddc5..4b53e6e0b 100644
          # Run model.
          if batch_desc.cg_mode == CUDAGraphMode.FULL:
              # Use explicit cudagraph replay for FULL mode.
-@@ -1307,6 +1880,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1307,6 +1880,22 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              output_intermediate_tensors = model_output
  
          finished_req_ids = scheduler_output.finished_req_ids
-+        # The gate-replay fields ride along ONLY when the gate is enabled.
-+        # Holding batch_desc/model_inputs unconditionally extends the step
-+        # tensors' lifetimes into sample_tokens, which shifts CUDA-allocator
-+        # block reuse under the sampler/speculator and flips greedy
-+        # near-ties: the gate-off path must stay bit-identical to pre-port.
++        # The replay fields ride along ONLY when a consumer exists: the gate
++        # re-forward OR the mandatory base-cache replay ([H] 2026-08-22 —
++        # the reader side in sample_tokens gates on (_gate_on or _base_on),
++        # but this setter kept gate-only, so the FIRST gate-off base-cache
++        # cell on V2 asserted `model_inputs is not None` in
++        # _moe_w2_replay_forward; latent on the trunk too, where every V2
++        # base-cache cell so far served with the gate enabled). Holding
++        # batch_desc/model_inputs unconditionally extends the step tensors'
++        # lifetimes into sample_tokens, which shifts CUDA-allocator block
++        # reuse under the sampler/speculator and flips greedy near-ties:
++        # the plain path (no gate, no base tier) must stay bit-identical
++        # to pre-port.
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_delta as _w2d_keep)
 +        _gate_on = moe_w2_gate is not None and moe_w2_gate.enabled()
++        _keep = _gate_on or (_w2d_keep._BASE_TIER is not None)
          self.execute_model_state = ExecuteModelState(
              input_batch=input_batch,
              attn_metadata=attn_metadata,
-@@ -1314,6 +1893,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1314,6 +1903,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              hidden_states=hidden_states,
              aux_hidden_states=aux_hidden_states,
              finished_req_ids=finished_req_ids,
-+            batch_desc=batch_desc if _gate_on else None,
++            batch_desc=batch_desc if _keep else None,
 +            model_inputs=(model_inputs
-+                          if (_gate_on and not dummy_run) else None),
++                          if (_keep and not dummy_run) else None),
 +            num_tokens_across_dp=(num_tokens_across_dp
-+                                  if _gate_on else None),
++                                  if _keep else None),
          )
  
          if not self.is_last_pp_rank:
-@@ -1336,8 +1920,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1336,8 +1930,38 @@ class GPUModelRunner(LoRAModelRunnerMixin):
          hidden_states = self.execute_model_state.hidden_states
          aux_hidden_states = self.execute_model_state.aux_hidden_states
          finished_req_ids = self.execute_model_state.finished_req_ids
@@ -19124,7 +19134,7 @@ index 30ca2ddc5..4b53e6e0b 100644
          if not self.is_last_pp_rank:
              # Non-last PP rank: hidden_states is None because this rank produced
              # IntermediateTensors instead of final hidden states. Receive the
-@@ -1424,7 +2038,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1424,7 +2048,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              sampler_output.sampled_token_ids,
              num_sampled,
              num_rejected,
@@ -19137,7 +19147,7 @@ index 30ca2ddc5..4b53e6e0b 100644
          )
  
          if self.speculator is not None:
-@@ -1436,7 +2054,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1436,7 +2064,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
              spec_hidden_states = hidden_states
              if hasattr(self.model, "get_mtp_target_hidden_states"):
                  pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
@@ -19148,7 +19158,7 @@ index 30ca2ddc5..4b53e6e0b 100644
              draft_tokens = self.speculator.propose(
                  input_batch,
                  attn_metadata,
-@@ -1451,16 +2071,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1451,16 +2081,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                  self.sampler.sampling_states.seeds.gpu,
                  mm_inputs=mm_inputs,
              )
@@ -19196,7 +19206,7 @@ index 30ca2ddc5..4b53e6e0b 100644
          # Post-step KV connector related operations.
          kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
          model_runner_output.kv_connector_output = kv_connector_output
-@@ -1576,3 +2225,11 @@ class ExecuteModelState(NamedTuple):
+@@ -1576,3 +2235,11 @@ class ExecuteModelState(NamedTuple):
      hidden_states: torch.Tensor | None
      aux_hidden_states: list[torch.Tensor] | None
      finished_req_ids: set[str]
