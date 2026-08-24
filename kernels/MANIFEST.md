@@ -255,7 +255,9 @@ atomic-order 4.7e-10 — the route's only atomic surface). In-serving
 (GLM-5.2 TP4 resident + MTP k=2): route ACTIVE, C1-MTP code 53-67 tok/s
 (mgemm verify: 36-44), C2 103-104 agg, C4 parity (verify T=12 is above
 the M∈[2,8] window by design). Guards runtime-certified in-serving via
-the captured graph route (fixed G=T groups).
+the captured graph route (fixed G=T groups). Paired quality GSM8K-200
+(P6, same tool/config/items, OFF→ON): 93.0% → 93.5%, discordants 4/5,
+McNemar exact p=1.000 — no significant regression.
 
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
