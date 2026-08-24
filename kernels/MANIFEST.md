@@ -227,6 +227,36 @@ boot-cert PIECEWISE 16/16 + FULL 8/8 with the route captured; paired
 quality GSM8K-200/GPQA-198 NT: no significant regression (McNemar
 p=0.500/1.000). Empty ext-call 16.2 µs (stage early-outs under guarded).
 
+### GLM family (K=6144, BASE-ONLY — [N] 2026-08-24, tor B F-B0..F-B3)
+
+Regenerated canons for the GLM-5.2 trellis geometry (H=6144, I=2048,
+serving pair base (2,2,1) cb0 — **no delta side stream**: the ext skips
+ucb2/dn3 and the glue keeps the delta buffer quadrants zeroed +
+zero-svh'd; DESIGN §5t/§5t′/§5t″). k1@N=6144 has GROUPS=192 (non-pow2):
+the CTAID decode uses an exact magic-div (`(x>>6)*0xAAAB>>17`, grid 1152
+= 3.06 waves — the fuller wave amortizes the tail, +2% vs the DS4
+canon despite 1.5× columns). Guard variant for it: `div192` mode of
+`gen/gen_m8_guard.py`. Generators: parameterized `gen_exl3_wave_{uni,k1}.py`
+(lab; `UNI_KDIM`/`K1_NDIM`, defaults regenerate the DS4 canons
+byte-identically — verified 3×).
+
+| cubin | kernel | solo cold (µs) | grid |
+|---|---|---|---|
+| `uni_m8[g]_k6144.cubin` | `exl3_wave_uni_k2cb0` | 38.11 (rot8 @1680; gate ≤55) | 768 |
+| `k1_m8[g]_n6144.cubin` | `exl3_wave_k1cb0` | 20.12 (rot24 @1680; gate ≤32) | 1152 |
+
+Validation: Gate1 vs numpy oracle rel ~2.07-2.08e-4 (+ M=1 lab reference
+at N=6144: degenerate row0 BIT-identical, rows 1-7 bit-zero); real GLM
+packs l03+l50 4/4 PASS (spread experts, w1/w3/w2); det ×2/×3 everywhere;
+base-only layer window 96.1 µs = 12.02 µs/tok @M=8 (burst-first-block,
+SETS=4/12); ext seam parity vs lab wrapper 4.5e-8, map linearity incl.
+empty expert through the guard 4.2e-8, d_in BIT-det (out: fp32
+atomic-order 4.7e-10 — the route's only atomic surface). In-serving
+(GLM-5.2 TP4 resident + MTP k=2): route ACTIVE, C1-MTP code 53-67 tok/s
+(mgemm verify: 36-44), C2 103-104 agg, C4 parity (verify T=12 is above
+the M∈[2,8] window by design). Guards runtime-certified in-serving via
+the captured graph route (fixed G=T groups).
+
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
 |---|---|---|---|
