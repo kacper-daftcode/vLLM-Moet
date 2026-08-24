@@ -3071,6 +3071,34 @@ index 051468ed1..9e5cc3dad 100644
          )
  
          # Enforce that we enough for at least 1 page per request
+diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+index b638db13f..9ec4597d9 100644
+--- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
++++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
+@@ -851,6 +851,23 @@ class MoERunner(MoERunnerInterface):
+         ):
+             return None
+ 
++        # moe_w2-served layers: the 2-bit/EXL3 branch intercepts in the
++        # quant method's apply before any modular-kernel dispatch, and the
++        # W2 build (build_layer_planes*/_exl3_build_layer) replaces
++        # process_weights_after_loading — the method's internal MK setup
++        # never runs, so supports_internal_mk is False by construction.
++        # Falling through would call the fp8 method's legacy
++        # maybe_make_prepare_finalize, which raises by upstream design
++        # (first hit: GLM-5.2 fp8 + EXL3 EP under TP2 — TP1 never calls
++        # this hook). The MK is dead machinery for a W2 layer: rank
++        # partials compose through the model's MoE all-reduce, exactly
++        # like the monolithic (DS4 mxfp4) EP cells that early-return
++        # above.
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_cubit)
++        if moe_w2_cubit.is_w2_layer(str(self.layer_name)):
++            return None
++
+         self.routed_experts._ensure_moe_quant_config_init()
+         # routing_tables only needed for round-robin expert placement with
+         # DeepEP all2all backend.
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
 index 7cdb04cfb..d8916b966 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
@@ -4057,10 +4085,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..a255ed0c9
+index 000000000..a6fbb55d1
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3793 @@
+@@ -0,0 +1,3868 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -4713,11 +4741,86 @@ index 000000000..a255ed0c9
 +_skip_logged = False
 +
 +
++_graph_envelope_checked = False
++
++
++def _check_graph_envelope(cfg) -> None:
++    """Fleet contract (user directive 2026-08-24): the decode/verify hot
++    path must NEVER silently fall out of CUDA graphs to eager.
++
++    A spec step verifies (1+k) tokens per sequence, so pure-decode batches
++    reach (1+k)*max_num_seqs tokens. vLLM rounds every capture size up to a
++    multiple of (1+k) and silently DROPS the ones above
++    max_cudagraph_capture_size (adjust_cudagraph_sizes_for_spec_decode
++    refuses only when NOTHING survives) — a too-small envelope leaves the
++    larger concurrencies to eager verify with no warning (measured: GLM
++    TP4+MTP k=2 seqs=4 with cap 8 captured only {3,6}; C4 verify T=12 ran
++    eager, 34.4 agg vs 64.5 no-spec). Refuse such boots with the exact
++    remedy instead. Sanctioned opt-outs: --enforce-eager (xcap capture
++    cells) and an explicit cudagraph_mode NONE. On pager cells
++    (BASE_CACHE_GB) a larger envelope raises the base-pool working-set
++    floor in lockstep (check_pool_floor / the [F] law: pool >= captured
++    tokens x top_k x layers x ownership) — when the pool cannot grow, the
++    remedy is reducing num_speculative_tokens or max_num_seqs, never
++    silent eager."""
++    global _graph_envelope_checked
++    if _graph_envelope_checked:
++        return
++    _graph_envelope_checked = True
++    if cfg.model_config is not None and cfg.model_config.enforce_eager:
++        return                      # explicit eager — sanctioned opt-out
++    comp = cfg.compilation_config
++    if comp is None:
++        return
++    mode = getattr(comp, "cudagraph_mode", None)
++    if mode is None or getattr(mode, "name", str(mode)) == "NONE":
++        return                      # graphs explicitly off — sanctioned
++    k = 0
++    if cfg.speculative_config is not None:
++        k = int(getattr(cfg.speculative_config,
++                        "num_speculative_tokens", 0) or 0)
++    seqs = int(cfg.scheduler_config.max_num_seqs)
++    need = (1 + k) * seqs
++    # Mirror adjust_cudagraph_sizes_for_spec_decode: sizes round up to
++    # multiples of m and survive only when still <= the cap, so coverage
++    # means SOME size lands in [need, cap] after rounding. Reading the
++    # config before or after the adjustment gives the same verdict
++    # (rounding is idempotent).
++    m = 1 + k
++    if (cfg.parallel_config is not None
++            and cfg.parallel_config.tensor_parallel_size > 1
++            and getattr(comp.pass_config, "enable_sp", False)):
++        m = max(m, cfg.parallel_config.tensor_parallel_size)
++    sizes = list(comp.cudagraph_capture_sizes or [])
++    cap = int(comp.max_cudagraph_capture_size or 0)
++    covered = any(
++        need <= ((s + m - 1) // m) * m <= cap for s in sizes)
++    if covered:
++        return
++    raise ValueError(
++        f"moe_w2 graph envelope: pure-decode{' spec-verify' if k else ''} "
++        f"steps reach (1+num_speculative_tokens)*max_num_seqs = "
++        f"(1+{k})*{seqs} = {need} tokens, but the captured cudagraph "
++        f"envelope (cudagraph_capture_sizes={sizes}, "
++        f"max_cudagraph_capture_size={cap}, rounding multiple {m}) does "
++        f"not cover that size — those steps would SILENTLY run eager, "
++        f"which the fleet contract forbids. Fix the config: extend the "
++        f"envelope (--compilation-config '{{\"cudagraph_capture_sizes\":"
++        f"[...,{need}],\"max_cudagraph_capture_size\":{need}}}'), or "
++        f"reduce num_speculative_tokens/max_num_seqs so (1+k)*max_num_seqs "
++        f"fits a captured size, or opt out explicitly with "
++        f"--enforce-eager (capture cells). On pager cells "
++        f"(VLLM_MOE_W2_BASE_CACHE_GB) a larger envelope raises the "
++        f"base-pool floor (pool >= captured tokens x top_k x layers x "
++        f"ownership) — if the pool cannot grow, reduce k or seqs instead.")
++
++
 +def _layer_contract(layer) -> dict:
 +    """Validate semantics the hand-written W2 path actually implements."""
 +    try:
 +        from vllm.config import get_current_vllm_config
 +        cfg = get_current_vllm_config()
++        _check_graph_envelope(cfg)
 +        if cfg.model_config.dtype != torch.bfloat16:
 +            raise ValueError(
 +                "VLLM_MOE_W2 kernels use BF16 intermediates and currently "
