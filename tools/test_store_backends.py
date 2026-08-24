@@ -83,6 +83,16 @@ def check_store_rows(store, parts, pairs, label, scan=False):
 def main():
     parts = build_parts(1234)
 
+    # Fail-closed sidecar gate (fork 72d9fdca4): a pack whose ckpt_id is
+    # None — the offline/unit-test default — is NEVER trusted at reopen,
+    # so every boot-from-pack step below would rebuild over its garbage
+    # staging. Pin a fixed identity for the whole run, as serving always
+    # has one; the identity-gate section swaps it per sub-case and
+    # restores this pin via its _ckpt_orig save.
+    from vllm.model_executor.layers.quantization.utils import (
+        moe_w2_store as _stmod_pin)
+    _stmod_pin._ckpt_id = lambda: "test-ckpt-fixed"
+
     os.environ.pop("VLLM_MOE_W2_STORE_DIR", None)
     os.environ.pop("VLLM_MOE_W2_BASE_RAM_GB", None)
     tier = make_tier("t-pinned")
@@ -142,7 +152,19 @@ def main():
             _json.dump(legacy, f)
         tier_c = make_tier("t-mmap")
         assert len(tier_c._store) == 0, "legacy sidecar (no ckpt_id) trusted"
-        print("[identity] A->B rebuild + legacy-stale  OK")
+        # fail-closed (72d9fdca4): an unresolved identity (None) is never
+        # trusted at reopen, even by the very process that wrote the pack
+        shutil.rmtree(PACK_DIR, ignore_errors=True)
+        _stmod._ckpt_id = lambda: None
+        tier_n = make_tier("t-mmap")
+        for li in range(N_LAYERS):
+            tier_n.add_layer_host_planes(li, *parts[li])
+        assert len(tier_n._store) == N_LAYERS
+        tier_n2 = make_tier("t-mmap")
+        assert len(tier_n2._store) == 0, \
+            "None-identity pack trusted at reopen (fail-closed broken)"
+        print("[identity] A->B rebuild + legacy-stale + None-never-trusted"
+              "  OK")
     finally:
         _stmod._ckpt_id = _ckpt_orig
 
