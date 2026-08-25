@@ -13,7 +13,17 @@ wszystkie własne scoreboardy przed oddaniem sterowania (oryginalny
 prolog startuje z czystym stanem jak przy zwykłym wejściu). Semantyka
 grup NIEPUSTYCH: bajt-w-bajt ciało oryginału (diff = sam blok).
 
-Użycie: python3 gen_m8_guard.py <src.sass> <dst.sass> <shift6|shift7>
+Użycie: python3 gen_m8_guard.py <src.sass> <dst.sass> <shift6|shift7|div192>
+       [rows16]
+
+div192 ([N] F-B0, k1_m8@N=6144): GROUPS=192 nie-pow2 — slot = ctaid//192
+przez magic //3 po >>6 (dokladne w zakresie gridu 1152); reszta bloku =
+shift7 verbatim (te same rejestry/scoreboardy, audyt bez zmian).
+
+rows16 ([O] tor C F-C0, kanony m16): row_map (6,16) i32 — stride
+eksperta 64 B zamiast 32 B (SHF *32 -> *64); test pustki BEZ zmian
+(row0 — prefix-packing to twardy kontrakt builderow niezaleznie od
+pojemnosci wierszy).
 """
 import re
 import sys
@@ -32,6 +42,26 @@ GUARD_SHIFT7 = """\
     [B------:R-:W0:-:S01] S2R R2, SR_CTAID.X ;
     [B------:R-:W1:-:S01] LDC.64 R20, c[0x0][0x398] ;  // d_rmap
     [B0-----:R-:W-:-:S06] SHF.R.U32.HI R2, RZ, 0x7, R2 ;  // slot = expert
+    [B------:R-:W-:-:S06] SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, R2, 0x1, R20 ;
+    [B----4-:R-:W2:-:S01] LDG.E.64 R24, desc[UR4][R20.64] ;  // row_map[e][0:2]
+    [B--2---:R-:W-:-:S06] IADD3 R24, PT, PT, R24, 0x1, RZ ;  // -1 -> 0
+    [B------:R-:W-:-:S08] ISETP.EQ.AND P0, PT, R24, RZ, PT ;
+    [B------:R-:W-:-:S06] MOV R24, RZ ;  // dystans ISETP->@P0 >=15 cykli
+    [B------:R-:W-:-:S06] MOV R24, RZ ;  // (wzorzec kanonu: predykat late)
+    [B------:R-:W-:-:S05] @P0 EXIT ;  // ekspert pusty: caly CTA konczy
+"""
+
+GUARD_DIV192 = """\
+    // ---- [E]+[N] m8g guard (F-B0 K=6144): CTA konczy, gdy
+    // row_map[expert][0] == -1 (KONTRAKT: prefix-packing). d_rmap =
+    // 4. param. GROUPS=192 nie-pow2: slot = (ctaid>>6)*0xAAAB>>17.
+    [B------:R-:W4:-:S01] LDCU.64 UR4, c[0x0][0x358] ;
+    [B------:R-:W0:-:S01] S2R R2, SR_CTAID.X ;
+    [B------:R-:W1:-:S01] LDC.64 R20, c[0x0][0x398] ;  // d_rmap
+    [B0-----:R-:W-:-:S06] SHF.R.U32.HI R2, RZ, 0x6, R2 ;  // x = ctaid>>6
+    [B------:R-:W-:-:S06] IMAD R2, R2, 0xaaab, RZ ;  // magic //3 (GROUPS=192)
+    [B------:R-:W-:-:S06] SHF.R.U32.HI R2, RZ, 0x11, R2 ;  // slot = expert
     [B------:R-:W-:-:S06] SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B
     [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, R2, 0x1, R20 ;
     [B----4-:R-:W2:-:S01] LDG.E.64 R24, desc[UR4][R20.64] ;  // row_map[e][0:2]
@@ -117,7 +147,14 @@ def first_use_audit(lines):
 
 def main():
     src, dst, mode = sys.argv[1], sys.argv[2], sys.argv[3]
-    guard = {"shift6": GUARD_SHIFT6, "shift7": GUARD_SHIFT7}[mode]
+    guard = {"shift6": GUARD_SHIFT6, "shift7": GUARD_SHIFT7,
+             "div192": GUARD_DIV192}[mode]
+    if len(sys.argv) > 4 and sys.argv[4] == "rows16":
+        # [O] m16: row_map (6,16) i32 -> stride eksperta 64 B
+        old = "SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B"
+        new = "SHF.L.U32 R2, R2, 0x6, RZ ;  // *64 B (rmap (6,16) [O])"
+        assert old in guard, "anchor stride rmap nie znaleziony"
+        guard = guard.replace(old, new)
     lines = open(src).read().splitlines(keepends=True)
     out = []
     injected_param = injected_guard = False

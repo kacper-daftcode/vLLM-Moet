@@ -259,6 +259,54 @@ the captured graph route (fixed G=T groups). Paired quality GSM8K-200
 (P6, same tool/config/items, OFF→ON): 93.0% → 93.5%, discordants 4/5,
 McNemar exact p=1.000 — no significant regression.
 
+### GLM family M=16 (dual-set with M8 — [O] 2026-08-25, tor C F-C0..F-C3)
+
+M=16-native canons widen the decode-wave window to **T∈[2,16]** — the
+HMMA tile is m16n8k16 and the m8 canons zeroed A-fragment rows 8-15;
+m16 fills the existing zeros with token data (hot loop cycle-identical
+to m8: 72.5/95.4 cyc/tile — 8 extra token rows cost zero additional
+HMMA and zero additional trellis decode). The flat row-8-15 offset does
+not fit the 12-bit LDGSTS immediate (and uni has no free register
+pair), so the A side is **INTERLEAVED**:
+`d_a16[slot][r%8][k//2][r//8][k%2]` — pairs {a01,a89}/{a23,a1011} land
+as 2× `LDGSTS.E.64` per slice (same instruction count, same
+barrier/pending discipline as the m8 cert). The epilogue folds rows
+8-15 through the epilogue-dead ping-pong region (+A_OFF): **zero
+additional BARs** vs m8, warp early-exit kept. ABI: `d_rmap` (6,16)
+int32 for the guarded set (`rows16` mode of `gen/gen_m8_guard.py`,
+stride 64 B; `div192 rows16` for k1). Group contract:
+**G = ceil(k·T/6)** — the previous G=T was a top-6 invariant and can
+silently overflow the slot buffers at top-8 (the fix ships with the
+glue and applies retroactively to the m8 route). Served as a
+**dual-set** with m8: the ext loader holds both, the glue picks m8 for
+T∈[2,8] (m16 pays ~15%/tok at M=8) and m16 for T∈[9,16].
+
+| cubin | kernel | solo cold (µs) | grid |
+|---|---|---|---|
+| `uni_m16[g]_k6144.cubin` | `exl3_wave_uni_k2cb0` | 45.63 (rot8 @1680; gate ≤46) | 768 |
+| `k1_m16[g]_n6144.cubin` | `exl3_wave_k1cb0` | 24.55 (rot24 @1680; gate ≤25) | 1152 |
+
+Validation: Gate1 vs numpy oracle rel 2.06-2.09e-4 (×2 kernels ×2
+runs); degenerate (rows 8-15 zero in): rows 0-7 **BIT-identical to the
+m8 canon** + rows 8-15 bit-zero out; real GLM packs l03+l50 4/4 PASS;
+det ×2/×3 everywhere; m8 baselines reproduced on the same card
+(37.99/20.12 µs); per-token −40%/−39% vs m8 (2.852/1.534 µs/tok @M=16).
+Guards m16g: +0.34%/+1.03% full map, empty map ~5.2 µs. Base-only
+layer window: M=16 = 7.34 µs/tok, M=12 = 9.63 µs/tok (the C4+MTP
+verify shape; layer stays flat in M — M=1→16 = +10%). Ext seam parity
+3/3 (5.5e-8; map linearity incl. empty expert 4.8e-8; d_in16 BIT-det,
+out fp32 atomic-order 4.7e-10). Builder tests 47+79 GREEN incl. the
+top-8 OOB regression (U=24 @T=3 covered by G=4). In-serving (GLM-5.2
+TP4 resident + MTP k=2, dual-set m8+m16): **C4-MTP agg 59-60 →
+194-203 tok/s (3.3×)** — verify T=12 moves off the mgemm union tax;
+C1/C2 within the ±3% gate (the G-fix empty groups cost ~2-2.5% at
+T≤8); cold prefill untouched (554 vs 559). Paired quality GSM8K-200
+**at C4** (fresh boots both arms; the m16 route never fires at C1):
+OFF 94.0% vs ON 91.0%, discordants 9:3, McNemar exact p=0.146 — no
+significant regression (near-tie drift floor at C4 pending an OFF-OFF
+control). Boot note: graph capture at T=12 needs deterministic KV
+headroom — pin `--kv-cache-memory-bytes` ≈2 GiB/rank at the 8k window.
+
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
 |---|---|---|---|
