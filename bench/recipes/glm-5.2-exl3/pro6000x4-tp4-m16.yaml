@@ -1,0 +1,91 @@
+id: glm-5.2-exl3/pro6000x4-tp4-m16
+model: GLM-5.2-FP8
+served_name: glm-5.2
+summary: "4x RTX PRO 6000 TP4 - EXL3 trellis base (2,2,1) resident via EP, MTP k=2, decode-wave M8+M16 dual-set"
+
+# The EXL3 base serves the routed experts from a trellis pack derived from
+# the FP8 checkpoint (the pack builder lives in the FD ext repo; the pack,
+# the ext repo checkout and the prebuilt torch-extension cache are provided
+# through the planes volume - see the box planes_cache entry):
+#   /planes/exl3-packs  - GLM-5.2 trellis pack, serving pair base (2,2,1)
+#   /planes/fd          - exllamav3 ext checkout (JIT source; prebuilt cache
+#                         under /planes/torchext makes boots compile-free)
+#   /planes/autotune    - exl3 coop-kernel tune cache (append-only)
+# Decode-wave canons ship in-image under /cubit-share/exl3-wave-m8
+# (kernels/MANIFEST.md "GLM family" sections; M8 for T<=8, M16 for
+# T in [9,16] - the MTP k=2 verify window at C<=4). Graph capture pins
+# exact verify sizes {3,6} next to the powers of two: the G-fix empty
+# groups at C1/C2 vanish at zero numerical delta (pad rows are weight-0).
+# KV pin: graph capture at T=12 needs deterministic headroom (2 GiB/rank
+# at the 8k window) - without it capture OOMs against the profiler
+# estimate.
+
+requires:
+  gpus: 4
+  vram_gb: 96
+  host_ram_gb: 640
+
+context: 8192
+load_timeout_s: 3600
+
+env:
+  VLLM_MOE_W2: "1"
+  VLLM_MOE_W2_EXL3_BASE: "1"
+  VLLM_MOE_W2_EXL3_PACK: /planes/exl3-packs
+  VLLM_MOE_W2_EXL3_REPO: /planes/fd
+  VLLM_MOE_W2_EXL3_W2K: "1"
+  VLLM_MOE_W2_EXL3_MOE_PREFILL: "1"
+  VLLM_MOE_W2_EXL3_WAVE_M8: "1"
+  VLLM_MOE_W2_EXL3_WAVE_M16: "1"
+  VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR: /cubit-share/exl3-wave-m8
+  VLLM_MOE_W2_DRAFT: "1"
+  VLLM_MOE_W2_NUM_LAYERS: "79"
+  VLLM_MOE_W2_EXL3_RESIDENT_KEYS: "78"
+  VLLM_MOE_W2_EXL3_CUDAGRAPH: "1"
+  VLLM_MOE_W2_EXL3_WAVE: "0"
+  VLLM_MOE_W2_EXL3_DELTA_VALIDATE: "0"
+  VLLM_MOE_W2_BASE_CACHE_GB: "44"
+  VLLM_MOE_W2_BASE_MISS_TOL: "8"
+  VLLM_MOE_W2_DELTA_GB: "0"
+  VLLM_MOE_W2_DELTA_POLICY: need
+  VLLM_MOE_W2_GATE: "0"
+  VLLM_MOE_W2_PREFETCH: "0"
+  VLLM_MOE_W2_PREFILL_FP4: "0"
+  VLLM_MOE_W2_PREFILL_T: "16"
+  VLLM_MOE_W2_STREAM_BUILD: "0"
+  VLLM_MOE_W2_KPI_EVERY: "200"
+  VLLM_MOE_W2_CUBIT_DIR: /cubit-share
+  TORCH_EXTENSIONS_DIR: /planes/torchext
+  EXLLAMAV3_TUNE_CACHE: /planes/autotune/glm-tp4-mtp.bin
+  # NOTE: the ext JIT must build SM120-only for the prebuilt
+  # /planes/torchext cache to be a no-op (flag-exact); the serving image
+  # bakes a multi-arch TORCH_CUDA_ARCH_LIST and container env wins over
+  # recipe env, so the box env pins TORCH_CUDA_ARCH_LIST=12.0 (docker -e
+  # beats image ENV) - see bench/boxes/rtx-pro6000x4.yaml.
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 4
+  - --disable-custom-all-reduce
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 8192
+  - --gpu-memory-utilization 0.93
+  - --kv-cache-memory-bytes 2147483648
+  - --max-num-batched-tokens 2048
+  - --max-num-seqs 4
+  - --max-logprobs 64
+  - --no-scheduler-reserve-full-isl
+  - --tool-call-parser glm47
+  - --reasoning-parser glm45
+  - --speculative-config {"method":"mtp","num_speculative_tokens":2}
+  - --compilation-config {"cudagraph_capture_sizes":[1,2,3,4,6,8,12],"max_cudagraph_capture_size":12}
+
+warmup:
+  decode_requests: 12
+
+suite_params:
+  # 8k window: the standard prefill (8000 words ~ 10.6k tok) would not fit;
+  # 5500 words ~ 7.3k tok is the campaign-validated anti-prefix-cache size.
+  prefill:
+    words: 5500

@@ -6,14 +6,24 @@ gpus:
 host_ram_gb: 1007
 
 runtime: docker
-docker_image: vllm-moet-recipes:v024
+# Rebuilt from patch @ vllm db13b2e9c (2026-07-26 fail-closed repair). The old
+# :v024 tag predates it and would measure retired code.
+docker_image: vllm-moet-recipes:v024-db13b2e9c
 shm_size: 64g
 
 env:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  VLLM_MOE_W2_STORE_DIR: /planes/packs
+  # Triton JIT cache on the same volume: per-shape compiles survive container
+  # restarts (the req1/TTFT finding, 2026-08-03).
+  TRITON_CACHE_DIR: /planes/triton
 
 models:
   DeepSeek-V4-Flash: /workspace/ds4flash-official
+
+planes_cache:
+  # rank-keyed, shared with the PRO6000 box on purpose
+  DeepSeek-V4-Flash: /workspace/moet-serve/planes-ds4-tp1
 
 log_dir: /root/logs/bench
 

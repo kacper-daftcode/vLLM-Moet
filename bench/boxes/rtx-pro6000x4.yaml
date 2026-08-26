@@ -6,18 +6,45 @@ gpus:
 host_ram_gb: 1007
 
 runtime: docker
-docker_image: vllm-moet-recipes:v024
+# Rebuilt from patch @ vllm 432f9d9cf (2026-08-26: the EXL3 EP line merge -
+# GLM-5.2 trellis serving + decode-wave M8/M16). Earlier note (90c0b7e44,
+# 2026-08-02): gate on Model Runner V2 + the 07-30/31 host-sync perf line.
+# Older tags would measure retired code.
+docker_image: vllm-moet-recipes:v024-432f9d9cf
 shm_size: 64g
 
 env:
   PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # This host needs P2P off (PCIe topology quirk; every serving cell on
+  # this box runs with it - the [M]/[N]/[O] GLM campaign lineage).
+  NCCL_P2P_DISABLE: "1"
+  # SM120-only JIT builds: the serving image bakes a multi-arch
+  # TORCH_CUDA_ARCH_LIST and container env wins over recipe env, so the
+  # box pins the single arch here (docker -e beats image ENV). Keeps the
+  # EXL3 recipes' prebuilt torch-extension caches valid (flag-exact).
+  TORCH_CUDA_ARCH_LIST: "12.0"
+  # /planes is the mounted planes-cache dir (rw); the pack store lives under it
+  # so both survive between runs without a second bind.
+  VLLM_MOE_W2_STORE_DIR: /planes/packs
+  # Triton JIT cache on the same volume: per-shape compiles survive container
+  # restarts (the req1/TTFT finding, 2026-08-03). Recipes without a planes
+  # mount just create the dir in-container - the ephemeral status quo.
+  TRITON_CACHE_DIR: /planes/triton
 
 models:
   GLM-5.2-NVFP4: /workspace/glm-5.2-nvfp4
+  GLM-5.2-FP8: /workspace/glm-5.2-fp8
   DeepSeek-V4-Flash: /workspace/ds4flash-official
 
 planes_cache:
   GLM-5.2-NVFP4: /workspace/.planes-cache-glm-bench
+  # Entries are rank-keyed (`...rank0of1`, `rank0of2`), so one directory serves
+  # TP1/TP2/TP4 cells without collisions.
+  DeepSeek-V4-Flash: /workspace/moet-serve/planes-ds4-tp1
+  # EXL3 trellis line: the volume carries the derived pack (hardlink farm of
+  # the box-local build), the FD ext checkout, the prebuilt torch-extension
+  # cache and the coop-autotune cache (recipe header documents the layout).
+  GLM-5.2-FP8: /workspace/.planes-glm52-exl3
 
 log_dir: /root/logs/bench
 
