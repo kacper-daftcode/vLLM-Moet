@@ -200,7 +200,9 @@ k4 = len(promoted)
 with btier._lock:
     for s in taken:
         btier._own(s, 0, int(btier._owner_ei[s]))
-        btier._step_pins.add(s)
+        # EP line acf34c62e consolidated the step-pin set into a bool
+        # mask (_step_pin_mask) folded into the hard-victim mask.
+        btier._step_pin_mask[s] = True
     taken2 = btier._take_slots_batch(k4, emergency=True)
 still2 = [e for e in promoted if int(btier._mirror[0, e]) >= 0]
 consistent = all(

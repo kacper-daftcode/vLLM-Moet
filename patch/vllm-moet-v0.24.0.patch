@@ -2267,6 +2267,163 @@ index 000000000..0c85b5dd5
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tools/test_moe_w2_exl3_m16_maps.py b/tools/test_moe_w2_exl3_m16_maps.py
+new file mode 100644
+index 000000000..a345f3c37
+--- /dev/null
++++ b/tools/test_moe_w2_exl3_m16_maps.py
+@@ -0,0 +1,151 @@
++#!/usr/bin/env python3
++"""Unit tests for moe_w2_exl3.build_m8_groups_graph with the [O]
++2026-08-25 group-count fix (G = ceil(min(T*k, E_reach)/cap) instead of
++the top-6-only G=T) and the m16 window (rows=16).
++
++Pure CPU, no GPU (the graph builder is device-agnostic torch ops).
++Run: python3 tools/test_moe_w2_exl3_m16_maps.py
++
++Covers:
++  (a) host<->graph parity, rows=8, top-6, G=T (legacy default — DS4
++      class, bit-compat regression)
++  (b) host<->graph parity, rows=16, top-8, G=ceil(kT/6) (GLM m16 class)
++  (c) REGRESSION of the [O] finding: top-8, T=3, DISJOINT routing
++      (union 24 > 6T=18) — legacy G=T scatters OUT OF BOUNDS; the fixed
++      G=4 must carry ALL 24 pairs
++  (d) surplus groups are EMPTY with prefix-packed real groups first
++  (e) rows=16 accepts a token count per expert up to 16 (T=16 full
++      overlap)
++  (f) determinism x2 (bit-identical)
++"""
++import importlib.util
++import math
++import os
++import sys
++
++import torch
++
++WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++spec = importlib.util.spec_from_file_location(
++    "moe_w2_exl3",
++    f"{WT}/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py")
++X3 = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(X3)
++
++E = 256
++FAILS = []
++NCHECKS = [0]
++
++
++def check(name, ok, detail=""):
++    NCHECKS[0] += 1
++    print(f"  {'PASS' if ok else 'FAIL'}  {name}  {detail}")
++    if not ok:
++        FAILS.append(name)
++
++
++def graph_vs_host(name, ids, wts, rows, groups):
++    """Graph builder (fixed G) vs host builder (real groups only):
++    real groups bit-identical, surplus groups empty."""
++    host = X3.build_m8_groups(ids, wts, cap=6, rows=rows)
++    ex, rm, rw = X3.build_m8_groups_graph(ids, wts, cap=6, rows=rows,
++                                          groups=groups)
++    ok = ex.shape == (groups, 6) and rm.shape == (groups, 6, rows) \
++        and rw.shape == (groups, 6, rows)
++    check(f"{name}: shapes (G={groups})", ok,
++          f"{tuple(ex.shape)}/{tuple(rm.shape)}")
++    nh = len(host)
++    ok_real = nh <= groups
++    for gi, (he, hm, hw) in enumerate(host):
++        ok_real &= bool(torch.equal(ex[gi].cpu(), he))
++        ok_real &= bool(torch.equal(rm[gi].cpu().to(torch.int32),
++                                    hm.to(torch.int32)))
++        ok_real &= bool(torch.equal(rw[gi].cpu(), hw))
++    check(f"{name}: real groups bit== host ({nh})", ok_real)
++    ok_emp = bool((rm[nh:] == -1).all()) and bool((rw[nh:] == 0).all())
++    check(f"{name}: surplus groups empty ({groups - nh})", ok_emp)
++    # kompletnosc: kazda para (t,e) topk ma dokladnie jeden wiersz
++    seen = {}
++    for gi in range(groups):
++        for s in range(6):
++            for r in range(rows):
++                t = int(rm[gi, s, r])
++                if t >= 0:
++                    seen[(t, int(ex[gi, s]))] = float(rw[gi, s, r])
++    want = {}
++    for t in range(ids.shape[0]):
++        for j in range(ids.shape[1]):
++            key = (t, int(ids[t, j]))
++            want[key] = want.get(key, 0.0) + float(wts[t, j])
++    ok_cov = set(seen) == set(want) and all(
++        abs(seen[kk] - torch.tensor(vv).half().item()) < 3e-3
++        for kk, vv in want.items())
++    check(f"{name}: all (t,e) pairs covered ({len(want)})", ok_cov)
++    return ex, rm, rw
++
++
++def main():
++    g = torch.Generator().manual_seed(20260825)
++
++    # (a) legacy DS4 class: top-6, rows=8, G=T (default arg path)
++    for T in (2, 4, 8):
++        ids = torch.stack([torch.randperm(E, generator=g)[:6]
++                           for _ in range(T)])
++        wts = torch.rand(T, 6, generator=g)
++        ex, rm, rw = X3.build_m8_groups_graph(ids, wts)   # legacy default
++        ex2, rm2, rw2 = X3.build_m8_groups_graph(ids, wts, cap=6, rows=8,
++                                                 groups=T)
++        check(f"(a) T={T}: legacy default == groups=T",
++              torch.equal(ex, ex2) and torch.equal(rm, rm2)
++              and torch.equal(rw, rw2))
++        graph_vs_host(f"(a) top-6 T={T}", ids, wts, 8, T)
++
++    # (b) GLM m16 class: top-8, rows=16, G=ceil(kT/6), random routing
++    for T in (2, 9, 12, 16):
++        ids = torch.stack([torch.randperm(E, generator=g)[:8]
++                           for _ in range(T)])
++        wts = torch.rand(T, 8, generator=g)
++        G = math.ceil(min(T * 8, E) / 6)
++        graph_vs_host(f"(b) top-8 rows16 T={T}", ids, wts, 16, G)
++
++    # (c) REGRESJA znaleziska [O]: top-8, T=3, routing ROZLACZNY
++    # (union 24 > 18 = 6T — stare G=T pisalo poza bufor S=6T)
++    ids = torch.arange(24, dtype=torch.int64).reshape(3, 8) * 7
++    wts = torch.rand(3, 8, generator=g)
++    G = math.ceil(24 / 6)
++    check("(c) G fix: 4 grupy dla U=24 @T=3", G == 4)
++    graph_vs_host("(c) top-8 disjoint T=3", ids, wts, 16, G)
++
++    # (d) surplus/prefix: maly union, duze G
++    ids = torch.tensor([[5, 9, 5, 9, 5, 9, 5, 9]] * 12, dtype=torch.int64)
++    wts = torch.rand(12, 8, generator=g)
++    ex, rm, rw = graph_vs_host("(d) union 2, G=16", ids, wts, 16, 16)
++    check("(d) grupa 0 realna, 1..15 puste",
++          bool((rm[0, 0] >= 0).any()) and bool((rm[1:] == -1).all()))
++
++    # (e) rows=16: pelny overlap T=16 -> 16 wierszy jednego eksperta
++    ids = torch.tensor([[3, 77, 130, 200, 250, 11, 42, 99]] * 16,
++                       dtype=torch.int64)
++    wts = torch.rand(16, 8, generator=g)
++    G = math.ceil(8 / 6)
++    ex, rm, rw = graph_vs_host("(e) full overlap T=16", ids, wts, 16, G)
++    check("(e) ekspert 3: wiersze 0-15",
++          rm[0, 0].tolist() == list(range(16)))
++
++    # (f) determinizm x2
++    ids = torch.stack([torch.randperm(E, generator=g)[:8]
++                       for _ in range(12)])
++    wts = torch.rand(12, 8, generator=g)
++    a = X3.build_m8_groups_graph(ids.clone(), wts.clone(), rows=16,
++                                 groups=16)
++    b = X3.build_m8_groups_graph(ids.clone(), wts.clone(), rows=16,
++                                 groups=16)
++    check("(f) determinizm", all(torch.equal(a[i], b[i]) for i in range(3)))
++
++    print(f"\n{NCHECKS[0]} checks, {len(FAILS)} failed"
++          + (f": {FAILS}" if FAILS else " — ALL GREEN"))
++    sys.exit(1 if FAILS else 0)
++
++
++if __name__ == "__main__":
++    main()
 diff --git a/tools/test_moe_w2_exl3_m8_maps.py b/tools/test_moe_w2_exl3_m8_maps.py
 new file mode 100644
 index 000000000..f9809ad7b
@@ -2541,7 +2698,7 @@ index 000000000..f9809ad7b
 +if __name__ == "__main__":
 +    main()
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
-index 6da3ec717..c84958ac0 100644
+index 6da3ec717..b2ef78322 100644
 --- a/vllm/compilation/breakable_cudagraph.py
 +++ b/vllm/compilation/breakable_cudagraph.py
 @@ -175,10 +175,13 @@ class BreakableCUDAGraphCapture:
@@ -2560,6 +2717,26 @@ index 6da3ec717..c84958ac0 100644
          self._current_graph = g
          self._capturing = True
  
+@@ -372,6 +375,19 @@ class BreakableCUDAGraphWrapper:
+         # session may issue many begin/end pairs (one per layer's break),
+         # and repeated gc would tank capture time the way it did for the
+         # pre-`gc_disable` piecewise path.
++        #
++        # Drain ALL in-flight device work before gc + empty_cache: the eager
++        # warmup that immediately precedes this capture launches ext kernels
++        # on side streams from raw data_ptrs the caching allocator does not
++        # track, so without a device-wide sync empty_cache (expandable
++        # segments: cuMemUnmap) can unmap blocks a still-running warmup
++        # kernel reads -> async illegal memory access surfacing at the next
++        # enqueue (measured: nospec-TP4 capture, IMA at empty_cache /
++        # ncclAllReduce, 2026-08-16..19; boots clean under
++        # CUDA_LAUNCH_BLOCKING=1). profile_cudagraph_memory already syncs
++        # before ITS empty_cache -- this path was the one missing it.
++        # Capture-only cost (once per captured descriptor).
++        torch.accelerator.synchronize()
+         gc.collect()
+         torch.accelerator.empty_cache()
+         # Sync the offloader's copy stream before capture so any in-flight
 diff --git a/vllm/compilation/cuda_graph.py b/vllm/compilation/cuda_graph.py
 index b63d86199..3cad1f058 100644
 --- a/vllm/compilation/cuda_graph.py
@@ -3071,11 +3248,54 @@ index 051468ed1..9e5cc3dad 100644
          )
  
          # Enforce that we enough for at least 1 page per request
+diff --git a/vllm/model_executor/layers/fused_moe/routed_experts.py b/vllm/model_executor/layers/fused_moe/routed_experts.py
+index 99a481cf6..9cc96018e 100644
+--- a/vllm/model_executor/layers/fused_moe/routed_experts.py
++++ b/vllm/model_executor/layers/fused_moe/routed_experts.py
+@@ -1087,6 +1087,11 @@ class RoutedExperts(PluggableLayer):
+         """
+         assert not self.quant_method.is_monolithic
+ 
++        # NOTE: the xcap MoE-input capture hook moved to
++        # MoERunner._forward_impl — the one chokepoint every route shares.
++        # Hooking here silently missed quant methods with internal modular
++        # kernels (native-fp8 eagle_head drafters never reach this path).
++
+         # Modular kernels use pre-computed routing
+         return self.quant_method.apply(
+             layer=self,
+@@ -1121,6 +1126,9 @@ class RoutedExperts(PluggableLayer):
+         """
+         assert self.quant_method.is_monolithic
+ 
++        # NOTE: xcap capture moved to MoERunner._forward_impl (see
++        # forward_modular note).
++
+         # Monolithic kernels handle routing internally
+         return self.quant_method.apply_monolithic(
+             layer=self,
 diff --git a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-index b638db13f..9ec4597d9 100644
+index b638db13f..edf44276c 100644
 --- a/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
 +++ b/vllm/model_executor/layers/fused_moe/runner/moe_runner.py
-@@ -851,6 +851,23 @@ class MoERunner(MoERunnerInterface):
+@@ -798,6 +798,16 @@ class MoERunner(MoERunnerInterface):
+         # TODO(bnell): this can be removed after MK migration is complete.
+         self.routed_experts._ensure_moe_quant_config_init()
+ 
++        # Env-gated MoE-input capture (xcap). The runner is the one true
++        # chokepoint: quant methods with internal modular kernels (e.g. a
++        # native-fp8 drafter under the eagle_head tag) never reach the
++        # RoutedExperts.forward_modular/forward_monolithic call sites, so
++        # hooking only there silently misses them (found on the GLM-5.2
++        # MTP layer-78 capture, 2026-08-23).
++        from vllm.model_executor.layers.quantization.utils import moe_w2_xcap
++        if moe_w2_xcap.enabled():
++            moe_w2_xcap.record(str(self.layer_name), hidden_states)
++
+         # Sync aux and main stream for shared expert multi-stream overlap.
+         self._maybe_sync_shared_experts_stream(shared_experts_input)
+ 
+@@ -851,6 +861,23 @@ class MoERunner(MoERunnerInterface):
          ):
              return None
  
@@ -3100,10 +3320,10 @@ index b638db13f..9ec4597d9 100644
          # routing_tables only needed for round-robin expert placement with
          # DeepEP all2all backend.
 diff --git a/vllm/model_executor/layers/quantization/fp8.py b/vllm/model_executor/layers/quantization/fp8.py
-index 7cdb04cfb..d8916b966 100644
+index 7cdb04cfb..bd35b795e 100644
 --- a/vllm/model_executor/layers/quantization/fp8.py
 +++ b/vllm/model_executor/layers/quantization/fp8.py
-@@ -671,6 +671,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -671,6 +671,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              layer.w13_input_scale = None
              layer.w2_input_scale = None
  
@@ -3111,21 +3331,27 @@ index 7cdb04cfb..d8916b966 100644
 +        # the GPU during load; stage them in host RAM until the 2-bit planes
 +        # are built in process_weights_after_loading. Block-quant models only
 +        # (DS4-Flash-FP8, GLM-5.2-FP8).
++        # Loader-level skip first (mirrors the modelopt method): a layer the
++        # pack store already serves (EXL3 boot-from-pack) needs NO checkpoint
++        # staging at all — on GLM-5.2-FP8 the raw experts are ~660 GB, which
++        # does not fit host RAM either.
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if self.block_quant and moe_w2_cubit.is_w2_layer(
 +                getattr(layer, "layer_name", "")):
-+            for pname in ("w13_weight", f"w13_{self.weight_scale_name}",
-+                          "w2_weight", f"w2_{self.weight_scale_name}"):
-+                p_ = getattr(layer, pname)
-+                attrs = dict(p_.__dict__)  # weight_loader, quant_method, ...
-+                newp = torch.nn.Parameter(p_.data.cpu(), requires_grad=False)
-+                layer.register_parameter(pname, newp)
-+                set_weight_attrs(newp, attrs)
++            if not moe_w2_cubit.plan_pack_skip(layer):
++                for pname in ("w13_weight", f"w13_{self.weight_scale_name}",
++                              "w2_weight", f"w2_{self.weight_scale_name}"):
++                    p_ = getattr(layer, pname)
++                    attrs = dict(p_.__dict__)  # weight_loader, quant_method, ...
++                    newp = torch.nn.Parameter(p_.data.cpu(),
++                                              requires_grad=False)
++                    layer.register_parameter(pname, newp)
++                    set_weight_attrs(newp, attrs)
 +
      def _setup_kernel(
          self,
          layer: RoutedExperts,
-@@ -717,6 +732,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -717,6 +738,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
              )
  
      def process_weights_after_loading(self, layer: RoutedExperts) -> None:
@@ -3134,7 +3360,10 @@ index 7cdb04cfb..d8916b966 100644
 +        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
 +        if self.block_quant and moe_w2_cubit.is_w2_layer(
 +                getattr(layer, "layer_name", "")):
-+            key = len(moe_w2_cubit._LAYERS)
++            # the CREATE-time counter when the loader-skip planner ran
++            # (identical build order); len(_LAYERS) for older paths
++            key = getattr(layer, "_moe_w2_create_key",
++                          len(moe_w2_cubit._LAYERS))
 +            moe_w2_cubit.build_layer_planes_fp8(
 +                layer, key, scale_suffix=self.weight_scale_name)
 +            layer._moe_w2_key = key
@@ -3143,7 +3372,7 @@ index 7cdb04cfb..d8916b966 100644
          # Allow for accessing weights and scales in standard way.
          w13 = layer.w13_weight
          w2 = layer.w2_weight
-@@ -802,7 +828,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -802,7 +837,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
  
      @property
      def supports_eplb(self) -> bool:
@@ -3153,7 +3382,7 @@ index 7cdb04cfb..d8916b966 100644
  
      def apply_monolithic(
          self,
-@@ -837,6 +864,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
+@@ -837,6 +873,22 @@ class Fp8MoEMethod(FusedMoEMethodBase):
          shared_experts: SharedExperts | None,
          shared_experts_input: torch.Tensor | None,
      ) -> torch.Tensor:
@@ -4085,10 +4314,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..a6fbb55d1
+index 000000000..75e252615
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,3868 @@
+@@ -0,0 +1,4361 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -4288,8 +4517,25 @@ index 000000000..a6fbb55d1
 +_EXL3_BASE = os.getenv("VLLM_MOE_W2_EXL3_BASE", "0") == "1"
 +_EXL3_PACK = os.getenv("VLLM_MOE_W2_EXL3_PACK", "/serve-tau/exl3-packs-ds4")
 +_EXL3_W2K = int(os.getenv("VLLM_MOE_W2_EXL3_W2K", "2"))
++# EP expert-range sharding under TP (feasibility §R2: ownership by GLOBAL
++# expert id keeps per-expert trellis geometry at TP1 — the wave/M8 canons
++# and the pack serve unchanged on every rank; composition rides the model's
++# existing MoE all-reduce). Optional VRAM-weighted ranges for mixed fleets:
++# VLLM_MOE_W2_EXL3_TP_SHARES="96,96,32,32" (one weight per rank, any unit).
++_EXL3_TP_SHARES = os.getenv("VLLM_MOE_W2_EXL3_TP_SHARES", "")
++# Partial residency on ONE rank (approximate-class cells, e.g. 1x5090):
++# top-N experts per layer resident, rest = weight-zeroed miss. Order from
++# heat manifests (exl3-heat-l{li}.manifest.json "hot" field) when
++# VLLM_MOE_W2_EXL3_HEAT_DIR is set, else ascending ids (debug only).
++_EXL3_RESIDENT_PER_LAYER = int(
++    os.getenv("VLLM_MOE_W2_EXL3_RESIDENT_PER_LAYER", "0"))
++_EXL3_HEAT_DIR = os.getenv("VLLM_MOE_W2_EXL3_HEAT_DIR", "")
 +# layer_key -> (Exl3BaseTier holding that one layer, pack layer index)
 +_EXL3_TIERS: dict[int, tuple] = {}
++# layer_key -> (owned-mask [E] bool on device, sentinel owned id 0-d long):
++# the _exl3_forward ownership transform (ids -> sentinel, weights -> 0 for
++# non-owned pairs). Empty when this rank owns everything.
++_EXL3_OWNED: dict[int, tuple] = {}
 +_exl3_config_checked = False
 +# v2 FP4 need-pool slot geometry (DS4 TP1 is uniform across layers): byte
 +# offsets of the [fp4_13|sc13|fp4_2|sc2] sections + matrix shapes, set once by
@@ -4356,9 +4602,20 @@ index 000000000..a6fbb55d1
 +# with its m8 cubins resolved (tier.ext_wave_m8_available(); missing ->
 +# fallbacks unchanged). M=1 stays on the M=1 wave route. Default OFF.
 +_EXL3_WAVE_M8 = os.getenv("VLLM_MOE_W2_EXL3_WAVE_M8", "0") == "1"
++# [O] F-C2 (tor C): rodzina m16 — DUAL-SET z m8 (T w [2,8] -> m8,
++# T w [9,16] -> m16; kara m16 @T<=8 ~15%, DESIGN 5u'). Osobny opt-in
++# dla czystego A/B w boot-certach; wymaga WAVE_M8=1 (wspolna trasa).
++_EXL3_WAVE_M16 = os.getenv("VLLM_MOE_W2_EXL3_WAVE_M16", "0") == "1"
 +_exl3_wave_m8_seen: list = []   # one-shot activation-log sentinel
 +_exl3_wave_m8g_seen: list = []  # one-shot activation-log sentinel (graph)
++_exl3_wave_m8b_seen: list = []  # one-shot sentinel: M8 base-only ([N] F-B2)
++_exl3_wave_m16_seen: list = []  # one-shot sentinel: M16 base-only ([O] F-C2)
++_exl3_ptab_base_ready: list = []  # one-shot init: ptab base-only stack
 +_EXL3_DELTA_GEOM: dict | None = None
++# Paged-base slot geometry (BASE cache over EXL3, [F] 2026-08-20): the base
++# stream's (2,2,W2K) sections in the base DeltaTier's slots — set by
++# _exl3_stage_base, consumed by init_base_paged's pointer arithmetic.
++_EXL3_BASE_GEOM: dict | None = None
 +
 +# 9b step-1 h_l capture ([P] 2026-08-03, default-off): mirrors the gate's
 +# VLLM_MOE_W2_GATE_HCAP_DIR knob — when set, the EXL3 forward copies each
@@ -4529,8 +4786,13 @@ index 000000000..a6fbb55d1
 +    # target's regardless of draft precision.
 +    from vllm.compilation import backends as _cb
 +    _tag = getattr(_cb, "model_tag", "backbone")
++    # eagle_head: the method="mtp" proposer loads its drafter under this
++    # tag (llm_base_proposer/set_model_tag) — GLM-5.2's single MTP layer
++    # (transformer index 78, plain `model.layers.78.mlp.experts` naming)
++    # is a full 256-expert MoE that can serve from an EXL3 pack exactly
++    # like the DSpark head; same opt-in, same cutoff discipline.
 +    if _tag != "backbone" and not (
-+            _tag == "dspark_head"
++            _tag in ("dspark_head", "eagle_head")
 +            and os.getenv("VLLM_MOE_W2_DRAFT", "0") == "1"):
 +        return False
 +    name = layer_name or ""
@@ -4934,7 +5196,10 @@ index 000000000..a6fbb55d1
 +        _, N2, K2h = layer.w2_weight.shape
 +    except Exception:  # noqa: BLE001 - unexpected layout: stage as before
 +        return False
-+    K13, K2 = K13h * 2, K2h * 2
++    # Packed-u8 checkpoints (mxfp4/nvfp4) store half-width rows; fp8
++    # block-quant checkpoints store full-width e4m3 rows.
++    _mult = 1 if layer.w13_weight.dtype == torch.float8_e4m3fn else 2
++    K13, K2 = K13h * _mult, K2h * _mult
 +    c13len, s13len = N13 * K13 // 4, N13 * K13 // 32
 +    c2len, s2len = N2 * K2 // 4, N2 * K2 // 32
 +    if _EXL3_BASE:
@@ -4993,8 +5258,13 @@ index 000000000..a6fbb55d1
 +                lidx, _pc.expected_sizes(
 +                    E, N13, K13, N2, K2, want_fp4=moe_w2_delta.enabled())):
 +            return False
-+    for pname in ("w13_weight", "w13_weight_scale",
-+                  "w2_weight", "w2_weight_scale"):
++    # fp8 block-quant methods register the scales as *_weight_scale_inv
++    # (Fp8MoEMethod.weight_scale_name); mxfp4/nvfp4 use *_weight_scale.
++    _s13 = ("w13_weight_scale" if hasattr(layer, "w13_weight_scale")
++            else "w13_weight_scale_inv")
++    _s2 = ("w2_weight_scale" if hasattr(layer, "w2_weight_scale")
++           else "w2_weight_scale_inv")
++    for pname in ("w13_weight", _s13, "w2_weight", _s2):
 +        p = getattr(layer, pname)
 +        p.data = torch.empty(0, dtype=p.data.dtype, device="cpu")
 +        p.weight_loader = _noop_loader
@@ -5208,17 +5478,21 @@ index 000000000..a6fbb55d1
 +    # (GATE=1) are now SUPPORTED over the EXL3 base — _exl3_forward composes
 +    # them additively (EXL3 serves the base experts, FP4-resident experts are
 +    # masked out and added from the pool; the gate/runner replay loop is
-+    # format-agnostic). Still refused fail-closed:
-+    #  - the 2-bit base CACHE: the resident EXL3 trellis tier IS the base, and
-+    #    both would not fit; the FP4 pool here promotes from its own pinned
-+    #    host store staged from the checkpoint (no 2-bit base tier).
++    # format-agnostic). Paged base ([F] 2026-08-20):
++    # VLLM_MOE_W2_BASE_CACHE_GB>0 now means the D3 mode-5 pager over the
++    # EXL3 pack — base rows live in the base DeltaTier's host store, the
++    # GPU pool is an expert cache, a routed miss zeroes its weight in-graph
++    # and the runner's mandatory fetch+replay loop restores it exactly
++    # (full quality, unlike RESIDENT_PER_LAYER's static zeroed misses).
++    # Still refused fail-closed:
 +    #  - split-quintal FP4 (DELTA_SPLIT): the eager torch apply reconstructs
 +    #    FULL e2m1 nibble planes; the radix-5 quintal refinement is only
 +    #    decodable against a resident 2-bit base slot the w4q kernel reads.
-+    if moe_w2_delta.base_enabled():
-+        problems.append("2-bit base cache active (unset "
-+                        "VLLM_MOE_W2_BASE_CACHE_GB; the EXL3 tier is the "
-+                        "resident base)")
++    if moe_w2_delta.base_enabled() and _EXL3_RESIDENT_PER_LAYER > 0:
++        problems.append(
++            "BASE_CACHE_GB with RESIDENT_PER_LAYER (pick one residency "
++            "mode: the pager serves the full owned set from host RAM at "
++            "full quality; static partial residency is the degraded class)")
 +    if moe_w2_delta.split_enabled():
 +        problems.append("split-FP4 active (unset VLLM_MOE_W2_DELTA_SPLIT; "
 +                        "EXL3 v2 serves the full-FP4 need-pool only)")
@@ -5227,7 +5501,19 @@ index 000000000..a6fbb55d1
 +            get_tensor_model_parallel_world_size)
 +        tp = get_tensor_model_parallel_world_size()
 +        if tp > 1:
-+            problems.append(f"TP world size {tp} > 1")
++            # EP expert-range sharding (2026-08-14): supported with the
++            # Δ-pack pool (or bare v1). The FP4-from-checkpoint pool flavor
++            # stages K-SLICED per-rank checkpoint params — wrong geometry
++            # under EP, refuse.
++            if moe_w2_delta.enabled() and not _EXL3_DELTA_PACK:
++                problems.append(
++                    f"TP {tp} with the FP4-from-checkpoint pool (EP serves "
++                    "the Δ-pack pool only; set VLLM_MOE_W2_EXL3_DELTA_PACK "
++                    "or VLLM_MOE_W2_DELTA_GB=0)")
++            # heat x TP (2026-08-20): RESIDENT_PER_LAYER under TP is now an
++            # interleaved split of the top-(N*tp) heat order per rank (see
++            # _exl3_owned_ids) — no longer refused. Same approximate-class
++            # quality contract as single-rank partial residency.
 +    except Exception:  # noqa: BLE001
 +        # offline tools without a distributed context; the per-rank shape
 +        # assert in _exl3_build_layer still catches TP-sharded experts.
@@ -5246,10 +5532,11 @@ index 000000000..a6fbb55d1
 +            pass
 +    if problems:
 +        raise ValueError(
-+            "VLLM_MOE_W2_EXL3_BASE supports resident TP1, eager, with an "
-+            "optional full-FP4 need-pool + gate (no 2-bit base cache, no "
-+            "split-FP4, no TP, --enforce-eager); refused: "
-+            + "; ".join(problems))
++            "VLLM_MOE_W2_EXL3_BASE supports resident TP1 (or EP "
++            "expert-range shards under TP with the Δ-pack pool), eager or "
++            "VLLM_MOE_W2_EXL3_CUDAGRAPH=1, with an optional need-pool + "
++            "gate and an optional paged base (BASE_CACHE_GB; no split-FP4); "
++            "refused: " + "; ".join(problems))
 +    if not os.path.isdir(_EXL3_PACK):
 +        raise ValueError(
 +            f"VLLM_MOE_W2_EXL3_BASE=1 but pack dir {_EXL3_PACK!r} does "
@@ -5257,15 +5544,23 @@ index 000000000..a6fbb55d1
 +    _exl3_config_checked = True
 +
 +
++_exl3_dense_offset: int | None = None
++
++
 +def _exl3_pack_index(layer, layer_key: int) -> int:
 +    """Pack file index for this layer, VERIFIED — pack files are keyed by
 +    the ABSOLUTE transformer layer index (build_exl3_pack.py writes
 +    exl3-l{li:02d} with manifest["layer"] == li). The transformer index is
-+    parsed from the layer NAME (never guessed from creation order); on
++    parsed from the layer NAME (never guessed from creation order). On
 +    DS4-Flash all 43 layers are MoE (first_k_dense_replace unset), so it
-+    coincides with layer_key (the is_w2_layer creation counter) and v1
-+    asserts that coincidence: a divergence means a dense-offset model this
-+    mode was never validated on — refuse rather than silently serve."""
++    coincides with layer_key (the is_w2_layer creation counter); on a
++    dense-offset stack (GLM-5.2: first_k_dense_replace=3, MoE l03..l77)
++    the two differ by the CONSTANT dense prefix. Accept exactly that
++    shape: the offset must be non-negative and identical for every W2
++    layer of the boot — anything else (interleaved dense/hybrid stacks)
++    still refuses, because the name->pack mapping is the only one
++    validated."""
++    global _exl3_dense_offset
 +    name = getattr(layer, "layer_name", "")
 +    from vllm.model_executor.layers.quantization.utils import (
 +        moe_w2_planes_cache as _pc)
@@ -5278,11 +5573,25 @@ index 000000000..a6fbb55d1
 +        raise ValueError(
 +            f"moe_w2 EXL3: layer index {lidx} (from {name!r}) outside the "
 +            f"main stack [0, {_layer_cutoff()})")
-+    if lidx != layer_key:
++    off = lidx - layer_key
++    if off < 0:
 +        raise ValueError(
-+            f"moe_w2 EXL3 v1: layer_key {layer_key} != transformer layer "
-+            f"index {lidx} (from {name!r}) — dense-offset MoE stacks are "
-+            "not validated with the EXL3 pack mapping; refusing")
++            f"moe_w2 EXL3: layer_key {layer_key} ahead of transformer "
++            f"layer index {lidx} (from {name!r}) — non-prefix dense "
++            "layout; refusing")
++    if _exl3_dense_offset is None:
++        _exl3_dense_offset = off
++        if off:
++            logger.info(
++                "moe_w2 EXL3: dense-offset stack — layer_key %d maps to "
++                "transformer layer %d (constant dense prefix %d)",
++                layer_key, lidx, off)
++    elif off != _exl3_dense_offset:
++        raise ValueError(
++            f"moe_w2 EXL3: non-constant dense offset ({off} at "
++            f"layer_key {layer_key}, {_exl3_dense_offset} earlier) — "
++            "interleaved dense/MoE stacks are not validated with the "
++            "EXL3 pack mapping; refusing")
 +    path = os.path.join(_EXL3_PACK, f"exl3-l{lidx:02d}.safetensors")
 +    if not os.path.exists(path):
 +        raise ValueError(f"moe_w2 EXL3: pack layer file missing: {path}")
@@ -5342,13 +5651,21 @@ index 000000000..a6fbb55d1
 +            (c13 + sc13b + c2 + sc2b) / 2**20)
 +
 +
-+def _exl3_stage_delta(layer_key: int, lidx: int, dev, E: int) -> None:
++def _exl3_stage_delta(layer_key: int, lidx: int, dev, E: int,
++                      owned: "list[int] | None" = None,
++                      hidden: int = 4096, inter: int = 2048) -> None:
 +    """P6 ([M] 2026-07-30): stage this layer's Δ-pool host sections from the
 +    delta pack. Slot layout = moe_w2_exl3.delta_slot_geom (w13 section |
 +    w2 section, opaque u8 for the tier). Verifies the pack's ABI binding
 +    (delta manifest -> base pack SHA256) by hashing ONE base layer file per
 +    boot (full-pack hashing costs minutes; one file is a spot check of the
-+    same build)."""
++    same build).
++
++    owned (EP / partial residency): stage only this rank's experts — the
++    ownership transform keeps non-owned ids out of `seen`, so the manager
++    and both promote paths never touch the un-staged rows. They are zeroed
++    (not left as empty-garbage) so even a hypothetical stray promotion
++    decodes finite bytes."""
 +    import hashlib
 +    import json as _json
 +    from safetensors import safe_open
@@ -5398,7 +5715,7 @@ index 000000000..a6fbb55d1
 +                f"{man['base_pack_sha256'][:16]}… but the served base pack "
 +                f"file hashes to {h.hexdigest()[:16]}…")
 +        _exl3_delta_abi_checked = True
-+    geom = delta_slot_geom(kd13, kd2)
++    geom = delta_slot_geom(kd13, kd2, hidden=hidden, inter=inter)
 +    geom["mults"] = (0, 0x83DCD12D)   # MUL1 delta stream (pack v3)
 +    ftier = moe_w2_delta.get_tier(n_experts=E, dev=dev,
 +                                  w13_bytes=geom["sec13"],
@@ -5406,10 +5723,15 @@ index 000000000..a6fbb55d1
 +    if ftier is None:
 +        raise RuntimeError("moe_w2 EXL3 Δ-pool: tier requested but get_tier "
 +                           "returned None (VLLM_MOE_W2_DELTA_GB=0?)")
-+    rows13 = torch.empty(E, geom["sec13"], dtype=torch.uint8, device=dev)
-+    rows2 = torch.empty(E, geom["sec2"], dtype=torch.uint8, device=dev)
++    if owned is None:
++        rows13 = torch.empty(E, geom["sec13"], dtype=torch.uint8, device=dev)
++        rows2 = torch.empty(E, geom["sec2"], dtype=torch.uint8, device=dev)
++    else:
++        rows13 = torch.zeros(E, geom["sec13"], dtype=torch.uint8, device=dev)
++        rows2 = torch.zeros(E, geom["sec2"], dtype=torch.uint8, device=dev)
++    stage_set = range(E) if owned is None else owned
 +    with safe_open(path, "pt") as f:
-+        for e in range(E):
++        for e in stage_set:
 +            parts = []
 +            for proj in ("w1", "w3"):
 +                for part in ("trellis", "suh", "svh"):
@@ -5431,7 +5753,8 @@ index 000000000..a6fbb55d1
 +                    f"moe_w2 EXL3 Δ-pool: e{e} w2 section is {row.numel()} "
 +                    f"B, expected {geom['sec2']} (layer {lidx})")
 +            rows2[e] = row.to(dev, non_blocking=True)
-+    ftier.add_layer_host_sections(layer_key, (rows13,), (rows2,))
++    ftier.add_layer_host_sections(layer_key, (rows13,), (rows2,),
++                                  owned=owned)
 +    del rows13, rows2
 +    _EXL3_DELTA_GEOM = geom
 +    if layer_key == 0:
@@ -5441,6 +5764,186 @@ index 000000000..a6fbb55d1
 +            "w2:tr|suh|svh]; base ABI sha %s… verified; policy=need)",
 +            _EXL3_DELTA_PACK, kd13, kd2, base_w2k,
 +            geom["slot_bytes"] / 2**20, man["base_pack_sha256"][:12])
++
++
++def _exl3_stage_base(layer_key: int, lidx: int, dev, E: int,
++                     owned: "list[int] | None" = None,
++                     hidden: int = 4096, inter: int = 2048):
++    """Paged base ([F] 2026-08-20, D3 mode 5): stage this layer's BASE rows
++    from the EXL3 pack into the base DeltaTier's host store (slot layout =
++    delta_slot_geom(2, W2K) — w13 section [tr1|suh1|svh1|tr3|suh3|svh3] +
++    w2 section [tr|suh|svh], same builder the Δ staging uses, so the
++    pointer arithmetic in init_base_paged shares the geometry). The GPU
++    pool becomes an expert cache over these rows; misses are fetched by
++    the runner's mandatory base replay loop, bit-exactly (the fetch copies
++    the same bytes a resident load would have).
++
++    Returns the base tier. `owned` = this rank's pageable set (EP under
++    TP); the pinned store keeps only those rows (compact layout)."""
++    from safetensors import safe_open
++    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    from vllm.model_executor.layers.quantization.utils.moe_w2_exl3 import (
++        delta_slot_geom)
++    global _EXL3_BASE_GEOM
++    geom = delta_slot_geom(2, _EXL3_W2K, hidden=hidden, inter=inter)
++    first = _EXL3_BASE_GEOM is None
++    btier = moe_w2_delta.get_base_tier(_layer_cutoff(), E, dev,
++                                       w13_bytes=geom["sec13"],
++                                       w2_bytes=geom["sec2"])
++    if first:
++        # Missing experts' pointers clamp to slot 0, and a NEVER-written
++        # slot must still decode finite bytes (arbitrary u8 reinterpreted
++        # as fp16 suh/svh can be inf/NaN, and 0-weight does not absorb NaN:
++        # 0*NaN = NaN). Zero-fill once: zero bytes decode to finite values,
++        # and occupied slots always hold real rows afterwards.
++        btier.pool.zero_()
++        _EXL3_BASE_GEOM = geom
++    path = os.path.join(_EXL3_PACK, f"exl3-l{lidx:02d}.safetensors")
++    alloc = torch.zeros if owned is not None else torch.empty
++    rows13 = alloc(E, geom["sec13"], dtype=torch.uint8, device=dev)
++    rows2 = alloc(E, geom["sec2"], dtype=torch.uint8, device=dev)
++    stage_set = range(E) if owned is None else owned
++    with safe_open(path, "pt") as f:
++        for e in stage_set:
++            parts = []
++            for proj in ("w1", "w3"):
++                for part in ("trellis", "suh", "svh"):
++                    t = f.get_tensor(f"e{e}.{proj}.k2.{part}")
++                    parts.append(t.contiguous().view(torch.uint8).view(-1))
++            row = torch.cat(parts)
++            if row.numel() != geom["sec13"]:
++                raise ValueError(
++                    f"moe_w2 EXL3 paged base: e{e} w13 section is "
++                    f"{row.numel()} B, expected {geom['sec13']} (layer "
++                    f"{lidx}; wrong pack geometry?)")
++            rows13[e] = row.to(dev, non_blocking=True)
++            parts = [f.get_tensor(f"e{e}.w2.k{_EXL3_W2K}.{part}")
++                     .contiguous().view(torch.uint8).view(-1)
++                     for part in ("trellis", "suh", "svh")]
++            row = torch.cat(parts)
++            if row.numel() != geom["sec2"]:
++                raise ValueError(
++                    f"moe_w2 EXL3 paged base: e{e} w2 section is "
++                    f"{row.numel()} B, expected {geom['sec2']} (layer "
++                    f"{lidx})")
++            rows2[e] = row.to(dev, non_blocking=True)
++    btier.add_layer_host_sections(layer_key, (rows13,), (rows2,),
++                                  owned=owned)
++    del rows13, rows2
++    if layer_key == 0:
++        logger.info(
++            "moe_w2 EXL3 PAGED base: host store staging from %s "
++            "(base (2,2,%d), slot %.2f MiB; GPU pool = expert cache, "
++            "misses fetch+replay at full quality)",
++            _EXL3_PACK, _EXL3_W2K, geom["slot_bytes"] / 2**20)
++    return btier
++
++
++def _exl3_owned_ids(lidx: int, E: int) -> "list[int] | None":
++    """This rank's expert-ownership set for pack layer `lidx` (global ids,
++    sorted), or None when the rank owns everything (TP1 full residency).
++
++    Two modes, mutually exclusive (guarded in _exl3_check_config):
++      - partial residency (VLLM_MOE_W2_EXL3_RESIDENT_PER_LAYER > 0): top-N
++        per layer by the heat manifests' "hot" order (approximate-class
++        cells: non-resident experts are weight-zeroed misses; the gate/Δ
++        machinery keeps upgrading the RESIDENT set). Under TP (heat x TP,
++        2026-08-20) each rank owns an INTERLEAVED slice of the top-(N*tp)
++        heat order — per-rank N resident, union coverage N*tp hottest
++        (interleaving balances per-rank union heat; partials still compose
++        through the MoE all-reduce like EP);
++      - EP ranges under TP: contiguous [lo, hi) split of [0, E) per rank,
++        equal by default, VRAM-weighted via VLLM_MOE_W2_EXL3_TP_SHARES
++        (mixed fleets: PRO ranks take more experts than 32 GB ranks)."""
++    if _EXL3_RESIDENT_PER_LAYER > 0:
++        n = min(_EXL3_RESIDENT_PER_LAYER, E)
++        try:
++            from vllm.distributed.parallel_state import (
++                get_tensor_model_parallel_rank,
++                get_tensor_model_parallel_world_size)
++            tp = get_tensor_model_parallel_world_size()
++            rank = get_tensor_model_parallel_rank()
++        except Exception:  # noqa: BLE001 - offline tools
++            tp, rank = 1, 0
++        total = min(n * tp, E)
++        if total == E and tp == 1:
++            return None
++        if _EXL3_HEAT_DIR:
++            import json as _json
++            mpath = os.path.join(_EXL3_HEAT_DIR,
++                                 f"exl3-heat-l{lidx:02d}.manifest.json")
++            if not os.path.exists(mpath):
++                # the 0731 heat pack covers layers 03-42; the first MoE
++                # layers have no heat data anywhere — fall back to the
++                # ascending prefix for THOSE layers only and say so.
++                logger.warning(
++                    "moe_w2 EXL3 heat: no manifest for layer %d (%s) — "
++                    "falling back to ascending ids for this layer",
++                    lidx, mpath)
++                return sorted(range(total)[rank::tp]) if tp > 1 \
++                    else list(range(n))
++            with open(mpath) as f:
++                hot = [int(e) for e in _json.load(f)["hot"]]
++            if len(hot) < total:
++                raise ValueError(
++                    f"moe_w2 EXL3 heat manifest {mpath} lists {len(hot)} "
++                    f"experts < RESIDENT_PER_LAYER*tp {total}")
++            if tp > 1:
++                return sorted(hot[:total][rank::tp])
++            return sorted(hot[:n])
++        logger.warning_once(
++            "moe_w2 EXL3 partial residency WITHOUT a heat order "
++            "(VLLM_MOE_W2_EXL3_HEAT_DIR unset) — resident set is the first "
++            "%d ids, expect poor coverage; debug only.", n)
++        return sorted(range(total)[rank::tp]) if tp > 1 else list(range(n))
++    from vllm.distributed.parallel_state import (
++        get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
++    try:
++        tp = get_tensor_model_parallel_world_size()
++        rank = get_tensor_model_parallel_rank()
++    except Exception:  # noqa: BLE001
++        return None    # offline tools without a distributed context
++    if tp <= 1:
++        return None
++    if _EXL3_TP_SHARES:
++        shares = [float(s) for s in _EXL3_TP_SHARES.split(",")]
++        if len(shares) != tp or min(shares) <= 0:
++            raise ValueError(
++                f"VLLM_MOE_W2_EXL3_TP_SHARES={_EXL3_TP_SHARES!r} needs "
++                f"{tp} positive comma-separated weights")
++    else:
++        shares = [1.0] * tp
++    tot = sum(shares)
++    bounds = [0]
++    acc = 0.0
++    for s in shares:
++        acc += s
++        bounds.append(round(E * acc / tot))
++    bounds[-1] = E
++    lo, hi = bounds[rank], bounds[rank + 1]
++    if hi <= lo:
++        raise ValueError(
++            f"moe_w2 EXL3 EP: rank {rank}/{tp} got an empty expert range "
++            f"[{lo}, {hi}) from shares {shares} — fix TP_SHARES")
++    return list(range(lo, hi))
++
++
++def exl3_owned_fraction(n_experts: int = 256) -> float:
++    """Fraction of the expert space this rank owns (1.0 = full ownership).
++
++    Only meaningful for the EXL3 line: EP expert-range sharding and partial
++    residency pool/promote OWNED experts exclusively, so working-set floors
++    computed against the full routed union overstate the per-rank need by
++    exactly this factor (the EP floor pessimism that used to force
++    VLLM_MOE_W2_FORCE_POOL on EP cells). The scalar line K-slices every
++    expert on every rank and must keep the unscaled floors (returns 1.0).
++    """
++    if not _EXL3_BASE:
++        return 1.0
++    if _EXL3_RESIDENT_PER_LAYER > 0:
++        return min(_EXL3_RESIDENT_PER_LAYER, n_experts) / n_experts
++    owned = _exl3_owned_ids(0, n_experts)  # EP branch ignores the layer idx
++    return 1.0 if owned is None else len(owned) / n_experts
 +
 +
 +def _exl3_build_layer(layer, layer_key: int) -> None:
@@ -5472,16 +5975,45 @@ index 000000000..a6fbb55d1
 +        K13, K2 = N2, N13 // 2               # H, I (mxfp4 layout)
 +        param_names = ("w13_weight", "w13_weight_scale", "w2_weight",
 +                       "w2_weight_scale")
-+    if (E, N13, K13, N2, K2) != (256, 4096, 4096, 4096, 2048):
++    owned = _exl3_owned_ids(lidx, 256)
++    from vllm.distributed.parallel_state import (
++        get_tensor_model_parallel_world_size)
++    try:
++        _tp = get_tensor_model_parallel_world_size()
++    except Exception:  # noqa: BLE001
++        _tp = 1
++    if _tp > 1:
++        # EP: checkpoint params (when staged at all) are sharded per rank
++        # by the vLLM loader (w13 column-parallel: N13 = 2*I/tp; w2
++        # row-parallel: K2 = I/tp; H stays full on both), but the tier
++        # ignores them (loader-skip + Δ pack). The pack itself is TP1
++        # full-geometry per expert — check the rank-local dims for the
++        # same self-consistency the TP1 branch uses (the relations are
++        # tp-invariant) and reconstruct the full geometry the tier
++        # serves: H = K13 (the unsharded reduction dim), I = K2 * tp.
++        # DS4 (H4096/I2048, tp2: 256/2048/4096/4096/1024 -> I 2048) and
++        # GLM-5.2 (H6144/I2048, dense-offset stack) both pass; anything
++        # inconsistent refuses.
++        if E != 256 or N13 != 2 * K2 or N2 != K13:
++            raise ValueError(
++                "moe_w2 EXL3 EP: inconsistent sharded expert geometry "
++                f"(need E=256, N13==2*K2, N2==K13); this layer has "
++                f"E={E}, N13={N13}, K13={K13}, N2={N2}, K2={K2}")
++        K2 = K2 * _tp          # full I; K13 (=H) is unsharded already
++    elif E != 256 or N13 != 2 * K2 or N2 != K13:
++        # TP1: serve the layer's own full geometry (H=K13, I=K2), checked
++        # for self-consistency; the tier verifies the pack rows against
++        # these dims at load. DS4 (H4096/I2048) and GLM-5.2 (H6144/I2048)
++        # both pass; anything inconsistent refuses.
 +        raise ValueError(
-+            "moe_w2 EXL3 serves the DS4 TP1 pack geometry only "
-+            "(E=256, H=4096, I=2048); this layer has "
-+            f"E={E}, N13={N13}, K13={K13}, N2={N2}, K2={K2} "
-+            "(TP-sharded or non-DS4 experts)")
++            "moe_w2 EXL3: inconsistent TP1 expert geometry (need E=256, "
++            f"N13==2*I, N2==H); this layer has E={E}, N13={N13}, "
++            f"K13={K13}, N2={N2}, K2={K2}")
 +    if pool_on and _EXL3_DELTA_PACK:
 +        # P6 Δ-pool: staged from the delta pack on disk; the checkpoint
 +        # experts are loader-skipped (v1-style) — nothing FP4 to stage.
-+        _exl3_stage_delta(layer_key, lidx, dev, E)
++        _exl3_stage_delta(layer_key, lidx, dev, E, owned=owned,
++                          hidden=K13, inter=K2)
 +    elif pool_on:
 +        if skipped:
 +            raise RuntimeError(
@@ -5500,24 +6032,62 @@ index 000000000..a6fbb55d1
 +                    raise RuntimeError(
 +                        f"moe_w2 EXL3 v2 cubin apply: moe_w4_mm_k{_kk}_a32."
 +                        f"cubin not loaded (VLLM_MOE_W2_CUBIT_DIR={_DIR})")
++    paged = moe_w2_delta.base_enabled()
++    # Per-key resident override ([G] 2026-08-22, W2 draft head over the
++    # pager): VLLM_MOE_W2_EXL3_RESIDENT_KEYS=43,44,45 keeps the listed
++    # layer keys FULLY RESIDENT while the backbone stays paged. The DSpark
++    # head's ffn runs in the PROPOSE phase, outside the target step's
++    # graph — a paged draft layer's misses would bump the shared miss
++    # counter and trigger pointless (and draft-blind) target replays,
++    # while a resident one just serves. 3 draft layers x 1.26 GiB fit
++    # next to the pool on 32 GB.
++    _res_keys = os.getenv("VLLM_MOE_W2_EXL3_RESIDENT_KEYS", "")
++    if paged and _res_keys and lidx in {
++            int(x) for x in _res_keys.split(",") if x.strip()}:
++        paged = False
++        logger.info("moe_w2 EXL3: layer_key %d RESIDENT by "
++                    "VLLM_MOE_W2_EXL3_RESIDENT_KEYS (paged base stays on "
++                    "for the backbone)", layer_key)
++    btier = None
++    if paged:
++        # D3 mode-5 pager: base rows to the base tier's HOST store; the
++        # GPU holds no resident pack tensors for this layer at all.
++        btier = _exl3_stage_base(layer_key, lidx, dev, E, owned=owned,
++                                 hidden=K13, inter=K2)
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_exl3 import (
 +        Exl3BaseTier)
 +    limit = contract["swiglu_limit"]
 +    tier = Exl3BaseTier(
 +        _EXL3_PACK, layers=[lidx], device=str(dev),
 +        w13_k=2, w2_k=_EXL3_W2K, num_experts=E, hidden=K13, inter=K2,
-+        act_limit=float(limit) if limit is not None else float("inf"))
++        act_limit=float(limit) if limit is not None else float("inf"),
++        experts={lidx: owned} if owned is not None else None,
++        paged=paged)
++    if paged:
++        tier.init_base_paged(btier, _EXL3_BASE_GEOM, [(layer_key, lidx)])
 +    _EXL3_TIERS[layer_key] = (tier, lidx)
++    if owned is not None:
++        mask = torch.zeros(E, dtype=torch.bool, device=dev)
++        mask[tier.owned[lidx]] = True
++        sent = torch.tensor(int(owned[0]), dtype=torch.long, device=dev)
++        _EXL3_OWNED[layer_key] = (mask, sent)
 +    stub = torch.empty(0, dtype=torch.uint8, device=dev)
 +    for name in param_names:
 +        layer.register_parameter(
 +            name, torch.nn.Parameter(stub, requires_grad=False))
++    own_note = ""
++    if owned is not None:
++        own_note = (f", owned {len(owned)}/{E} "
++                    f"[{owned[0]}..{owned[-1]}]"
++                    if owned == list(range(owned[0], owned[-1] + 1))
++                    else f", owned {len(owned)}/{E} (heat)")
 +    logger.info(
 +        "moe_w2 EXL3 base: layer_key %d <- pack layer %d "
-+        "(w13_k=2, w2_k=%d, %.2f GiB resident, %d/%d layers loaded%s)",
++        "(w13_k=2, w2_k=%d, %.2f GiB resident, %d/%d layers loaded%s%s%s)",
 +        layer_key, lidx, tier.w2_k, tier.total_bytes() / 2**30,
 +        len(_EXL3_TIERS), _layer_cutoff(),
-+        ", +FP4 need-pool" if pool_on else "")
++        ", +FP4 need-pool" if pool_on else "",
++        ", PAGED (host store + pool cache)" if paged else "", own_note)
 +
 +
 +def build_layer_planes(layer, layer_key: int) -> None:
@@ -5643,6 +6213,12 @@ index 000000000..a6fbb55d1
 +    fragment-major planes, then replaces the originals with empty stubs. The
 +    e2m1 nibbles of the same requant feed the optional FP4 delta tier.
 +    """
++    if _EXL3_BASE:
++        # EXL3 boot-from-pack (same dispatch as the mxfp4 variant): the
++        # pack replaces the checkpoint experts entirely — plan_pack_skip
++        # already stubbed the fp8 params at CREATE, nothing to requant.
++        _exl3_build_layer(layer, layer_key)
++        return
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 +    from vllm.model_executor.layers.quantization.utils.moe_w2_planes import (
 +        fp8_block_to_codes_scales, pack_fp4_fragment_major)
@@ -7227,6 +7803,36 @@ index 000000000..a6fbb55d1
 +    return True
 +
 +
++def _exl3_base_ensure_ok(x: torch.Tensor) -> bool:
++    """True when the paged base may run the synchronous prefill-ensure
++    fetch: a prefill-sized call on a REAL batch, outside capture. Same
++    dummy-batch discipline as _exl3_prefill_ensure_ok (KV-profiling
++    forwards and capture warmups must never promote), minus the FP4-knob
++    gating — the BASE ensure is mandatory whenever the pager is on
++    (decode misses replay, but an un-ensured prefill would replay per
++    CHUNK, i.e. constantly).
++
++    The threshold is the DECODE WINDOW (M8: T <= 8), NOT _PREFILL_T:
++    a short real prompt (e.g. 14 tokens < _PREFILL_T=16) is still a
++    prefill whose working set can exceed the pool — measured on TP1
++    full-E (14 tok x top-6 x 43 layers ~ 3.6k pairs > 2847 slots): the
++    strict fixed-point loop then pins itself into pool exhaustion and
++    fail-closes at the 32-pass cap with a constant residue. Ensure is
++    layer-scoped (pins rotate per layer), so it handles any prompt size
++    the pool can hold PER LAYER."""
++    if x.shape[0] <= 8:
++        return False
++    if torch.cuda.is_current_stream_capturing():
++        return False
++    try:
++        from vllm.forward_context import get_forward_context
++        if get_forward_context().attn_metadata is None:
++            return False
++    except (ImportError, AssertionError):
++        pass
++    return True
++
++
 +_exl3_ptab_ready: list = []   # one-shot init sentinel (glue fix [V] 08-05)
 +
 +
@@ -7252,6 +7858,27 @@ index 000000000..a6fbb55d1
 +                "(%d tier(s), %d layers, refresh-on-mutation)",
 +                len(by_tier), len(_EXL3_TIERS))
 +    _exl3_ptab_ready.append(1)
++
++
++def _exl3_ensure_ptabs_base() -> None:
++    """[N] F-B2: one-time ptab wiring for the BASE-ONLY decode-wave-M8
++    route (GLM H=6144, no Δ pool): static stacks, no refresh hooks —
++    init_ptabs_base_only per tier. First eager forward precedes any
++    capture (the profile/dummy run), same ordering contract as
++    _exl3_ensure_ptabs."""
++    if _exl3_ptab_base_ready:
++        return
++    assert not torch.cuda.is_current_stream_capturing(), \
++        "moe_w2 EXL3 base-only ptab init reached capture before eager"
++    by_tier: dict[int, tuple] = {}
++    for lk, (tier, li) in _EXL3_TIERS.items():
++        by_tier.setdefault(id(tier), (tier, []))[1].append((lk, li))
++    for tier, pairs in by_tier.values():
++        tier.init_ptabs_base_only(pairs)
++    logger.info("moe_w2 EXL3 decode-wave ptab stack ready (BASE-ONLY, "
++                "%d tier(s), %d layers, static)",
++                len(by_tier), len(_EXL3_TIERS))
++    _exl3_ptab_base_ready.append(1)
 +
 +
 +def _exl3_forward(
@@ -7291,9 +7918,104 @@ index 000000000..a6fbb55d1
 +        _hcap_buf(layer_key, x).copy_(x[0], non_blocking=True)
 +    ids = topk_ids.long()
 +    wts = topk_weights.float()
++    ep = _EXL3_OWNED.get(layer_key)
++    if ep is not None:
++        # EP / partial-residency ownership transform (one point for EVERY
++        # route below — wave M1, M8 graph/eager, unified, dual, batched):
++        # non-owned (t, j) pairs are redirected to the owned sentinel id at
++        # weight 0 (fixed shapes, no syncs — capture-safe). Downstream this
++        # (a) zeroes their contribution [the ranks' partials compose through
++        # the model's MoE all-reduce], (b) keeps the M8 union builders from
++        # decoding foreign experts, and (c) filters `seen`/ensure_resident/
++        # force_promote candidates to owned experts — the pool and gate
++        # machinery never see the other ranks' ids at all.
++        own_mask, sent = ep
++        own_pairs = own_mask[ids]
++        ids = torch.where(own_pairs, ids, sent)
++        wts = wts * own_pairs
 +    from vllm.model_executor.layers.quantization.utils import moe_w2_delta
++    btier = moe_w2_delta._BASE_TIER
++    if btier is not None and tier.paged:
++        # Paged base ([F] 2026-08-20): the scalar base-cache contract on
++        # the EXL3 tier, in tensor ops instead of desc kernels. All of it
++        # is capture-safe (fixed shapes, no host syncs) and — the crux —
++        # computed from CURRENT tensor contents: the runner's mandatory
++        # fetch+replay re-executes this graph after promotions, re-reads
++        # slot_table, and the previously missing pairs serve exactly.
++        # GATED ON THIS LAYER'S tier.paged ([I] 2026-08-22): a RESIDENT
++        # layer under an otherwise-paged cell (VLLM_MOE_W2_EXL3_
++        # RESIDENT_KEYS — the W2 draft head) has NO base-tier slot row
++        # (staging skipped), so the residency mask read below would be
++        # all-False and `wts *= bres` silently ZEROED its every routed
++        # contribution — measured as the drafter acceptance collapsing
++        # 2.88 -> ~2.0 with the pool miss-free (the paged/resident A/B
++        # chain in the [I] ledger entry). Resident layers serve straight
++        # from their resident tables, exactly like a resident-only cell.
++        if torch.cuda.is_current_stream_capturing():
++            btier.notify_capture()
++        # seen marks land BEFORE any fetch decision (victim protection:
++        # the manager never evicts this window's experts).
++        moe_w2_delta.mark_seen(btier.seen[layer_key], ids.view(-1))
++        if layer_key == 0:
++            # per-step miss-counter reset, in-graph (layer 0 runs first)
++            btier.miss_count.zero_()
++        if (btier.route_log is not None
++                and x.shape[0] <= btier.route_log.shape[1]):
++            # decode routing log for the draft-affinity prefetcher
++            # (VLLM_MOE_W2_PREFETCH=1) — the runner folds the PREVIOUS
++            # step's log into the token->experts table and prefetches at
++            # step start (the mode-5 lookahead lever, recall@24 = 0.918).
++            # In-graph safe: fixed shapes, static destination (the scalar
++            # glue's idiom).
++            _k = min(ids.shape[1], btier.route_log.shape[2])
++            btier.route_log[layer_key, :ids.shape[0], :_k].copy_(
++                ids[:, :_k], non_blocking=True)
++        if _exl3_base_ensure_ok(x):
++            # eager prefill: fetch the chunk's routed set up-front (the
++            # 2-bit base-cache prefill idiom — decode misses replay, a
++            # prefill without ensure would replay every chunk).
++            btier.ensure_resident(layer_key, ids.view(-1))
++        bres = btier.slot_table[layer_key][ids] >= 0        # [m, k] bool
++        # missing routed pairs: count in-graph (runner reads post-logits;
++        # pairs already weight-zeroed by ownership/topp do not count) and
++        # zero their contribution — the replay restores them.
++        btier.miss_count.add_(
++            ((~bres) & (wts != 0)).sum().to(torch.int32))
++        wts = wts * bres
 +    ftier = moe_w2_delta._TIER
 +    if ftier is None:
++        # [N] F-B2 (tor B K=6144): M8 BASE-ONLY decode wave — GLM bez
++        # puli Δ (DELTA_GB=0). Bramka: geometria 6144 (loader ext ma dla
++        # niej zestaw base-only uni_k6144+k1_n6144), zestaw GUARDED
++        # (trasa graph/eager przez forward_topk_wave_m8_graph — stale
++        # G grup [fix [O]: G=ceil(min(T*k, |owned|)/6) — top-8 moze
++        # przekroczyc stare 6T slotow], puste grupy wychodza guardem
++        # ~4.5 us), plan (2,2,1). Verify MTP i dekod C>1 przestaja
++        # placic ∝ unii na mgemm.
++        if (_EXL3_WAVE_M8 and 2 <= x.shape[0] <= 8 and _EXL3_W2K == 1
++                and not _EXL3_DELTA_PACK and tier.H == 6144
++                and _EXL3_CUDAGRAPH and tier.ext_wave_m8_guarded()):
++            _exl3_ensure_ptabs_base()
++            y, n_groups = tier.forward_topk_wave_m8_graph(lidx, x, ids, wts)
++            if not _exl3_wave_m8b_seen:
++                logger.info("moe_w2 EXL3 decode-wave-M8 route ACTIVE "
++                            "(BASE-ONLY H=6144, fixed groups=%d)", n_groups)
++                _exl3_wave_m8b_seen.append(1)
++            return y.to(x.dtype)
++        # [O] F-C2 (tor C): M16 BASE-ONLY — DUAL-SET z trasa m8: okno
++        # T w [9,16] (verify C4+MTP = T 12!); T<=8 obsluzone wyzej przez
++        # m8 (kara m16 @T<=8 ~15% — decyzja pomiarowa DESIGN 5u').
++        if (_EXL3_WAVE_M8 and _EXL3_WAVE_M16 and 9 <= x.shape[0] <= 16
++                and _EXL3_W2K == 1 and not _EXL3_DELTA_PACK
++                and tier.H == 6144 and _EXL3_CUDAGRAPH
++                and tier.ext_wave_m16_guarded()):
++            _exl3_ensure_ptabs_base()
++            y, n_groups = tier.forward_topk_wave_m16_graph(lidx, x, ids, wts)
++            if not _exl3_wave_m16_seen:
++                logger.info("moe_w2 EXL3 decode-wave-M16 route ACTIVE "
++                            "(BASE-ONLY H=6144, fixed groups=%d)", n_groups)
++                _exl3_wave_m16_seen.append(1)
++            return y.to(x.dtype)
 +        # v1 path: bare EXL3 base, no need-pool / gate
 +        return tier.forward_topk(lidx, x, ids, wts).to(x.dtype)
 +    # record this step's routed experts so the gate's force_promote sees the
@@ -7959,10 +8681,10 @@ index 000000000..a6fbb55d1
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..b78d65142
+index 000000000..e2223c1d8
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2511 @@
+@@ -0,0 +1,2672 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -8118,6 +8840,21 @@ index 000000000..b78d65142
 +_POOL_HEAT_FILL = min(max(
 +    float(os.getenv("VLLM_MOE_W2_POOL_HEAT_FILL", "0.9")), 0.0), 1.0)
 +_POOL_HEAT_VERSION = "pool-heat-v1"
++
++# ---- STATIC membership (residency-policy arm A) ---------------------------
++# VLLM_MOE_W2_DELTA_STATIC=/path/list.tsv ("layer<TAB>expert" rows, #-comments)
++# freezes the Δ/quality tier to an offline-chosen membership: the worker
++# loads the whole list into the pool right after finalize_auto (post-KV,
++# pre-cudagraph — the same timing contract as the pool warm-start) and then
++# FREEZES every membership mutation for the run (background promote, gate
++# force_promote, affinity/pilot prefetch, prefill ensure). slot_table never
++# changes after the fill, so the mode is trivially graph-safe. Membership
++# quality then comes entirely from the offline ranking — the tri-tier
++# comparison arm against the fleet's runtime dynamics (Δ-pool + gate).
++# Fail-fast by contract: a list that exceeds the pool, names an unstaged
++# layer or an out-of-range expert ABORTS the boot — silently trimming would
++# serve a different membership than the experiment declares.
++_STATIC_LIST = os.getenv("VLLM_MOE_W2_DELTA_STATIC", "")
 +
 +# ---- lazy-promotion hysteresis (colibri's REPIN anti-ping-pong) ----------
 +# When the pool is FULL, a lazy background promotion evicts the least-
@@ -8334,15 +9071,18 @@ index 000000000..b78d65142
 +        # the CURRENT step. Never evictable (even in the emergency pass) —
 +        # without this, a fixed-point iteration can evict pass-k's fetches
 +        # to serve pass-k+1 (their seen marks are zeroed after each
-+        # snapshot) and ping-pong past the replay cap.
-+        self._step_pins: set[int] = set()
-+        # Prefill-layer pin scope (ensure_resident): pins live only until
-+        # the NEXT ensure_resident call (the layer's eager GEMMs are done
-+        # by then). Step-scoped pins would accumulate the whole prefill
-+        # working set (61 layers x routed >> pool) and starve every later
-+        # layer's fetch; no scope at all lets the emergency eviction take
-+        # the CURRENT layer's slots between its fetch and its GEMMs.
-+        self._layer_pins: set[int] = set()
++        # snapshot) and ping-pong past the replay cap. Bool mask [n_slots]
++        # _step_pin_mask (allocated in _alloc_owner, which __init__ already
++        # ran above), not a python set: the base-cache configs rebuild the
++        # eviction exclusion once per REPLAYED step from these, and
++        # set->list->index_put per call was measured CPU tax on the forward
++        # thread ([G] 2026-08-22). The prefill-layer pin scope
++        # (_layer_pin_mask, ensure_resident) lives only until the NEXT
++        # ensure_resident call (the layer's eager GEMMs are done by then):
++        # step-scoped pins would accumulate the whole prefill working set
++        # (61 layers x routed >> pool) and starve every later layer's
++        # fetch; no scope at all lets the emergency eviction take the
++        # CURRENT layer's slots between its fetch and its GEMMs.
 +        # Residency coupling (BASE tier only, split-FP4 over the base
 +        # cache): the coexisting FP4 tier whose refinement slots read THIS
 +        # tier's base slots — its mapped experts are eviction-blocked here.
@@ -8353,6 +9093,10 @@ index 000000000..b78d65142
 +        # replay path (ensure_resident per MoE layer) instead of the
 +        # graph replay — see internal/EAGER_FIRE_NEXT_SESSION.md.
 +        self._sub_floor = False
++        # STATIC membership (arm A): set by load_static_membership after the
++        # boot fill — every mutation entry point then no-ops, so slot_table
++        # is constant for the whole run (see _STATIC_LIST).
++        self._frozen = False
 +        # Draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1, base tier only):
 +        # route_log = in-graph [n_layers, T_cap, K_cap] routing log written
 +        # by the forward glue; _aff = token->experts affinity table folded
@@ -8412,6 +9156,8 @@ index 000000000..b78d65142
 +        self._owner_li = torch.full((n,), -1, dtype=torch.long)
 +        self._owner_ei = torch.full((n,), -1, dtype=torch.long)
 +        self._owner_tick = torch.zeros(n, dtype=torch.long)
++        self._step_pin_mask = torch.zeros(n, dtype=torch.bool)
++        self._layer_pin_mask = torch.zeros(n, dtype=torch.bool)
 +
 +    def _own(self, slot: int, li: int, ei: int) -> None:
 +        """Reserve a slot for (li, ei) at the current tick (lock held)."""
@@ -8494,14 +9240,19 @@ index 000000000..b78d65142
 +        self.add_layer_host_sections(layer_key,
 +                                     (w13_plane_gpu,), (w2_plane_gpu,))
 +
-+    def add_layer_host_sections(self, layer_key: int, parts13, parts2):
++    def add_layer_host_sections(self, layer_key: int, parts13, parts2,
++                                owned=None):
 +        """Stage a layer whose slot sections arrive as SEPARATE GPU tensors
 +        (e.g. [fp4_13|sc13] / [fp4_2|sc2] for the over-base FP4 tier): copy
 +        each part D2H into its slice of the host row — a GPU-side cat of
 +        multi-GiB planes is exactly the transient that OOMs a 32 GB card
 +        during load. With the pack-file store a layer already on disk is
-+        skipped entirely (persistent quantization cache)."""
-+        self._store.add_layer(layer_key, (*parts13, *parts2))
++        skipped entirely (persistent quantization cache).
++
++        `owned` (EP / partial residency): this rank's global expert ids for
++        the layer — the pinned store keeps only those rows (compact layout;
++        see PinnedHostStore)."""
++        self._store.add_layer(layer_key, (*parts13, *parts2), owned=owned)
 +
 +    def start(self):
 +        if self._thread is not None:   # idempotent: started once at tier creation
@@ -8668,7 +9419,9 @@ index 000000000..b78d65142
 +            # gets pulled to the slower FP4 path). freq/lru: promote the hottest
 +            # candidates first so the limited pool tracks genuinely hot experts
 +            # across ALL layers (vs the layer-sorted order that starved past layer 0).
-+            if self._policy != "need":
++            # STATIC membership: frozen tiers never lazy-promote (stats above
++            # keep accruing — the freq signal stays observable).
++            if self._policy != "need" and not self._frozen:
 +                if self._policy == "freq" and len(cand) > 1:
 +                    ca = torch.tensor(cand)
 +                    order = torch.argsort(self._freq[ca[:, 0], ca[:, 1]],
@@ -8723,11 +9476,8 @@ index 000000000..b78d65142
 +        tk = self._owner_tick
 +        lic, eic = li.clamp(min=0), ei.clamp(min=0)
 +        blocked = ((li < 0) | self._seen_host[lic, eic].to(torch.bool)
-+                   | ((self._tick - tk) < 2))
-+        if self._step_pins:
-+            blocked[list(self._step_pins)] = True
-+        if self._layer_pins:
-+            blocked[list(self._layer_pins)] = True
++                   | ((self._tick - tk) < 2)
++                   | self._step_pin_mask | self._layer_pin_mask)
 +        if bool(blocked.all()):
 +            return None
 +        key = self._freq[lic, eic].double()
@@ -8840,6 +9590,82 @@ index 000000000..b78d65142
 +            logger.warning("moe_w2 pool-heat preload failed: %s", e)
 +            return 0
 +
++    def load_static_membership(self) -> int:
++        """STATIC membership (residency-policy arm A): read the frozen
++        (layer, expert) list from VLLM_MOE_W2_DELTA_STATIC, promote all of it
++        into the pool, then freeze membership for the rest of the run.
++
++        Driven by the worker after finalize_auto (the pool must be sized) and
++        BEFORE any cudagraph capture (slot_table writes precede graph
++        bake-in) — the preload_pool timing contract. Unlike the warm-start
++        this is NOT best-effort: any shortfall (list > pool, unstaged layer,
++        out-of-range pair, store row that fails to map) raises and kills the
++        boot, because a partially-honored list would silently change the
++        experiment's declared membership. Returns the number of experts
++        promoted (== the deduplicated list length on success)."""
++        if not _STATIC_LIST:
++            return 0
++        import time as _time
++        t0 = _time.perf_counter()
++        pairs: list[tuple[int, int]] = []
++        seen_pairs: set[tuple[int, int]] = set()
++        with open(_STATIC_LIST, "r", encoding="utf-8") as f:
++            for ln, line in enumerate(f, 1):
++                line = line.strip()
++                if not line or line.startswith("#"):
++                    continue
++                try:
++                    li_s, ei_s = line.split("\t")
++                    li, ei = int(li_s), int(ei_s)
++                except ValueError as e:
++                    raise RuntimeError(
++                        f"moe_w2 static membership: {_STATIC_LIST}:{ln}: "
++                        f"expected 'layer<TAB>expert', got {line!r}") from e
++                if not (0 <= li < self.n_layers and 0 <= ei < self.E):
++                    raise RuntimeError(
++                        f"moe_w2 static membership: {_STATIC_LIST}:{ln}: "
++                        f"({li}, {ei}) out of range "
++                        f"[{self.n_layers} layers x {self.E} experts]")
++                if (li, ei) not in seen_pairs:
++                    seen_pairs.add((li, ei))
++                    pairs.append((li, ei))
++        if len(pairs) > self.n_slots:
++            raise RuntimeError(
++                f"moe_w2 static membership: {len(pairs)} experts do not fit "
++                f"the {self.n_slots}-slot pool ({self.n_slots * self.slot_bytes / 2**30:.2f} GiB) — "
++                f"raise the pool or shrink the list; refusing to trim")
++        missing = sorted({li for li, _ in pairs if li not in self._store})
++        if missing:
++            raise RuntimeError(
++                f"moe_w2 static membership: layers {missing} have no staged "
++                f"host rows (store holds {len(self._store)} layers) — "
++                f"list/config mismatch")
++        total = 0
++        for i in range(0, len(pairs), 256):
++            total += self.prefetch_pairs(pairs[i:i + 256])
++        if total != len(pairs):
++            unmapped = [(li, ei) for li, ei in pairs
++                        if int(self._mirror[li, ei]) < 0]
++            raise RuntimeError(
++                f"moe_w2 static membership: only {total}/{len(pairs)} "
++                f"experts mapped (first unmapped: {unmapped[:8]}) — "
++                f"refusing to serve a partial membership")
++        self._frozen = True
++        per_layer = torch.zeros(self.n_layers, dtype=torch.int32)
++        for li, _ in pairs:
++            per_layer[li] += 1
++        logger.info(
++            "moe_w2 [%s] STATIC membership: %d experts pinned "
++            "(%.2f GiB, %.1f%% of the pool) in %.1f s from %s; per-layer "
++            "min/med/max %d/%d/%d — membership FROZEN for this run "
++            "(background promote/evict, gate fills and prefetch disabled)",
++            self._tag, total, total * self.slot_bytes / 2**30,
++            100.0 * total / max(self.n_slots, 1),
++            _time.perf_counter() - t0, _STATIC_LIST,
++            int(per_layer.min()), int(per_layer.median()),
++            int(per_layer.max()))
++        return total
++
 +    def _take_slots_batch(self, k: int, emergency: bool = False,
 +                          min_cold: int = 2,
 +                          admission_keys=None,
@@ -8906,10 +9732,8 @@ index 000000000..b78d65142
 +        # step that marked them is over and they are not step-pinned.
 +        hard = torch.zeros_like(li, dtype=torch.bool)
 +        hard |= (li < 0)
-+        if self._step_pins:
-+            hard[list(self._step_pins)] = True
-+        if self._layer_pins:
-+            hard[list(self._layer_pins)] = True
++        hard |= self._step_pin_mask
++        hard |= self._layer_pin_mask
 +        blocked = hard | self._seen_host[lic, eic].to(torch.bool)
 +        # Residency coupling (split-FP4 over the base cache): never evict a
 +        # BASE slot whose expert is mapped in the coupled FP4 tier — the
@@ -8979,19 +9803,43 @@ index 000000000..b78d65142
 +            if take <= 0:
 +                continue
 +            victims = torch.topk(kk, take, largest=False)
++            if admission_keys is None:
++                # Plain path (base cache / prefetch / manager): unmap ALL
++                # victims in ONE vectorized batch. The per-victim loop cost
++                # 2 scalar reads + 1 CUDA index_put EACH — hundreds of tiny
++                # launches per C8 step at a full pool, on the forward
++                # thread ([G] 2026-08-22 profile).
++                vidx = victims.indices
++                vli = self._owner_li[vidx]
++                vei = self._owner_ei[vidx]
++                self.slot_table[vli.to(self.dev), vei.to(self.dev)] = -1
++                self._mirror[vli, vei] = -1
++                n_take = int(vidx.numel())
++                self._n_evicted += n_take
++                self._win_evicted += n_take
++                if _TRACE >= 2:
++                    for s, li_, ei_ in zip(vidx.tolist(), vli.tolist(),
++                                           vei.tolist()):
++                        logger.info(
++                            "[%s] evict   L%-2d E%-3d  slot %-4d (cold %d "
++                            "ticks)", self._tag, li_, ei_, s,
++                            self._tick - int(self._owner_tick[s]))
++                lst = vidx.tolist()
++                taken.update(lst)
++                out.extend(lst)
++                continue
 +            vidx = victims.indices.tolist()
 +            vkey = victims.values.tolist()
 +            for s, vk in zip(vidx, vkey):
-+                if admission_keys is not None:
-+                    # value-monotone admission: the slot granted next serves
-+                    # candidate #len(out) (callers zip candidates with the
-+                    # returned slots in order). Victims come cheapest-first
-+                    # and candidate priorities descend, so the first losing
-+                    # pairing ends the whole take (later pairs only worse).
-+                    if len(out) >= len(admission_keys) or \
-+                            not (admission_keys[len(out)] > vk):
-+                        self._fire_mutate_hooks()
-+                        return out
++                # value-monotone admission: the slot granted next serves
++                # candidate #len(out) (callers zip candidates with the
++                # returned slots in order). Victims come cheapest-first
++                # and candidate priorities descend, so the first losing
++                # pairing ends the whole take (later pairs only worse).
++                if len(out) >= len(admission_keys) or \
++                        not (admission_keys[len(out)] > vk):
++                    self._fire_mutate_hooks()
++                    return out
 +                vli = int(self._owner_li[s])
 +                vei = int(self._owner_ei[s])
 +                self.slot_table[vli, vei] = -1
@@ -9116,8 +9964,8 @@ index 000000000..b78d65142
 +        Manager work is scheduled by step_end and must finish before the next
 +        model forward."""
 +        with self._lock:
-+            self._step_pins.clear()
-+            self._layer_pins.clear()
++            self._step_pin_mask.zero_()
++            self._layer_pin_mask.zero_()
 +
 +    def step_end(self) -> None:
 +        """Close this step's SEEN window (runner: after the replay loop /
@@ -9183,8 +10031,8 @@ index 000000000..b78d65142
 +                    self._snapshot_event = event
 +                    self._snapshot_pending = True
 +        with self._lock:
-+            self._step_pins.clear()
-+            self._layer_pins.clear()
++            self._step_pin_mask.zero_()
++            self._layer_pin_mask.zero_()
 +        self.wake()
 +
 +    # ---- draft-affinity prefetch (VLLM_MOE_W2_PREFETCH=1) ------------------
@@ -9208,7 +10056,7 @@ index 000000000..b78d65142
 +
 +        Best-effort by design: never emergency-evicts, capped per step,
 +        wrong predictions cost one cold slot each and decay away."""
-+        if self.route_log is None:
++        if self._frozen or self.route_log is None:
 +            return 0
 +        # route_log may be armed for LOOKA/PILOT only — the affinity
 +        # predictor still needs its own opt-in.
@@ -9264,7 +10112,7 @@ index 000000000..b78d65142
 +        `cold_ticks` > 0 restricts eviction victims to slots idle at least
 +        that many ticks (speculative callers must not churn the hot set);
 +        free slots are always eligible."""
-+        if not pairs:
++        if self._frozen or not pairs:
 +            return 0
 +        with self._lock:
 +            pairs = [(li, ei) for li, ei in pairs
@@ -9277,19 +10125,26 @@ index 000000000..b78d65142
 +            if not plan:
 +                return 0
 +            rows = self._store.rows_for([p for p, _ in plan])
-+            for ((li, ei), slot), row in zip(plan, rows):
-+                self._own(slot, li, ei)
-+                self._step_pins.add(slot)
-+                with torch.cuda.stream(self._stream):
-+                    self.pool[slot].copy_(row, non_blocking=True)
++            pli = torch.tensor([li for (li, _e), _s in plan],
++                               dtype=torch.long)
++            pei = torch.tensor([ei for (_l, ei), _s in plan],
++                               dtype=torch.long)
++            pslot = torch.tensor([s for _p, s in plan], dtype=torch.long)
++            self._owner_li[pslot] = pli
++            self._owner_ei[pslot] = pei
++            self._owner_tick[pslot] = self._tick
++            self._step_pin_mask[pslot] = True
 +            with torch.cuda.stream(self._stream):
++                for (_p, slot), row in zip(plan, rows):
++                    self.pool[slot].copy_(row, non_blocking=True)
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
-+            for (li, ei), slot in plan:
-+                self.slot_table[li, ei] = slot
-+                self._mirror[li, ei] = slot
-+                self._freq[li, ei] += 1.0
++            ps32 = pslot.to(torch.int32)
++            self.slot_table[pli.to(self.dev), pei.to(self.dev)] = \
++                ps32.to(self.dev)
++            self._mirror[pli, pei] = ps32
++            self._freq[pli, pei] += 1.0
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +            self._kpi_prefetched += len(plan)
@@ -9330,6 +10185,8 @@ index 000000000..b78d65142
 +        Returns:
 +            number of experts newly promoted to FP4.
 +        """
++        if self._frozen:
++            return 0
 +        _ft = None
 +        if _FIRE_TIMING:
 +            global LAST_FORCE_TIMING
@@ -9392,7 +10249,7 @@ index 000000000..b78d65142
 +                hs = slots[hit]
 +                self._owner_tick[hs] = self._tick
 +                if pin:
-+                    self._step_pins.update(hs.tolist())
++                    self._step_pin_mask[hs] = True
 +            keep = torch.ones(seen.shape[0], dtype=torch.bool)
 +            if layer_filter is not None:
 +                lf = torch.zeros(self.n_layers, dtype=torch.bool)
@@ -9462,22 +10319,29 @@ index 000000000..b78d65142
 +            rows = self._store.rows_for([p for p, _ in plan])
 +            if _ft is not None:
 +                _ft_mark("read")
-+            for ((li, ei), slot), row in zip(plan, rows):
-+                self._own(slot, li, ei)
-+                if pin:
-+                    self._step_pins.add(slot)
-+                with torch.cuda.stream(self._stream):
-+                    self.pool[slot].copy_(row, non_blocking=True)
++            pli = torch.tensor([li for (li, _e), _s in plan],
++                               dtype=torch.long)
++            pei = torch.tensor([ei for (_l, ei), _s in plan],
++                               dtype=torch.long)
++            pslot = torch.tensor([s for _p, s in plan], dtype=torch.long)
++            self._owner_li[pslot] = pli
++            self._owner_ei[pslot] = pei
++            self._owner_tick[pslot] = self._tick
++            if pin:
++                self._step_pin_mask[pslot] = True
 +            with torch.cuda.stream(self._stream):
++                for (_p, slot), row in zip(plan, rows):
++                    self.pool[slot].copy_(row, non_blocking=True)
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
 +            if _ft is not None:
 +                _ft_mark("h2d")
-+            for (li, ei), slot in plan:
-+                self.slot_table[li, ei] = slot
-+                self._mirror[li, ei] = slot
-+                self._freq[li, ei] += 1.0
++            ps32 = pslot.to(torch.int32)
++            self.slot_table[pli.to(self.dev), pei.to(self.dev)] = \
++                ps32.to(self.dev)
++            self._mirror[pli, pei] = ps32
++            self._freq[pli, pei] += 1.0
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +            if _ft is not None:
@@ -9505,7 +10369,7 @@ index 000000000..b78d65142
 +                # (pool-content-dependent) a source of run-to-run greedy
 +                # nondeterminism. The fix is a bigger pool, not a knob.
 +                self._kpi_unfixed += len(cand) - len(plan)
-+                npin = len(self._step_pins)
++                npin = int(self._step_pin_mask.sum())
 +                ncpl = (int((self._coupled_fp4._mirror[
 +                    self._owner_li.clamp(min=0),
 +                    self._owner_ei.clamp(min=0)] >= 0).sum())
@@ -9530,7 +10394,7 @@ index 000000000..b78d65142
 +        cudagraph capture (prefill is eager), serialized with the manager via
 +        the lock. Marks the ids seen first so the batched eviction never picks
 +        this layer's in-flight experts as victims. Returns experts fetched."""
-+        if layer_key not in self._store:
++        if self._frozen or layer_key not in self._store:
 +            return 0
 +        ids = ids.unique().long()
 +        mark_seen(self.seen[layer_key], ids.to(self.dev))
@@ -9542,8 +10406,8 @@ index 000000000..b78d65142
 +        ids_cpu = ids.cpu()
 +        with self._lock:
 +            # open THIS layer's pin scope (releases the previous layer's —
-+            # its GEMMs are done; see _layer_pins in __init__)
-+            self._layer_pins.clear()
++            # its GEMMs are done; see _layer_pin_mask in __init__)
++            self._layer_pin_mask.zero_()
 +            slots = self._mirror[layer_key].long()[ids_cpu]
 +            hit = slots >= 0
 +            if bool(hit.any()):
@@ -9553,7 +10417,7 @@ index 000000000..b78d65142
 +                # take them — seen/coldness are soft exclusions there.
 +                hs = slots[hit]
 +                self._owner_tick[hs] = self._tick
-+                self._layer_pins.update(hs.tolist())
++                self._layer_pin_mask[hs] = True
 +            cand = [(layer_key, int(e)) for e in ids_cpu[~hit].tolist()]
 +        if not cand:
 +            return 0
@@ -9594,19 +10458,26 @@ index 000000000..b78d65142
 +            # store may warm FREE arena slots with them but must not evict
 +            # its decode hot set (a long prefill would wipe the arena).
 +            rows = self._store.rows_for([p for p, _ in plan], scan=True)
-+            for ((li, ei), slot), row in zip(plan, rows):
-+                self._own(slot, li, ei)
-+                self._layer_pins.add(slot)
-+                with torch.cuda.stream(self._stream):
-+                    self.pool[slot].copy_(row, non_blocking=True)
++            pli = torch.tensor([li for (li, _e), _s in plan],
++                               dtype=torch.long)
++            pei = torch.tensor([ei for (_l, ei), _s in plan],
++                               dtype=torch.long)
++            pslot = torch.tensor([s for _p, s in plan], dtype=torch.long)
++            self._owner_li[pslot] = pli
++            self._owner_ei[pslot] = pei
++            self._owner_tick[pslot] = self._tick
++            self._layer_pin_mask[pslot] = True
 +            with torch.cuda.stream(self._stream):
++                for (_p, slot), row in zip(plan, rows):
++                    self.pool[slot].copy_(row, non_blocking=True)
 +                ev = torch.cuda.Event()
 +                ev.record(self._stream)
 +            ev.synchronize()
-+            for (li, ei), slot in plan:
-+                self.slot_table[li, ei] = slot
-+                self._mirror[li, ei] = slot
-+                self._freq[li, ei] += 1.0
++            ps32 = pslot.to(torch.int32)
++            self.slot_table[pli.to(self.dev), pei.to(self.dev)] = \
++                ps32.to(self.dev)
++            self._mirror[pli, pei] = ps32
++            self._freq[pli, pei] += 1.0
 +            self._n_promoted += len(plan)
 +            self._win_promoted += len(plan)
 +        if len(plan) < len(cand):
@@ -10191,9 +11062,20 @@ index 000000000..b78d65142
 +    """
 +    force = os.getenv("VLLM_MOE_W2_FORCE_POOL", "0") == "1"
 +    seq_f = float(min(max(max_num_seqs, 1), 4))
++    # EP / partial residency (EXL3): this rank only ever pools its OWNED
++    # experts, so the per-step working set shrinks by the ownership
++    # fraction; without the scale, EP cells trip the full-union floors and
++    # need FORCE_POOL (measured pessimism, handoff 2026-08-16). Scalar
++    # line: fraction is 1.0 (K-sliced experts, full routed set per rank).
++    from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
++    owned_frac = moe_w2_cubit.exl3_owned_fraction()
++    if owned_frac < 1.0:
++        logger.info(
++            "moe_w2 pool floors scaled by EP/residency ownership fraction "
++            "%.3f (rank pools owned experts only).", owned_frac)
 +    t = _BASE_TIER
 +    if t is not None and len(t._store) > 0:
-+        pairs = int(len(t._store) * top_k * (1 + n_spec) * seq_f)
++        pairs = int(len(t._store) * top_k * (1 + n_spec) * seq_f * owned_frac)
 +        hard = int(1.15 * pairs)
 +        comfort = int(1.40 * pairs)
 +        gib = t.n_slots * t.slot_bytes / 2**30
@@ -10246,7 +11128,8 @@ index 000000000..b78d65142
 +            moe_w2_gate)
 +        fp_growth = 1.0 + 0.35 * max(moe_w2_gate.fire_fp_max() - 1, 0)
 +        fire_floor = int(len(d._store) * top_k * (1 + n_spec)
-+                         * min(max(max_num_seqs, 1), 4) * fp_growth)
++                         * min(max(max_num_seqs, 1), 4) * fp_growth
++                         * owned_frac)
 +        if d.n_slots < fire_floor:
 +            # Sub-floor pools serve in DEGRADED mode: a fire can only
 +            # PARTIALLY upgrade its step, and the measured-sound operating
@@ -10476,10 +11359,10 @@ index 000000000..b78d65142
 +            + "; ".join(str(e) for e in errors))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
 new file mode 100644
-index 000000000..f8e41e45b
+index 000000000..3e515c571
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
-@@ -0,0 +1,826 @@
+@@ -0,0 +1,1447 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""EXL3 trellis base tier for the moe_w2 stack (vLLM-Moet).
 +
@@ -10512,6 +11395,22 @@ index 000000000..f8e41e45b
 +import torch.nn.functional as F
 +
 +_EXT = None
++# m-bucketing of the batched (prefill/fallback) mgemm shapes: pad m > 8 to
++# the next multiple, collapsing the coop-autotune key space (see _batched
++# docstring). 0/1 disables.
++_M_BUCKET = int(os.environ.get("VLLM_MOE_W2_EXL3_M_BUCKET", "16"))
++# Prefill route over exl3_moe_dual (mission PREFILL-TRELLIS-GLM, [M]
++# 2026-08-24): union-decode fused MoE-FFN — decodes each routed expert's
++# trellis ONCE and runs MMA over its token rows, vs _batched's m*k slot
++# expansion that re-decodes the trellis per (token, expert) assignment.
++# Measured 8.08x vs the mgemm expansion on the DS4 prefill anatomy ([T]
++# 8253865); geometry (K/N) is runtime, so GLM's H=6144 serves from the
++# same compiled instance pair. Opt-in per cell.
++_MOE_PREFILL = os.environ.get("VLLM_MOE_W2_EXL3_MOE_PREFILL", "0") == "1"
++# Per-call fused cap: the kernel stages at most this many token rows per
++# expert (temp buffers are [concurrency, 128, H|I]); batches whose densest
++# expert exceeds it split on the token axis and recurse.
++_MOE_PREFILL_ROWS = 128
 +
 +
 +def delta_slot_geom(dk13: int = 2, dk2: int = 2, hidden: int = 4096,
@@ -10620,18 +11519,26 @@ index 000000000..f8e41e45b
 +
 +def build_m8_groups_graph(topk_ids: torch.Tensor,
 +                          topk_weights: torch.Tensor,
-+                          cap: int = 6, rows: int = 8):
-+    """Capture-safe (fixed-shape, device-only) builder of the M8 groups —
-+    the in-graph counterpart of build_m8_groups (charter CS [E]
++                          cap: int = 6, rows: int = 8,
++                          groups: "int | None" = None):
++    """Capture-safe (fixed-shape, device-only) builder of the M8/M16
++    groups — the in-graph counterpart of build_m8_groups (charter CS [E]
 +    2026-08-10, F0c: parity 20000/20000 bit-identical with the host
 +    builder, including (t,e) duplicates, token overlaps, partial and
 +    fully-empty groups).
 +
-+    G is FIXED at T (union <= 6T, cap 6 => ceil/6 <= T): real groups come
++    G (`groups`) MUST cover the worst-case union: ceil(min(T*k, E_reach)
++    / cap), where E_reach is the number of experts this rank can see
++    after the ownership transform (owned set; E when unsharded). The
++    legacy default G=T is a TOP-6 invariant (union <= 6T) — [O]
++    2026-08-25 finding: top-8 models (GLM) can exceed 6T slots and the
++    scatters below then write OUT OF BOUNDS (silent). Callers pass
++    `groups` from Exl3BaseTier._wave_groups_for; the default stays only
++    for backward compatibility of top-6 call sites. Real groups come
 +    first, surplus groups are EMPTY (all row_map -1, experts = repeat of
-+    union[0] so slot pointers stay dereferenceable; the m8g canon guard
-+    exits those CTAs in the prologue). Rows are PREFIX-PACKED from row 0
-+    — the m8g guard's emptiness test reads row 0 only, so this packing
++    union[0] so slot pointers stay dereferenceable; the m8g/m16g canon
++    guard exits those CTAs in the prologue). Rows are PREFIX-PACKED from
++    row 0 — the guard's emptiness test reads row 0 only, so this packing
 +    is a hard contract, not a convention.
 +
 +    Everything is sort/cumsum/scatter/where on the input device with
@@ -10642,7 +11549,7 @@ index 000000000..f8e41e45b
 +    Returns (experts [G, cap] i64, row_map [G, cap, rows] i32,
 +    row_weights [G, cap, rows] f16), all on topk_ids.device."""
 +    T, k = topk_ids.shape
-+    G = T
++    G = groups if groups is not None else T
 +    S = G * cap
 +    N = T * k
 +    dev = topk_ids.device
@@ -10735,7 +11642,32 @@ index 000000000..f8e41e45b
 +    def __init__(self, pack_dir: str, layers, device: str = "cuda:0",
 +                 w13_k: int = 2, w2_k: int | None = None,
 +                 num_experts: int = 256, hidden: int = 4096,
-+                 inter: int = 2048, act_limit: float = 10.0):
++                 inter: int = 2048, act_limit: float = 10.0,
++                 experts=None, paged: bool = False):
++        """experts: optional expert-ownership subset (EP sharding / partial
++        residency). None = all E resident (TP1 full, the historical
++        behavior). A sequence of GLOBAL expert ids = uniform subset for
++        every layer; a dict {layer_idx: sequence} = per-layer subsets
++        (heat-ordered partial residency). Non-owned experts stay addressable
++        in every pointer table — their pointers ALIAS the anchor (first
++        owned) expert's tensors, the established wrong-but-finite clamp
++        pattern — but the caller contract is that non-owned (t, j) pairs
++        always carry weight 0 (weight-side zeroing, same as fp4_mask), so
++        they contribute exactly nothing while never dereferencing unmapped
++        memory. Only owned experts' bytes are loaded (VRAM scales with
++        len(experts)).
++
++        paged (BASE cache over the EXL3 tier, 2026-08-20 [F]): NO pack
++        tensors are loaded to the GPU — base bytes live in the base
++        DeltaTier's pool slots and every base pointer (both the _tables
++        g/u/d tuples and the ptab base rows) derives from that tier's
++        slot_table, recomputed at pool-MUTATION time by refresh_base_ptrs
++        (the refresh_ptabs idiom applied to the base stream). `experts`
++        keeps its ownership meaning (the rank's PAGEABLE set); residency
++        within it is dynamic. Missing experts point at pool slot 0
++        (wrong-but-finite) and the forward glue zeroes their weights from
++        the same slot_table in-graph, so a fetch+replay serves them
++        exactly."""
 +        from safetensors import safe_open
 +        self.dev = device
 +        self.E = num_experts
@@ -10768,17 +11700,69 @@ index 000000000..f8e41e45b
 +        # forward_topk_wave_m8_graph).
 +        self._wave_m8_guarded: bool | None = None
 +        self._m8_gbufs: dict | None = None
++        # M16 decode-wave state (tor C [O] 2026-08-25, F-C2): rodzina m16
++        # (GLM base-only, okno T w [2,16], DUAL-SET z m8 — patrz dispatch)
++        # + jej bufory (A-side w layoucie PRZEPLATANYM — ABI kanonow m16).
++        self._wave_m16_avail: bool | None = None
++        self._wave_m16_guarded: bool | None = None
++        self._m16_bufs: tuple | None = None
++        self._m16_gbufs: dict | None = None
++        # paged-base state (init_base_paged); None = resident base.
++        self.paged = paged
++        self._base_pairs: list | None = None
++        self._base_keys: torch.Tensor | None = None
 +
++        # per-layer ownership (EP sharding / heat residency); values are
++        # sorted LongTensors of global expert ids, E-long when full.
++        self.owned: dict[int, torch.Tensor] = {}
 +        for li in layers:
++            if experts is None:
++                own = list(range(self.E))
++            elif isinstance(experts, dict):
++                own = experts.get(li)
++                own = (list(range(self.E)) if own is None
++                       else sorted(int(e) for e in own))
++            else:
++                own = sorted(int(e) for e in experts)
++            if not own:
++                raise ValueError(
++                    f"moe_w2 EXL3: empty expert subset for layer {li}")
++            own_set = set(own)
++            anchor = own[0]
++            self.owned[li] = torch.tensor(own, dtype=torch.long,
++                                          device=device)
++            if paged:
++                # No resident bytes: placeholder [E] pointer tables, filled
++                # by refresh_base_ptrs from the base tier's slot_table
++                # before the first forward (init_base_paged runs at build).
++                self._tables[li] = {
++                    proj: tuple(
++                        torch.zeros(self.E, dtype=torch.int64, device=device)
++                        for _ in range(3))
++                    for proj in ("g", "u", "d")
++                }
++                continue
 +            path = os.path.join(pack_dir, f"exl3-l{li:02d}.safetensors")
 +            keep = {}
 +            with safe_open(path, "pt") as f:
-+                for ei in range(self.E):
++                for ei in own:
 +                    for proj, kb in (("w1", self.w13_k), ("w3", self.w13_k),
 +                                     ("w2", self.w2_k)):
 +                        for part in ("trellis", "suh", "svh"):
 +                            k = f"e{ei}.{proj}.k{kb}.{part}"
 +                            keep[k] = f.get_tensor(k).to(device)
++            # non-owned experts: alias the anchor's tensors so every [E]
++            # pointer table stays fully dereferenceable (wrong-but-finite);
++            # the weight-side zeroing contract keeps their contribution 0.
++            if len(own) < self.E:
++                for ei in range(self.E):
++                    if ei in own_set:
++                        continue
++                    for proj, kb in (("w1", self.w13_k), ("w3", self.w13_k),
++                                     ("w2", self.w2_k)):
++                        for part in ("trellis", "suh", "svh"):
++                            keep[f"e{ei}.{proj}.k{kb}.{part}"] = \
++                                keep[f"e{anchor}.{proj}.k{kb}.{part}"]
 +            # layer-prefixed keys: multi-layer tiers must not overwrite the
 +            # previous layer's tensors (the pointer tables would dangle)
 +            self._store.update({f"l{li}.{k}": v for k, v in keep.items()})
@@ -10799,7 +11783,16 @@ index 000000000..f8e41e45b
 +            }
 +
 +    def total_bytes(self) -> int:
-+        return sum(t.numel() * t.element_size() for t in self._store.values())
++        # dedup by storage: non-owned aliases must not double-count
++        seen: set[int] = set()
++        tot = 0
++        for t in self._store.values():
++            p = t.data_ptr()
++            if p in seen:
++                continue
++            seen.add(p)
++            tot += t.numel() * t.element_size()
++        return tot
 +
 +    def _mgemm(self, A, tabs, C, A_had, idx, wts, kb, mults=(0, 0),
 +               num_tokens=1):
@@ -10830,8 +11823,43 @@ index 000000000..f8e41e45b
 +        delta down-proj reduction (already masked by the caller).
 +        delta_gu_sel: [m, k] 0/1 gate for the Δ g/u contribution pre-
 +        activation (unified semantics); None with dtabs = ungated add
-+        (dual semantics)."""
++        (dual semantics).
++
++        m-BUCKETING (2026-08-14 [B]): chunked-prefill compositions produce
++        an effectively unbounded stream of novel m values, and the coop
++        autotuner pays a measured 30-120 s FIRST CALL per (size_m, ...) key
++        ([L] 2026-08-11 root-cause; re-measured as ~100 s engine-wide
++        stalls, twice per C4 cell, TP2 EP boots 2026-08-14). Rows above the
++        decode window (m > 8) are padded to the next multiple of
++        VLLM_MOE_W2_EXL3_M_BUCKET (default 16, 0/1 disables): pad rows
++        carry row-0 ids at weight 0 — exactly zero contribution, the
++        weight-side idiom — and the result is sliced back to the caller's
++        m. The shape space collapses to <= BATCHED/bucket keys, so every
++        shape tunes once per cache lifetime instead of once per prompt
++        composition."""
 +        t = self._tables[li]
++        m0, k = topk_ids.shape
++        if _M_BUCKET > 1 and m0 > 8:
++            m_pad = -(-m0 // _M_BUCKET) * _M_BUCKET
++            if m_pad != m0:
++                pad = m_pad - m0
++                x = torch.cat([x, torch.zeros(
++                    pad, x.shape[1], dtype=x.dtype, device=x.device)])
++                topk_ids = torch.cat(
++                    [topk_ids, topk_ids[:1].expand(pad, k)])
++                base_w2_wts = torch.cat([base_w2_wts, torch.zeros(
++                    pad, k, dtype=base_w2_wts.dtype,
++                    device=base_w2_wts.device)])
++                if delta_w2_wts is not None:
++                    delta_w2_wts = torch.cat(
++                        [delta_w2_wts, torch.zeros(
++                            pad, k, dtype=delta_w2_wts.dtype,
++                            device=delta_w2_wts.device)])
++                if delta_gu_sel is not None:
++                    delta_gu_sel = torch.cat(
++                        [delta_gu_sel, torch.zeros(
++                            pad, k, dtype=delta_gu_sel.dtype,
++                            device=delta_gu_sel.device)])
 +        m, k = topk_ids.shape
 +        bszm = m * k
 +        xh = x.half()
@@ -10872,13 +11900,127 @@ index 000000000..f8e41e45b
 +        Cd = torch.zeros(bszm, 1, self.H, dtype=torch.float, device=self.dev)
 +        self._mgemm(h, t["d"], Cd, Ah2, ids, w_base, self.w2_k,
 +                    num_tokens=m)
-+        y = Cd[:m, 0]
++        y = Cd[:m0, 0]
 +        if dtabs is not None:
 +            w_d = delta_w2_wts.half().reshape(1, bszm).contiguous()
 +            Cd2 = torch.zeros_like(Cd)
 +            self._mgemm(h, dtabs["d"], Cd2, Ah2, ids, w_d, dk2, dmults,
 +                        num_tokens=m)
-+            y = y + Cd2[:m, 0]
++            y = y + Cd2[:m0, 0]
++        return y
++
++    def _graph_cap_tokens(self) -> int:
++        """Largest CUDA-graph-captured token count for this engine (0 when
++        graphs are off / offline). The fused prefill route does host syncs
++        (argsort/bincount/.item()) and dynamic shapes, so it must engage
++        strictly ABOVE every capturable size: a warmup taking the fused
++        route for a size that later captures via _batched would leave the
++        mgemm autotune cold and fire it inside capture (the 4b8618e26
++        crash class), and capturing the fused route itself is illegal."""
++        cap = getattr(self, "_graph_cap", None)
++        if cap is None:
++            cap = 0
++            try:
++                from vllm.config import get_current_vllm_config
++                cfg = get_current_vllm_config()
++                if (cfg is not None and cfg.model_config is not None
++                        and not cfg.model_config.enforce_eager):
++                    comp = cfg.compilation_config
++                    mode = getattr(comp, "cudagraph_mode", None)
++                    if (mode is not None
++                            and getattr(mode, "name", "NONE") != "NONE"):
++                        cap = int(comp.max_cudagraph_capture_size or 0)
++            except Exception:  # noqa: BLE001 - offline tools: no config
++                cap = 0
++            self._graph_cap = cap
++        return cap
++
++    def _moe_dual_bufs(self, E: int):
++        """Lazy per-tier scratch for exl3_moe_dual: 4x state [conc, 128, H]
++        + 4x intermediate [conc, 128, I] halves and the 9 null int64
++        pointer tables that ride the (unused) delta stream on base-only
++        cells. Allocated on first fused prefill — the engine's profiling
++        run takes this route (T = max_num_batched_tokens > graph cap), so
++        the bytes are accounted before the KV pool is sized."""
++        bufs = getattr(self, "_dual_bufs", None)
++        if bufs is None:
++            conc = int(self.ext.exl3_moe_max_concurrency(
++                torch.cuda.current_device()))
++            st = tuple(torch.empty(conc, _MOE_PREFILL_ROWS, self.H,
++                                   dtype=torch.half, device=self.dev)
++                       for _ in range(4))
++            it = tuple(torch.empty(conc, _MOE_PREFILL_ROWS, self.I,
++                                   dtype=torch.half, device=self.dev)
++                       for _ in range(4))
++            null = torch.zeros(E, dtype=torch.int64, device=self.dev)
++            bufs = (st, it, tuple(null for _ in range(9)))
++            self._dual_bufs = bufs
++        return bufs
++
++    def _fused_prefill(self, li: int, x: torch.Tensor,
++                       topk_ids: torch.Tensor,
++                       wts: torch.Tensor) -> torch.Tensor:
++        """T-above-graph-cap route: one exl3_moe_dual call for the whole
++        chunk — expert-major union decode (trellis decoded once per ACTIVE
++        expert, MMA over its token rows) instead of _batched's m*k slot
++        expansion (trellis re-decoded per assignment). Base-only: the
++        delta stream rides null pointer tables (the compiled single-plan
++        instance pair). EP compaction falls out naturally: only pairs with
++        a nonzero weight enter the sorted assignment lists, so non-owned
++        sentinel pairs (ownership transform, weight 0), base-miss-zeroed
++        pairs (pager bres) and fp4-masked pairs vanish instead of
++        computing dead slots — the algebra is identical (they contributed
++        exactly 0 in _batched). Eager-only by construction (host syncs);
++        the caller gates on the graph capture envelope."""
++        if (self.w13_k, self.w2_k) != (2, 1):
++            raise ValueError(
++                "VLLM_MOE_W2_EXL3_MOE_PREFILL=1: exl3_moe_dual ships a "
++                "single compiled base-plan instance (2,2,1) 3INST; this "
++                f"tier serves w13_k={self.w13_k}, w2_k={self.w2_k} — "
++                "unset the flag or serve the (2,2,1) base pack")
++        t = self._tables[li]
++        m0, k = topk_ids.shape
++        dev = self.dev
++        y = torch.zeros(m0, self.H, dtype=torch.float, device=dev)
++        flat_wts = wts.reshape(-1)
++        live = flat_wts != 0
++        flat_ids = topk_ids.reshape(-1)[live]
++        if flat_ids.numel() == 0:
++            return y
++        flat_wts = flat_wts[live]
++        flat_tok = torch.arange(
++            m0, device=dev).repeat_interleave(k)[live]
++        order = flat_ids.argsort()
++        E = t["g"][0].shape[0]
++        counts = torch.bincount(flat_ids[order], minlength=E + 1)
++        # Host syncs are legal here (route engages only above the graph
++        # capture envelope, i.e. eager prefill shapes).
++        if int(counts.max().item()) > _MOE_PREFILL_ROWS:
++            # Densest expert exceeds the per-call staging rows: split the
++            # token range and recurse — per-expert load only shrinks.
++            # Rare on flat routing (needs >128 of the chunk's tokens on
++            # one expert); worst case degenerates toward per-token cost.
++            mid = m0 // 2
++            y[:mid] = self._fused_prefill(
++                li, x[:mid], topk_ids[:mid], wts[:mid])
++            y[mid:] = self._fused_prefill(
++                li, x[mid:], topk_ids[mid:], wts[mid:])
++            return y
++        num_active = int((counts[:E] > 0).sum().item())
++        st, it, null9 = self._moe_dual_bufs(E)
++        self.ext.exl3_moe_dual(
++            x.half().contiguous(), y, counts,
++            flat_tok[order].contiguous(),
++            flat_wts[order].half().contiguous(),
++            *st, *it,
++            0,                                   # MOE_ACT_SILU (gated)
++            self.w13_k, self.w13_k, self.w2_k,   # base plan (2,2,1) cb0
++            2, 2, 3,                             # delta selector (null)
++            *t["g"], *t["u"], *t["d"],
++            *null9,
++            False, False,                        # base: 3INST
++            False, True,                         # delta selector: MUL1
++            float(self.act_limit), num_active)
 +        return y
 +
 +    @torch.inference_mode()
@@ -10889,10 +12031,17 @@ index 000000000..f8e41e45b
 +        [m, k] float; fp4_mask [m, k] bool, True = served by FP4 tier.
 +        Returns y [m, H] float32 with masked contributions EXCLUDED
 +        (weight-side zeroing at fixed shapes — no compaction, no host
-+        syncs, batch-of-tokens in one mgemm per projection)."""
++        syncs, batch-of-tokens in one mgemm per projection). With
++        VLLM_MOE_W2_EXL3_MOE_PREFILL=1, chunks strictly above the CUDA
++        graph capture envelope (and never during capture) take the fused
++        expert-major union-decode route instead (_fused_prefill)."""
 +        wts = topk_weights
 +        if fp4_mask is not None:
 +            wts = wts.masked_fill(fp4_mask, 0.0)
++        if (_MOE_PREFILL
++                and topk_ids.shape[0] > max(8, self._graph_cap_tokens())
++                and not torch.cuda.is_current_stream_capturing()):
++            return self._fused_prefill(li, x, topk_ids, wts)
 +        return self._batched(li, x, topk_ids, wts)
 +
 +    @torch.inference_mode()
@@ -11060,7 +12209,10 @@ index 000000000..f8e41e45b
 +        Cached: env + ext build cannot change within a process."""
 +        if self._wave_m8_avail is None:
 +            try:
-+                self._wave_m8_avail = bool(self.ext.exl3_wave_m8_available())
++                # [N] F-B2: sonda per-geometria (H=6144 -> zestaw GLM
++                # base-only uni_k6144+k1_n6144; H=4096 -> pelny dualny).
++                self._wave_m8_avail = bool(
++                    self.ext.exl3_wave_m8_available(self.H))
 +            except Exception:
 +                self._wave_m8_avail = False
 +        return self._wave_m8_avail
@@ -11074,7 +12226,8 @@ index 000000000..f8e41e45b
 +        ext_wave_m8_available (old ext / plain cubins -> False)."""
 +        if self._wave_m8_guarded is None:
 +            try:
-+                self._wave_m8_guarded = bool(self.ext.exl3_wave_m8_guarded())
++                self._wave_m8_guarded = bool(
++                    self.ext.exl3_wave_m8_guarded(self.H))
 +            except Exception:
 +                self._wave_m8_guarded = False
 +        return self._wave_m8_guarded
@@ -11091,6 +12244,14 @@ index 000000000..f8e41e45b
 +                torch.empty(12, 8, self.I, dtype=torch.half, device=self.dev),
 +                torch.empty(12, 8, self.H, dtype=torch.half, device=self.dev),
 +            )
++            if self.H == 6144:
++                # [N] F-B2 base-only: ucb2/dn3 wylaczone => kwadranty
++                # delta c_up[12:24) i c_down[6:12) NIGDY nie sa pisane,
++                # a act/out czytaja je addytywnie — zero RAZ przy
++                # alokacji chroni przed 0*NaN ze smieci torch.empty
++                # (swieze wiersze -1 zeruje stage_in tylko w bazie).
++                self._m8_bufs[1][12:].zero_()
++                self._m8_bufs[3][6:].zero_()
 +        return self._m8_bufs
 +
 +    @torch.inference_mode()
@@ -11148,7 +12309,22 @@ index 000000000..f8e41e45b
 +                self.act_limit, 6)
 +        return out, len(groups)
 +
-+    def _m8_graph_bufs(self) -> dict:
++    def _wave_groups_for(self, li: int, T: int, k: int,
++                         cap: int = 6) -> int:
++        """Liczba grup trasy wave-M8/M16 dla kroku T tokenow top-k —
++        POKRYWA najgorszy przypadek unii: ceil(min(T*k, E_reach)/cap),
++        gdzie E_reach = |owned[li]| (po transformie ownership routed idy
++        to podzbior owned + sentinel z owned; E przy pelnym wladaniu).
++        Fix znaleziska [O] 2026-08-25: stare G=T bylo inwariantem top-6
++        (union <= 6T) — top-8 (GLM) moze go zlamac => silent OOB w
++        builderze. Dla top-6 zwraca dokladnie T (bez zmian dla DS4).
++        Statyczne per (li, T, k) — capture-safe (numel = metadana hosta,
++        zero syncow)."""
++        reach = self.owned[li].numel() if li in self.owned else self.E
++        u_max = min(T * k, reach)
++        return -(-u_max // cap)
++
++    def _m8_graph_bufs(self, g_max: int = 8) -> dict:
 +        """Persistent buffers of the capture-safe M8 route: the ext call
 +        args must live at STABLE addresses (kernel launch params are
 +        frozen into the captured graph), so the in-graph builder/gather
@@ -11157,20 +12333,24 @@ index 000000000..f8e41e45b
 +        cols layout (G, 18, 6) row-major: for group g the six slot-major
 +        pointer arrays the ext takes are CONTIGUOUS row-slices
 +        (cols[g,0:4] flat = 24 up_tr, [4:8] suh, [8:12] svh, [12:14]
-+        dn_tr, [14:16] dn_suh, [16:18] dn_svh) — zero per-call copies."""
++        dn_tr, [14:16] dn_suh, [16:18] dn_svh) — zero per-call copies.
++        g_max: maksymalne G tej trasy (fix [O]: dla top-8 > 8; sizing
++        raz, przy pierwszym forwardzie — profile-run poprzedza capture)."""
 +        if self._m8_gbufs is None:
 +            self._m8_gbufs = {
-+                "rmap": torch.full((8, 6, 8), -1, dtype=torch.int32,
++                "rmap": torch.full((g_max, 6, 8), -1, dtype=torch.int32,
 +                                   device=self.dev),
-+                "rw": torch.zeros(8, 6, 8, dtype=torch.half,
++                "rw": torch.zeros(g_max, 6, 8, dtype=torch.half,
 +                                  device=self.dev),
-+                "cols": torch.zeros(8, 18, 6, dtype=torch.int64,
++                "cols": torch.zeros(g_max, 18, 6, dtype=torch.int64,
 +                                    device=self.dev),
 +                "out": torch.zeros(8, self.H, dtype=torch.float,
 +                                   device=self.dev),
 +                "xh": torch.zeros(8, self.H, dtype=torch.half,
 +                                  device=self.dev),
 +            }
++        assert self._m8_gbufs["rmap"].shape[0] >= g_max, \
++            "m8 graph bufs undersized (alloc before capture at max T)"
 +        return self._m8_gbufs
 +
 +    @torch.inference_mode()
@@ -11195,22 +12375,27 @@ index 000000000..f8e41e45b
 +            "wave m8 serves the base (2,2,1) pair (w13_k=2, w2_k=1)"
 +        assert self._ptab is not None, \
 +            "forward_topk_wave_m8_graph before init_ptabs()"
-+        bufs = self._m8_graph_bufs()
++        k = topk_ids.shape[1]
++        # fix [O] 2026-08-25: G pokrywa najgorsza unie (top-8 > 6T slots;
++        # top-6: G == T bez zmian). Sizing bufow po maksimum okna trasy.
++        G = self._wave_groups_for(li, T, k)
++        bufs = self._m8_graph_bufs(self._wave_groups_for(li, 8, k))
 +        a_had, c_up, d_in, c_down = self._m8_workbufs()
 +        ptab = self._ptab[li]
 +
-+        experts, rmap, rw = build_m8_groups_graph(topk_ids, topk_weights)
-+        bufs["rmap"][:T].copy_(rmap)
-+        bufs["rw"][:T].copy_(rw)
-+        # (18, T*6) -> (T, 18, 6) into the persistent slot-major buffer
++        experts, rmap, rw = build_m8_groups_graph(topk_ids, topk_weights,
++                                                  groups=G)
++        bufs["rmap"][:G].copy_(rmap)
++        bufs["rw"][:G].copy_(rw)
++        # (18, G*6) -> (G, 18, 6) into the persistent slot-major buffer
 +        cols_all = ptab.index_select(1, experts.reshape(-1))
-+        bufs["cols"][:T].copy_(cols_all.view(18, T, 6).permute(1, 0, 2))
++        bufs["cols"][:G].copy_(cols_all.view(18, G, 6).permute(1, 0, 2))
 +        xh = bufs["xh"][:T]
 +        xh.copy_(x.reshape(T, self.H))
 +        out = bufs["out"][:T]
 +        out.zero_()
 +
-+        for g in range(T):
++        for g in range(G):
 +            cg = bufs["cols"][g]
 +            self.ext.exl3_decode_wave_dual_m8(
 +                xh, out,
@@ -11224,7 +12409,127 @@ index 000000000..f8e41e45b
 +                cg[16:18].reshape(-1),
 +                a_had, c_up, d_in, c_down,
 +                self.act_limit, 6)
-+        return out, T
++        return out, G
++
++    # ---- M=16-native decode wave (tor C [O] 2026-08-25, F-C2) ----
++
++    def ext_wave_m16_available(self) -> bool:
++        """Sonda zestawu m16 (GLM base-only H=6144): loader per-geometria
++        w ext (uni_m16[g]_k6144 + k1_m16[g]_n6144 z katalogu
++        VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR). Degradacja jak m8
++        (stary ext / brak plikow -> False)."""
++        if self._wave_m16_avail is None:
++            try:
++                self._wave_m16_avail = bool(
++                    self.ext.exl3_wave_m16_available(self.H))
++            except Exception:
++                self._wave_m16_avail = False
++        return self._wave_m16_avail
++
++    def ext_wave_m16_guarded(self) -> bool:
++        """True gdy loader ma GUARDED zestaw m16 (*_m16g*, guard pustej
++        grupy rows-16) — warunek trasy w grafach (stale G grup)."""
++        if self._wave_m16_guarded is None:
++            try:
++                self._wave_m16_guarded = bool(
++                    self.ext.exl3_wave_m16_guarded(self.H))
++            except Exception:
++                self._wave_m16_guarded = False
++        return self._wave_m16_guarded
++
++    def _m16_workbufs(self) -> tuple:
++        """Lazy per-tier m16 work buffers (a_had16, c_up, d_in16, c_down)
++        — 12/24/12/12 slotow x 16 wierszy; a_had16/d_in16 w LAYOUCIE
++        PRZEPLATANYM (ABI kanonow m16, DESIGN 5u — stage-kernele ext
++        pisza go same). CALOSC zerowana RAZ przy alokacji: kwadranty
++        delta c_up[12:24) i gorna polowa c_down[6:12) NIGDY nie sa
++        pisane w base-only (act/out czytaja je addytywnie — 0*0=0);
++        wiersze/pary -1 nadpisuje stage_in_m16 zerami przy kazdym kroku
++        (bufor brudny miedzy grupami by design, jak m8)."""
++        if self._m16_bufs is None:
++            self._m16_bufs = (
++                torch.zeros(12, 16, self.H, dtype=torch.half,
++                            device=self.dev),
++                torch.zeros(24, 16, self.I, dtype=torch.half,
++                            device=self.dev),
++                torch.zeros(12, 16, self.I, dtype=torch.half,
++                            device=self.dev),
++                torch.zeros(12, 16, self.H, dtype=torch.half,
++                            device=self.dev),
++            )
++        return self._m16_bufs
++
++    def _m16_graph_bufs(self, g_max: int) -> dict:
++        """Persistent buffery trasy m16 w grafach (adresy stabilne —
++        wzorzec _m8_graph_bufs); rmap/rw rows=16, out/xh do T=16."""
++        if self._m16_gbufs is None:
++            self._m16_gbufs = {
++                "rmap": torch.full((g_max, 6, 16), -1, dtype=torch.int32,
++                                   device=self.dev),
++                "rw": torch.zeros(g_max, 6, 16, dtype=torch.half,
++                                  device=self.dev),
++                "cols": torch.zeros(g_max, 18, 6, dtype=torch.int64,
++                                    device=self.dev),
++                "out": torch.zeros(16, self.H, dtype=torch.float,
++                                   device=self.dev),
++                "xh": torch.zeros(16, self.H, dtype=torch.half,
++                                  device=self.dev),
++            }
++        assert self._m16_gbufs["rmap"].shape[0] >= g_max, \
++            "m16 graph bufs undersized (alloc before capture at max T)"
++        return self._m16_gbufs
++
++    @torch.inference_mode()
++    def forward_topk_wave_m16_graph(self, li: int, x: torch.Tensor,
++                                    topk_ids: torch.Tensor,
++                                    topk_weights: torch.Tensor):
++        """Capture-safe decode step for T in [2, 16] tokens on the
++        M=16-native wave (tor C F-C2): G = _wave_groups_for(li, T, k)
++        ext calls per step (fix [O]: pokrywa najgorsza unie top-k;
++        puste grupy wychodza guardem m16g), groups built ON DEVICE
++        (build_m8_groups_graph rows=16), pointers gathered from the
++        persistent ptab. DUAL-SET: dispatch kieruje tu T w [9,16]
++        (T<=8 zostaje na trasie m8 — kara m16 @T<=8 ~15%, DESIGN 5u');
++        okno [2,8] wspierane dla parity/A-B. Requires
++        ext_wave_m16_guarded(). Legal in-graph and eager."""
++        T = x.shape[0]
++        assert 2 <= T <= 16, "graph wave m16 serves T in [2, 16]"
++        assert self.w13_k == 2 and self.w2_k == 1, \
++            "wave m16 serves the base (2,2,1) pair (w13_k=2, w2_k=1)"
++        assert self._ptab is not None, \
++            "forward_topk_wave_m16_graph before init_ptabs()"
++        k = topk_ids.shape[1]
++        G = self._wave_groups_for(li, T, k)
++        bufs = self._m16_graph_bufs(self._wave_groups_for(li, 16, k))
++        a16, c_up, di16, c_dn = self._m16_workbufs()
++        ptab = self._ptab[li]
++
++        experts, rmap, rw = build_m8_groups_graph(topk_ids, topk_weights,
++                                                  rows=16, groups=G)
++        bufs["rmap"][:G].copy_(rmap)
++        bufs["rw"][:G].copy_(rw)
++        cols_all = ptab.index_select(1, experts.reshape(-1))
++        bufs["cols"][:G].copy_(cols_all.view(18, G, 6).permute(1, 0, 2))
++        xh = bufs["xh"][:T]
++        xh.copy_(x.reshape(T, self.H))
++        out = bufs["out"][:T]
++        out.zero_()
++
++        for g in range(G):
++            cg = bufs["cols"][g]
++            self.ext.exl3_decode_wave_dual_m16(
++                xh, out,
++                bufs["rmap"][g],
++                bufs["rw"][g],
++                cg[0:4].reshape(-1),
++                cg[4:8].reshape(-1),
++                cg[8:12].reshape(-1),
++                cg[12:14].reshape(-1),
++                cg[14:16].reshape(-1),
++                cg[16:18].reshape(-1),
++                a16, c_up, di16, c_dn,
++                self.act_limit, 6)
++        return out, G
 +
 +    # ---- persistent decode-wave pointer tables (glue fix [V] 2026-08-05) --
 +    # Row layout of the per-layer [18, E] int64 table. Rows are grouped so a
@@ -11240,6 +12545,44 @@ index 000000000..f8e41e45b
 +    # entry points at the resident zero vector instead of the pool — the same
 +    # semantics the per-step dmask/torch.where used to apply, moved to
 +    # pool-mutation time.
++
++    def init_ptabs_base_only(self, pairs) -> None:
++        """[N] F-B2 (tor B K=6144): ptab stack bez puli Δ — wiersze bazowe
++        jak w init_ptabs (statyczne tensory packa; na komorce paged
++        odswieza je hub bazy), wiersze Δ STATYCZNE: tr/suh ALIASOWANE na
++        odpowiedniki bazowe (waznosc wskaznikow: stage_in w trybie
++        base-only czyta tylko sloty bazowe, ale gather wysyla pelne
++        tablice — alias trzyma je legalnymi), svh Δ = rezydentne wektory
++        ZEROWE (wiersze 10/11/17 — act/out mnoza zerowe kwadranty c_up/
++        c_down przez te wektory: 0*0=0, zadnego NaN). Zero hookow — stack
++        w pelni statyczny; pool mutacje nie istnieja bez ftier."""
++        assert not torch.cuda.is_current_stream_capturing(), \
++            "init_ptabs_base_only during capture"
++        self._ptab_pairs = sorted(pairs)
++        L = len(self._ptab_pairs)
++        stack = torch.zeros(L, 18, self.E, dtype=torch.int64, device=self.dev)
++        zu = self._zero_svh_up.data_ptr()
++        zd = self._zero_svh_dn.data_ptr()
++        for ix, (_lk, li) in enumerate(self._ptab_pairs):
++            t = self._tables[li]
++            for row, src in ((0, t["g"][0]), (1, t["u"][0]),
++                             (4, t["g"][1]), (5, t["u"][1]),
++                             (8, t["g"][2]), (9, t["u"][2]),
++                             (12, t["d"][0]), (14, t["d"][1]),
++                             (16, t["d"][2])):
++                stack[ix, row] = src
++            stack[ix, 2] = stack[ix, 0]      # dg.tr  <- alias g.tr
++            stack[ix, 3] = stack[ix, 1]      # du.tr  <- alias u.tr
++            stack[ix, 6] = stack[ix, 4]      # dg.suh <- alias g.suh
++            stack[ix, 7] = stack[ix, 5]      # du.suh <- alias u.suh
++            stack[ix, 10] = zu               # dg.svh <- ZERO
++            stack[ix, 11] = zu               # du.svh <- ZERO
++            stack[ix, 13] = stack[ix, 12]    # dd.tr  <- alias d.tr
++            stack[ix, 15] = stack[ix, 14]    # dd.suh <- alias d.suh
++            stack[ix, 17] = zd               # dd.svh <- ZERO
++        self._ptab_stack = stack
++        self._ptab = {li: stack[ix]
++                      for ix, (_lk, li) in enumerate(self._ptab_pairs)}
 +
 +    def init_ptabs(self, ftier, geom: dict, pairs) -> None:
 +        """Build the persistent ptab stack and hook refreshes into the delta
@@ -11306,6 +12649,167 @@ index 000000000..f8e41e45b
 +        P[:, 13] = sp + d_tr
 +        P[:, 15] = sp + d_suh
 +        P[:, 17] = torch.where(pooled, sp + d_svh, self._ptab_zd)
++
++    # ---- paged base (BASE cache over EXL3, [F] 2026-08-20) ---------------
++    # The base stream's pointers become slot-table-derived exactly like the
++    # Δ rows above: base bytes live in the base DeltaTier's pool ([n_slots,
++    # base_slot_bytes], sections [w13: tr1|suh1|svh1|tr3|suh3|svh3 | w2:
++    # tr|suh|svh] = delta_slot_geom(w13_k, w2_k) offsets), and every
++    # mutation of that pool (fetch, eviction, prefill ensure) refreshes
++    # BOTH pointer surfaces: the per-layer _tables g/u/d tuples (mgemm
++    # batched/prefill paths — device tensors the kernel dereferences at
++    # run time) and the ptab stack base rows (decode-wave paths). Missing
++    # experts clamp to slot 0 (wrong-but-finite; the pool is zero-filled
++    # at creation so even a never-written slot decodes finite bytes) and
++    # the forward glue zeroes their weights from the same slot_table
++    # in-graph — the replay after a fetch recomputes both from CURRENT
++    # tensor contents, which is what makes it exact.
++
++    def init_base_paged(self, btier, geom: dict, pairs) -> None:
++        """Wire the paged base: `pairs` = [(layer_key, li), ...] mapping the
++        base tier's slot_table rows to this tier's pack layers. Tiers are
++        built ONE PER LAYER, so the pointer refresh is consolidated in a
++        per-btier hub (_Exl3BasePtrHub): every tier's `_tables` become
++        views of ONE [P, 9, E] buffer and a SINGLE mutate hook refreshes
++        all layers with one index_select + 9 vectorized writes. The
++        original per-tier hooks fired n_layers times per pool mutation
++        (fetch/prefetch/eviction), ~15 small CUDA ops each, on the forward
++        thread — profiled as the dominant CPU tax of the pager ([G]
++        2026-08-22). Registration is strictly pre-capture (asserted), so
++        captured graphs bake pointers to the hub buffer and refresh
++        mutates it in place — the refresh_ptabs contract, unchanged."""
++        assert self.paged, "init_base_paged on a resident-base tier"
++        assert not torch.cuda.is_current_stream_capturing(), \
++            "init_base_paged during capture"
++        self._base_pairs = sorted(pairs)
++        self._base_keys = torch.tensor([lk for lk, _ in self._base_pairs],
++                                       dtype=torch.long, device=self.dev)
++        self._base_pool_base = btier.pool.data_ptr()
++        self._base_slot_bytes = int(btier.slot_bytes)
++        self._base_offs = geom["offs"]
++        hub = getattr(btier, "_exl3_base_ptr_hub", None)
++        if hub is None:
++            hub = _Exl3BasePtrHub(btier)
++            btier._exl3_base_ptr_hub = hub
++            btier.mutate_hooks.append(hub.refresh)
++        for lk, li in self._base_pairs:
++            hub.register(self, lk, li)
++
++    @torch.inference_mode()
++    def refresh_base_ptrs(self, btier) -> None:
++        """Recompute THIS tier's base pointers from the CURRENT base
++        slot_table. Kept for tools/tests; serving refreshes through the
++        per-btier hub (one call for ALL layer-tiers), which owns the buffer
++        these `_tables` view into."""
++        st = btier.slot_table.index_select(0, self._base_keys)   # [L, E] i32
++        sp = (st.clamp_min(0).to(torch.int64) * self._base_slot_bytes
++              + self._base_pool_base)
++        offs = self._base_offs
++        for ix, (_lk, li) in enumerate(self._base_pairs):
++            row = sp[ix]
++            t = self._tables[li]
++            for proj in ("g", "u", "d"):
++                otr, osuh, osvh = offs[proj]
++                tr, suh, svh = t[proj]
++                tr.copy_(row + otr)
++                suh.copy_(row + osuh)
++                svh.copy_(row + osvh)
++        self._write_base_ptab_rows(sp)
++
++    def _write_base_ptab_rows(self, sp) -> None:
++        """Write the decode-wave ptab BASE rows from `sp` = [n_pairs, E]
++        pool byte addresses (Δ rows are refresh_ptabs'). No-op until the
++        wave route builds a ptab stack for this tier."""
++        if self._ptab is None:
++            return
++        offs = self._base_offs
++        P = self._ptab_stack
++        (g_tr, g_suh, g_svh) = offs["g"]
++        (u_tr, u_suh, u_svh) = offs["u"]
++        (d_tr, d_suh, d_svh) = offs["d"]
++        P[:, 0] = sp + g_tr
++        P[:, 1] = sp + u_tr
++        P[:, 4] = sp + g_suh
++        P[:, 5] = sp + u_suh
++        P[:, 8] = sp + g_svh
++        P[:, 9] = sp + u_svh
++        P[:, 12] = sp + d_tr
++        P[:, 14] = sp + d_suh
++        P[:, 16] = sp + d_svh
++
++
++class _Exl3BasePtrHub:
++    """Consolidated base-pointer refresh for the paged base (D3 mode 5).
++
++    One Exl3BaseTier exists PER LAYER (43 on DS4-Flash), and the original
++    per-tier mutate hooks made every base-pool mutation (fetch, prefetch,
++    eviction batch) fire n_layers refreshes x ~15 small CUDA ops each —
++    ~800+ tiny launches per fetch on the forward thread, profiled as the
++    dominant CPU-side tax of the pager (GPU idle 40-60%, [G] ledger
++    2026-08-22). The hub owns ONE [P, 9, E] int64 pointer buffer; each
++    registered tier's per-layer `_tables` are rebound to views of it
++    (strictly pre-capture: registration happens at layer build), and a
++    SINGLE mutate hook refreshes every layer with one index_select over
++    the base slot_table + 9 vectorized column writes. Column order:
++    g(tr, suh, svh), u(...), d(...) = rows 0..8 — matching the tuple
++    layout consumers unpack. Decode-wave ptab base rows are delegated
++    per tier from the same `sp` (only tiers that built a ptab)."""
++
++    def __init__(self, btier):
++        self.btier = btier
++        self.slot_bytes = int(btier.slot_bytes)
++        self.pool_base = btier.pool.data_ptr()
++        self.entries: list = []          # (tier, layer_key, lidx)
++        self.buf = None                  # [P, 9, E] int64 (device)
++        self.keys = None                 # [P] long (device)
++
++    def register(self, tier, layer_key: int, lidx: int) -> None:
++        assert not torch.cuda.is_current_stream_capturing(), \
++            "base-ptr hub registration during capture"
++        self.entries.append((tier, layer_key, lidx))
++        dev = tier._tables[lidx]["g"][0].device
++        e = tier.E
++        buf = torch.zeros((len(self.entries), 9, e), dtype=torch.int64,
++                          device=dev)
++        self.buf = buf
++        self.keys = torch.tensor([lk for _t, lk, _l in self.entries],
++                                 dtype=torch.long, device=dev)
++        # rebind EVERY registered tier's tables into the (re)allocated
++        # buffer; consumers re-read tier._tables[li] per call, and capture
++        # has not happened yet, so old buffers die with their views.
++        for ix, (t, _lk, li) in enumerate(self.entries):
++            b = buf[ix]
++            t._tables[li] = {
++                "g": (b[0], b[1], b[2]),
++                "u": (b[3], b[4], b[5]),
++                "d": (b[6], b[7], b[8]),
++            }
++        self.refresh()
++
++    @torch.inference_mode()
++    def refresh(self) -> None:
++        """Mutation-time, eager host code — the refresh_ptabs contract,
++        executed ONCE for all layers instead of once per layer-tier."""
++        st = self.btier.slot_table.index_select(0, self.keys)    # [P, E]
++        sp = (st.clamp_min(0).to(torch.int64) * self.slot_bytes
++              + self.pool_base)
++        offs = self.entries[0][0]._base_offs
++        b = self.buf
++        (g_tr, g_suh, g_svh) = offs["g"]
++        (u_tr, u_suh, u_svh) = offs["u"]
++        (d_tr, d_suh, d_svh) = offs["d"]
++        b[:, 0] = sp + g_tr
++        b[:, 1] = sp + g_suh
++        b[:, 2] = sp + g_svh
++        b[:, 3] = sp + u_tr
++        b[:, 4] = sp + u_suh
++        b[:, 5] = sp + u_svh
++        b[:, 6] = sp + d_tr
++        b[:, 7] = sp + d_suh
++        b[:, 8] = sp + d_svh
++        for ix, (t, _lk, _li) in enumerate(self.entries):
++            if t._ptab is not None:
++                t._write_base_ptab_rows(sp[ix:ix + 1])
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py b/vllm/model_executor/layers/quantization/utils/moe_w2_gate.py
 new file mode 100644
 index 000000000..37c5d4973
@@ -12924,10 +14428,10 @@ index 000000000..7da0e2969
 +    _ckpt_id.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 000000000..30081e6b9
+index 000000000..6a5bd159a
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
-@@ -0,0 +1,944 @@
+@@ -0,0 +1,982 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Host-side expert stores for the 2-bit MoE tiers (moe_w2_delta.DeltaTier).
@@ -13150,7 +14654,17 @@ index 000000000..30081e6b9
 +
 +
 +class PinnedHostStore:
-+    """Per-layer host tensors, exactly the pre-store `_host` dict."""
++    """Per-layer host tensors, exactly the pre-store `_host` dict.
++
++    EP / partial residency: `add_layer(..., owned=[global ids])` keeps a
++    COMPACT [n_owned, slot_bytes] tensor plus a per-layer id->row map
++    instead of the full [E, slot_bytes]. The full-E layout stored zeroed
++    rows for foreign experts at full price — 65 GiB/rank regardless of
++    ownership, which is what OOMed TP8 (8 ranks = 520 GiB of unreclaimable
++    shm; measured 2026-08-19, 3x cgroup OOM). The ownership transform
++    keeps foreign ids out of every candidate path, so `rows_for` maps
++    global ids through the row map and FAIL-FASTS on a foreign id rather
++    than silently serving zeros."""
 +
 +    resident = True
 +
@@ -13158,6 +14672,8 @@ index 000000000..30081e6b9
 +        self.slot_bytes = slot_bytes
 +        self._pinned = pinned
 +        self._layers: dict[int, torch.Tensor] = {}
++        # layer_key -> [E] global-id -> compact row (-1 = foreign)
++        self._rowmaps: dict[int, list[int]] = {}
 +
 +    def __contains__(self, layer_key: int) -> bool:
 +        return layer_key in self._layers
@@ -13165,8 +14681,17 @@ index 000000000..30081e6b9
 +    def __len__(self) -> int:
 +        return len(self._layers)
 +
-+    def add_layer(self, layer_key: int, parts) -> None:
++    def add_layer(self, layer_key: int, parts, owned=None) -> None:
 +        E = parts[0].shape[0]
++        if owned is not None:
++            idx = torch.as_tensor(sorted(int(e) for e in owned),
++                                  dtype=torch.long, device=parts[0].device)
++            parts = [t.index_select(0, idx) for t in parts]
++            rmap = [-1] * E
++            for row, ei in enumerate(idx.tolist()):
++                rmap[ei] = row
++            self._rowmaps[layer_key] = rmap
++            E = int(idx.numel())
 +        host = torch.empty(E, self.slot_bytes, dtype=torch.uint8,
 +                           pin_memory=self._pinned)
 +        off = 0
@@ -13178,12 +14703,24 @@ index 000000000..30081e6b9
 +
 +    def rows_for(self, pairs, scan: bool = False) -> list[torch.Tensor]:
 +        """Host rows for [(layer, expert), ...]; zero-copy pinned views.
++        Global expert ids; compact layers map through their row map.
 +        `scan` (a prefill-sized one-shot batch) only matters for the
 +        tiered backend's arena policy — ignored here."""
-+        return [self._layers[li][ei] for li, ei in pairs]
++        rows = []
++        for li, ei in pairs:
++            rmap = self._rowmaps.get(li)
++            if rmap is not None:
++                ei = rmap[ei]
++                assert ei >= 0, (
++                    f"moe_w2 store: foreign expert row requested from "
++                    f"compact store (layer {li}) — ownership transform "
++                    f"breached")
++            rows.append(self._layers[li][ei])
++        return rows
 +
 +    def release(self) -> None:
 +        self._layers = {}
++        self._rowmaps = {}
 +
 +
 +class MmapPackStore:
@@ -13290,7 +14827,12 @@ index 000000000..30081e6b9
 +    def __len__(self) -> int:
 +        return len(self._present)
 +
-+    def add_layer(self, layer_key: int, parts) -> None:
++    def add_layer(self, layer_key: int, parts, owned=None) -> None:
++        # `owned` accepted for interface parity with PinnedHostStore; the
++        # pack-file layout is fixed at (li*E + ei)*stride, so foreign rows
++        # are written as zeros at full size (the pack lives on disk where
++        # the page cache reclaims cold pages — RAM is not the constraint
++        # this backend solves).
 +        if not 0 <= int(layer_key) < self.n_layers:
 +            raise ValueError(
 +                f"moe_w2 store layer {layer_key} outside "
@@ -13872,6 +15414,107 @@ index 000000000..30081e6b9
 +        tag, store.path, slot_bytes / 2**20, store.stride, n_layers,
 +        n_experts)
 +    return store
+diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_xcap.py b/vllm/model_executor/layers/quantization/utils/moe_w2_xcap.py
+new file mode 100644
+index 000000000..6a82831ed
+--- /dev/null
++++ b/vllm/model_executor/layers/quantization/utils/moe_w2_xcap.py
+@@ -0,0 +1,95 @@
++# SPDX-License-Identifier: Apache-2.0
++"""Env-gated MoE-input capture for Hessian building (offline EXL3 quant).
++
++Purpose ([G] 2026-08-22): the DSpark draft head's MoE layers
++(layers.{43..45}) only execute during DECODE drafting (prefill builds KV
++and returns before the ffn), so their w1/w3 input distribution cannot be
++captured by the corpus-prefill rig (fd/tools/rigs/capture_hidden.py).
++This module captures it from a LIVE serving cell instead: hook the
++routed-expert input in the quant method's apply(), accumulate
++H = sum x x^T + fp16 samples per layer, and periodically write files in
++exactly the format fd/tools/build_base_pack.py consumes
++(H_layer{K}.pt: {"H": fp32 [D, D], "count": int}; x_layer{K}.pt: fp16
++[N, D]).
++
++Env:
++  VLLM_MOE_W2_XCAP_DIR       enable + output dir (mount rw)
++  VLLM_MOE_W2_XCAP_LAYERS    comma layer indices (default: 43,44,45)
++  VLLM_MOE_W2_XCAP_SAMPLE_CAP  stored x rows per layer (default 24000)
++  VLLM_MOE_W2_XCAP_SAVE_EVERY  save each N record calls (default 500)
++
++Arming: records only while the marker file ``<DIR>/ARM`` exists — create
++it AFTER startup so profiling/warmup dummy batches never pollute the
++capture. No-ops during cudagraph capture (a D2H inside capture would
++fault) and adds nothing to the step unless enabled.
++"""
++import os
++import re
++import threading
++
++import torch
++
++_DIR = os.environ.get("VLLM_MOE_W2_XCAP_DIR", "")
++_LAYERS = ({int(x) for x in
++            os.environ.get("VLLM_MOE_W2_XCAP_LAYERS", "43,44,45").split(",")
++            if x.strip()}
++           if _DIR else set())
++_CAP = int(os.environ.get("VLLM_MOE_W2_XCAP_SAMPLE_CAP", "24000"))
++_SAVE_EVERY = int(os.environ.get("VLLM_MOE_W2_XCAP_SAVE_EVERY", "500"))
++_LOCK = threading.Lock()
++_STATE: dict = {}
++_IDX_RE = re.compile(r"\.layers\.(\d+)\.")
++
++
++def enabled() -> bool:
++    return bool(_DIR)
++
++
++def _armed() -> bool:
++    return os.path.exists(os.path.join(_DIR, "ARM"))
++
++
++def record(layer_name: str, x: torch.Tensor) -> None:
++    """Accumulate this call's routed-expert input rows for `layer_name`."""
++    if not _DIR or torch.cuda.is_current_stream_capturing():
++        return
++    m = _IDX_RE.search(layer_name or "")
++    if m is None or int(m.group(1)) not in _LAYERS:
++        return
++    if not _armed():
++        return
++    li = int(m.group(1))
++    xf = x.detach().reshape(-1, x.shape[-1]).float()
++    with _LOCK:
++        st = _STATE.get(li)
++        if st is None:
++            st = _STATE[li] = dict(
++                H=torch.zeros(xf.shape[-1], xf.shape[-1],
++                              dtype=torch.float32, device=xf.device),
++                count=0, xs=[], sampled=0, calls=0)
++        st["H"] += xf.T @ xf
++        st["count"] += xf.shape[0]
++        if st["sampled"] < _CAP:
++            st["xs"].append(xf.half().cpu())
++            st["sampled"] += xf.shape[0]
++        st["calls"] += 1
++        if st["calls"] % _SAVE_EVERY == 0:
++            _save(li, st)
++
++
++def _save(li: int, st: dict) -> None:
++    os.makedirs(_DIR, exist_ok=True)
++    hp = os.path.join(_DIR, f"H_layer{li:02d}.pt")
++    torch.save({"H": st["H"].cpu(), "count": st["count"]}, hp + ".tmp")
++    os.replace(hp + ".tmp", hp)
++    if st["xs"]:
++        xp = os.path.join(_DIR, f"x_layer{li:02d}.pt")
++        torch.save(torch.cat(st["xs"])[:_CAP], xp + ".tmp")
++        os.replace(xp + ".tmp", xp)
++
++
++def flush() -> None:
++    """Write every layer's current accumulators (call-site optional)."""
++    with _LOCK:
++        for li, st in _STATE.items():
++            _save(li, st)
 diff --git a/vllm/model_executor/layers/quantization/utils/prefill_timers.py b/vllm/model_executor/layers/quantization/utils/prefill_timers.py
 new file mode 100644
 index 000000000..fd83f500b
@@ -14580,10 +16223,10 @@ index 44e486db7..d03eba3d4 100644
      "DeepseekV4ForCausalLM",
 diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
 new file mode 100644
-index 000000000..be4a87b32
+index 000000000..dbe47e26e
 --- /dev/null
 +++ b/vllm/models/deepseek_v4/nvidia/dspark.py
-@@ -0,0 +1,488 @@
+@@ -0,0 +1,506 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""DSpark draft model for DeepSeek-V4 (semi-autoregressive speculative decoding).
@@ -14595,6 +16238,7 @@ index 000000000..be4a87b32
 +include the future query tokens in the top-k indices for each query token.
 +"""
 +
++import os
 +from collections.abc import Iterable
 +
 +import regex as re
@@ -14861,10 +16505,20 @@ index 000000000..be4a87b32
 +        assert vllm_config.speculative_config is not None
 +        self.draft_model_config = vllm_config.speculative_config.draft_model_config
 +        self.config = self.draft_model_config.hf_config
++        # Replicated drafter (VLLM_DSPARK_REPLICATE=1): constructed under a
++        # world-1 TP swap, so the parallel layers here are full-size. The
++        # target's embed/lm_head are TP shards and cannot be aliased; claim
++        # own full copies instead and load them from the checkpoint
++        # (``embed.weight`` / ``head.weight`` - see _remap_dspark_name).
++        self._replicated = os.environ.get("VLLM_DSPARK_REPLICATE", "0") == "1"
++        if self._replicated:
++            self.has_own_embed_tokens = True
++            self.has_own_lm_head = True
 +        self.model = DSparkDeepseekV4Model(
 +            vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
 +        )
-+        # Shared with the target (aliased by the speculator's load utility).
++        # Shared with the target (aliased by the speculator's load utility)
++        # unless replicated (own full copy, loaded from the checkpoint).
 +        self.lm_head = ParallelLMHead(
 +            self.config.vocab_size,
 +            self.config.hidden_size,
@@ -15048,8 +16702,15 @@ index 000000000..be4a87b32
 +    def _remap_dspark_name(self, name: str) -> str | None:
 +        """Map a checkpoint ``mtp.{i}.*`` name to this model's parameter path.
 +
-+        Returns None for non-mtp weights (owned by the target model).
++        Returns None for non-mtp weights (owned by the target model) - except
++        under replication, where the drafter loads its own full embed/head
++        copies from the target checkpoint instead of aliasing TP shards.
 +        """
++        if self._replicated:
++            if name == "embed.weight":
++                return "model.embed_tokens.weight"
++            if name == "head.weight":
++                return "lm_head.weight"
 +        m = re.match(r"mtp\.(\d+)\.(.*)", name)
 +        if m is None:
 +            return None
@@ -15073,10 +16734,25 @@ index 000000000..be4a87b32
 +            return f"model.{rest}"
 +        return f"model.layers.{stage}.{rest}"
 diff --git a/vllm/models/deepseek_v4/nvidia/model.py b/vllm/models/deepseek_v4/nvidia/model.py
-index aa60ad34c..66fbd00d7 100644
+index aa60ad34c..76f7562ef 100644
 --- a/vllm/models/deepseek_v4/nvidia/model.py
 +++ b/vllm/models/deepseek_v4/nvidia/model.py
-@@ -46,7 +46,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ import typing
+ from collections.abc import Callable, Iterable, MutableSequence, Sequence
+ from itertools import islice
+@@ -16,6 +17,7 @@ from vllm.distributed import (
+     get_tensor_model_parallel_world_size,
+ )
+ from vllm.distributed.eplb.eplb_state import EplbLayerState
++from vllm.logger import init_logger
+ from vllm.model_executor.kernels.mhc.tilelang import (
+     hc_head_fused_kernel_tilelang,
+     mhc_fused_post_pre_tilelang,
+@@ -46,7 +48,12 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
      VocabParallelEmbedding,
  )
  from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -15090,7 +16766,133 @@ index aa60ad34c..66fbd00d7 100644
  from vllm.model_executor.models.utils import (
      AutoWeightsLoader,
      PPMissingLayer,
-@@ -917,7 +922,7 @@ class DeepseekV4DecoderLayer(nn.Module):
+@@ -69,6 +76,65 @@ from vllm.sequence import IntermediateTensors
+ from vllm.utils.math_utils import cdiv
+ from vllm.v1.attention.backends.registry import AttentionBackendEnum
+ 
++logger = init_logger(__name__)
++
++# ---- routed-expert prune-renorm (residency-policy arm C) -------------------
++# VLLM_MOE_W2_PRUNE_LIST=/path/list.tsv ("layer<TAB>expert" rows, #-comments)
++# statically removes the listed experts from the ROUTING UNIVERSE. DS4
++# selection is sqrt(softplus(logits)) + e_score_correction_bias with the
++# routing WEIGHTS gathered from the UNBIASED scores of the selected experts
++# and renormalized over the top-k (norm_topk_prob), so the per-layer bias is
++# the single choke point both routing call sites read (the FusedMoE internal
++# router holds the Parameter; the mega-moe forward reads .data per step):
++# pinning bias[pruned] = -inf after weight load makes top-k always pick k
++# SURVIVORS and the renormalization is constructive — one static tensor
++# edit, zero per-step work, graph-safe. This is the "mask" semantic. The
++# Sinter-parity "drop" semantic (select on unpruned scores, then drop +
++# renormalize within the k, effective k shrinks) is deliberately NOT
++# implemented until a cross-platform prune-currency comparison demands it —
++# VLLM_MOE_W2_PRUNE_MODE reserves the switch. Hash-routed layers (tid2eid
++# lookup bypasses selection scores entirely) cannot be pruned this way:
++# listing one aborts the boot. Default OFF: env unset = untouched routing.
++_W2_PRUNE_PLAN: "dict[int, list[int]] | None | bool" = False  # False=unparsed
++
++
++def _w2_prune_plan() -> "dict[int, list[int]] | None":
++    global _W2_PRUNE_PLAN
++    if _W2_PRUNE_PLAN is not False:
++        return _W2_PRUNE_PLAN
++    path = os.getenv("VLLM_MOE_W2_PRUNE_LIST", "")
++    if not path:
++        _W2_PRUNE_PLAN = None
++        return None
++    mode = os.getenv("VLLM_MOE_W2_PRUNE_MODE", "mask")
++    if mode != "mask":
++        raise RuntimeError(
++            f"VLLM_MOE_W2_PRUNE_MODE={mode!r} is not implemented (only "
++            "'mask'; 'drop' is reserved for the Sinter-parity variant)")
++    plan: dict[int, list[int]] = {}
++    n = 0
++    with open(path, "r", encoding="utf-8") as f:
++        for ln, line in enumerate(f, 1):
++            line = line.strip()
++            if not line or line.startswith("#"):
++                continue
++            try:
++                li_s, ei_s = line.split("\t")
++                li, ei = int(li_s), int(ei_s)
++            except ValueError as e:
++                raise RuntimeError(
++                    f"prune list {path}:{ln}: expected 'layer<TAB>expert', "
++                    f"got {line!r}") from e
++            if ei not in plan.setdefault(li, []):
++                plan[li].append(ei)
++                n += 1
++    logger.info(
++        "moe_w2 PRUNE mask armed: %d experts over %d layers from %s "
++        "(selection-bias -inf, weights renormalize over survivors)",
++        n, len(plan), path)
++    _W2_PRUNE_PLAN = plan
++    return plan
++
+ 
+ class DeepseekV4MLP(nn.Module):
+     def __init__(
+@@ -539,7 +605,8 @@ class DeepseekV4MoE(nn.Module):
+ 
+         self.gate.e_score_correction_bias = None
+         self.gate.tid2eid = None
+-        is_hash_moe = extract_layer_index(prefix) < config.num_hash_layers
++        self.layer_idx = extract_layer_index(prefix)
++        is_hash_moe = self.layer_idx < config.num_hash_layers
+         self.hash_indices_dtype = torch.int64 if self.use_mega_moe else torch.int32
+         if is_hash_moe:
+             # hash MoE doesn't use e_score_correction_bias
+@@ -733,6 +800,49 @@ class DeepseekV4MoE(nn.Module):
+     def finalize_mega_moe_weights(self) -> None:
+         if self.use_mega_moe:
+             self.experts.finalize_weights()
++        # Post-load hook shared by every load path (main model, DSpark,
++        # MTP) — the prune mask needs the FINAL bias values.
++        self._apply_w2_prune_mask()
++
++    def _apply_w2_prune_mask(self) -> None:
++        """Pin the selection bias of this layer's pruned experts to -inf
++        (see _w2_prune_plan). Fail-fast on any plan/config mismatch — a
++        partially-applied prune would misdeclare the experiment's routing
++        universe."""
++        plan = _w2_prune_plan()
++        if plan is None:
++            return
++        ids = plan.get(self.layer_idx)
++        if not ids:
++            return
++        if self.gate.tid2eid is not None:
++            raise RuntimeError(
++                f"moe_w2 PRUNE: layer {self.layer_idx} is hash-routed "
++                f"(tid2eid) — table lookup bypasses selection scores; "
++                f"remove it from the prune plan")
++        bias = self.gate.e_score_correction_bias
++        if bias is None:
++            raise RuntimeError(
++                f"moe_w2 PRUNE: layer {self.layer_idx} has no "
++                f"e_score_correction_bias — the -inf selection mask has "
++                f"no choke point on this gate")
++        bad = [e for e in ids if not 0 <= e < self.n_routed_experts]
++        if bad:
++            raise RuntimeError(
++                f"moe_w2 PRUNE: layer {self.layer_idx}: expert ids {bad[:8]} "
++                f"out of range [0, {self.n_routed_experts})")
++        if len(ids) > self.n_routed_experts - self.n_activated_experts:
++            raise RuntimeError(
++                f"moe_w2 PRUNE: layer {self.layer_idx}: pruning {len(ids)} "
++                f"of {self.n_routed_experts} experts leaves fewer than "
++                f"top_k={self.n_activated_experts} survivors")
++        idx = torch.tensor(sorted(ids), dtype=torch.long,
++                           device=bias.data.device)
++        bias.data.index_fill_(0, idx, float("-inf"))
++        logger.info(
++            "moe_w2 PRUNE: layer %d — %d/%d experts removed from the "
++            "routing universe (selection bias -inf)",
++            self.layer_idx, len(ids), self.n_routed_experts)
+ 
+ 
+ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
+@@ -917,7 +1027,7 @@ class DeepseekV4DecoderLayer(nn.Module):
          return x, residual, post_mix, res_mix
  
  
@@ -15099,7 +16901,7 @@ index aa60ad34c..66fbd00d7 100644
      def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
          super().__init__()
  
-@@ -1005,7 +1010,10 @@ class DeepseekV4Model(nn.Module):
+@@ -1005,7 +1115,10 @@ class DeepseekV4Model(nn.Module):
          # refreshes it correctly across captured shapes. Only allocated on
          # the last PP rank — that's where MTP target hidden states are
          # produced.
@@ -15111,7 +16913,7 @@ index aa60ad34c..66fbd00d7 100644
              self._mtp_hidden_buffer = torch.empty(
                  vllm_config.scheduler_config.max_num_batched_tokens,
                  self.hc_dim,
-@@ -1058,7 +1066,12 @@ class DeepseekV4Model(nn.Module):
+@@ -1058,7 +1171,12 @@ class DeepseekV4Model(nn.Module):
              input_ids = input_ids.to(torch.int64)
  
          residual, post_mix, res_mix = None, None, None
@@ -15125,7 +16927,7 @@ index aa60ad34c..66fbd00d7 100644
              hidden_states, residual, post_mix, res_mix = layer(
                  hidden_states,
                  positions,
-@@ -1067,17 +1080,29 @@ class DeepseekV4Model(nn.Module):
+@@ -1067,17 +1185,29 @@ class DeepseekV4Model(nn.Module):
                  res_mix,
                  residual,
              )
@@ -15161,7 +16963,7 @@ index aa60ad34c..66fbd00d7 100644
  
          hidden_states = hc_head_fused_kernel_tilelang(
              hidden_states,
-@@ -1088,6 +1113,8 @@ class DeepseekV4Model(nn.Module):
+@@ -1088,6 +1218,8 @@ class DeepseekV4Model(nn.Module):
              self.hc_eps,
          )
          hidden_states = self.norm(hidden_states)
@@ -15170,7 +16972,7 @@ index aa60ad34c..66fbd00d7 100644
          return hidden_states
  
      def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-@@ -1314,7 +1341,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
+@@ -1314,7 +1446,9 @@ class DeepseekV4MixtureOfExperts(MixtureOfExperts):
              moe.experts.update_expert_map()
  
  
@@ -20116,10 +21918,10 @@ index 000000000..20c41524c
 +        self._prev_sched_l = length
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
 new file mode 100644
-index 000000000..88841d5f4
+index 000000000..eaeaae9e0
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/speculator.py
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,335 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""DSpark speculator: semi-autoregressive parallel drafting.
@@ -20146,17 +21948,25 @@ index 000000000..88841d5f4
 +"""
 +
 +import time
++from contextlib import nullcontext
 +from typing import Any
 +
 +import torch
 +
 +from vllm.config import VllmConfig
 +from vllm.config.compilation import CUDAGraphMode
++from vllm.logger import init_logger
 +from vllm.v1.worker.gpu.input_batch import InputBatch
 +from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 +from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 +from vllm.v1.worker.gpu.spec_decode.dspark.scheduler import DSparkScheduler
-+from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
++from vllm.v1.worker.gpu.spec_decode.dspark.utils import (
++    dspark_replicate_enabled,
++    load_dspark_model,
++    replicated_tp_group,
++)
++
++logger = init_logger(__name__)
 +
 +
 +class DSparkSpeculator(DFlashSpeculator):
@@ -20164,6 +21974,19 @@ index 000000000..88841d5f4
 +
 +    def __init__(self, vllm_config: VllmConfig, device: torch.device):
 +        super().__init__(vllm_config, device)
++
++        # Replicated drafter: the world-1 TP swap must be active around every
++        # drafter build/run - construction captures tp sizes, but some layers
++        # also query the group at call time (VocabParallelEmbedding's
++        # unconditional all-reduce, LogitsProcessor's gather).
++        self._replicated_drafter = dspark_replicate_enabled(vllm_config)
++        self._tp_ctx = replicated_tp_group if self._replicated_drafter else nullcontext
++        if self._replicated_drafter:
++            logger.info(
++                "DSpark drafter replication ON: full drafter per rank, "
++                "comm-free draft step (drops backbone all-reduces, logits "
++                "all-gathers and per-token Markov collectives)."
++            )
 +
 +        # Anchor-as-first (N slots) unless the checkpoint uses the 1+N fill-in
 +        # block, where the anchor is a separate bonus token.
@@ -20239,6 +22062,18 @@ index 000000000..88841d5f4
 +    def set_cost_table(self, r_grid: list[int], times_by_l: list[list[float]]) -> None:
 +        """Install the shape-aware cost table T(R, L) on the scheduler policy."""
 +        self._scheduler.set_cost_table(r_grid, times_by_l)
++
++    def propose(self, *args, **kwargs) -> torch.Tensor:
++        # All drafter forwards (combine/precompute/draft/Markov) happen inside
++        # propose; under replication they must see the world-1 TP group.
++        with self._tp_ctx():
++            return super().propose(*args, **kwargs)
++
++    def capture(self, attn_states: dict | None = None) -> None:
++        # Draft CUDA graphs are captured through _generate_draft here; the
++        # capture must record the comm-free (world-1) path.
++        with self._tp_ctx():
++            super().capture(attn_states)
 +
 +    def load_draft_model(
 +        self,
@@ -20424,12 +22259,15 @@ index 000000000..88841d5f4
 +        self._sample_sequential(num_reqs, head_hidden)
 diff --git a/vllm/v1/worker/gpu/spec_decode/dspark/utils.py b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
 new file mode 100644
-index 000000000..b5f2a540a
+index 000000000..5a47c6826
 --- /dev/null
 +++ b/vllm/v1/worker/gpu/spec_decode/dspark/utils.py
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,152 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import os
++from contextlib import contextmanager
 +
 +import torch.nn as nn
 +
@@ -20437,6 +22275,59 @@ index 000000000..b5f2a540a
 +from vllm.distributed.parallel_state import get_pp_group
 +from vllm.model_executor.model_loader import get_model
 +from vllm.v1.worker.gpu.spec_decode.eagle.utils import _should_share
++
++
++def dspark_replicate_enabled(vllm_config: VllmConfig) -> bool:
++    """Replicated (non-TP-sharded) DSpark drafter: ``VLLM_DSPARK_REPLICATE=1``.
++
++    Every rank holds the full drafter and computes drafts locally
++    (data-parallel over identical inputs), which removes every drafter
++    collective from the decode step: the backbone all-reduces, the draft
++    logits all-gather and the per-draft-token Markov all-reduce/all-gather
++    pair. Costs full drafter weights + full embed/lm_head copies per rank,
++    so it is meant for ranks with VRAM headroom (e.g. EP-TP on 96 GB cards).
++    """
++    if os.environ.get("VLLM_DSPARK_REPLICATE", "0") != "1":
++        return False
++    parallel = vllm_config.parallel_config
++    if parallel.tensor_parallel_size <= 1:
++        return False
++    if parallel.data_parallel_size != 1:
++        raise ValueError(
++            "VLLM_DSPARK_REPLICATE requires data_parallel_size == 1: the "
++            "drafter borrows this rank's single-rank DP group as its TP "
++            "stand-in."
++        )
++    return True
++
++
++@contextmanager
++def replicated_tp_group():
++    """Swap the global TP group for this rank's single-rank DP group.
++
++    Under the swap ``get_tensor_model_parallel_world_size() == 1``, so
++    parallel layers construct full-size, weight loaders load full tensors,
++    and every TP collective short-circuits. Must be active both at drafter
++    construction/load AND around every drafter forward: some layers decide
++    at call time, not init time (``VocabParallelEmbedding.forward``
++    all-reduces unconditionally; ``LogitsProcessor`` gathers via the global
++    group).
++
++    Only valid with an initialized world-1 DP group (DP=1), which
++    ``dspark_replicate_enabled`` guarantees.
++    """
++    import vllm.distributed.parallel_state as parallel_state
++
++    dp_group = parallel_state._DP
++    assert dp_group is not None and dp_group.world_size == 1, (
++        "replicated_tp_group needs an initialized single-rank DP group"
++    )
++    saved = parallel_state._TP
++    parallel_state._TP = dp_group
++    try:
++        yield
++    finally:
++        parallel_state._TP = saved
 +
 +
 +def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Module:
@@ -20469,10 +22360,30 @@ index 000000000..b5f2a540a
 +        ),
 +    )
 +
++    replicate = dspark_replicate_enabled(vllm_config)
 +    with set_model_tag("dspark_head"):
-+        draft_model = get_model(
-+            vllm_config=draft_vllm_config, model_config=draft_model_config
-+        )
++        if replicate:
++            # Build + load under the world-1 TP swap: full-size parallel
++            # layers, full weight loads (incl. the model's own embed/head
++            # copies), zero collectives at runtime.
++            with replicated_tp_group():
++                draft_model = get_model(
++                    vllm_config=draft_vllm_config, model_config=draft_model_config
++                )
++            if not (
++                getattr(draft_model, "has_own_embed_tokens", False)
++                and getattr(draft_model, "has_own_lm_head", False)
++            ):
++                raise ValueError(
++                    "VLLM_DSPARK_REPLICATE=1, but "
++                    f"{type(draft_model).__name__} did not claim its own "
++                    "embed/lm_head copies - this draft model family does not "
++                    "support drafter replication."
++                )
++        else:
++            draft_model = get_model(
++                vllm_config=draft_vllm_config, model_config=draft_model_config
++            )
 +
 +    if get_pp_group().world_size != 1:
 +        raise NotImplementedError("DSpark does not support pipeline parallelism.")
@@ -22050,7 +23961,7 @@ index 657fc8267..dee74ffb4 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a313..4bf3b010c 100644
+index 5e266a313..1531fbf50 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -383,6 +383,29 @@ class Worker(WorkerBase):
@@ -22094,7 +24005,7 @@ index 5e266a313..4bf3b010c 100644
          self.model_runner.reload_weights(*args, **kwargs)
  
      @torch.inference_mode()
-@@ -616,6 +643,31 @@ class Worker(WorkerBase):
+@@ -616,6 +643,42 @@ class Worker(WorkerBase):
          ):
              self.model_runner._init_kv_zero_meta()
  
@@ -22123,10 +24034,21 @@ index 5e266a313..4bf3b010c 100644
 +        except Exception as e:  # noqa: BLE001 - warm-start is best-effort
 +            logger.warning("moe_w2 pool warm-start failed: %s", e)
 +
++        # moe_w2 STATIC Δ membership (VLLM_MOE_W2_DELTA_STATIC): load the
++        # frozen expert list into the Δ pool and freeze all membership
++        # mutation for the run (residency-policy arm A). Same timing
++        # contract as the two blocks above. Deliberately NOT wrapped:
++        # a bad list must kill the boot (fail-fast contract) — silently
++        # serving a trimmed membership would invalidate the experiment.
++        from vllm.model_executor.layers.quantization.utils import (
++            moe_w2_delta as _w2_delta)
++        if _w2_delta._TIER is not None:
++            _w2_delta._TIER.load_static_membership()
++
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-@@ -788,6 +840,16 @@ class Worker(WorkerBase):
+@@ -788,6 +851,16 @@ class Worker(WorkerBase):
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
  
@@ -22143,7 +24065,7 @@ index 5e266a313..4bf3b010c 100644
      def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          return self.model_runner.get_supported_tasks()
  
-@@ -905,6 +967,8 @@ class Worker(WorkerBase):
+@@ -905,6 +978,8 @@ class Worker(WorkerBase):
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
@@ -22152,7 +24074,7 @@ index 5e266a313..4bf3b010c 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -914,15 +978,114 @@ class Worker(WorkerBase):
+@@ -914,15 +989,114 @@ class Worker(WorkerBase):
              and not get_pp_group().is_last_rank
          )
  
@@ -22269,7 +24191,7 @@ index 5e266a313..4bf3b010c 100644
      def take_draft_token_ids(self) -> DraftTokenIds | None:
          return self.model_runner.take_draft_token_ids()
  
-@@ -1051,6 +1214,11 @@ class Worker(WorkerBase):
+@@ -1051,6 +1225,11 @@ class Worker(WorkerBase):
                  format (need layerwise processing) or kernel format (direct
                  copy / sparse patch application).
          """
@@ -22281,7 +24203,7 @@ index 5e266a313..4bf3b010c 100644
          self._check_weight_transfer_engine()
  
          if self._weight_update_active:
-@@ -1169,6 +1337,23 @@ class Worker(WorkerBase):
+@@ -1169,6 +1348,23 @@ class Worker(WorkerBase):
      def shutdown(self) -> None:
          gc.unfreeze()
  
@@ -22305,7 +24227,7 @@ index 5e266a313..4bf3b010c 100644
          # has_kv_transfer_group can be None during interpreter shutdown.
          if ensure_kv_transfer_shutdown is not None:
              ensure_kv_transfer_shutdown()
-@@ -1184,6 +1369,22 @@ class Worker(WorkerBase):
+@@ -1184,6 +1380,22 @@ class Worker(WorkerBase):
          # can be reclaimed when running in-process
          if model_runner := getattr(self, "model_runner", None):
              model_runner.shutdown()
