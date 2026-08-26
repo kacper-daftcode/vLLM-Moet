@@ -301,11 +301,17 @@ TP4 resident + MTP k=2, dual-set m8+m16): **C4-MTP agg 59-60 →
 194-203 tok/s (3.3×)** — verify T=12 moves off the mgemm union tax;
 C1/C2 within the ±3% gate (the G-fix empty groups cost ~2-2.5% at
 T≤8); cold prefill untouched (554 vs 559). Paired quality GSM8K-200
-**at C4** (fresh boots both arms; the m16 route never fires at C1):
-OFF 94.0% vs ON 91.0%, discordants 9:3, McNemar exact p=0.146 — no
-significant regression (near-tie drift floor at C4 pending an OFF-OFF
-control). Boot note: graph capture at T=12 needs deterministic KV
-headroom — pin `--kv-cache-memory-bytes` ≈2 GiB/rank at the 8k window.
+**at C4** (fresh boots per arm; the m16 route never fires at C1),
+**r1/r2/r3 with same-config floor controls**: OFF 94.0/93.0/93.5% vs
+ON 91.0/94.0/91.5%; same-config pairs (OFF×OFF, ON×ON) flip 9-15
+items/pair at C4 batching — the near-tie drift floor — and every
+cross-arm pair (7-14 flips, McNemar p=0.146-1.0) sits inside that
+band, with the r1 asymmetry (9:3) reversed in r2 (4:6). **No
+detectable quality regression.** Boot note: graph capture at T=12
+needs deterministic KV headroom — pin `--kv-cache-memory-bytes`
+≈2 GiB/rank at the 8k window; adding exact verify sizes {3,6} to
+`cudagraph_capture_sizes` trims the G-fix empty groups at C1/C2
+(G 6→4 / 11→8) at zero numerical delta (pad rows are weight-0).
 
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
