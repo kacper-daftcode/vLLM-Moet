@@ -72,6 +72,17 @@ RUN pip install --no-cache-dir --break-system-packages flashinfer-python==0.6.14
         --index-url https://flashinfer.ai/whl/cu130 \
         "flashinfer-jit-cache==0.6.14+cu130"
 
+# 2b. cusparse/cusolver headers into the CUDA include dir: torch's
+#     ATen/cuda/CUDAContextLight.h includes <cusparse.h>, but the base
+#     image ships those headers only inside the pip nvidia-cu13 wheels —
+#     any torch cpp_extension JIT (the EXL3 trellis ext of the
+#     glm-5.2-exl3 recipes) fails to compile without them, and depfiles
+#     written against per-container copies go permanently dirty across
+#     container restarts.
+RUN cp /usr/local/lib/python3.12/dist-packages/nvidia/cu13/include/cusparse*.h \
+       /usr/local/lib/python3.12/dist-packages/nvidia/cu13/include/cusolver*.h \
+       /usr/local/cuda/include/
+
 # 3. our patch, applied to the installed package (pure-Python delta;
 #    includes the DSpark speculative-decoding backport)
 COPY patch/vllm-moet-v0.24.0.patch /tmp/vllm-moet.patch
