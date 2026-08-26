@@ -10,6 +10,22 @@ historical_releases:
 # pass: runtime_manifests.<release>.<box> with patch_sha256, cubins, moet_sha,
 # and either vllm_sha (venv) or image_id (Docker).
 runtime_manifests:
+  baseline-2026-07-10:
+    rtx-pro6000x4:
+      # Live append to the current release (2026-08-26): the GLM-5.2 EXL3
+      # trellis row (glm-5.2-exl3/pro6000x4-tp4-m16) served from the
+      # recipes image built at moet ed79a36 (patch @ vllm 432f9d9cf - the
+      # EXL3 EP line merge). Docker runtime: image_id carries the runtime
+      # identity, decode-wave cubins ship in-image (kernels/MANIFEST.md
+      # "GLM family" sections), so the repo-cubins digest stays null (the
+      # v2026.07.31 docker precedent). The pre-existing imported rows of
+      # this release remain historical-allowlisted.
+      patch_sha256: 4284e7107c84bd81bfd9a41d7f75255308423a5b64dfcbf567becba77ab05f19
+      cubins: null
+      moet_sha: ed79a36c2367e70df8666b817e667f2d744ee2d8
+      image_id: sha256:26d2f2f7f53bcd8b5cf4b354aad7a835cd12e93d524d9c6dbbe7def71bf285c7
+      model_manifests:
+        GLM-5.2-FP8: f5dd2d99bf092510f3671676863b129013813ed4595c8e6d556e813a234cac3e
   v2026.07.31-quality:
     rtx-pro6000x8:
       # INCOMPLETE campaign (2026-08-01): maxq + pro6000x1 live double-green

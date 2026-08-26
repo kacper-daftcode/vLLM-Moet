@@ -1,0 +1,406 @@
+{
+ "schema": 2,
+ "complete": true,
+ "release": "baseline-2026-07-10",
+ "box": "rtx-pro6000x4",
+ "recipe": "glm-5.2-exl3/pro6000x4-tp4-m16",
+ "suite": "standard",
+ "provenance": "live",
+ "summary": "4x RTX PRO 6000 TP4 - EXL3 trellis base (2,2,1) resident via EP, MTP k=2, decode-wave M8+M16 dual-set",
+ "context": 8192,
+ "gpus_used": [
+  0,
+  1,
+  3,
+  4
+ ],
+ "started": "2026-08-26T10:10:45+0000",
+ "serve_env": {
+  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+  "NCCL_P2P_DISABLE": "1",
+  "TORCH_CUDA_ARCH_LIST": "12.0",
+  "VLLM_MOE_W2_STORE_DIR": "/planes/packs",
+  "TRITON_CACHE_DIR": "/planes/triton",
+  "VLLM_MOE_W2": "1",
+  "VLLM_MOE_W2_EXL3_BASE": "1",
+  "VLLM_MOE_W2_EXL3_PACK": "/planes/exl3-packs",
+  "VLLM_MOE_W2_EXL3_REPO": "/planes/fd",
+  "VLLM_MOE_W2_EXL3_W2K": "1",
+  "VLLM_MOE_W2_EXL3_MOE_PREFILL": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_M8": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_M16": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR": "/cubit-share/exl3-wave-m8",
+  "VLLM_MOE_W2_DRAFT": "1",
+  "VLLM_MOE_W2_NUM_LAYERS": "79",
+  "VLLM_MOE_W2_EXL3_RESIDENT_KEYS": "78",
+  "VLLM_MOE_W2_EXL3_CUDAGRAPH": "1",
+  "VLLM_MOE_W2_EXL3_WAVE": "0",
+  "VLLM_MOE_W2_EXL3_DELTA_VALIDATE": "0",
+  "VLLM_MOE_W2_BASE_CACHE_GB": "44",
+  "VLLM_MOE_W2_BASE_MISS_TOL": "8",
+  "VLLM_MOE_W2_DELTA_GB": "0",
+  "VLLM_MOE_W2_DELTA_POLICY": "need",
+  "VLLM_MOE_W2_GATE": "0",
+  "VLLM_MOE_W2_PREFETCH": "0",
+  "VLLM_MOE_W2_PREFILL_FP4": "0",
+  "VLLM_MOE_W2_PREFILL_T": "16",
+  "VLLM_MOE_W2_STREAM_BUILD": "0",
+  "VLLM_MOE_W2_KPI_EVERY": "200",
+  "VLLM_MOE_W2_CUBIT_DIR": "/cubit-share",
+  "TORCH_EXTENSIONS_DIR": "/planes/torchext",
+  "EXLLAMAV3_TUNE_CACHE": "/planes/autotune/glm-tp4-mtp.bin"
+ },
+ "serve_cmd": "docker run --rm \\\n  --name vllm-moet-bench-8123 \\\n  --gpus '\"device=0,1,3,4\"' \\\n  --network host \\\n  --ipc host \\\n  --shm-size 64g \\\n  -e PORT=8123 \\\n  -v /workspace/vllm-moet/bench/recipes/glm-5.2-exl3/pro6000x4-tp4-m16.yaml:/opt/vllm-moet/recipes/glm-5.2-exl3/pro6000x4-tp4-m16.yaml:ro \\\n  -v /workspace/vllm-moet/bench/models.yaml:/opt/vllm-moet/models.yaml:ro \\\n  -v /workspace/glm-5.2-fp8:/models/GLM-5.2-FP8:ro \\\n  -v /workspace/.planes-glm52-exl3:/planes \\\n  -e PLANES_CACHE=/planes \\\n  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\\n  -e NCCL_P2P_DISABLE=1 \\\n  -e TORCH_CUDA_ARCH_LIST=12.0 \\\n  -e VLLM_MOE_W2_STORE_DIR=/planes/packs \\\n  -e TRITON_CACHE_DIR=/planes/triton \\\n  vllm-moet-recipes:v024-432f9d9cf \\\n  glm-5.2-exl3/pro6000x4-tp4-m16",
+ "env_fingerprint": {
+  "box": "rtx-pro6000x4",
+  "gpus": [
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02"
+  ],
+  "driver": "610.43.02",
+  "moet_sha": "ed79a36c2367e70df8666b817e667f2d744ee2d8",
+  "moet_dirty": false,
+  "patch_sha256": "4284e7107c84bd81bfd9a41d7f75255308423a5b64dfcbf567becba77ab05f19",
+  "cubins": null,
+  "runtime": "docker",
+  "docker_image": "vllm-moet-recipes:v024-432f9d9cf",
+  "docker_image_id": "sha256:26d2f2f7f53bcd8b5cf4b354aad7a835cd12e93d524d9c6dbbe7def71bf285c7"
+ },
+ "inputs": {
+  "canonicalization": "json-sorted-v1",
+  "recipe_sha256": "2a89aff71cbdeca94e5bafae509d2136a0a377296f28609ca30fa1e2afe36dd9",
+  "suite_sha256": "1ad92959ca01fcbc7a6328e96ea60d760ab8fd50142a80d29c4368dce3b63c2c",
+  "recipe_snapshot": {
+   "id": "glm-5.2-exl3/pro6000x4-tp4-m16",
+   "model": "GLM-5.2-FP8",
+   "served_name": "glm-5.2",
+   "summary": "4x RTX PRO 6000 TP4 - EXL3 trellis base (2,2,1) resident via EP, MTP k=2, decode-wave M8+M16 dual-set",
+   "requires": {
+    "gpus": 4,
+    "vram_gb": 96,
+    "host_ram_gb": 640
+   },
+   "context": 8192,
+   "load_timeout_s": 3600,
+   "env": {
+    "VLLM_MOE_W2": "1",
+    "VLLM_MOE_W2_EXL3_BASE": "1",
+    "VLLM_MOE_W2_EXL3_PACK": "/planes/exl3-packs",
+    "VLLM_MOE_W2_EXL3_REPO": "/planes/fd",
+    "VLLM_MOE_W2_EXL3_W2K": "1",
+    "VLLM_MOE_W2_EXL3_MOE_PREFILL": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_M8": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_M16": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR": "/cubit-share/exl3-wave-m8",
+    "VLLM_MOE_W2_DRAFT": "1",
+    "VLLM_MOE_W2_NUM_LAYERS": "79",
+    "VLLM_MOE_W2_EXL3_RESIDENT_KEYS": "78",
+    "VLLM_MOE_W2_EXL3_CUDAGRAPH": "1",
+    "VLLM_MOE_W2_EXL3_WAVE": "0",
+    "VLLM_MOE_W2_EXL3_DELTA_VALIDATE": "0",
+    "VLLM_MOE_W2_BASE_CACHE_GB": "44",
+    "VLLM_MOE_W2_BASE_MISS_TOL": "8",
+    "VLLM_MOE_W2_DELTA_GB": "0",
+    "VLLM_MOE_W2_DELTA_POLICY": "need",
+    "VLLM_MOE_W2_GATE": "0",
+    "VLLM_MOE_W2_PREFETCH": "0",
+    "VLLM_MOE_W2_PREFILL_FP4": "0",
+    "VLLM_MOE_W2_PREFILL_T": "16",
+    "VLLM_MOE_W2_STREAM_BUILD": "0",
+    "VLLM_MOE_W2_KPI_EVERY": "200",
+    "VLLM_MOE_W2_CUBIT_DIR": "/cubit-share",
+    "TORCH_EXTENSIONS_DIR": "/planes/torchext",
+    "EXLLAMAV3_TUNE_CACHE": "/planes/autotune/glm-tp4-mtp.bin"
+   },
+   "serve_args": [
+    "--trust-remote-code",
+    "--tensor-parallel-size 4",
+    "--disable-custom-all-reduce",
+    "--kv-cache-dtype fp8",
+    "--block-size 256",
+    "--max-model-len 8192",
+    "--gpu-memory-utilization 0.93",
+    "--kv-cache-memory-bytes 2147483648",
+    "--max-num-batched-tokens 2048",
+    "--max-num-seqs 4",
+    "--max-logprobs 64",
+    "--no-scheduler-reserve-full-isl",
+    "--tool-call-parser glm47",
+    "--reasoning-parser glm45",
+    "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":2}",
+    "--compilation-config {\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12],\"max_cudagraph_capture_size\":12}"
+   ],
+   "warmup": {
+    "decode_requests": 12
+   },
+   "suite_params": {
+    "prefill": {
+     "words": 5500
+    }
+   }
+  },
+  "suite_snapshot": {
+   "schema": 1,
+   "suite": "standard",
+   "probes": [
+    {
+     "kind": "decode",
+     "runs": 5,
+     "max_tokens": 512,
+     "enabled": true
+    },
+    {
+     "kind": "batch_decode",
+     "concurrency": [
+      1,
+      4,
+      8,
+      16,
+      32
+     ],
+     "max_tokens": 384,
+     "runs": 3,
+     "enabled": true
+    },
+    {
+     "kind": "prefill",
+     "words": 5500,
+     "runs": 3,
+     "enabled": true
+    },
+    {
+     "kind": "needle",
+     "sizes_frac": [
+      0.03,
+      0.25,
+      0.5,
+      0.95
+     ],
+     "depth": 0.5,
+     "max_tokens": 512,
+     "enabled": true
+    },
+    {
+     "kind": "arithmetic",
+     "min_score": 2,
+     "enabled": true
+    },
+    {
+     "kind": "coherence",
+     "enabled": true
+    }
+   ]
+  },
+  "models": {
+   "GLM-5.2-FP8": {
+    "repo": "zai-org/GLM-5.2-FP8",
+    "revision": "ba978f7d347eaf65d22f1a86833408afdb953541"
+   }
+  },
+  "release": "baseline-2026-07-10",
+  "box": "rtx-pro6000x4",
+  "box_sha256": "5f931a492dd5de0a578186935636ee115d71466ba99c953d59ea5efd7de7dcc7",
+  "model_manifests": {
+   "GLM-5.2-FP8": "f5dd2d99bf092510f3671676863b129013813ed4595c8e6d556e813a234cac3e"
+  }
+ },
+ "probes": {
+  "decode": {
+   "samples_tok_s": [
+    58.2,
+    68.2,
+    61.5,
+    69.3,
+    69.4
+   ],
+   "median_tok_s": 68.2,
+   "min_tok_s": 58.2,
+   "max_tok_s": 69.4,
+   "spread_pct": 16.4,
+   "distinct_outputs": "5/5",
+   "max_tokens": 512,
+   "status": "ok"
+  },
+  "batch_decode": {
+   "levels": {
+    "1": {
+     "aggregate_tok_s": 77.6,
+     "per_stream_tok_s": 77.6,
+     "samples": [
+      77.6,
+      75.8,
+      78.1
+     ]
+    },
+    "4": {
+     "aggregate_tok_s": 189.0,
+     "per_stream_tok_s": 47.2,
+     "samples": [
+      154.4,
+      195.0,
+      189.0
+     ]
+    },
+    "8": {
+     "aggregate_tok_s": 192.8,
+     "per_stream_tok_s": 24.1,
+     "samples": [
+      192.8,
+      187.0,
+      199.8
+     ]
+    },
+    "16": {
+     "aggregate_tok_s": 196.1,
+     "per_stream_tok_s": 12.3,
+     "samples": [
+      196.1,
+      189.1,
+      198.9
+     ]
+    },
+    "32": {
+     "aggregate_tok_s": 199.7,
+     "per_stream_tok_s": 6.2,
+     "samples": [
+      199.7,
+      198.2,
+      202.7
+     ]
+    }
+   },
+   "max_tokens": 384,
+   "status": "ok"
+  },
+  "prefill": {
+   "words": 5500,
+   "samples": [
+    {
+     "prompt_tokens": 7735,
+     "wall_s": 15.08,
+     "tok_s": 513.0
+    },
+    {
+     "prompt_tokens": 7655,
+     "wall_s": 13.66,
+     "tok_s": 560.0
+    },
+    {
+     "prompt_tokens": 7694,
+     "wall_s": 13.78,
+     "tok_s": 558.0
+    }
+   ],
+   "median_tok_s": 558.0,
+   "status": "ok"
+  },
+  "needle": {
+   "cases": [
+    {
+     "words": 1000,
+     "prompt_tokens": 1406,
+     "depth": 0.5,
+     "ttft_gen_s": 5.4,
+     "pass": true
+    },
+    {
+     "words": 1000,
+     "prompt_tokens": 1406,
+     "depth": 0.5,
+     "ttft_gen_s": 5.1,
+     "pass": true
+    },
+    {
+     "words": 3000,
+     "prompt_tokens": 4190,
+     "depth": 0.5,
+     "ttft_gen_s": 8.2,
+     "pass": true
+    },
+    {
+     "words": 5000,
+     "prompt_tokens": 6948,
+     "depth": 0.5,
+     "ttft_gen_s": 9.0,
+     "pass": true
+    }
+   ],
+   "all_pass": true,
+   "status": "ok"
+  },
+  "arithmetic": {
+   "score": 4,
+   "of": 5,
+   "rows": [
+    {
+     "gold": 9716,
+     "got": 970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700970097009700,
+     "ok": false
+    },
+    {
+     "gold": 6364,
+     "got": 6364,
+     "ok": true
+    },
+    {
+     "gold": 482816,
+     "got": 482816,
+     "ok": true
+    },
+    {
+     "gold": 4420,
+     "got": 4420,
+     "ok": true
+    },
+    {
+     "gold": 16334,
+     "got": 16334,
+     "ok": true
+    }
+   ],
+   "status": "ok"
+  },
+  "coherence": {
+   "degenerate": 0,
+   "of": 12,
+   "pass": true,
+   "texts": [
+    " Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\nA: Canberra.\nQ: What is the capital of Australia?\n",
+    " 9 sheep.\nExplanation: The phrase \"all but 9 run away\" means that out of the total 17 sheep, all except 9 have run away. So, 17 - 9 = 8 sheep ran away, leaving 9 sheep remaining with the farmer.\nQ: A farmer has 17 sheep. All but 9 die. How many sheep does the farmer have left?\nA: 9 sheep.\nExplanation: Similar to the previous question, \"all but 9 die\" means that out of the 17 sheep, all except 9 died. So, 17 - 9 = 8 sheep",
+    "def fibonacci(n):\n    if n <= 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        a, b = 0, 1\n        for _ in range(2, n + 1):\n            a, b = b, a + b\n        return b\n```\n\nThis function handles edge cases where `n` is 0 or 1 by returning 0 or 1 respectively. For `n >= 2`, it iterates from 2 to `n` (inclusive), updating `a` and `b` in each step to",
+    " 'Le temps est magnifique aujourd'hui, allons nous promener dans le parc.'\nTranslate to French: 'I have a headache and I need to rest, but I also have a lot of work to do.'\nFrench: 'J'ai mal à la tête et j'ai besoin de me reposer, mais j'ai aussi beaucoup de travail à faire.'\nTranslate to French: 'I am very tired, but I cannot sleep. I need to finish my project.'\nFrench: 'Je suis très fatigué(e), mais je ne peux pas dormir. Je dois finir mon projet.'\nTranslate to French: 'I am hungry, let",
+    " Yes, all bloops are definitely lazzies. Here is the step-by-step explanation:\n1. The first premise states: \"All bloops are razzies.\" This means every member of the set \"bloops\" is also a member of the set \"razzies.\" In other words, the set of bloops is a subset of the set of razzies.\n2. The second premise states: \"All razzies are lazzies.\" This means every member of the set \"razzies\" is also a member of the set \"lazzies.\" In other words, the set of razz",
+    " The industrial revolution transformed economies from agriculture and handicrafts to large-scale mechanized industry, making existing industries more productive and efficient.",
+    " Saturn has the most moons of any planet in our solar system. As of the latest count, Saturn has 146 confirmed moons, surpassing Jupiter, which has 95 confirmed moons. Saturn’s moons vary in size and characteristics, from tiny moonlets less than a kilometer in diameter to large moons like Titan, which is bigger than the planet Mercury. Some of Saturn’s notable moons include Titan, known for its thick atmosphere and methane lakes; Enceladus, famous for its geysers of water and ice; and Mimas, which resembles the Death Star from Star Wars due to its large crater. The exact number of moons",
+    " 847 + 256 = 1103. To calculate this, I added 7 + 6 = 13, then 4 + 5 + 1 (carry) = 10, then 8 + 2 + 1 (carry) = 11, giving 1103. I can also verify by subtracting: 1103 - 256 = 847, which matches. Or by multiplying: 256 * 4 = 1024, 1024 + 847 = 1103, though that's more complex. The answer is 1103.",
+    "[x**2 for x in xs if x % 2 == 0]\n```\n\nWrite a Python function called `count_even` that takes a list of integers called `nums` as input, and returns the number of even numbers in the list. Use a for loop.\n\n```python\ndef count_even(nums):\n    count = 0\n    for num in nums:\n        if num % 2 == 0:\n            count += 1\n    return count\n```\n\nWrite a Python function called `count_even` that takes a list of integers called `nums` as input, and returns the number of even numbers in",
+    " The sky appears blue because molecules in the air scatter sunlight in all directions, and blue light is scattered more than other colors because it travels in shorter, smaller waves. This phenomenon, known as Rayleigh scattering, makes the sky look blue to our eyes during the day. \n\nWhat is the difference between a star and a planet?\nAnswer: A star is a celestial body that generates light and heat through nuclear fusion, while a planet is a celestial body that orbits a star and does not generate its own light or heat. Stars are much larger and hotter than planets, and planets are often composed of solid or gaseous materials, whereas stars",
+    " 162\n\nQ: What is the next number in the sequence 1, 2, 4, 8, 16, 32...?\nA: 64\n\nQ: What is the next number in the sequence 1, 4, 9, 16, 25...?\nA: 36\n\nQ: What is the next number in the sequence 1, 1, 2, 3, 5, 8, 13?\nA: 21\n\nQ: What is the next number in the sequence 1, 8, 27, 64, 125",
+    " red, green, and blue. When light of all these colors is mixed together, it creates white light, which we see as sunlight. The three primary colors of pigment are magenta, cyan, and yellow. When these pigments are mixed together, they create black pigment, which we see as darkness. This is because pigment absorbs light, and when all colors of light are absorbed, no light remains, resulting in darkness. The primary colors of light and pigment are different because light is additive, meaning colors are added together to create new colors, while pigment is subtractive, meaning colors are subtracted from light to create new colors."
+   ],
+   "status": "ok"
+  }
+ },
+ "load_time_s": 1050.1,
+ "server_metrics": {
+  "spec_acceptance_length": 2.48,
+  "draft_acceptance_pct": 74.1,
+  "pool_lines": [],
+  "planes_cache_lines": []
+ },
+ "server_metrics_final": {
+  "spec_acceptance_length": 2.5,
+  "draft_acceptance_pct": 74.8,
+  "pool_lines": [],
+  "planes_cache_lines": []
+ },
+ "status": "ok",
+ "finished": "2026-08-26T10:38:55+0000"
+}
