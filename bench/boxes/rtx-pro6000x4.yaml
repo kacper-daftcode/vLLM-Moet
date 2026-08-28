@@ -10,7 +10,7 @@ runtime: docker
 # GLM-5.2 trellis serving + decode-wave M8/M16). Earlier note (90c0b7e44,
 # 2026-08-02): gate on Model Runner V2 + the 07-30/31 host-sync perf line.
 # Older tags would measure retired code.
-docker_image: vllm-moet-recipes:v024-432f9d9cf
+docker_image: vllm-moet-recipes:v024-892954707
 shm_size: 64g
 
 env:

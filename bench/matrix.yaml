@@ -1,7 +1,8 @@
 schema: 2
-current_release: baseline-2026-07-10
-previous_release: null
+current_release: v2026.08.28-x4-prefill
+previous_release: baseline-2026-07-10
 historical_releases:
+  - v2026.08.28-x4-prefill
   - baseline-2026-07-10
   - v2026.07.17-quality
   - v2026.07.27-quality
@@ -10,6 +11,19 @@ historical_releases:
 # pass: runtime_manifests.<release>.<box> with patch_sha256, cubins, moet_sha,
 # and either vllm_sha (venv) or image_id (Docker).
 runtime_manifests:
+  v2026.08.28-x4-prefill:
+    rtx-pro6000x4:
+      # Targeted release (service window [X] 2026-08-28): the trellis row
+      # re-measured with the prefill-native x4 route enabled in the recipe
+      # (VLLM_MOE_W2_EXL3_WAVE_PREFILL=1; MANIFEST "GLM family M=16x4").
+      # Image rebuilt at moet 096d0dc (patch @ vllm 892954707); other
+      # rows carry over as imported from baseline-2026-07-10.
+      patch_sha256: 37b1be3d60b80ccc9703876e23b4b7ab60923ba47059048df7fd04db87b899b9
+      cubins: null
+      moet_sha: 096d0dc187b3ee3109f3dd7e4f7848463f2632ea
+      image_id: sha256:6b09ea8e416a527e7c9e57e67fe73ce0fe2fb8aaad43b2d67d0d685789f797c5
+      model_manifests:
+        GLM-5.2-FP8: f5dd2d99bf092510f3671676863b129013813ed4595c8e6d556e813a234cac3e
   baseline-2026-07-10:
     rtx-pro6000x4:
       # Live append to the current release (2026-08-26): the GLM-5.2 EXL3

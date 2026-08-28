@@ -1,0 +1,408 @@
+{
+ "schema": 2,
+ "complete": true,
+ "release": "v2026.08.28-x4-prefill",
+ "box": "rtx-pro6000x4",
+ "recipe": "glm-5.2-exl3/pro6000x4-tp4-m16",
+ "suite": "standard",
+ "provenance": "live",
+ "summary": "4x RTX PRO 6000 TP4 - EXL3 trellis base (2,2,1) resident via EP, MTP k=2, decode-wave M8+M16 dual-set",
+ "context": 8192,
+ "gpus_used": [
+  2,
+  5,
+  7,
+  8
+ ],
+ "started": "2026-08-28T10:54:38+0000",
+ "serve_env": {
+  "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+  "NCCL_P2P_DISABLE": "1",
+  "TORCH_CUDA_ARCH_LIST": "12.0",
+  "VLLM_MOE_W2_STORE_DIR": "/planes/packs",
+  "TRITON_CACHE_DIR": "/planes/triton",
+  "VLLM_MOE_W2": "1",
+  "VLLM_MOE_W2_EXL3_BASE": "1",
+  "VLLM_MOE_W2_EXL3_PACK": "/planes/exl3-packs",
+  "VLLM_MOE_W2_EXL3_REPO": "/planes/fd",
+  "VLLM_MOE_W2_EXL3_W2K": "1",
+  "VLLM_MOE_W2_EXL3_MOE_PREFILL": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_PREFILL": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_M8": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_M16": "1",
+  "VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR": "/cubit-share/exl3-wave-m8",
+  "VLLM_MOE_W2_DRAFT": "1",
+  "VLLM_MOE_W2_NUM_LAYERS": "79",
+  "VLLM_MOE_W2_EXL3_RESIDENT_KEYS": "78",
+  "VLLM_MOE_W2_EXL3_CUDAGRAPH": "1",
+  "VLLM_MOE_W2_EXL3_WAVE": "0",
+  "VLLM_MOE_W2_EXL3_DELTA_VALIDATE": "0",
+  "VLLM_MOE_W2_BASE_CACHE_GB": "44",
+  "VLLM_MOE_W2_BASE_MISS_TOL": "8",
+  "VLLM_MOE_W2_DELTA_GB": "0",
+  "VLLM_MOE_W2_DELTA_POLICY": "need",
+  "VLLM_MOE_W2_GATE": "0",
+  "VLLM_MOE_W2_PREFETCH": "0",
+  "VLLM_MOE_W2_PREFILL_FP4": "0",
+  "VLLM_MOE_W2_PREFILL_T": "16",
+  "VLLM_MOE_W2_STREAM_BUILD": "0",
+  "VLLM_MOE_W2_KPI_EVERY": "200",
+  "VLLM_MOE_W2_CUBIT_DIR": "/cubit-share",
+  "TORCH_EXTENSIONS_DIR": "/planes/torchext",
+  "EXLLAMAV3_TUNE_CACHE": "/planes/autotune/glm-tp4-mtp.bin"
+ },
+ "serve_cmd": "docker run --rm \\\n  --name vllm-moet-bench-8123 \\\n  --gpus '\"device=2,5,7,8\"' \\\n  --network host \\\n  --ipc host \\\n  --shm-size 64g \\\n  -e PORT=8123 \\\n  -v /workspace/vllm-moet/bench/recipes/glm-5.2-exl3/pro6000x4-tp4-m16.yaml:/opt/vllm-moet/recipes/glm-5.2-exl3/pro6000x4-tp4-m16.yaml:ro \\\n  -v /workspace/vllm-moet/bench/models.yaml:/opt/vllm-moet/models.yaml:ro \\\n  -v /workspace/glm-5.2-fp8:/models/GLM-5.2-FP8:ro \\\n  -v /workspace/.planes-glm52-exl3:/planes \\\n  -e PLANES_CACHE=/planes \\\n  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \\\n  -e NCCL_P2P_DISABLE=1 \\\n  -e TORCH_CUDA_ARCH_LIST=12.0 \\\n  -e VLLM_MOE_W2_STORE_DIR=/planes/packs \\\n  -e TRITON_CACHE_DIR=/planes/triton \\\n  vllm-moet-recipes:v024-892954707 \\\n  glm-5.2-exl3/pro6000x4-tp4-m16",
+ "env_fingerprint": {
+  "box": "rtx-pro6000x4",
+  "gpus": [
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA GeForce RTX 5090, 32607 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02",
+   "NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 97887 MiB, 610.43.02"
+  ],
+  "driver": "610.43.02",
+  "moet_sha": "096d0dc187b3ee3109f3dd7e4f7848463f2632ea",
+  "moet_dirty": true,
+  "patch_sha256": "37b1be3d60b80ccc9703876e23b4b7ab60923ba47059048df7fd04db87b899b9",
+  "cubins": null,
+  "runtime": "docker",
+  "docker_image": "vllm-moet-recipes:v024-892954707",
+  "docker_image_id": "sha256:6b09ea8e416a527e7c9e57e67fe73ce0fe2fb8aaad43b2d67d0d685789f797c5"
+ },
+ "inputs": {
+  "canonicalization": "json-sorted-v1",
+  "recipe_sha256": "0847070a77a7c29fce472a0ab524ed34cac0e38638d5ea637cb0d9d483704c08",
+  "suite_sha256": "1ad92959ca01fcbc7a6328e96ea60d760ab8fd50142a80d29c4368dce3b63c2c",
+  "recipe_snapshot": {
+   "id": "glm-5.2-exl3/pro6000x4-tp4-m16",
+   "model": "GLM-5.2-FP8",
+   "served_name": "glm-5.2",
+   "summary": "4x RTX PRO 6000 TP4 - EXL3 trellis base (2,2,1) resident via EP, MTP k=2, decode-wave M8+M16 dual-set",
+   "requires": {
+    "gpus": 4,
+    "vram_gb": 96,
+    "host_ram_gb": 640
+   },
+   "context": 8192,
+   "load_timeout_s": 3600,
+   "env": {
+    "VLLM_MOE_W2": "1",
+    "VLLM_MOE_W2_EXL3_BASE": "1",
+    "VLLM_MOE_W2_EXL3_PACK": "/planes/exl3-packs",
+    "VLLM_MOE_W2_EXL3_REPO": "/planes/fd",
+    "VLLM_MOE_W2_EXL3_W2K": "1",
+    "VLLM_MOE_W2_EXL3_MOE_PREFILL": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_PREFILL": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_M8": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_M16": "1",
+    "VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR": "/cubit-share/exl3-wave-m8",
+    "VLLM_MOE_W2_DRAFT": "1",
+    "VLLM_MOE_W2_NUM_LAYERS": "79",
+    "VLLM_MOE_W2_EXL3_RESIDENT_KEYS": "78",
+    "VLLM_MOE_W2_EXL3_CUDAGRAPH": "1",
+    "VLLM_MOE_W2_EXL3_WAVE": "0",
+    "VLLM_MOE_W2_EXL3_DELTA_VALIDATE": "0",
+    "VLLM_MOE_W2_BASE_CACHE_GB": "44",
+    "VLLM_MOE_W2_BASE_MISS_TOL": "8",
+    "VLLM_MOE_W2_DELTA_GB": "0",
+    "VLLM_MOE_W2_DELTA_POLICY": "need",
+    "VLLM_MOE_W2_GATE": "0",
+    "VLLM_MOE_W2_PREFETCH": "0",
+    "VLLM_MOE_W2_PREFILL_FP4": "0",
+    "VLLM_MOE_W2_PREFILL_T": "16",
+    "VLLM_MOE_W2_STREAM_BUILD": "0",
+    "VLLM_MOE_W2_KPI_EVERY": "200",
+    "VLLM_MOE_W2_CUBIT_DIR": "/cubit-share",
+    "TORCH_EXTENSIONS_DIR": "/planes/torchext",
+    "EXLLAMAV3_TUNE_CACHE": "/planes/autotune/glm-tp4-mtp.bin"
+   },
+   "serve_args": [
+    "--trust-remote-code",
+    "--tensor-parallel-size 4",
+    "--disable-custom-all-reduce",
+    "--kv-cache-dtype fp8",
+    "--block-size 256",
+    "--max-model-len 8192",
+    "--gpu-memory-utilization 0.93",
+    "--kv-cache-memory-bytes 2147483648",
+    "--max-num-batched-tokens 2048",
+    "--max-num-seqs 4",
+    "--max-logprobs 64",
+    "--no-scheduler-reserve-full-isl",
+    "--tool-call-parser glm47",
+    "--reasoning-parser glm45",
+    "--speculative-config {\"method\":\"mtp\",\"num_speculative_tokens\":2}",
+    "--compilation-config {\"cudagraph_capture_sizes\":[1,2,3,4,6,8,12],\"max_cudagraph_capture_size\":12}"
+   ],
+   "warmup": {
+    "decode_requests": 12
+   },
+   "suite_params": {
+    "prefill": {
+     "words": 5500
+    }
+   }
+  },
+  "suite_snapshot": {
+   "schema": 1,
+   "suite": "standard",
+   "probes": [
+    {
+     "kind": "decode",
+     "runs": 5,
+     "max_tokens": 512,
+     "enabled": true
+    },
+    {
+     "kind": "batch_decode",
+     "concurrency": [
+      1,
+      4,
+      8,
+      16,
+      32
+     ],
+     "max_tokens": 384,
+     "runs": 3,
+     "enabled": true
+    },
+    {
+     "kind": "prefill",
+     "words": 5500,
+     "runs": 3,
+     "enabled": true
+    },
+    {
+     "kind": "needle",
+     "sizes_frac": [
+      0.03,
+      0.25,
+      0.5,
+      0.95
+     ],
+     "depth": 0.5,
+     "max_tokens": 512,
+     "enabled": true
+    },
+    {
+     "kind": "arithmetic",
+     "min_score": 2,
+     "enabled": true
+    },
+    {
+     "kind": "coherence",
+     "enabled": true
+    }
+   ]
+  },
+  "models": {
+   "GLM-5.2-FP8": {
+    "repo": "zai-org/GLM-5.2-FP8",
+    "revision": "ba978f7d347eaf65d22f1a86833408afdb953541"
+   }
+  },
+  "release": "v2026.08.28-x4-prefill",
+  "box": "rtx-pro6000x4",
+  "box_sha256": "ec3cffce66dbf862ec9f23c6146c39b4bb412ade7a4d8c10b8f485f8c6712cb7",
+  "model_manifests": {
+   "GLM-5.2-FP8": "f5dd2d99bf092510f3671676863b129013813ed4595c8e6d556e813a234cac3e"
+  }
+ },
+ "probes": {
+  "decode": {
+   "samples_tok_s": [
+    73.1,
+    68.8,
+    71.9,
+    74.3,
+    69.4
+   ],
+   "median_tok_s": 71.9,
+   "min_tok_s": 68.8,
+   "max_tok_s": 74.3,
+   "spread_pct": 7.6,
+   "distinct_outputs": "5/5",
+   "max_tokens": 512,
+   "status": "ok"
+  },
+  "batch_decode": {
+   "levels": {
+    "1": {
+     "aggregate_tok_s": 81.5,
+     "per_stream_tok_s": 81.5,
+     "samples": [
+      81.5,
+      80.2,
+      81.8
+     ]
+    },
+    "4": {
+     "aggregate_tok_s": 202.7,
+     "per_stream_tok_s": 50.7,
+     "samples": [
+      171.2,
+      202.7,
+      210.0
+     ]
+    },
+    "8": {
+     "aggregate_tok_s": 183.5,
+     "per_stream_tok_s": 22.9,
+     "samples": [
+      181.1,
+      183.5,
+      203.6
+     ]
+    },
+    "16": {
+     "aggregate_tok_s": 195.7,
+     "per_stream_tok_s": 12.2,
+     "samples": [
+      197.7,
+      195.7,
+      193.6
+     ]
+    },
+    "32": {
+     "aggregate_tok_s": 196.7,
+     "per_stream_tok_s": 6.1,
+     "samples": [
+      196.7,
+      196.6,
+      200.2
+     ]
+    }
+   },
+   "max_tokens": 384,
+   "status": "ok"
+  },
+  "prefill": {
+   "words": 5500,
+   "samples": [
+    {
+     "prompt_tokens": 7735,
+     "wall_s": 4.75,
+     "tok_s": 1629.0
+    },
+    {
+     "prompt_tokens": 7655,
+     "wall_s": 3.63,
+     "tok_s": 2111.0
+    },
+    {
+     "prompt_tokens": 7694,
+     "wall_s": 3.65,
+     "tok_s": 2106.0
+    }
+   ],
+   "median_tok_s": 2106.0,
+   "status": "ok"
+  },
+  "needle": {
+   "cases": [
+    {
+     "words": 1000,
+     "prompt_tokens": 1406,
+     "depth": 0.5,
+     "ttft_gen_s": 2.8,
+     "pass": true
+    },
+    {
+     "words": 1000,
+     "prompt_tokens": 1406,
+     "depth": 0.5,
+     "ttft_gen_s": 3.8,
+     "pass": true
+    },
+    {
+     "words": 3000,
+     "prompt_tokens": 4190,
+     "depth": 0.5,
+     "ttft_gen_s": 3.9,
+     "pass": true
+    },
+    {
+     "words": 5000,
+     "prompt_tokens": 6948,
+     "depth": 0.5,
+     "ttft_gen_s": 3.1,
+     "pass": true
+    }
+   ],
+   "all_pass": true,
+   "status": "ok"
+  },
+  "arithmetic": {
+   "score": 4,
+   "of": 5,
+   "rows": [
+    {
+     "gold": 9716,
+     "got": 9700,
+     "ok": false
+    },
+    {
+     "gold": 6364,
+     "got": 6364,
+     "ok": true
+    },
+    {
+     "gold": 482816,
+     "got": 482816,
+     "ok": true
+    },
+    {
+     "gold": 4420,
+     "got": 4420,
+     "ok": true
+    },
+    {
+     "gold": 16334,
+     "got": 16334,
+     "ok": true
+    }
+   ],
+   "status": "ok"
+  },
+  "coherence": {
+   "degenerate": 0,
+   "of": 12,
+   "pass": true,
+   "texts": [
+    " Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is the capital of Australia.\nQ: What is the capital of Australia?\nA: Canberra is",
+    " 9 sheep.\nExplanation: The phrase \"all but 9 run away\" means that out of the total 17 sheep, all of them except for 9 ran away. So, the farmer is left with 9 sheep that did not run away. The wording is a bit tricky, but the key is to understand that \"all but 9\" means \"all except 9,\" leaving 9 sheep remaining.\nQ: A farmer has 17 sheep. All but 9 run away. How many sheep does the farmer have left?\nA: 9 sheep.\nExplanation: The phrase \"all but 9 run away\"",
+    "def fibonacci(n):\n    if n < 0:\n        raise ValueError(\"n must be a non-negative integer\")\n    if n == 0:\n        return 0\n    if n == 1:\n        return 1\n    a, b = 0, 1\n    for _ in range(2, n + 1):\n        a, b = b, a + b\n    return b\n```\n\nThis function computes the Fibonacci sequence iteratively by updating two variables (`a` and `b`) in a loop. It handles edge cases for `n=0` and `n=1` explicitly",
+    " 'Le temps est magnifique aujourd'hui, allons nous promener dans le parc.'\nThis is a translation task from English to French. The input is: 'The weather is beautiful today, let's go for a walk in the park.' The output is: 'Le temps est magnifique aujourd'hui, allons nous promener dans le parc.' The translation is correct and natural. The input and output are aligned in length and structure. The input has 13 words, 2 clauses; the output has 13 words, 2 clauses. The input has 1 comma; the output has 1 comma. The input has 1",
+    " Yes, all bloops are definitely lazzies. Here's the step-by-step reasoning:\n1. The premise states \"all bloops are razzies\" - this means every member of the set \"bloops\" is also a member of the set \"razzies\".\n2. The premise states \"all razzies are lazzies\" - this means every member of the set \"razzies\" is also a member of the set \"lazzies\".\n3. Combining these: Since every bloop is a razzie (step 1), and every razzie is a lazzie (",
+    " The industrial revolution transformed economies from agriculture and handicrafts to large-scale mechanized industry and factory systems, making existing industries more productive and efficient.",
+    " Saturn has the most moons (18 confirmed and growing), compared to Jupiter's 16, Uranus' 15, Neptune's 8, Mars' 2, Earth's 1, Mercury and Venus have none. Note that there are 4 additional candidate moons around Saturn awaiting confirmation by professional observers, which if confirmed would give Saturn 22 moons total. There are also 6 unconfirmed \"candidate moons\" around Jupiter, 4 around Neptune, and 1 around Uranus awaiting confirmation, for a possible grand total of 30 \"candidate moons\" plus the 50 confirmed moons already known around the six planets, for a",
+    " 847 + 256 = 1103. Here's the step-by-step breakdown:\n1. **Add the ones place**: 7 + 6 = 13. Write down **3**, carry over **1** to the tens place.\n2. **Add the tens place (including the carry)**: 4 + 5 + 1 (carry) = 10. Write down **0**, carry over **1** to the hundreds place.\n3. **Add the hundreds place (including the carry)**: 8 + 2 + 1 (carry) = 11. Write down **1**.\n",
+    "[x**2 for x in xs if x % 2 == 0]\n```\n\nWrite a one-line Python list comprehension that squares the odd numbers in a list called xs.\n\n```python\n[x**2 for x in xs if x % 2 != 0]\n```\n\nWrite a one-line Python list comprehension that squares the numbers in a list called xs whose values are divisible by 3.\n\n```python\n[x**2 for x in xs if x % 3 == 0]\n```\n\nWrite a one-line Python list comprehension that squares the numbers in a list called xs whose values are divisible by 3 and odd.\n\n",
+    " The sky appears blue because molecules in the air scatter sunlight in all directions, and blue light is scattered more than other colors because it travels in shorter, smaller waves. This is called Rayleigh scattering, named after Lord Rayleigh, who discovered the effect in the late 19th century. The blue light reaches our eyes from all directions, making the sky appear blue. However, the sky is not blue at night because there is no sunlight to scatter. The sky is also not blue at sunrise and sunset because the sunlight travels through a thicker layer of atmosphere, and most of the blue light is scattered away, leaving mostly red and yellow light",
+    " 162\n\nExplanation: Each number is multiplied by 3 to get the next number.\n2 × 3 = 6\n6 × 3 = 18\n18 × 3 = 54\n54 × 3 = 162\n\nSo, the next number is 162. ✅\n\nQ: What is the next number in the sequence 1, 2, 4, 8, 16?\nA: 32\n\nExplanation: Each number is multiplied by 2 to get the next number.\n1 × 2 = 2\n2 × 2 = 4\n4 × 2 =",
+    " red, green, and blue. When light of all these colors is mixed together, it creates white light, which is the color of sunlight. The primary colors of pigment are magenta, cyan, and yellow. When these colors are mixed together, they create black pigment. Sunlight contains a mixture of all colors, while black pigment absorbs all colors of light. When a surface absorbs light, it appears dark to our eyes. If a surface absorbs all colors except red, it appears red to our eyes. If a surface absorbs all colors except green, it appears green. If a surface absorbs all colors except blue, it appears blue."
+   ],
+   "status": "ok"
+  }
+ },
+ "load_time_s": 860.1,
+ "server_metrics": {
+  "spec_acceptance_length": 2.62,
+  "draft_acceptance_pct": 81.0,
+  "pool_lines": [],
+  "planes_cache_lines": []
+ },
+ "server_metrics_final": {
+  "spec_acceptance_length": 2.48,
+  "draft_acceptance_pct": 74.2,
+  "pool_lines": [],
+  "planes_cache_lines": []
+ },
+ "status": "ok",
+ "finished": "2026-08-28T11:17:27+0000"
+}
