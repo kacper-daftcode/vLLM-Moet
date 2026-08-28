@@ -35,6 +35,11 @@ env:
   VLLM_MOE_W2_EXL3_REPO: /planes/fd
   VLLM_MOE_W2_EXL3_W2K: "1"
   VLLM_MOE_W2_EXL3_MOE_PREFILL: "1"
+  # Prefill-native x4 route (MANIFEST "GLM family M=16x4"): expert-major
+  # m16x4 canons for eager chunks above the graph envelope; the moe_dual
+  # route stays as the fall-through (older FD checkouts, missing cubins).
+  # Line-cell before/after on the same probe: 547 -> 1829-1951 tok/s.
+  VLLM_MOE_W2_EXL3_WAVE_PREFILL: "1"
   VLLM_MOE_W2_EXL3_WAVE_M8: "1"
   VLLM_MOE_W2_EXL3_WAVE_M16: "1"
   VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR: /cubit-share/exl3-wave-m8
