@@ -2697,6 +2697,99 @@ index 000000000..f9809ad7b
 +
 +if __name__ == "__main__":
 +    main()
+diff --git a/tools/test_wave_x4_builder.py b/tools/test_wave_x4_builder.py
+new file mode 100644
+index 000000000..777e73188
+--- /dev/null
++++ b/tools/test_wave_x4_builder.py
+@@ -0,0 +1,87 @@
++"""Builders' test for the x4 prefill route slot builder (tor D F-D2):
++build_x4_slots must place every sorted (token, expert) assignment
++exactly once in a slot of its expert (<=64 rows/slot), pad partial
++slots with -1/weight-0 rows, and pad the last group to 6 slots with
++empty expert-0 slots. Pure-tensor function — runs on CPU."""
++import importlib.util
++import os
++
++import torch
++
++WT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
++spec = importlib.util.spec_from_file_location(
++    "moe_w2_exl3",
++    os.path.join(WT, "vllm/model_executor/layers/quantization/utils/"
++                     "moe_w2_exl3.py"))
++_m = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(_m)
++build_x4_slots = _m.build_x4_slots
++
++
++def _check_case(E, T, topk, seed):
++    g = torch.Generator().manual_seed(seed)
++    ids = torch.stack([torch.randperm(E, generator=g)[:topk]
++                       for _ in range(T)]).reshape(-1)
++    tok = torch.arange(T).repeat_interleave(topk)
++    wts = torch.rand(T * topk, generator=g)
++    order = ids.argsort(stable=True)
++    ids_s, tok_s, wts_s = ids[order], tok[order], wts[order]
++    counts = torch.bincount(ids_s, minlength=E)
++    built = build_x4_slots(counts, tok_s, wts_s)
++    assert built is not None
++    row_map, row_wts, slot_e, G = built
++    S = row_map.shape[0]
++    assert S == 6 * G and row_wts.shape == (S, 64) and slot_e.shape == (S,)
++    n_slots = int(((counts + 63) // 64).sum())
++    assert G == (n_slots + 5) // 6
++    # kazde przypisanie dokladnie raz, w slocie swojego eksperta
++    seen = []
++    starts = torch.cumsum(counts, 0) - counts
++    for s in range(S):
++        rows = row_map[s]
++        live = rows >= 0
++        n = int(live.sum())
++        # zwarte wiersze: pusty ogon po zywych
++        assert bool((rows[:n] >= 0).all()) and bool((rows[n:] == -1).all())
++        assert bool((row_wts[s][n:] == 0).all())
++        if s >= n_slots:
++            assert n == 0                      # pad slot
++            continue
++        e = int(slot_e[s])
++        lo, hi = int(starts[e]), int(starts[e] + counts[e])
++        for r in range(n):
++            tokv = int(rows[r])
++            # znajdz w zakresie eksperta
++            hit = [i for i in range(lo, hi) if int(tok_s[i]) == tokv
++                   and i not in seen]
++            assert hit, f"tok {tokv} nie w zakresie e{e}"
++            i = hit[0]
++            seen.append(i)
++            assert abs(float(row_wts[s][r]) - float(wts_s[i])) < 2e-3
++    assert len(seen) == T * topk
++
++
++def test_uniform_64():
++    _check_case(E=16, T=128, topk=8, seed=1)      # 64/eksperta exact
++
++
++def test_random_spill():
++    _check_case(E=8, T=200, topk=4, seed=2)       # county ~100 => spill
++
++
++def test_sparse():
++    _check_case(E=32, T=16, topk=4, seed=3)       # rzadkie, ciezki pad
++
++
++def test_empty():
++    counts = torch.zeros(8, dtype=torch.long)
++    assert build_x4_slots(counts, torch.zeros(0, dtype=torch.long),
++                          torch.zeros(0)) is None
++
++
++if __name__ == "__main__":
++    test_uniform_64()
++    test_random_spill()
++    test_sparse()
++    test_empty()
++    print("test_wave_x4_builder: 4/4 PASS")
 diff --git a/vllm/compilation/breakable_cudagraph.py b/vllm/compilation/breakable_cudagraph.py
 index 6da3ec717..b2ef78322 100644
 --- a/vllm/compilation/breakable_cudagraph.py
@@ -11359,10 +11452,10 @@ index 000000000..e2223c1d8
 +            + "; ".join(str(e) for e in errors))
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
 new file mode 100644
-index 000000000..3e515c571
+index 000000000..fdcdb214d
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_exl3.py
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1586 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""EXL3 trellis base tier for the moe_w2 stack (vLLM-Moet).
 +
@@ -11411,6 +11504,55 @@ index 000000000..3e515c571
 +# expert (temp buffers are [concurrency, 128, H|I]); batches whose densest
 +# expert exceeds it split on the token axis and recurse.
 +_MOE_PREFILL_ROWS = 128
++# Prefill route over the m16x4 SASS canon pair (tor D, mission
++# PREFILL-TRELLIS-GLM F-D2): expert-major driver — trellis decoded once
++# per (expert, 64-row slot), tensor-core HMMA over 4 slabs of 16 rows.
++# Lab window vs the exl3_moe_dual equivalent on the same planes/shape:
++# 2.09x full-route (28.9 -> 13.8 ms/layer @chunk 2048 top-8, DESIGN
++# 5w). GLM base-only (H=6144, plan (2,2,1)); needs the x4 cubin set in
++# VLLM_MOE_W2_EXL3_WAVE_M8_CUBIN_DIR. Takes precedence over
++# _MOE_PREFILL for eligible chunks; falls through when unavailable.
++_WAVE_PREFILL = os.environ.get("VLLM_MOE_W2_EXL3_WAVE_PREFILL", "0") == "1"
++
++
++def build_x4_slots(counts: torch.Tensor, tok_sorted: torch.Tensor,
++                   wts_sorted: torch.Tensor):
++    """Expert-major slot builder for the x4 prefill route: every expert
++    is cut into ceil(count/64) slots of <=64 sorted assignment rows;
++    slots pack into groups of 6 (pad slots ride expert 0 with all rows
++    empty — staged as zeros by the ext, skipped by the scatter). Empty
++    rows carry token -1 / weight 0. Pure tensor function
++    (device-agnostic), unit-tested in tools/test_wave_x4_builder.py.
++    Returns (row_map (6G,64) int32, row_wts (6G,64) half,
++    slot_expert (6G,) long, G) or None when nothing routed."""
++    E = counts.shape[0]
++    dev = counts.device
++    seg = (counts + 63) // 64
++    n_slots = int(seg.sum().item())
++    if n_slots == 0:
++        return None
++    G = (n_slots + 5) // 6
++    S = 6 * G
++    slot_e = torch.repeat_interleave(torch.arange(E, device=dev), seg)
++    cum_seg = torch.cumsum(seg, 0) - seg
++    segix = (torch.arange(n_slots, device=dev)
++             - torch.repeat_interleave(cum_seg, seg))
++    starts = torch.cumsum(counts, 0) - counts
++    base = starts[slot_e] + segix * 64
++    idx = base.unsqueeze(1) + torch.arange(64, device=dev)
++    limit = (starts[slot_e] + counts[slot_e]).unsqueeze(1)
++    valid = idx < limit
++    idxc = idx.clamp(max=max(int(tok_sorted.numel()) - 1, 0))
++    neg1 = torch.tensor(-1, dtype=torch.int32, device=dev)
++    row_map = torch.full((S, 64), -1, dtype=torch.int32, device=dev)
++    row_map[:n_slots] = torch.where(valid, tok_sorted[idxc].to(torch.int32),
++                                    neg1)
++    zero = torch.zeros((), dtype=wts_sorted.dtype, device=dev)
++    row_wts = torch.zeros(S, 64, dtype=torch.half, device=dev)
++    row_wts[:n_slots] = torch.where(valid, wts_sorted[idxc], zero).half()
++    slot_e_pad = torch.zeros(S, dtype=torch.long, device=dev)
++    slot_e_pad[:n_slots] = slot_e
++    return row_map, row_wts, slot_e_pad, G
 +
 +
 +def delta_slot_geom(dk13: int = 2, dk2: int = 2, hidden: int = 4096,
@@ -12023,6 +12165,94 @@ index 000000000..3e515c571
 +            float(self.act_limit), num_active)
 +        return y
 +
++    def _x4_bufs(self):
++        """Lazy scratch of the x4 route (one group of 6 experts in
++        flight): a16x4/di16x4 = rotated A-frag ABIs of the canons
++        (ABI-ROT / ABI-ROT-k1, DESIGN 5v''/5v'''), c_up/c_down = flat
++        canon outputs. ~20 MB total, shared across layers. (A
++        two-stream group-interleave variant was probed and measured a
++        wash — 13.61 vs 13.82 ms/layer, the [K]-class co-residency
++        penalty eats the gap-fill gains — so the launcher stays
++        single-stream; DESIGN 5w''')."""
++        bufs = getattr(self, "_x4_scratch", None)
++        if bufs is None:
++            hv = torch.half
++            bufs = (torch.empty(12, 4, 384, 256, dtype=hv, device=self.dev),
++                    torch.empty(12, 64, self.I, dtype=hv, device=self.dev),
++                    torch.empty(6, 4, 128, 256, dtype=hv, device=self.dev),
++                    torch.empty(6, 64, self.H, dtype=hv, device=self.dev))
++            self._x4_scratch = bufs
++        return bufs
++
++    def _x4_tabs(self, li: int):
++        """Pointer tables in x4 slot order: up = interleaved (w1, w3)
++        per expert (2E,), down = (E,). Rebuilt FRESH on every call —
++        the paged-base pool mutates trellis addresses on fetch/evict,
++        so any cached derived table goes stale after the first pager
++        mutation (found on silicon: boot-B needle 0/4 vs baseline 4/4;
++        the moe_dual route reads the tier tables per call for the same
++        reason). Cost: 3x stack+reshape of (E,) int64 — noise next to
++        the layer itself."""
++        t = self._tables[li]
++        up = tuple(torch.stack((g, u), dim=1).reshape(-1)
++                   for g, u in zip(t["g"], t["u"]))
++        dn = tuple(d.contiguous() for d in t["d"])
++        return up + dn
++
++    def _wave_prefill(self, li: int, x: torch.Tensor,
++                      topk_ids: torch.Tensor,
++                      wts: torch.Tensor) -> torch.Tensor:
++        """Prefill-native x4 route (tor D F-D2): expert-major driver over
++        the m16x4 canon pair — trellis decoded once per (expert, 64-row
++        slot), HMMA over 4 slabs of 16 rows; 5 phases per group of 6
++        experts inside ext.exl3_decode_wave_x4_layer (one call per
++        layer). Eager-only (host syncs), engaged above the graph
++        capture envelope. Seam parity vs the moe_dual route 3/3
++        (rel 6.5e-4, repeat-band 1e-9 class — DESIGN 5w)."""
++        t = self._tables[li]                     # ensure/refresh first
++        m0, k = topk_ids.shape
++        dev = self.dev
++        y = torch.zeros(m0, self.H, dtype=torch.float, device=dev)
++        flat_wts = wts.reshape(-1)
++        live = flat_wts != 0
++        flat_ids = topk_ids.reshape(-1)[live]
++        if flat_ids.numel() == 0:
++            return y
++        flat_wts = flat_wts[live]
++        flat_tok = torch.arange(
++            m0, device=dev).repeat_interleave(k)[live]
++        order = flat_ids.argsort()
++        E = t["g"][0].shape[0]
++        counts = torch.bincount(flat_ids[order], minlength=E)[:E]
++        built = build_x4_slots(counts, flat_tok[order],
++                               flat_wts[order])
++        if built is None:
++            return y
++        row_map, row_wts, slot_e, G = built
++        up_tr, up_suh, up_svh, dn_tr, dn_suh, dn_svh = self._x4_tabs(li)
++        se2 = (slot_e.unsqueeze(1) * 2
++               + torch.arange(2, device=dev)).reshape(-1)
++        self.ext.exl3_decode_wave_x4_layer(
++            x.half().contiguous(), y, row_map, row_wts,
++            up_tr[se2].view(G, 12), up_suh[se2].view(G, 12),
++            up_svh[se2].view(G, 12),
++            dn_tr[slot_e].view(G, 6), dn_suh[slot_e].view(G, 6),
++            dn_svh[slot_e].view(G, 6),
++            *self._x4_bufs(), float(self.act_limit))
++        return y
++
++    def _wave_prefill_eligible(self, topk_ids: torch.Tensor) -> bool:
++        if not _WAVE_PREFILL:
++            return False
++        # getattr: cells mounting an FD build without the x4 launcher
++        # must fall through to the moe_dual route, not crash.
++        avail = getattr(self.ext, "exl3_wave_x4_available", None)
++        return (avail is not None
++                and (self.w13_k, self.w2_k) == (2, 1)
++                and topk_ids.shape[0] > max(8, self._graph_cap_tokens())
++                and not torch.cuda.is_current_stream_capturing()
++                and bool(avail(self.H)))
++
 +    @torch.inference_mode()
 +    def forward_topk(self, li: int, x: torch.Tensor, topk_ids: torch.Tensor,
 +                     topk_weights: torch.Tensor,
@@ -12038,6 +12268,8 @@ index 000000000..3e515c571
 +        wts = topk_weights
 +        if fp4_mask is not None:
 +            wts = wts.masked_fill(fp4_mask, 0.0)
++        if self._wave_prefill_eligible(topk_ids):
++            return self._wave_prefill(li, x, topk_ids, wts)
 +        if (_MOE_PREFILL
 +                and topk_ids.shape[0] > max(8, self._graph_cap_tokens())
 +                and not torch.cuda.is_current_stream_capturing()):

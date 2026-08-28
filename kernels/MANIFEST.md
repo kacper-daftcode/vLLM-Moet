@@ -313,6 +313,49 @@ needs deterministic KV headroom — pin `--kv-cache-memory-bytes`
 `cudagraph_capture_sizes` trims the G-fix empty groups at C1/C2
 (G 6→4 / 11→8) at zero numerical delta (pad rows are weight-0).
 
+### GLM family M=16×4 — prefill-native (tor D, [T]/[U]/[V] 2026-08-27)
+
+Prefill-native canons amortize the trellis decode over **4 slabs of
+16 rows** (64 tokens per expert slot): 16 warps = 4 k-splits × 4 slab
+groups, the decode runs at the m16 canon rate while HMMA covers 4×
+the rows; decoded fragments are shared through smem with UNIFORM-REG
+addressing, accumulators stay slab-private in registers. The A-side
+ABIs carry the rotation in the LAYOUT (`d_a16x4` per-slab slice
+rotation; `d_a16x4k1` slice-pair swap) because LDGSTS has no UR
+addend on the global side. Consumed by the expert-major prefill route
+(`VLLM_MOE_W2_EXL3_WAVE_PREFILL=1`, eager chunks above the graph
+envelope; ext `exl3_decode_wave_x4_layer`, 5 launches per group of 6
+experts). Generators: `internal` wave-sass-lab
+`gen_exl3_wave_uni_x4.py` (X4_DIRECT=1 X4_ADV2=1 X4_PRE=1) and
+`gen_exl3_wave_k1_x4.py`.
+
+| cubin | kernel | solo cold µs (lock-1680 class¹) | grid |
+|---|---|---|---|
+| `uni_m16x4d_k6144.cubin` | `exl3_wave_uni_k2cb0` | 134.27 (rot8 @1680; ≤0.6×4×anchor PASS 0.5975) | 768 |
+| `k1_m16x4_n6144.cubin` | `exl3_wave_k1cb0` | 74.63 (rot24 @1680; 0.5646) | 1152 |
+
+¹ Absolute numbers measured at a VERIFIED sm-lock 1680 under load
+(clock-class finding [R]: older cert absolutes are boost-class).
+
+Validation: Gate1 oracle rel 2.05-2.09e-4 (both kernels, ×5/×5 runs);
+degenerate per slab: out-of-slab rows bit-zero ×4/×4; real GLM packs
+l03+l50 24/24 + 12/12; det ×10+ at 2 CTA/SM; CUBIT_VERIFY 0/0/0.
+Layer window @chunk 2048 top-8 on real planes: **2.21× MoE-only vs
+the exl3_moe_dual equivalent** (28.9 → 13.1 ms/layer; 2.09× with the
+stage kernels). Route seam parity vs the moe_dual route 3/3 (rel
+6.6e-4; scatter repeat-band 1e-9 class). In-serving boot-cert
+(GLM-5.2 TP4 + MTP k=2, fresh boots per arm): **cold prefill
+2051-2152 tok/s vs the line's moe_dual 870-881 = 2.33-2.44×**
+(vs the paired same-recipe baseline: 4.8×); needle 4/4 both arms;
+paired prompt-logprob KLD sits exactly at the cross-boot floor
+(0.2887/5.45% flips vs a moe_dual↔moe_dual cross-boot control at
+0.2884/5.67%); 15-min mixed soak (~890k tokens) clean with the KLD
+still at the floor. Ops notes: derived pointer tables must be rebuilt
+per call on paged-base cells (stale-pointer incident caught by the
+needle probe and fixed — fork `a913b0a07`); a two-stream group
+launcher measured a wash (13.61 vs 13.82 ms — co-residency eats the
+gap-fill) and the launcher stays single-stream.
+
 ## Sparse‑MLA prefill (SM120)
 | cubin | SASS | kernel | purpose |
 |---|---|---|---|

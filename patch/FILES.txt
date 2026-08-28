@@ -14,6 +14,7 @@ tools/test_moe_w2_exl3.py
 tools/test_moe_w2_exl3_delta.py
 tools/test_moe_w2_exl3_m16_maps.py
 tools/test_moe_w2_exl3_m8_maps.py
+tools/test_wave_x4_builder.py
 vllm/compilation/breakable_cudagraph.py
 vllm/compilation/cuda_graph.py
 vllm/config/speculative.py
