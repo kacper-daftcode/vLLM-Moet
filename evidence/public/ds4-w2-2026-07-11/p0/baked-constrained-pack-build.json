@@ -1,0 +1,30 @@
+{
+  "arena_bytes": 134217728,
+  "experts": 8,
+  "final_events": {
+    "high": 0,
+    "low": 0,
+    "max": 0,
+    "oom": 0,
+    "oom_group_kill": 0,
+    "oom_kill": 0,
+    "sock_throttled": 0
+  },
+  "layers": 48,
+  "logical_pack_bytes": 1610612736,
+  "max_cgroup_anon": 631267328,
+  "max_cgroup_current": 818429952,
+  "max_cgroup_file": 145010688,
+  "min_cgroup_high_available": null,
+  "min_cgroup_max_available": 1329053696,
+  "probe": "constrained-pack-build",
+  "provenance": {
+    "captured_at": "2026-07-12T03:17:22.364693+00:00",
+    "image": "vllm-moet-sm120:v024-w2union-241ba984b1c5",
+    "image_id": "sha256:fc6e1244d60855fe45ccc0236daaaa722abcb8d354200eb92aca104bd954d3f2",
+    "kernel": "7.0.0-14-generic"
+  },
+  "slot_bytes": 4194304,
+  "write_cache_drop_bytes": 1610612736,
+  "write_cache_drop_calls": 48
+}
