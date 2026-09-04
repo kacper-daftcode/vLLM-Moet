@@ -4407,10 +4407,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..75e252615
+index 000000000..4fa6168cc
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,4361 @@
+@@ -0,0 +1,4382 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -6653,11 +6653,32 @@ index 000000000..75e252615
 +        n_moe = max(n_layers - n_dense, 1)
 +        max_len = int(vcfg.model_config.max_model_len)
 +        spec_on = vcfg.speculative_config is not None
++        # Measure what the planes can actually claim. This runs right after
++        # the first layer's requant, whose dequant transients (the layer's
++        # experts widened to fp32, several GiB per rank) are freed but held
++        # by the caching allocator — mem_get_info() reports them as USED.
++        # Measured 2026-09-04 (GLM-5.2 TP4, explicit 20 GiB delta pool):
++        # "free 29.0 GiB" and a refusal ~22 GiB short for a geometry that
++        # serves. Return the cache to the driver first, and log the
++        # components so the next refusal is diagnosable.
++        torch.cuda.synchronize(dev)
++        torch.cuda.empty_cache()
 +        free_b, _total_b = torch.cuda.mem_get_info(dev)
++        cached_b = (torch.cuda.memory_reserved(dev)
++                    - torch.cuda.memory_allocated(dev))
 +        planes_total = bytes_per_layer * (n_moe - len(_LAYERS))
 +        kv_floor = max_len * 16 * 1024            # ~15.6 KB/tok measured
 +        reserve = 2 * 2**30 + (int(1.7 * 2**30) if spec_on else 0) + kv_floor
 +        budget = free_b - reserve
++        logger.info(
++            "moe_w2 resident-fit check: planes %.1f GiB (%d MoE layers x "
++            "%.2f GiB) vs budget %.1f GiB = free %.1f (allocator cache %.1f "
++            "after empty_cache, allocated %.1f) - reserve %.1f (KV floor "
++            "%.1f for %d tokens%s)", planes_total / 2**30, n_moe,
++            bytes_per_layer / 2**30, budget / 2**30, free_b / 2**30,
++            cached_b / 2**30, torch.cuda.memory_allocated(dev) / 2**30,
++            reserve / 2**30, kv_floor / 2**30, max_len,
++            ", graphs, MTP scratch" if spec_on else ", graphs")
 +        if planes_total > budget and os.getenv(
 +                "VLLM_MOE_W2_FORCE_RESIDENT", "0") == "1":
 +            # Explicit consent valve (the FORCE_POOL pattern): the reserve
@@ -22837,7 +22858,7 @@ index 3192b9aea..3b5cc9a82 100644
      model_runner.kv_connector.set_disabled(False)
      torch.accelerator.synchronize()
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..4bd28d826 100644
+index 74938a823..03852523c 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -24072,7 +24093,49 @@ index 74938a823..4bd28d826 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5209,6 +6255,39 @@ class GPUModelRunner(
+@@ -5151,6 +6197,41 @@ class GPUModelRunner(
+             new_config = update_config(config, config_overrides)
+             setattr(self, config_name, new_config)
+ 
++    def moe_w2_check_pool_floor(self) -> None:
++        """moe_w2 pool-floor guard: refuse to serve a base-cache pool or an
++        FP4 need-pool sized below its per-step working set (silent quality
++        corruption: routed experts keep zeroed contributions; gate fires
++        that can never cover their own step). VLLM_MOE_W2_FORCE_POOL=1
++        downgrades the failure to a warning.
++
++        Called by the worker from initialize_from_config, AFTER
++        finalize_auto() has allocated the deferred auto pool
++        (VLLM_MOE_W2_DELTA_GB=auto) and before cudagraph capture: the plane
++        builder has registered every MoE layer, the spec/scheduler configs
++        are final, and every pool now has its real slot count. No-op for
++        dummy-weight loads and for models without a moe_w2 tier.
++        """
++        if not getattr(self, "_moe_w2_floor_check_armed", False):
++            return
++        if moe_w2_delta._BASE_TIER is None and moe_w2_delta._TIER is None:
++            return
++        try:
++            n_spec = 0
++            if self.speculative_config is not None:
++                n_spec = int(getattr(
++                    self.speculative_config,
++                    "num_speculative_tokens", 0) or 0)
++            topk = int(getattr(
++                self.model_config.hf_text_config,
++                "num_experts_per_tok", 0) or 0)
++            if topk > 0:
++                moe_w2_delta.check_pool_floor(
++                    topk, n_spec, int(self.scheduler_config.max_num_seqs))
++        except ValueError:
++            raise
++        except Exception as e:  # noqa: BLE001 - guard must not break boot
++            logger.warning("moe_w2 pool-floor check skipped: %s", e)
++
+     @instrument(span_name="Loading (GPU)")
+     def load_model(self, load_dummy_weights: bool = False) -> None:
+         """
+@@ -5209,6 +6290,39 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -24112,41 +24175,21 @@ index 74938a823..4bd28d826 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +6336,33 @@ class GPUModelRunner(
+@@ -5257,6 +6371,13 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
-+        # moe_w2 pool-floor guard: refuse to serve a base-cache pool sized
-+        # below its per-step working set (silent quality corruption:
-+        # routed experts keep zeroed contributions). Runs here because the
-+        # plane builder has registered every MoE layer by end-of-load and
-+        # the spec/scheduler configs are final. VLLM_MOE_W2_FORCE_POOL=1
-+        # downgrades the failure to a warning.
-+        if (moe_w2_delta._BASE_TIER is not None
-+                or moe_w2_delta._TIER is not None) and not load_dummy_weights:
-+            try:
-+                _w2d_floor = moe_w2_delta
-+                if _w2d_floor._BASE_TIER is not None or _w2d_floor._TIER is not None:
-+                    _n_spec = 0
-+                    if self.speculative_config is not None:
-+                        _n_spec = int(getattr(
-+                            self.speculative_config,
-+                            "num_speculative_tokens", 0) or 0)
-+                    _topk = int(getattr(
-+                        self.model_config.hf_text_config,
-+                        "num_experts_per_tok", 0) or 0)
-+                    if _topk > 0:
-+                        _w2d_floor.check_pool_floor(
-+                            _topk, _n_spec,
-+                            int(self.scheduler_config.max_num_seqs))
-+            except ValueError:
-+                raise
-+            except Exception as e:  # noqa: BLE001 - guard must not break boot
-+                logger.warning("moe_w2 pool-floor check skipped: %s", e)
++        # moe_w2 pool-floor guard: NOT here. The delta tier's auto pool
++        # (VLLM_MOE_W2_DELTA_GB=auto) is only allocated after the KV cache
++        # exists (gpu_worker.initialize_from_config -> finalize_auto), so a
++        # check at end-of-load saw n_slots == 0 for every auto config and
++        # refused the boot unconditionally. The worker calls
++        # moe_w2_check_pool_floor() right after finalize_auto().
++        self._moe_w2_floor_check_armed = not load_dummy_weights
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +7075,8 @@ class GPUModelRunner(
+@@ -5969,7 +7090,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -24156,7 +24199,7 @@ index 74938a823..4bd28d826 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7982,9 @@ class GPUModelRunner(
+@@ -6875,8 +7997,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -24168,7 +24211,7 @@ index 74938a823..4bd28d826 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +8037,8 @@ class GPUModelRunner(
+@@ -6929,7 +8052,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
@@ -24193,7 +24236,7 @@ index 657fc8267..dee74ffb4 100644
                  ubatch_metadata[0].context.cpu_wait_event.set()
                  for thread in ubatch_threads:
 diff --git a/vllm/v1/worker/gpu_worker.py b/vllm/v1/worker/gpu_worker.py
-index 5e266a313..1531fbf50 100644
+index 5e266a313..921382ad5 100644
 --- a/vllm/v1/worker/gpu_worker.py
 +++ b/vllm/v1/worker/gpu_worker.py
 @@ -383,6 +383,29 @@ class Worker(WorkerBase):
@@ -24237,7 +24280,7 @@ index 5e266a313..1531fbf50 100644
          self.model_runner.reload_weights(*args, **kwargs)
  
      @torch.inference_mode()
-@@ -616,6 +643,42 @@ class Worker(WorkerBase):
+@@ -616,6 +643,49 @@ class Worker(WorkerBase):
          ):
              self.model_runner._init_kv_zero_meta()
  
@@ -24253,6 +24296,13 @@ index 5e266a313..1531fbf50 100644
 +                moe_w2_delta._TIER.finalize_auto()
 +        except Exception as e:  # noqa: BLE001 - opt-in path, never fatal
 +            logger.warning("moe_w2 delta auto-sizing failed: %s", e)
++
++        # moe_w2 pool-floor guard — here, not at end-of-load: the auto pool
++        # above has just been sized, so the check sees the real slot count
++        # (at end-of-load every DELTA_GB=auto config read n_slots == 0 and
++        # was refused, 2026-09-04). ValueError = fail-closed refusal.
++        if hasattr(self.model_runner, "moe_w2_check_pool_floor"):
++            self.model_runner.moe_w2_check_pool_floor()
 +
 +        # moe_w2 BASE pool warm-start (VLLM_MOE_W2_POOL_HEAT): preload the
 +        # previous run's hot ownership into the GPU slot pool. Same timing
@@ -24280,7 +24330,7 @@ index 5e266a313..1531fbf50 100644
      @instrument(span_name="Warmup (GPU)")
      def compile_or_warm_up_model(self) -> CompilationTimes:
          warmup_sizes: list[int] = []
-@@ -788,6 +851,16 @@ class Worker(WorkerBase):
+@@ -788,6 +858,16 @@ class Worker(WorkerBase):
      def get_model(self) -> nn.Module:
          return self.model_runner.get_model()
  
@@ -24297,7 +24347,7 @@ index 5e266a313..1531fbf50 100644
      def get_supported_tasks(self) -> tuple[SupportedTask, ...]:
          return self.model_runner.get_supported_tasks()
  
-@@ -905,6 +978,8 @@ class Worker(WorkerBase):
+@@ -905,6 +985,8 @@ class Worker(WorkerBase):
              if isinstance(
                  output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
              ):
@@ -24306,7 +24356,7 @@ index 5e266a313..1531fbf50 100644
                  return output
  
          assert isinstance(output, IntermediateTensors)
-@@ -914,15 +989,114 @@ class Worker(WorkerBase):
+@@ -914,15 +996,114 @@ class Worker(WorkerBase):
              and not get_pp_group().is_last_rank
          )
  
@@ -24423,7 +24473,7 @@ index 5e266a313..1531fbf50 100644
      def take_draft_token_ids(self) -> DraftTokenIds | None:
          return self.model_runner.take_draft_token_ids()
  
-@@ -1051,6 +1225,11 @@ class Worker(WorkerBase):
+@@ -1051,6 +1232,11 @@ class Worker(WorkerBase):
                  format (need layerwise processing) or kernel format (direct
                  copy / sparse patch application).
          """
@@ -24435,7 +24485,7 @@ index 5e266a313..1531fbf50 100644
          self._check_weight_transfer_engine()
  
          if self._weight_update_active:
-@@ -1169,6 +1348,23 @@ class Worker(WorkerBase):
+@@ -1169,6 +1355,23 @@ class Worker(WorkerBase):
      def shutdown(self) -> None:
          gc.unfreeze()
  
@@ -24459,7 +24509,7 @@ index 5e266a313..1531fbf50 100644
          # has_kv_transfer_group can be None during interpreter shutdown.
          if ensure_kv_transfer_shutdown is not None:
              ensure_kv_transfer_shutdown()
-@@ -1184,6 +1380,22 @@ class Worker(WorkerBase):
+@@ -1184,6 +1387,22 @@ class Worker(WorkerBase):
          # can be reclaimed when running in-process
          if model_runner := getattr(self, "model_runner", None):
              model_runner.shutdown()
