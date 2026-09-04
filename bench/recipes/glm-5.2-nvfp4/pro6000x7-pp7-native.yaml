@@ -1,0 +1,52 @@
+id: glm-5.2-nvfp4/pro6000x7-pp7-native
+role: baseline
+model: GLM-5.2-NVFP4
+served_name: glm-5.2
+summary: "7x RTX PRO 6000 PP7 - stock NVFP4 native quality baseline (no spec)"
+
+requires:
+  gpus: 7
+  vram_gb: 96
+
+context: 131072
+load_timeout_s: 3600
+
+# Native pseudo-recipe for the GLM-5.2 anchor family. The stock NVFP4
+# checkpoint (433 GB) does not fit TP4 (384 GB); the first anchor attempt
+# on TP8 lost GPU 8 to a hardware wedge mid-run (2026-08-29), so the anchor
+# was measured on the seven remaining cards as PP7 x TP1 (62 GB/rank). The
+# 2026-07-28 criterion is outcome-based on the SERVE geometry (window, seqs,
+# sampling), and the registry already pairs candidates across TP geometries
+# (DS4 TP1 vs the TP2 anchor), so PP7 is a valid anchor geometry. NO
+# speculative config on purpose: greedy accuracy is spec-invariant and the
+# candidates pair on tokens, not on decode speed. The manual anchors
+# glm-5.2/native-pp7-{gsm8k-c2,gpqa-nt} (llm_decode_bench 0.4.29, 2026-08-31
+# and 2026-09-04) were measured with exactly these serve args at C=2; a
+# runner-bound (strict:true) re-measurement through this recipe promotes them
+# past their manual provenance. Prefer TP8 once eight cards are back — the
+# geometry is then the plain stock deployment.
+env:
+  VLLM_MOE_W2: "0"
+
+serve_args:
+  - --trust-remote-code
+  - --tensor-parallel-size 1
+  - --pipeline-parallel-size 7
+  - --kv-cache-dtype fp8
+  - --block-size 256
+  - --max-model-len 131072
+  - --gpu-memory-utilization 0.90
+  - --max-num-batched-tokens 2048
+  - --max-num-seqs 4
+  - --no-scheduler-reserve-full-isl
+  - --tool-call-parser glm47
+  - --reasoning-parser glm45
+  - --compilation-config {"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}
+
+suite_params:
+  gsm8k:
+    concurrency: 2
+  gpqa:
+    concurrency: 2
+  batch_decode:
+    concurrency: [1, 2]

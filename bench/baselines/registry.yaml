@@ -197,3 +197,31 @@ baselines:
     measured: 2026-08-12
     provenance: live
     anchors: "74.24% (147/198), tokens avg 810; == 6976c7ff 147/198 McNemar p=1.0 (flips 19/19); vs 2-bit candidate p=1.0 (flips 13/12); 0731 reasons ~2x longer (810 vs 422 tok)"
+  glm-5.2/native-pp7-gsm8k-c2:
+    file: glm-5.2/native-pp7-gsm8k-c2.json
+    artifact_sha256: 2844c41f650d8568c1fdfe3bacfef861958d7828fe48bff145eddc85d35e1f8b
+    checkpoint: GLM-5.2-NVFP4
+    model: GLM-5.2-NVFP4
+    model_revision: aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
+    context: 131072
+    strict: false
+    protocol: {profile: gsm8k, runs: 200, concurrency: 2, max_tokens: 6000, request_overrides: {chat_template_kwargs: {enable_thinking: false}}}
+    mode: "non-think (enable_thinking=false), greedy, conc 2, max_tokens 6000, no-spec, stock NVFP4 VLLM_MOE_W2=0"
+    hardware: 7x RTX PRO 6000 (PP7 x TP1; TP8 lost GPU 8 to a hardware wedge mid-anchor 2026-08-29)
+    measured: 2026-08-31
+    provenance: imported
+    anchors: "96.0% (192/200), 0 truncated, tokens avg 150.9 p50 136 p90 241; manual llm_decode_bench 0.4.29 against the pro6000x7-pp7-native pseudo-recipe args; first GLM native anchor of the project. Paired: trellis TP4 bare (93.5%) flips 8/3 McNemar p=0.227 ns"
+  glm-5.2/native-pp7-gpqa-nt:
+    file: glm-5.2/native-pp7-gpqa-nt.json
+    artifact_sha256: 2b5a8b1264ed5f117ace847863416c3b7d4917acec19d31153d01c20ef52edf8
+    checkpoint: GLM-5.2-NVFP4
+    model: GLM-5.2-NVFP4
+    model_revision: aec724e8c7b8ee9db3b48c01c320f63f9cdaf8aa
+    context: 131072
+    strict: false
+    protocol: {profile: gpqa-diamond, runs: 198, concurrency: 2, max_tokens: 30000, request_overrides: {chat_template_kwargs: {enable_thinking: false}}}
+    mode: "non-think (enable_thinking=false), greedy, conc 2, max_tokens 30000, no-spec, stock NVFP4 VLLM_MOE_W2=0"
+    hardware: 7x RTX PRO 6000 (PP7 x TP1)
+    measured: 2026-09-04
+    provenance: imported
+    anchors: "70.20% (139/198), 4 truncated at 30k, tokens avg 1394.8 p50 641 p90 1362; manual llm_decode_bench 0.4.29 against the pro6000x7-pp7-native pseudo-recipe args. Paired: trellis TP4 bare @24k/mt20k 60.6% (120/198) flips 39/20 McNemar p=0.018 REGRESSION, tails 25 vs 4"
