@@ -3,4 +3,4 @@
 # tools/check_patch_files.py --update, byte-verified wherever a fork
 # clone is available (dev boxes; CI has none). Regenerations only move
 # this FORWARD along the branch - see AGENTS.md. Never edit by hand.
-91627836cc4f1dbe0c15cbf5e4d94a1d239fce06
+d8aea5d42f369e1da197cad4ddb48e02aa332a2e

@@ -67,6 +67,7 @@ vllm/v1/attention/ops/triton_decode_attention.py
 vllm/v1/core/sched/scheduler.py
 vllm/v1/engine/core.py
 vllm/v1/kv_cache_interface.py
+vllm/v1/outputs.py
 vllm/v1/spec_decode/dynamic/utils.py
 vllm/v1/worker/gpu/cudagraph_utils.py
 vllm/v1/worker/gpu/input_batch.py

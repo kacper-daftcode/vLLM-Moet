@@ -4407,10 +4407,10 @@ index 000000000..d26ce2cf4
 +        "on" if _verify() else "off")
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
 new file mode 100644
-index 000000000..4fa6168cc
+index 000000000..e8cb669a9
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_cubit.py
-@@ -0,0 +1,4382 @@
+@@ -0,0 +1,4422 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Routed experts on 2-bit tensor-sym planes (cubit moe_w2) for the
@@ -5312,7 +5312,8 @@ index 000000000..4fa6168cc
 +                # delta file at CREATE so a partial pack refuses early.
 +                dpath = os.path.join(_EXL3_DELTA_PACK,
 +                                     f"exl3-delta-l{lidx:02d}.safetensors")
-+                if not os.path.exists(dpath):
++                if (not os.path.exists(dpath)
++                        and not _exl3_delta_optional(lidx)):
 +                    raise ValueError(
 +                        f"moe_w2 EXL3 Δ-pool: delta pack layer file missing: "
 +                        f"{dpath}")
@@ -5640,6 +5641,21 @@ index 000000000..4fa6168cc
 +_exl3_dense_offset: int | None = None
 +
 +
++def _exl3_delta_optional(lidx: int) -> bool:
++    """True when transformer layer `lidx` sits past the target stack, i.e.
++    it is a drafter (MTP) layer served under VLLM_MOE_W2_DRAFT: delta
++    packs are built for the target's MoE layers only (GLM-5.2: l03..l77,
++    drafter l78), so a missing delta file there means base-only for the
++    drafter, not a partial pack. Target layers keep the fail-fast."""
++    try:
++        from vllm.config import get_current_vllm_config
++        hf = get_current_vllm_config().model_config.hf_text_config
++        n_target = int(getattr(hf, "num_hidden_layers", 0) or 0)
++    except Exception:  # noqa: BLE001 - no config -> keep the strict rule
++        return False
++    return n_target > 0 and lidx >= n_target
++
++
 +def _exl3_pack_index(layer, layer_key: int) -> int:
 +    """Pack file index for this layer, VERIFIED — pack files are keyed by
 +    the ABSOLUTE transformer layer index (build_exl3_pack.py writes
@@ -5768,6 +5784,16 @@ index 000000000..4fa6168cc
 +    global _EXL3_DELTA_GEOM, _exl3_delta_abi_checked
 +    path = os.path.join(_EXL3_DELTA_PACK,
 +                        f"exl3-delta-l{lidx:02d}.safetensors")
++    if not os.path.exists(path) and _exl3_delta_optional(lidx):
++        # Drafter (MTP) layer appended after the target stack: the delta
++        # pack set covers the target's MoE layers only (GLM-5.2: l03..l77,
++        # drafter = l78). Served base-only — the need-pool never holds a
++        # slot for this layer (no host rows -> no candidates), the target
++        # verifies every draft, so greedy output is unaffected.
++        logger.info(
++            "moe_w2 EXL3 Δ-pool: no delta pack for drafter layer_key %d "
++            "(transformer layer %d) — served base-only", layer_key, lidx)
++        return
 +    with open(os.path.join(
 +            _EXL3_DELTA_PACK,
 +            f"exl3-delta-l{lidx:02d}.manifest.json")) as f:
@@ -7831,6 +7857,20 @@ index 000000000..4fa6168cc
 +    global _exl3_delta_val_n
 +    if _exl3_delta_val_n >= 12 or not bool(dmask.any()):
 +        return
++    # The reference dequantizes the base from the tier's RESIDENT store
++    # (`l{lidx}.e{e}.{p}.k{k}.trellis` keys); a paged base (BASE_CACHE_GB,
++    # experts in the host store / GPU slot pool) has none of them — the
++    # first pooled step then died on KeyError (GLM TP4 EP pager,
++    # 2026-09-05). Say so once and skip instead of killing the engine.
++    if not any(k.endswith(".trellis") for k in tier._store):
++        if _exl3_delta_val_n == 0:
++            logger.warning(
++                "VLLM_MOE_W2_EXL3_DELTA_VALIDATE=1 needs a RESIDENT EXL3 "
++                "base (the torch reference dequantizes it from the tier "
++                "store); this tier serves a paged base — validation "
++                "skipped")
++        _exl3_delta_val_n = 12
++        return
 +    _exl3_delta_val_n += 1
 +    import torch.nn.functional as F
 +    g = _EXL3_DELTA_GEOM
@@ -8795,10 +8835,10 @@ index 000000000..4fa6168cc
 +    ready.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
 new file mode 100644
-index 000000000..e2223c1d8
+index 000000000..e6d442358
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_delta.py
-@@ -0,0 +1,2672 @@
+@@ -0,0 +1,2688 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""FP4 delta tier for the 1-GPU 2-bit MoE path (quality restoration).
@@ -9062,7 +9102,12 @@ index 000000000..e2223c1d8
 +        self._auto_pending = _AUTO and pool_gb is None
 +        self.n_slots = 0 if self._auto_pending else max(
 +            int(_gb * 2**30) // self.slot_bytes, 8)
-+        self.pool = torch.empty(self.n_slots, self.slot_bytes, dtype=torch.uint8,
++        # ZEROED, not torch.empty: the capture-safe consumers read slot 0
++        # for every non-pooled pair through clamped pointer tables and rely
++        # on the bytes being FINITE (the contribution is then zeroed by a
++        # weight-side 0*x — 0*NaN = NaN). Fresh VRAM is not finite in
++        # general; zero trellis/suh/svh bytes decode to exact zeros.
++        self.pool = torch.zeros(self.n_slots, self.slot_bytes, dtype=torch.uint8,
 +                                device=dev)
 +        # device table read by the desc kernel; host mirror for the manager
 +        self.slot_table = torch.full((n_layers, n_experts), -1,
@@ -9334,7 +9379,8 @@ index 000000000..e2223c1d8
 +                free_b / 2**30, _RESERVE_GB)
 +            return
 +        self.n_slots = int(n)
-+        self.pool = torch.empty(self.n_slots, self.slot_bytes,
++        # zeroed for the same finite-slot-0 reason as the eager allocation
++        self.pool = torch.zeros(self.n_slots, self.slot_bytes,
 +                                dtype=torch.uint8, device=self.dev)
 +        self._alloc_owner(self.n_slots)
 +        self._free = list(range(self.n_slots))
@@ -11051,11 +11097,21 @@ index 000000000..e2223c1d8
 +    return max_miss <= fp_thresh()
 +
 +
++class StrictReplayNonConvergence(RuntimeError):
++    """Strict base-cache replay exhausted FP_MAX with residue above the
++    miss tolerance. The TP runner turns this into a per-step fail-closed
++    (the step's requests finish with an error, the engine keeps serving)
++    instead of the engine-killing exception it used to be — a 30 GiB pool
++    below the prefill working set took the whole GLM TP4 server down on
++    its first GSM8K prefill (2026-09-04) where refusing the request was
++    the documented intent."""
++
++
 +def fp_validate_complete(max_miss: int) -> None:
 +    """Fail closed when strict replay exhausted its bound with residue."""
 +    if (_REPLAY_MODE == "strict"
 +            and max_miss > base_miss_tol()):
-+        raise RuntimeError(
++        raise StrictReplayNonConvergence(
 +            "moe_w2 strict base-cache replay did not converge: "
 +            f"{max_miss} missing pairs remain after {_FP_MAX} passes "
 +            f"(tolerance {base_miss_tol()}); grow the base pool or set "
@@ -14681,10 +14737,10 @@ index 000000000..7da0e2969
 +    _ckpt_id.cache_clear()
 diff --git a/vllm/model_executor/layers/quantization/utils/moe_w2_store.py b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
 new file mode 100644
-index 000000000..6a5bd159a
+index 000000000..6d330a8a8
 --- /dev/null
 +++ b/vllm/model_executor/layers/quantization/utils/moe_w2_store.py
-@@ -0,0 +1,982 @@
+@@ -0,0 +1,996 @@
 +# SPDX-License-Identifier: Apache-2.0
 +# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 +"""Host-side expert stores for the 2-bit MoE tiers (moe_w2_delta.DeltaTier).
@@ -15639,6 +15695,20 @@ index 000000000..6a5bd159a
 +            "the RAM share; it also persists quantization across boots).")
 +    dir_ = os.getenv("VLLM_MOE_W2_STORE_DIR", "").strip()
 +    if not dir_:
++        return PinnedHostStore(slot_bytes, pinned=pinned)
++    # Which tiers take the pack-file backend (default: every tier, the
++    # historical behaviour). A pack persists the tier's whole store on
++    # disk — for the FP4/Δ need-pool that is the full expert set (GLM-5.2
++    # TP4: 4 x 226 GB written in 8 minutes, 2026-09-05, filling the volume
++    # that also holds the docker root). VLLM_MOE_W2_STORE_TAGS=base keeps
++    # the base pack and leaves the need-pool store in pinned host RAM.
++    pack_tags = {t.strip() for t in os.getenv(
++        "VLLM_MOE_W2_STORE_TAGS", "base,fp4").split(",") if t.strip()}
++    if tag not in pack_tags:
++        logger.info(
++            "moe_w2 store[%s]: pinned host RAM (VLLM_MOE_W2_STORE_TAGS=%s "
++            "keeps this tier off the pack dir %s)", tag,
++            ",".join(sorted(pack_tags)), dir_)
 +        return PinnedHostStore(slot_bytes, pinned=pinned)
 +    ram_raw = os.getenv("VLLM_MOE_W2_BASE_RAM_GB", "").strip().lower()
 +    if tag == "base" and ram_raw not in ("", "0", "0.0"):
@@ -20030,7 +20100,7 @@ index dbe3c5705..f12d719fb 100644
      _fwd_grouped_kernel_stage1[grid](
          q,
 diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
-index 90d93a110..418f33346 100644
+index 90d93a110..d94043d90 100644
 --- a/vllm/v1/core/sched/scheduler.py
 +++ b/vllm/v1/core/sched/scheduler.py
 @@ -57,7 +57,10 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
@@ -20059,7 +20129,30 @@ index 90d93a110..418f33346 100644
  
          # Create the KV cache manager.
          if hash_block_size is None:
-@@ -1573,6 +1583,11 @@ class Scheduler(SchedulerInterface):
+@@ -1497,6 +1507,12 @@ class Scheduler(SchedulerInterface):
+                 kv_connector_output.invalid_block_ids,
+                 num_scheduled_tokens,
+             )
++        # moe_w2 fail-closed step: the runner reports the requests whose
++        # step ran with zeroed expert contributions (strict base-cache
++        # replay did not converge). Their sampled tokens are dropped and
++        # they finish with an error below — the engine keeps serving.
++        moe_w2_failed_req_ids = set(
++            model_runner_output.moe_w2_failed_req_ids or ())
+ 
+         # Persist per-step routed experts into the scheduler-side slot
+         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
+@@ -1529,6 +1545,9 @@ class Scheduler(SchedulerInterface):
+             if failed_kv_load_req_ids and req_id in failed_kv_load_req_ids:
+                 # skip failed or rescheduled requests from KV load failure
+                 continue
++            if req_id in moe_w2_failed_req_ids:
++                # zeroed-contribution step: no token from it is served
++                continue
+             request = self.requests.get(req_id)
+             if request is None or request.is_finished():
+                 # The request is already finished. This can happen if the
+@@ -1573,6 +1592,11 @@ class Scheduler(SchedulerInterface):
                      num_invalid_spec_tokens=scheduler_output.num_invalid_spec_tokens,
                      request_id=req_id,
                  )
@@ -20071,7 +20164,40 @@ index 90d93a110..418f33346 100644
  
              # Free encoder inputs only after the step has actually executed.
              if request.has_encoder_inputs:
-@@ -2263,6 +2278,17 @@ class Scheduler(SchedulerInterface):
+@@ -1729,6 +1753,32 @@ class Scheduler(SchedulerInterface):
+                     )
+                 )
+ 
++        if moe_w2_failed_req_ids:
++            # moe_w2 fail-closed step (see ModelRunnerOutput): finish the
++            # affected requests with an error, same shape as a KV load
++            # failure. Requests aborted meanwhile are already gone.
++            failed = [
++                rid for rid in moe_w2_failed_req_ids
++                if rid in self.requests and not self.requests[rid].is_finished()
++            ]
++            if failed:
++                logger.error(
++                    "moe_w2: strict base-cache replay did not converge; "
++                    "finishing %d request(s) with an error: %s",
++                    len(failed), failed)
++                requests = [self.requests[rid] for rid in failed]
++                self.finish_requests(failed, RequestStatus.FINISHED_ERROR)
++                for request in requests:
++                    outputs[request.client_index].append(
++                        EngineCoreOutput(
++                            request_id=request.request_id,
++                            new_token_ids=[],
++                            finish_reason=request.get_finished_reason(),
++                            events=request.take_events(),
++                            trace_headers=request.trace_headers,
++                        )
++                    )
++
+         # KV Connector: update state for finished KV Transfers.
+         if kv_connector_output:
+             self._update_from_kv_xfer_finished(kv_connector_output)
+@@ -2263,6 +2313,17 @@ class Scheduler(SchedulerInterface):
              perf_stats=perf_stats,
          )
  
@@ -20163,6 +20289,23 @@ index 5a2a5c5e2..33c628e8e 100644
          if self.cache_dtype_str == "fp8_ds_mla":
              if self.model_version == "deepseek_v4":
                  # DeepseekV4: 448B NoPE + 128B RoPE + 8B fp8 scale = 584B per token.
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 9f13ad939..ef4ee6860 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -269,6 +269,12 @@ class ModelRunnerOutput:
+     # information related to cudagraph execution
+     cudagraph_stats: CUDAGraphStat | None = None
+ 
++    # moe_w2: request ids whose step failed CLOSED (strict base-cache replay
++    # did not converge — logits carry zeroed expert contributions). The
++    # scheduler finishes them with FinishReason.ERROR and emits no tokens
++    # for them from this step; the engine keeps serving.
++    moe_w2_failed_req_ids: list[str] | None = None
++
+     # Per-step routed experts data captured by the worker.
+     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
+     #                         num_experts_per_tok); expert IDs as uint8/uint16.
 diff --git a/vllm/v1/spec_decode/dynamic/utils.py b/vllm/v1/spec_decode/dynamic/utils.py
 index de869b19a..348eaf2e9 100644
 --- a/vllm/v1/spec_decode/dynamic/utils.py
@@ -22858,7 +23001,7 @@ index 3192b9aea..3b5cc9a82 100644
      model_runner.kv_connector.set_disabled(False)
      torch.accelerator.synchronize()
 diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
-index 74938a823..03852523c 100644
+index 74938a823..381a88e4e 100644
 --- a/vllm/v1/worker/gpu_model_runner.py
 +++ b/vllm/v1/worker/gpu_model_runner.py
 @@ -4,6 +4,7 @@
@@ -23211,7 +23354,7 @@ index 74938a823..03852523c 100644
          with record_function_or_nullcontext("gpu_model_runner: postprocess"):
              if self.use_aux_hidden_state_outputs:
                  # True when EAGLE 3 is used.
-@@ -4395,6 +4651,485 @@ class GPUModelRunner(
+@@ -4395,6 +4651,497 @@ class GPUModelRunner(
                  assert broadcasted is not None
                  logits = broadcasted["logits"]
  
@@ -23323,6 +23466,18 @@ index 74938a823..03852523c 100644
 +                    _w2d.fp_validate_complete(_max_miss)
 +                    if _replays:
 +                        _btier.kpi_fp(_replays, _max_miss)
++            except moe_w2_delta.StrictReplayNonConvergence as e:
++                # Fail CLOSED per step, not per engine: the requests in this
++                # step finish with an error (scheduler, via the flag on this
++                # step's ModelRunnerOutput) and none of these logits becomes
++                # a served token; every other request keeps being served.
++                # Raising here used to take the whole engine down (measured:
++                # GLM TP4 pager, 30 GiB pool, first GSM8K prefill).
++                self._moe_w2_step_error = str(e)
++                logger.error(
++                    "moe_w2 strict base-cache replay did not converge - "
++                    "failing this step's requests closed (engine stays up): "
++                    "%s", e)
 +            except Exception as e:
 +                logger.exception("moe_w2 mandatory base-cache replay failed")
 +                raise RuntimeError(
@@ -23697,7 +23852,7 @@ index 74938a823..03852523c 100644
          self.execute_model_state = ExecuteModelState(
              scheduler_output,
              logits,
-@@ -4416,6 +5151,119 @@ class GPUModelRunner(
+@@ -4416,6 +5163,119 @@ class GPUModelRunner(
  
          return None
  
@@ -23817,7 +23972,7 @@ index 74938a823..03852523c 100644
      def _input_fits_in_drafter(
          self, common_attn_metadata: CommonAttentionMetadata | None
      ) -> bool:
-@@ -4441,6 +5289,12 @@ class GPUModelRunner(
+@@ -4441,6 +5301,12 @@ class GPUModelRunner(
              # receive sampled token ids from the last PP rank.
              if self.use_async_scheduling and not get_pp_group().is_last_rank:
                  self._pp_receive_prev_sampled_token_ids_to_input_batch()
@@ -23830,7 +23985,7 @@ index 74938a823..03852523c 100644
              # In case of PP with kv transfer, we need to pass through the
              # kv_connector_output
              return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
-@@ -4605,6 +5459,23 @@ class GPUModelRunner(
+@@ -4605,6 +5471,23 @@ class GPUModelRunner(
              # tokens on the CPU, so they are run after bookkeeping.
              propose_draft_token_ids(valid_sampled_token_ids)
  
@@ -23854,7 +24009,25 @@ index 74938a823..03852523c 100644
          # Finalize KV connector (wait_for_save + clear metadata) after
          # draft model runs. Deferred from target model forward to allow
          # draft model to also save its KV cache.
-@@ -4696,13 +5567,35 @@ class GPUModelRunner(
+@@ -4633,6 +5516,17 @@ class GPUModelRunner(
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
+             )
++        # moe_w2 fail-closed step (strict base-cache replay did not
++        # converge): every request of this step is reported failed; the
++        # scheduler finishes them with an error and drops their tokens.
++        _w2_step_error = getattr(self, "_moe_w2_step_error", None)
++        if _w2_step_error:
++            self._moe_w2_step_error = None
++            output.moe_w2_failed_req_ids = list(req_ids_output_copy)
++            logger.error(
++                "moe_w2: failing %d request(s) closed after a non-converged "
++                "strict replay: %s", len(req_ids_output_copy),
++                req_ids_output_copy)
+ 
+         if not self.use_async_scheduling:
+             if self.routed_experts_initialized:
+@@ -4696,13 +5590,35 @@ class GPUModelRunner(
      def _pp_broadcast_prev_sampled_token_ids(
          self, sampled_token_ids: torch.Tensor
      ) -> None:
@@ -23895,7 +24068,7 @@ index 74938a823..03852523c 100644
          # Skip for chunked prefill: sampled tokens are dummy
          # and will be discarded, no need to broadcast.
          if not self._is_all_reqs_chunked_prefill():
-@@ -4711,16 +5604,33 @@ class GPUModelRunner(
+@@ -4711,16 +5627,33 @@ class GPUModelRunner(
              )
  
      def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
@@ -23933,7 +24106,7 @@ index 74938a823..03852523c 100644
  
          # construct `prev_req_id_to_index` here so `_prepare_input_ids`
          # can map req_id -> previous batch row
-@@ -4731,18 +5641,154 @@ class GPUModelRunner(
+@@ -4731,18 +5664,154 @@ class GPUModelRunner(
              if i in discard_req_indices_set:
                  continue
              prev_req_id_to_index[req_id] = i
@@ -24093,7 +24266,7 @@ index 74938a823..03852523c 100644
          draft_token_ids, req_ids = self._get_draft_token_ids_cpu()
          return DraftTokenIds(req_ids, draft_token_ids)
  
-@@ -5151,6 +6197,41 @@ class GPUModelRunner(
+@@ -5151,6 +6220,41 @@ class GPUModelRunner(
              new_config = update_config(config, config_overrides)
              setattr(self, config_name, new_config)
  
@@ -24135,7 +24308,7 @@ index 74938a823..03852523c 100644
      @instrument(span_name="Loading (GPU)")
      def load_model(self, load_dummy_weights: bool = False) -> None:
          """
-@@ -5209,6 +6290,39 @@ class GPUModelRunner(
+@@ -5209,6 +6313,39 @@ class GPUModelRunner(
                          )
                          eplb_models += 1
  
@@ -24175,7 +24348,7 @@ index 74938a823..03852523c 100644
                  self._setup_eagle3_aux_hidden_state_outputs()
  
                  # Resolve the MoE model, unwrapping VLM wrappers if needed.
-@@ -5257,6 +6371,13 @@ class GPUModelRunner(
+@@ -5257,6 +6394,13 @@ class GPUModelRunner(
              format_gib(self.model_memory_usage),
              time_after_load - time_before_load,
          )
@@ -24189,7 +24362,7 @@ index 74938a823..03852523c 100644
          if not load_dummy_weights:
              prepare_communication_buffer_for_model(self.model)
              if (drafter := getattr(self, "drafter", None)) and (
-@@ -5969,7 +7090,8 @@ class GPUModelRunner(
+@@ -5969,7 +7113,8 @@ class GPUModelRunner(
              else:
                  hidden_states = outputs
  
@@ -24199,7 +24372,7 @@ index 74938a823..03852523c 100644
                  self.speculative_config.use_eagle()
                  or self.speculative_config.uses_draft_model()
                  or self.speculative_config.uses_extract_hidden_states()
-@@ -6875,8 +7997,9 @@ class GPUModelRunner(
+@@ -6875,8 +8020,9 @@ class GPUModelRunner(
          # because some of them change the threshold at init time.
          self.calculate_reorder_batch_threshold()
  
@@ -24211,7 +24384,7 @@ index 74938a823..03852523c 100644
              self.speculative_config.use_eagle()
              or self.speculative_config.uses_draft_model()
          ):
-@@ -6929,7 +8052,8 @@ class GPUModelRunner(
+@@ -6929,7 +8075,8 @@ class GPUModelRunner(
          )
  
          # Initialize drafter's cudagraph dispatcher if using spec decode.
