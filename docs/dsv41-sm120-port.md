@@ -125,7 +125,26 @@ our concurrency scaling and KV capacity on four cards are lower (util 0.92 vs 0.
 KV per token per GPU in vLLM's FP8 layout), and their Engram cache is what makes 128 GB hosts
 work at all — vLLM's pinned offload needs ~190 GiB of host RAM.
 
-So four cards work for ≤ ~1–2M total KV tokens without any offload machinery; the 1M‑token window
+**Why 0.95 failed, and how to run at 0.94–0.95.** The OOM was not per‑rank asymmetry in the
+profile: it hit during the FlashInfer **autotune** step (`kernel_warmup.py: Running FlashInfer
+autotune with N tokens`), which runs a full forward at `max_num_batched_tokens` *after* the KV
+cache is allocated and sweeps MXFP8 GEMM tactics, each with its own workspace — a transient the
+memory profile never saw. The autotune result is cached under
+`/root/.cache/vllm/flashinfer_autotune_cache/<flashinfer>/<arch>/<hash>/autotune_configs.json`
+(keyed by the kernel shapes, i.e. the TP layout and flags); once it exists the warmup replays the
+cached tactics and its peak is an ordinary forward. So: bring the configuration up once at a
+conservative utilization to populate the cache (or start with
+`--kernel-config '{"enable_flashinfer_autotune": false}'`), keep `/root/.cache/vllm` mounted, then
+raise the utilization. Measured with the cache in place (TP4, DSpark k=5, mnbt 4096, capture 64,
+text‑only):
+
+| util | KV | idle / C8‑load peak per GPU | notes |
+|---|---|---|---|
+| 0.92 | 2.54 GiB → 1.00M tokens | 89.6 GB | first start (populates the autotune cache) |
+| 0.94 | **4.44 GiB → 1.75M tokens** | 91.7 / 93.8 GB | C8 @17.5K 469 tok/s, 0 errors — recommended |
+| 0.95 | **5.39 GiB → 2.13M tokens** | 92.7 / **97.2 GB** | C8 @1.1K **773 tok/s**, C8 @17.5K 578, C1 289; 8×146K concurrent (1.17M populated) OK — 0.7 GB from the wall |
+
+So four cards work for ≤ ~2M total KV tokens without any offload machinery; the 1M‑token window
 is possible only by trading KV (KV/token at TP4 is ~2.6 KB/GPU). Headroom is the limiting factor, not fit: the vLLM‑Moet expert tiers (2‑bit base,
 FP4 delta, base cache) would halve the 259.5 GiB of experts and are the route to comfortable TP4
 or TP2, but they need a port of the `moe_w2` stack onto this vLLM base plus K=5120 / K=576·1152
