@@ -97,6 +97,23 @@ fp8 KV, `--gpu-memory-utilization 0.90`):
 | prefill | ~8.9k tok/s (single request, incl. decode of the answer) |
 | decode, single stream | **150.9 tok/s** (512 tokens); DSpark accepted 726 of 2,200 drafted over 440 steps (~2.65 tok/step) |
 
+## TP4 (4× RTX PRO 6000) — fits, thinly
+
+Engram lives in host RAM either way, so the GPU‑resident part is 286 GiB (experts 259.5 + 16.2
+scales, dense/attention ~6.6, embeddings/vision 3.7). Measured (same image, GPUs 0–3, 2026‑09‑16):
+
+| config | outcome |
+|---|---|
+| util 0.95, `--max-num-batched-tokens 8192`, no DSpark, `--language-model-only`, capture 64, ctx 256K | weights **78.9 GiB/GPU**, KV 6.85 GiB (2.03M tokens) allocated — then rank 3 OOM (320 MiB for the mHC post kernel, 217 MiB free) during warmup and an NCCL hang of the other ranks; the profile leaves no headroom for per‑rank asymmetry |
+| util **0.92**, `--max-num-batched-tokens 4096`, otherwise as above | **serves**: weights 78.8 GiB/GPU, KV **5.22 GiB → 2,060,792 tokens** (7.86× at 256K), 89.5 GB/GPU used; `17*19 → 323`, needle PASS at 62K prompt tokens, prefill ~9k tok/s, decode **106 tok/s** single stream (no drafter) |
+
+So four cards work for ≤ ~1M total KV tokens without any offload machinery; DSpark's drafter
+(~1.7 GiB/GPU at TP4) and a 1M‑token window are possible only by trading KV (KV/token at TP4 is
+~2.6 KB/GPU). Headroom is the limiting factor, not fit: the vLLM‑Moet expert tiers (2‑bit base,
+FP4 delta, base cache) would halve the 259.5 GiB of experts and are the route to comfortable TP4
+or TP2, but they need a port of the `moe_w2` stack onto this vLLM base plus K=5120 / K=576·1152
+cubin families.
+
 ## Apply / build / run
 
 ```bash
