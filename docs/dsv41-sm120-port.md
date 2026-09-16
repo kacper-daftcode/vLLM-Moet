@@ -107,9 +107,26 @@ scales, dense/attention ~6.6, embeddings/vision 3.7). Measured (same image, GPUs
 | util 0.95, `--max-num-batched-tokens 8192`, no DSpark, `--language-model-only`, capture 64, ctx 256K | weights **78.9 GiB/GPU**, KV 6.85 GiB (2.03M tokens) allocated — then rank 3 OOM (320 MiB for the mHC post kernel, 217 MiB free) during warmup and an NCCL hang of the other ranks; the profile leaves no headroom for per‑rank asymmetry |
 | util **0.92**, `--max-num-batched-tokens 4096`, otherwise as above | **serves**: weights 78.8 GiB/GPU, KV **5.22 GiB → 2,060,792 tokens** (7.86× at 256K), 89.5 GB/GPU used; `17*19 → 323`, needle PASS at 62K prompt tokens, prefill ~9k tok/s, decode **106 tok/s** single stream (no drafter) |
 
-So four cards work for ≤ ~1M total KV tokens without any offload machinery; DSpark's drafter
-(~1.7 GiB/GPU at TP4) and a 1M‑token window are possible only by trading KV (KV/token at TP4 is
-~2.6 KB/GPU). Headroom is the limiting factor, not fit: the vLLM‑Moet expert tiers (2‑bit base,
+With DSpark (drafter +2.4 GiB/GPU at TP4, same flags otherwise): weights 81.2 GiB/GPU, KV
+**2.54 GiB → 1,003,825 tokens** (3.83× at 256K). Synthetic repeated‑text sweep (T=0, 1024 forced
+output tokens, `ignore_eos`, unique prefixes): C1 **336 tok/s** (DSpark acceptance 80%), C4 555,
+C8 590 total tok/s at 1.5K input; C1 313, C4 425, C8 479 at 24K input; code prompt 194 tok/s
+(acceptance 72%), prose 157 tok/s (25%). The same sweep on TP8: C1 211, C4 820, C8 1109 at 1.5K;
+C1 173, C4 514, C8 520 at 24K; code 256 tok/s. DSpark acceptance is set by the workload (23–80%),
+not by the TP layout.
+
+Reference point — [0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000](https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000)
+(SGLang image + adapter; SM120 sparse decode through a Triton kernel and 64‑token re‑paging of
+the prefill sources instead of native kernels; Engram in a 64 GiB DDR5 row cache with exact NVMe
+misses for 128 GB hosts; TP4/EP4; 275 W): C1 197–232 tok/s, C8 700–750 total tok/s on repeated
+synthetic text with 8,192 forced output tokens at ~80% acceptance; 4.06M populated KV tokens at
+memory fraction 0.95 and 4.2M allocated. Our per‑stream decode on four cards is equal or higher;
+our concurrency scaling and KV capacity on four cards are lower (util 0.92 vs 0.95, ~2.7 KB of
+KV per token per GPU in vLLM's FP8 layout), and their Engram cache is what makes 128 GB hosts
+work at all — vLLM's pinned offload needs ~190 GiB of host RAM.
+
+So four cards work for ≤ ~1–2M total KV tokens without any offload machinery; the 1M‑token window
+is possible only by trading KV (KV/token at TP4 is ~2.6 KB/GPU). Headroom is the limiting factor, not fit: the vLLM‑Moet expert tiers (2‑bit base,
 FP4 delta, base cache) would halve the 259.5 GiB of experts and are the route to comfortable TP4
 or TP2, but they need a port of the `moe_w2` stack onto this vLLM base plus K=5120 / K=576·1152
 cubin families.
