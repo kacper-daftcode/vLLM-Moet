@@ -1,0 +1,82 @@
+# vLLM-Moet: DeepSeek-V4.1-Flash on SM120 (RTX PRO 6000 Blackwell / RTX 5090)
+#
+# Serving image = official vllm/vllm-openai:deepseekv41-flash-0909 (the tag the vLLM
+# recipe pins for DeepSeek-V4.1-Flash on NVIDIA) with the SM120 kernel gaps closed:
+#   1. FlashInfer 0.6.18 sparse-MLA SM120: instantiations for the DeepSeek-V4.1
+#      geometry (SWA page 32, compressed page 128, SWA rows 1152/192) and a
+#      page-size-aware dispatch hook (tools/dsv41_sm120/patch_flashinfer.py +
+#      sparse_mla_sm120_dsv41.cu). The AOT sparse_mla_sm120.so is removed (it would
+#      be loaded INSTEAD of the patched JIT sources) and the module is precompiled
+#      into the JIT cache, so the first serve pays no JIT compile.
+#   2. DeepGEMM 8b1392b9 (the pin vendored in the image): SM120 FP8 paged MQA logits
+#      accept the 128-row indexer pages of the compress_ratio=1 layers
+#      (tools/dsv41_sm120/patch_deepgemm.py); _C is rebuilt INSIDE the official image
+#      so the python/glibc/torch ABI matches by construction, like Dockerfile.sm120-v024.
+# vLLM itself is untouched: the model's page geometry stays identical to the
+# datacenter (SM100) path, only the kernels learned the shapes.
+#
+# Build (from the repo root):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41 -t vllm-moet-sm120:dsv41-0909 .
+#
+# Serve (official checkpoint, 8x RTX PRO 6000, TP8, DSpark k=5, 1M context):
+#   docker run -d --name ds41-flash --gpus '"device=0,1,2,3,4,5,7,8"' --network host --ipc host \
+#     --ulimit memlock=-1:-1 --ulimit stack=67108864 \
+#     -v /path/to/DeepSeek-V4.1-Flash:/model:ro \
+#     -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e NCCL_P2P_DISABLE=1 \
+#     vllm-moet-sm120:dsv41-0909 \
+#     --model /model --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
+#     --tensor-parallel-size 8 --tokenizer-mode deepseek_v41 \
+#     --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice \
+#     --kv-cache-dtype fp8 --gpu-memory-utilization 0.90 --max-model-len 1048576 \
+#     --max-num-seqs 64 --max-num-batched-tokens 16384 \
+#     --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}' \
+#     --host 0.0.0.0 --port 8000
+#   (enable_adaptive_verification must stay false: DeepseekV4IndexerBackend on this path
+#    does not support it - the same override the vLLM recipe applies on AMD.)
+#
+# Port notes, gap inventory and validation: docs/dsv41-sm120-port.md.
+
+ARG BASE_IMAGE=vllm/vllm-openai:deepseekv41-flash-0909
+
+# ---------------------------------------------------------------- deep_gemm
+# The runtime image ships nvcc 13.0 + torch 2.13 + py3.12 for JIT, and the CUDA
+# headers/libs live in the pip nvidia-cu13 wheels (no apt CUDA dev packages
+# needed): CPATH for the headers, a symlink dir for the unversioned -lnvrtc.
+FROM ${BASE_IMAGE} AS deepgemm-builder
+ARG DEEPGEMM_REF=8b1392b978f5a03c828dd1711090d7fb50958b8a
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir --break-system-packages pybind11 wheel
+RUN git clone https://github.com/deepseek-ai/DeepGEMM.git /deepgemm \
+    && cd /deepgemm && git checkout "$DEEPGEMM_REF" \
+    && git submodule update --init --depth 1 third-party/cutlass third-party/fmt
+COPY tools/dsv41_sm120/patch_deepgemm.py /tmp/patch_deepgemm.py
+RUN python3 /tmp/patch_deepgemm.py /deepgemm
+RUN mkdir -p /tmp/linklibs \
+    && ln -sf /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libnvrtc.so.13 /tmp/linklibs/libnvrtc.so \
+    && ln -sf /usr/local/cuda/lib64/libcudart.so.13 /tmp/linklibs/libcudart.so \
+    && cd /deepgemm \
+    && CPATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include \
+       LIBRARY_PATH=/tmp/linklibs \
+       python3 setup.py build_ext --inplace \
+    && ls -la /deepgemm/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so
+
+# ---------------------------------------------------------------- final image
+FROM ${BASE_IMAGE}
+
+# 1. DeepGEMM _C with the SM120 block_kv=128 paged MQA path (headers are unchanged,
+#    so the vendored JIT device sources stay as shipped).
+COPY --from=deepgemm-builder /deepgemm/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so \
+     /usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so
+
+# 2. FlashInfer DSV4.1 SM120 instantiations: patch the installed JIT sources, drop the
+#    AOT artifact, precompile for the sm_120 family so no worker JIT-compiles at boot.
+COPY tools/dsv41_sm120/ /opt/vllm-moet/dsv41_sm120/
+RUN python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer.py \
+    && rm -f /usr/local/lib/python3.12/dist-packages/flashinfer_jit_cache/jit_cache/sparse_mla_sm120/sparse_mla_sm120.so \
+    && FLASHINFER_CUDA_ARCH_LIST=12.0f python3 -c \
+       "from flashinfer.jit.mla import gen_sparse_mla_sm120_module; s = gen_sparse_mla_sm120_module(); s.build(verbose=False); assert s.jit_library_path.exists(), s.jit_library_path; print('precompiled', s.jit_library_path)" \
+    && python3 -c "import vllm.third_party.deep_gemm as dg; print('deep_gemm', dg.__version__, dg._C.__file__)"
+
+LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120" \
+      org.opencontainers.image.description="vllm/vllm-openai:deepseekv41-flash-0909 + DSV4.1 SM120 sparse-MLA instantiations (FlashInfer) + DeepGEMM 128-row paged MQA logits on sm_120"
