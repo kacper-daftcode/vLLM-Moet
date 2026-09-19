@@ -120,7 +120,20 @@ not available on the host — check IOMMU / ACS settings.
 ## Memory headroom
 
 DeepSeek at `GPU_MEM_UTIL=0.94` peaks at ~96.0 GB/GPU under C8 with 7.7K-token prompts (1.2 GB from
-the wall) — do not raise it. Qwen with `--kv-cache-memory 32GiB` uses ~88 GB/GPU; vLLM's own
+the wall). Where the card goes (vLLM's own start-up accounting, per GPU of 94.97 GiB usable):
+84.4 GiB weights + non-torch, 1.8 GiB peak activation at 4096 batched tokens, 0.4 GiB CUDA graphs,
+**3.1 GiB KV = 1.47M tokens**; another ~4 GiB appear during serving (FlashInfer/DeepGEMM workspaces,
+NCCL, allocator) — `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` changes none of it (84.41 GiB
+consumed, same KV), so this is real allocation, not fragmentation. The 4.2M-token pools that the
+EP4 SGLang recipe reports on the same cards come from its 72.6 GiB weight footprint, not from a
+knob on this side.
+
+Capacity profile, measured 2026-09-19: `GPU_MEM_UTIL=0.95 MAX_NUM_BATCHED_TOKENS=2048` gives
+**4.19 GiB KV = 2.21M tokens (+50 %, 4.2× concurrency at 512K)** at the same decode speed
+(67 steps/s, 147 / 347 tok/s), **−7 % prefill** (10.1–11.0k vs 11.0–11.9k tok/s) and a thinner
+margin: 716 MiB free at the peak of 8×131K-token streams + a 367K needle + vision (all passed).
+Use it only with the FlashInfer autotune cache already populated (the cold sweep OOMs at 0.95),
+and keep `0.94 / 4096` where prefill or margin matter more. Qwen with `--kv-cache-memory 32GiB` uses ~88 GB/GPU; vLLM's own
 start-up estimate would give only 5.6 GiB of KV because the GPU-PLE profile run over-reports its
 peak activation (a compile-time transient), hence the explicit KV size. Image/video prompts on
 Qwen (it is a VL model) were not stress-tested for memory; drop `KV_CACHE_MEMORY` to 28 GiB if

@@ -144,6 +144,57 @@ DDR5 row cache with exact NVMe misses — vLLM's offload needs ~190 GiB pinned),
 81 GiB; our pool is 1.49M at 512K), and its image tokenization matches the checkpoint's reference
 exactly. Its `ram` mode on a large‑memory host is a sound baseline at 40 steps/s.
 
+## What was worth taking from the other stack (checked 2026-09-19)
+
+- **Its MoE kernel — no.** vLLM can run the same FlashInfer CUTLASS W4A8 fused MoE with
+  `--moe-backend flashinfer_cutlass_afp8`, and the B12x sm_120 kernels with `--moe-backend b12x`.
+  Per layer at the served rank shape on an RTX 5090 (`tools/sm120_perf/moe_backends_bench.py`):
+  DeepGEMM chain (served) 99 µs vs FlashInfer CUTLASS 207 µs vs B12x 157 µs at 6 tokens/step; 593 vs
+  1000 vs 716 µs at 48 (C8). B12x wins only at 1 token/step (26 vs 43 µs), i.e. without DSpark.
+  B12x's dense MXFP8 GEMM is 1.4–3× slower than this repo's GEMV at the decode shapes with
+  identical numerics (`tools/sm120_perf/dense_b12x_bench.py`). Details: `tools/dsv41_sm120/README.md`.
+- **Its KV capacity — not a knob here.** vLLM's accounting per card: 84.4 GiB weights + non-torch,
+  1.8 GiB activation peak, 0.4 GiB graphs, 3.1 GiB KV; `expandable_segments` changes nothing (real
+  allocations, not fragmentation). The only configuration lever is `GPU_MEM_UTIL=0.95` +
+  `MAX_NUM_BATCHED_TOKENS=2048`: 2.21M tokens (+50 %) at −7 % prefill and 716 MiB of margin under
+  the heaviest stress we run — documented as an opt-in capacity profile in
+  [sm120-deploy.md](sm120-deploy.md), default unchanged. Closing the gap to 4.2M means the EP4
+  weight layout (72.6 vs 81 GiB per card), a code-level change.
+- **Its image tokenization — an upstream vLLM issue, not a local patch.** vLLM's `safe_resize`
+  reserves `COMPRESS_PAD_TO − 1 = 3` tokens of `vision_max_n_token` because its image block carries
+  the compressor-alignment pad (0–3 tokens), an even-row pad and a 2-token tail pad *inside* the
+  1024-wide bidirectional SWA index rows (`max_image_tokens = vision_max_n_token` in
+  `attention.py`, `image_width` in `combine_topk_swa_indices`). The reference processor has no such
+  pads, so an image whose reference grid is 1022–1024 tokens (3024×588 → 14×72 = 1024) is shrunk
+  to the next grid that fits 1021 (13×67 = 886). The fix belongs upstream: widen the SWA image
+  span by the pad allowance instead of shrinking the image. Issue text below; not patched in this
+  image because the span width is a compile-time constant of the index kernel.
+
+<details>
+<summary>Draft vLLM issue: DeepSeek-V4.1 image processor shrinks budget-boundary images (886 instead of 1024 tokens)</summary>
+
+**Summary.** `vllm/models/deepseek_v4/common/mm_preprocess.py::safe_resize` subtracts
+`COMPRESS_PAD_TO - 1` (= 3) from `vision_max_n_token` before checking whether an image fits. The
+checkpoint's reference `inference/image_processor.py` checks against the full 1024. Any image whose
+reference token grid is 1022–1024 tokens is therefore resized down in vLLM. Example: a 3024×588
+PNG → reference 14×72 grid = 1024 tokens (SGLang reports `image_tokens: 1024`); vLLM produces 886
+(13×67). Five other sizes (1024², 640×480, 1920×1080, 300×200, 4000×3000) match the reference
+exactly (652, 206, 968, 189, 1001). Script: `tools/sm120_perf/image_tokens_check.py` in
+vLLM‑Moet.
+
+**Why the reserve exists.** `build_image_block` adds a position-dependent compressor pad
+(0–3), an even-row pad and a 2-token tail pad inside the image span, and
+`DeepseekV4Attention.max_image_tokens = vision_max_n_token` (also `image_width` in the
+`combine_topk_swa_indices` warmup keys) bounds the bidirectional SWA index rows by exactly 1024, so
+the block must stay ≤ 1024 including pads.
+
+**Suggested fix.** Let `safe_resize` use the full `vision_max_n_token` (reference behaviour) and
+widen the attention-side span bound to `vision_max_n_token + (COMPRESS_PAD_TO - 1) + row_len + 2`
+(or pad the span bound to the next multiple of 128, which the prefill rows already use), so the
+kernel constant covers the padded block. Version: official `vllm/vllm-openai:deepseekv41-flash-0909`
+(v0.1.dev20904+g179dd0fa9), sm_120 and unchanged upstream code path.
+</details>
+
 ## Reproduce
 
 ```bash

@@ -57,6 +57,30 @@ required. The FC1/FC2 padding output (5.9 + 23.6 MB per layer) is written by the
 (tiles are skipped only when the whole 64-row tile is padding); a smaller BLOCK_M would need a
 new DeepGEMM kernel instantiation. The glue kernels above are what was left to take.
 
+## The other sm_120 kernels for the same job: FlashInfer CUTLASS W4A8 and B12x (2026-09-19)
+
+vLLM 0.30 can drive two other MXFP4-expert kernels on sm_120 with a flag: `--moe-backend
+flashinfer_cutlass_afp8` (FlashInfer's CUTLASS fused MoE, MXFP8 activations × MXFP4 weights — the
+kernel 0xSero's SGLang stack uses here) and `--moe-backend b12x` (`pip install b12x`, the
+local-inference-lab CuTe-DSL kernels for Blackwell consumer/pro parts, `w4a8_mx`). Per MoE layer on
+the served rank shape (384 experts, K 5120, I 640, top-6), cold L2, RTX 5090
+(`tools/sm120_perf/moe_backends_bench.py`):
+
+| tokens per step | DeepGEMM chain (served) | FlashInfer CUTLASS W4A8 | B12x `w4a8_mx` |
+|---:|---:|---:|---:|
+| 1 | 43 µs | 84 µs | **26 µs** |
+| 6 (DSpark k=5, one stream) | **99 µs** | 207 µs | 157 µs |
+| 16 | **251 µs** | 455 µs | 350 µs |
+| 48 (C8 decode) | **593 µs** | 1 000 µs | 716 µs |
+| 64 | **698 µs** | 1 190 µs | 834 µs |
+
+B12x wins only without speculative decoding (one token per step); with DSpark's 6+ verified
+tokens the DeepGEMM chain is 1.6× faster than B12x and 2.1× faster than FlashInfer's CUTLASS
+MoE, so the served path stays. B12x also ships a dense MXFP8 GEMM (`b12x.gemm.blockscaled.mm`);
+against the GEMV above at the six decode shapes it is 1.4–3× slower at M = 6 (e.g. `wo_b`
+5120←2048: 6.7 vs 9.7 µs, `kv_a` 576←5120: 5.1 vs 15.1 µs) with identical numerics
+(`tools/sm120_perf/dense_b12x_bench.py`).
+
 Run the tests inside the built image on one SM120 GPU:
 
 ```bash
