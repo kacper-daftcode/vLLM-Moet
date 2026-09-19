@@ -14,7 +14,9 @@ For every case this script checks
            (the per-token math is independent of the page grouping).
 
 Shapes follow vLLM's V4.1 indexer: 32 heads, head_dim 128, fp32 weights,
-2-D context_lens, next_n 1 (native decode) and 2.
+2-D context_lens; native decode with next_n 1, 2 and 6 (DSpark k=5), plus the
+varlen mode (`indices=`, one row per token, 1..6 tokens per request) that
+vLLM's SM100 decode path and adaptive verification rely on.
 
 Run inside the serving image on one SM120 GPU with the patched _C.so in place:
   python3 test_deepgemm_sm120_paged_mqa.py [--module vllm.third_party.deep_gemm]
@@ -140,26 +142,86 @@ def run_case(dg, bsz: int, next_n: int, avg_kv: int, device) -> dict:
     return res
 
 
+def run_case_varlen(dg, bsz: int, max_tokens_per_seq: int, avg_kv: int, device) -> dict:
+    """Varlen decode (vLLM's SM100 path, DeepGEMM `indices=`): every query row is one
+    token; rows of the same request share its block-table row and see a causal context
+    (ctx - t + 1 + j). This is the mode adaptive verification needs (device-side query
+    lengths), so it is validated on sm_120 for both indexer page sizes."""
+    torch.manual_seed(11)
+    heads, dim = 32, 128
+    max_model_len = ((int(1.3 * avg_kv) + max_tokens_per_seq + 127) // 128) * 128
+    context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (bsz,), device=device, dtype=torch.int32)
+    context_lens[bsz // 2] = 0  # empty request in the middle
+    tokens_per_seq = torch.randint(1, max_tokens_per_seq + 1, (bsz,), device=device, dtype=torch.int32)
+    tokens_per_seq[0] = 1
+    tokens_per_seq[-1] = max_tokens_per_seq
+    rows = int(tokens_per_seq.sum().item())
+    indices = torch.arange(bsz, device=device, dtype=torch.int32).repeat_interleave(tokens_per_seq)
+    offs = torch.cat([torch.arange(int(n), device=device, dtype=torch.int32) for n in tokens_per_seq.tolist()])
+    # row j of a request with t drafted tokens sees ctx - (t - 1) + j tokens (causal block)
+    ctx_rows = (context_lens[indices] - (tokens_per_seq[indices] - 1) + offs).clamp_min(0)
+    ctx_rows = torch.where(context_lens[indices] == 0, torch.zeros_like(ctx_rows), ctx_rows)
+    q = torch.randn((rows, 1, heads, dim), device=device, dtype=torch.bfloat16)
+    weights = torch.randn((rows, heads), device=device, dtype=torch.float)
+    kv_tokens = torch.randn((bsz, max_model_len, dim), device=device, dtype=torch.bfloat16)
+    ctx2d = ctx_rows.view(-1, 1).contiguous()
+    positions = torch.arange(max_model_len, device=device).unsqueeze(0).expand(rows, -1)
+    neginf_mask = ~(positions < ctx2d)
+
+    q_in = q.to(torch.float8_e4m3fn)
+    q_sim = q_in.to(torch.bfloat16)
+    res = dict(case=f"varlen bsz={bsz} rows={rows} tps<={max_tokens_per_seq} avg_kv={avg_kv}")
+    out_by_pbs = {}
+    for block_kv in (64, 128):
+        kv_cache, block_table = paged_views(kv_tokens, context_lens, block_kv, max_model_len, device)
+        kv_in, kv_sim = kv_cache_cast_to_fp8(kv_cache)
+        row_block_table = block_table[indices.long()].contiguous()  # one block-table row per query row
+        sim_logits = ref_paged_mqa_logits(q_sim, kv_sim, weights, ctx_rows, row_block_table, max_model_len, True)
+        meta = dg.get_paged_mqa_logits_metadata(ctx2d, block_kv, dg.get_num_sms(), indices=indices)
+        kw = dict(q=(q_in, None), kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=row_block_table,
+                  schedule_meta=meta, max_context_len=max_model_len, clean_logits=False, logits_dtype=torch.float,
+                  indices=indices)
+        logits = dg.fp8_fp4_paged_mqa_logits(**kw)
+        torch.cuda.synchronize()
+        again = dg.fp8_fp4_paged_mqa_logits(**kw)
+        torch.cuda.synchronize()
+        lm = logits.masked_fill(neginf_mask, 0)
+        res[f"self_consistent_{block_kv}"] = bool(torch.equal(lm, again.masked_fill(neginf_mask, 0)))
+        res[f"ref_diff_{block_kv}"] = calc_diff(lm, sim_logits.masked_fill(neginf_mask, 0))
+        out_by_pbs[block_kv] = lm
+    res["parity_maxdiff"] = (out_by_pbs[64] - out_by_pbs[128]).abs().max().item()
+    res["parity"] = "BIT-EXACT" if torch.equal(out_by_pbs[64], out_by_pbs[128]) else f"maxdiff={res['parity_maxdiff']:.3e}"
+    res["ok"] = (res["ref_diff_64"] < 1e-3 and res["ref_diff_128"] < 1e-3 and res["self_consistent_64"]
+                 and res["self_consistent_128"] and res["parity_maxdiff"] <= 1e-3)
+    return res
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--module", default="vllm.third_party.deep_gemm")
+    ap.add_argument("--only", choices=("native", "varlen"), default=None, help="run one family of cases")
     args = ap.parse_args()
     dg = importlib.import_module(args.module)
     device = torch.device("cuda")
     print(f"device={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)} deep_gemm={dg.__version__} from {dg.__file__}")
-    cases = list(itertools.product((16, 256), (1, 2), (2048, 8192)))
+    # native decode: (bsz, next_n, avg_kv); DSpark k=5 -> next_n 6 is the served shape on sm_120
+    cases = [("native",) + c for c in itertools.product((16, 256), (1, 2, 6), (2048, 8192))]
+    # varlen (indices=): (bsz, max_tokens_per_seq, avg_kv)
+    cases += [("varlen",) + c for c in itertools.product((16, 64), (1, 6), (2048, 8192))]
+    if args.only:
+        cases = [c for c in cases if c[0] == args.only]
     fails = 0
     t0 = time.time()
-    for bsz, next_n, avg_kv in cases:
+    for kind, bsz, n, avg_kv in cases:
         try:
-            r = run_case(dg, bsz, next_n, avg_kv, device)
+            r = run_case(dg, bsz, n, avg_kv, device) if kind == "native" else run_case_varlen(dg, bsz, n, avg_kv, device)
         except Exception as e:  # noqa: BLE001
-            r = dict(case=f"bsz={bsz} next_n={next_n} avg_kv={avg_kv}", ok=False, err=repr(e)[:200])
+            r = dict(case=f"{kind} bsz={bsz} n={n} avg_kv={avg_kv}", ok=False, err=repr(e)[:200])
         fails += 0 if r["ok"] else 1
         if "err" in r:
-            print(f"[BAD] {r['case']:<34} ERROR {r['err']}")
+            print(f"[BAD] {r['case']:<44} ERROR {r['err']}")
         else:
-            print(f"[{'ok ' if r['ok'] else 'BAD'}] {r['case']:<34} ref64={r['ref_diff_64']:.2e} ref128={r['ref_diff_128']:.2e} "
+            print(f"[{'ok ' if r['ok'] else 'BAD'}] {r['case']:<44} ref64={r['ref_diff_64']:.2e} ref128={r['ref_diff_128']:.2e} "
                   f"selfc={int(r['self_consistent_64'])}{int(r['self_consistent_128'])} parity={r['parity']}")
         sys.stdout.flush()
     print(f"\n{len(cases) - fails}/{len(cases)} passed in {time.time() - t0:.0f}s")
