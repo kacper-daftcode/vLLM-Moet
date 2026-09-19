@@ -443,6 +443,15 @@ model thinly (81 GiB/GPU of weights); the same image runs TP8 with a 1M window o
 (`GPUS=0,…,7 TP=8 MAX_MODEL_LEN=1048576`, 7.5M‑token KV pool). Gap inventory, validation and the
 memory budget per configuration: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
 
+Measured head‑to‑head on the same host against the other public 4× RTX PRO 6000 recipe for this
+checkpoint ([0xSero's SGLang launcher](https://github.com/0xSero/deepseek-v4.1-flash-4x-rtx-pro-6000),
+his settings, his benchmark methodology, one client for both): identical quality (GSM8K‑200 96.5 %
+vs 96.5–97.5 %, McNemar p = 1; needle 6/6 both up to 367K tokens; same DSpark tokens/step) at
+**67 vs 40 decode steps/s** with his Engram table in RAM — single stream +53–66 %, C8 +24–30 %,
+prefill equal; his default NVMe row‑cache mode runs at 13–29 steps/s on unseen text. His stack
+keeps 2.8× the KV tokens and fits 128 GB hosts. Full tables and caveats:
+**[docs/dsv41-sm120-vs-0xsero.md](docs/dsv41-sm120-vs-0xsero.md)**.
+
 ## Qwen3.8‑Flash‑Next‑FP8 on 4× RTX PRO 6000 — official checkpoint, official image, 3× the decode
 
 The official `vllm/vllm-openai` nightly serves this 177B‑A6B model on sm_120 out of the box, at

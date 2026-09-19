@@ -7,7 +7,11 @@ step goes"), `tools/qwen38_sm120/README.md`.
 
 | script | what it does |
 |---|---|
-| `decode_bench.py BASE MODEL [chat_template_kwargs_json]` | single-stream prose/code decode (tok/s, steps/s, tok/step via streaming chunks) + a ~16K prefill |
+| `decode_bench.py BASE MODEL [chat_template_kwargs_json]` | single-stream prose/code decode (tok/s, steps/s, tok/step via streaming chunks) + a ~16K prefill; `API_KEY` env adds the Bearer header |
+| `openai_matrix.py --base URL --model M --model-dir DIR --sizes ... --concurrencies ... --output-tokens N --out F` | burst-serving matrix with 0xSero's `benchmarks/matrix.py` methodology (exact-size token-id prompts, forced output budget, shared decode window) through `/v1/completions`, so vLLM and SGLang are measured by one client; `--metrics-url` reads vLLM's DSpark counters per wave — `docs/dsv41-sm120-vs-0xsero.md` |
+| `quality_cmp.py --base URL --model M --out F [--api-key K]` | same-checkpoint fidelity probes: arithmetic (thinking off/on), coherence, 24 greedy answers for cross-stack diff, tool round trip, strict JSON schema, vision smoke, needle at ~29K/106K/400K tokens |
+| `compare_outputs.py A.json B.json [--tokenizer tokenizer.json]` | two `quality_cmp.py` results side by side + greedy-output agreement (identical count, first divergence in chars/tokens) |
+| `image_tokens_check.py BASE MODEL [API_KEY]` | image token count of a served DeepSeek-V4.1 stack for six image sizes vs the checkpoint's `inference/image_processor.py` formula |
 | `prefill_probe.py BASE MODEL GPUS [ntok] [kwargs]` | prefill on a fresh random prompt (no prefix-cache hit) while sampling `nvidia-smi` for the peak GPU memory |
 | `needle_any.py BASE MODEL '{"chat_template_kwargs":{...}}' [targets]` | needle-in-a-haystack at two depths per target length + two coherence prompts |
 | `concurrency_probe.py BASE MODEL [C] [prompt_tok] [kwargs]` | C parallel requests (~prompt_tok in, 256 out): per-request times, aggregate tok/s, error count |

@@ -1,0 +1,379 @@
+{
+ "label": "vLLM-Moet sm120 (ours)",
+ "base": "http://127.0.0.1:8001",
+ "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+ "started": "2026-09-19T09:11:11",
+ "arith_nothink": {
+  "score": 5,
+  "of": 5,
+  "rows": [
+   {
+    "gold": 9716,
+    "got": 9716,
+    "ok": true,
+    "completion_tokens": 3,
+    "s": 0.06
+   },
+   {
+    "gold": 6364,
+    "got": 6364,
+    "ok": true,
+    "completion_tokens": 3,
+    "s": 0.06
+   },
+   {
+    "gold": 482816,
+    "got": 482816,
+    "ok": true,
+    "completion_tokens": 3,
+    "s": 0.07
+   },
+   {
+    "gold": 4420,
+    "got": 4420,
+    "ok": true,
+    "completion_tokens": 3,
+    "s": 0.06
+   },
+   {
+    "gold": 16334,
+    "got": 16334,
+    "ok": true,
+    "completion_tokens": 3,
+    "s": 0.06
+   }
+  ]
+ },
+ "arith_nothink_s": 0.3,
+ "arith_think": {
+  "score": 5,
+  "of": 5,
+  "rows": [
+   {
+    "gold": 9716,
+    "got": 9716,
+    "ok": true,
+    "completion_tokens": 40,
+    "s": 0.17
+   },
+   {
+    "gold": 6364,
+    "got": 6364,
+    "ok": true,
+    "completion_tokens": 41,
+    "s": 0.2
+   },
+   {
+    "gold": 482816,
+    "got": 482816,
+    "ok": true,
+    "completion_tokens": 40,
+    "s": 0.18
+   },
+   {
+    "gold": 4420,
+    "got": 4420,
+    "ok": true,
+    "completion_tokens": 36,
+    "s": 0.17
+   },
+   {
+    "gold": 16334,
+    "got": 16334,
+    "ok": true,
+    "completion_tokens": 46,
+    "s": 0.19
+   }
+  ]
+ },
+ "arith_think_s": 0.9,
+ "coherence": {
+  "degenerate": 0,
+  "of": 12,
+  "texts": [
+   " Canberra\nB: Sydney\nC: Melbourne\nD: Perth\nA: Canberra",
+   " 9",
+   "def fibonacci(n):\n    if n <= 0:\n        return 0\n    elif n == 1:\n        return 1\n    else:\n        a, b = 0, 1\n        for _ in range(2, n + 1):\n            a, b = b, a + b\n        return b\n```",
+   " 'Le temps est magnifique aujourd'hui, allons nous promener dans le parc.'\nThe weather is beautiful today, let's go for a walk in the park.\nThe weather is beautiful today, let's go for a walk in the park.\nThe weather is beautiful today, let's go for a walk in the park.\nThe weather is beautiful today, let's go for a walk in the park.\nThe weather is beautiful today, let's go for a walk in the park.\nThe weather is beautiful today, let's go for a walk in the park.\nThe weather is beautiful today, let's go for a walk in the",
+   " Let's think step by step.",
+   " The industrial revolution transformed economies from agriculture and handicrafts to large-scale industry and mechanized manufacturing, increasing productivity and efficiency.\n\nThe industrial revolution transformed economies from agriculture and handicrafts to large-scale industry and mechanized manufacturing, increasing productivity and efficiency.",
+   " Saturn\nB: Jupiter\nC: Uranus\nD: Neptune\nB: Jupiter",
+   " 847 + 256 = 1103.\nQ: What is 847 + 256? Show your work.\nA: 847 + 256 = 1103.\nQ: What is 847 + 256? Show your work.\nA: 847 + 256 = 1103.\nQ: What is 847 + 256? Show your work.\nA: 847 + 256 = 1103.\nQ: What is 847 + 256? Show your work.\nA: 847 + 256 = 1103.\nQ: What is 847 + 256? Show your work.\n",
+   "xs = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n```\n\nThe output should be a list of the squares of the even numbers in xs.\n\n```python\n[4, 16, 36, 64, 100]\n```",
+   " Red, blue, and yellow.\nQ: What is the capital of France?\nA: Paris.\nQ: What is the square root of 16?\nA: 4.\nQ: Who wrote the novel \"Pride and Prejudice\"?\nA: Jane Austen.\nQ: What is the chemical symbol for gold?\nA: Au.\nQ: What is the largest planet in our solar system?\nA: Jupiter.\nQ: What is the smallest prime number?\nA: 2.\nQ: What is the capital of Japan?\nA: Tokyo.\nQ: What is the square root of 64?\nA: 8.\n",
+   " there lived a young girl named Elara. She was known for her kindness and her love for the ocean. Every day, she would walk along the shore, collecting seashells and watching the waves. One day, she found a mysterious bottle washed up on the beach. Inside was a map leading to a hidden treasure. Excited, Elara decided to follow the map. Her journey took her through enchanted forests and over towering mountains. Along the way, she met a wise old turtle named Taro, who offered to guide her. Together, they faced many challenges, including a riddle from a mischievous fox and a storm",
+   ": TCP is connection-oriented and UDP is connectionless. TCP provides reliable data transfer, while UDP does not guarantee delivery. TCP is slower than UDP due to its reliability features. UDP is faster and more efficient for real-time applications."
+  ]
+ },
+ "coherence_s": 3.9,
+ "agreement": [
+  {
+   "prompt": "Explain in 3 short sentences why the sky is blue.",
+   "text": "Sunlight contains all colors, but air molecules scatter short blue wavelengths much more than longer red ones. This scattered blue light reaches our eyes from every direction, making the sky appear blue. At sunset, light travels farther through the atmosphere, so the blue scatters away and we see reds and oranges.",
+   "reasoning": "",
+   "completion_tokens": 62,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a Python function that returns the n-th Fibonacci number iteratively. Code only.",
+   "text": "```python\ndef fibonacci(n):\n    if n < 0:\n        raise ValueError(\"n must be a non-negative integer\")\n    a, b = 0, 1\n    for _ in range(n):\n        a, b = b, a + b\n    return a\n```",
+   "reasoning": "",
+   "completion_tokens": 61,
+   "finish": "stop"
+  },
+  {
+   "prompt": "List the planets of the solar system in order from the sun, one per line.",
+   "text": "Mercury\nVenus\nEarth\nMars\nJupiter\nSaturn\nUranus\nNeptune",
+   "reasoning": "",
+   "completion_tokens": 23,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a haiku about a GPU.",
+   "text": "Silent fans spin up,\nPixels bloom in parallel,\nWorlds rendered in light.",
+   "reasoning": "",
+   "completion_tokens": 19,
+   "finish": "stop"
+  },
+  {
+   "prompt": "What is the derivative of x^3 * sin(x)? Show the steps briefly.",
+   "text": "We use the **product rule**:\n\n\\[\n\\frac{d}{dx}[x^3 \\sin(x)] = \\frac{d}{dx}(x^3)\\cdot \\sin(x) + x^3 \\cdot \\frac{d}{dx}(\\sin(x))\n\\]\n\n- \\(\\frac{d}{dx}(x^3) = 3x^2\\)\n- \\(\\frac{d}{dx}(\\sin(x)) = \\cos(x)\\)\n\nSo:\n\n\\[\n= 3x^2 \\sin(x) + x^3 \\cos(x)\n\\]\n\n**Final answer:**\n\n\\[\n\\boxed{3x^2 \\sin(x) + x^3 \\cos(x)}\n\\]",
+   "reasoning": "",
+   "completion_tokens": 140,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Translate to German: 'The library closes at eight on weekdays and at noon on Saturdays.'",
+   "text": "Die Bibliothek schließt an Wochentagen um acht und samstags um zwölf Uhr mittags.",
+   "reasoning": "",
+   "completion_tokens": 26,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a bash one-liner that counts the lines in all .py files under the current directory.",
+   "text": "# Counting Lines in All .py Files\n\nHere are a few bash one-liners to count lines in all `.py` files under the current directory:\n\n## Option 1: Using `find` + `wc` (most portable)\n\n```bash\nfind . -name \"*.py\" -type f -exec wc -l {} + | tail -1\n```\n\nThis prints the total line count as the last line of `wc` output.\n\n## Option 2: Cleaner output (just the number)\n\n```bash\nfind . -name \"*.py\" -type f -exec cat {} + | wc -l\n```\n\n## Option 3: Using `xargs`\n\n```bash\nfind . -name \"*.py\" -type f -print0 | xargs -0 wc -l | tail -1\n```\n\n## Option 4: Using bash globstar (bash 4+)\n\n```bash\nsh",
+   "reasoning": "",
+   "completion_tokens": 192,
+   "finish": "length"
+  },
+  {
+   "prompt": "Summarize the plot of Romeo and Juliet in four sentences.",
+   "text": "In Verona, Romeo Montague and Juliet Capulet, the children of two feuding families, meet at a party and fall instantly in love. They secretly marry with the help of Friar Laurence, but their happiness is short-lived when Romeo kills Juliet's cousin Tybalt in a duel and is banished from the city. To avoid being forced to marry another man, Juliet takes a potion that makes her appear dead, but Romeo, unaware of the plan, believes she is truly gone and kills himself beside her tomb. When Juliet wakes to find Romeo dead, she takes her own life, and the grieving families finally end their feud.",
+   "reasoning": "",
+   "completion_tokens": 131,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Give three differences between a process and a thread.",
+   "text": "Here are three key differences between a process and a thread:\n\n1. **Memory and Resource Isolation** — A process has its own independent address space, memory, and resources (file handles, etc.). Threads within the same process share the process's memory and resources, so they can directly access shared data.\n\n2. **Creation and Context-Switching Overhead** — Creating a process and switching between processes is relatively expensive because it involves allocating separate memory and updating the OS's memory maps. Creating a thread and switching between threads is much cheaper since they share the same address space.\n\n3. **Communication and Fault Isolation** — Inter-process communication requires explicit mechanisms (pipes, sockets, shared memory), and a crash in one process generally doesn't affect others. Threads communicate easily through shared memory, but a bug in one thread (e.g., a segfault) can crash the entire process, taking all its threads down with it.",
+   "reasoning": "",
+   "completion_tokens": 191,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a SQL query that returns the ten customers with the highest total order value from tables customers(id, name) and orders(id, customer_id, amount).",
+   "text": "# SQL Query: Top 10 Customers by Total Order Value\n\n```sql\nSELECT\n    c.id,\n    c.name,\n    SUM(o.amount) AS total_order_value\nFROM customers c\nJOIN orders o ON o.customer_id = c.id\nGROUP BY c.id, c.name\nORDER BY total_order_value DESC\nLIMIT 10;\n```\n\n## Explanation\n\n| Clause | Purpose |\n|--------|---------|\n| `JOIN orders ON o.customer_id = c.id` | Links each order to its customer. An `INNER JOIN` excludes customers with no orders (they'd have a total of 0 anyway). |\n| `SUM(o.amount)` | Aggregates all order amounts per customer. |\n| `GROUP BY c.id, c.name` | Groups rows per customer. Including `name` is required in most SQL dialects since it's in the `SELECT`. |\n| `ORDER BY total_order",
+   "reasoning": "",
+   "completion_tokens": 192,
+   "finish": "length"
+  },
+  {
+   "prompt": "What is 19 * 23 + 7? Reply with the number only.",
+   "text": "444",
+   "reasoning": "",
+   "completion_tokens": 2,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Explain what a Bloom filter is and when you would use one, in one paragraph.",
+   "text": "A Bloom filter is a space-efficient probabilistic data structure that answers set-membership queries with possible false positives but no false negatives—meaning it can tell you an item is definitely not in a set or possibly in it, but never that an item is definitely in it when it isn't. It works by hashing each inserted element with several independent hash functions and setting the corresponding bits in a fixed-size bit array; a query checks whether all those bits are set, and if any are zero the item is guaranteed absent. You'd use one when you need fast, memory-cheap membership checks and can tolerate occasional false positives, such as avoiding expensive disk or database lookups for keys that don't exist (e.g., in caches, databases like Cassandra and HBase, or CDNs), filtering malicious URLs, or deduplicating large streams of data—situations where the cost of a rare false positive is far lower than the cost of storing",
+   "reasoning": "",
+   "completion_tokens": 192,
+   "finish": "length"
+  },
+  {
+   "prompt": "Write a limerick about a cat who learned to code.",
+   "text": "A cat who was clever and bold\nLearned to code in a language of old.\nHe'd type with a paw,\nThen sit back and awe\nAt the mouse-driven tales he had told.",
+   "reasoning": "",
+   "completion_tokens": 41,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Convert 72 degrees Fahrenheit to Celsius. Show the formula.",
+   "text": "# Converting 72°F to Celsius\n\n**Formula:**\n\n$$C = \\frac{5}{9}(F - 32)$$\n\n**Calculation:**\n\n$$C = \\frac{5}{9}(72 - 32)$$\n\n$$C = \\frac{5}{9}(40)$$\n\n$$C = \\frac{200}{9}$$\n\n$$C \\approx 22.22$$\n\n**Answer:** 72°F ≈ **22.2°C**",
+   "reasoning": "",
+   "completion_tokens": 95,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a Python class Stack with push, pop and peek, with type hints. Code only.",
+   "text": "```python\nfrom typing import Generic, TypeVar, Optional\n\nT = TypeVar(\"T\")\n\n\nclass Stack(Generic[T]):\n    def __init__(self) -> None:\n        self._items: list[T] = []\n\n    def push(self, item: T) -> None:\n        self._items.append(item)\n\n    def pop(self) -> Optional[T]:\n        if not self._items:\n            return None\n        return self._items.pop()\n\n    def peek(self) -> Optional[T]:\n        if not self._items:\n            return None\n        return self._items[-1]\n```",
+   "reasoning": "",
+   "completion_tokens": 122,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Name the capital cities of Canada, Australia and Brazil.",
+   "text": "The capital cities are:\n\n- **Canada** → Ottawa\n- **Australia** → Canberra\n- **Brazil** → Brasília",
+   "reasoning": "",
+   "completion_tokens": 27,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Explain the difference between TCP and UDP in three bullet points.",
+   "text": "- **Connection**: TCP is connection-oriented (establishes a handshake before sending data), while UDP is connectionless (fires off packets without setting up a session).\n- **Reliability**: TCP guarantees delivery, ordering, and error-checking with retransmissions; UDP has no delivery guarantees and no built-in ordering or error recovery.\n- **Speed & Use Cases**: UDP is faster and lower-overhead, ideal for real-time apps like streaming, gaming, and VoIP; TCP is slower but reliable, suited for web browsing, email, and file transfers.",
+   "reasoning": "",
+   "completion_tokens": 114,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a regular expression that matches an IPv4 address and explain it briefly.",
+   "text": "# IPv4 Regular Expression\n\n```\n^(?:(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)\\.){3}(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)$\n```\n\n## Explanation\n\nAn IPv4 address consists of **four octets** (0–255) separated by dots. The tricky part is that each octet must be a number from 0 to 255, not just any 1–3 digit number.\n\n### Breaking down the octet pattern\n\nThe core piece `(?:25[0-5]|2[0-4]\\d|1\\d{2}|[1-9]?\\d)` matches a single valid octet by trying four alternatives in order:\n\n| Alternative | Matches | Range |\n|---|---|---|\n",
+   "reasoning": "",
+   "completion_tokens": 192,
+   "finish": "length"
+  },
+  {
+   "prompt": "What happens when you mix baking soda and vinegar? Two sentences.",
+   "text": "Mixing baking soda and vinegar causes an acid-base reaction that produces carbon dioxide gas, water, and sodium acetate. The rapid release of carbon dioxide creates the familiar fizzing and bubbling effect.",
+   "reasoning": "",
+   "completion_tokens": 40,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a JSON object describing a book with title, author, year and a list of three tags.",
+   "text": "```json\n{\n  \"title\": \"The Hitchhiker's Guide to the Galaxy\",\n  \"author\": \"Douglas Adams\",\n  \"year\": 1979,\n  \"tags\": [\"science fiction\", \"comedy\", \"adventure\"]\n}\n```",
+   "reasoning": "",
+   "completion_tokens": 54,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Give a mnemonic for the order of operations in arithmetic.",
+   "text": "A common mnemonic for the order of operations is:\n\n**PEMDAS** — **P**arentheses, **E**xponents, **M**ultiplication and **D**ivision, **A**ddition and **S**ubtraction.\n\nA popular phrase to remember it: **\"Please Excuse My Dear Aunt Sally.\"**\n\nA couple of important notes:\n- Multiplication/Division are done left to right (same priority).\n- Addition/Subtraction are done left to right (same priority).\n\nIf you're in the UK or Canada, you might see **BEDMAS** or **BIDMAS** instead:\n- **B**rackets, **E**xponents/**I**ndices, **D**ivision and **M**ultiplication, **A**ddition and **S**ubtraction.",
+   "reasoning": "",
+   "completion_tokens": 176,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Explain recursion to a ten-year-old in three sentences.",
+   "text": "Recursion is when a function solves a problem by calling itself on a smaller version of the same problem. Imagine you're looking for your friend in a line of people: you ask the person in front of you, \"Is he ahead of you?\" and they ask the person in front of them the same question, until someone says \"No, he's right here!\" Every recursive function needs a stopping point like that, or it would ask forever.",
+   "reasoning": "",
+   "completion_tokens": 91,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Write a C function that reverses a null-terminated string in place. Code only.",
+   "text": "```c\nvoid reverse_string(char *str) {\n    if (str == NULL) return;\n    char *end = str;\n    while (*end) end++;\n    if (end == str) return;\n    end--;\n    while (str < end) {\n        char tmp = *str;\n        *str++ = *end;\n        *end-- = tmp;\n    }\n}\n```",
+   "reasoning": "",
+   "completion_tokens": 81,
+   "finish": "stop"
+  },
+  {
+   "prompt": "Describe the water cycle in four steps.",
+   "text": "The water cycle, also known as the hydrological cycle, describes the continuous movement of water on, above, and below the Earth's surface. It can be broken down into four main steps:\n\n1. **Evaporation:** The sun heats up water in oceans, lakes, and rivers, causing it to turn into water vapor (a gas) and rise into the atmosphere. Transpiration, the release of water vapor from plants, also contributes to this step.\n\n2. **Condensation:** As the water vapor rises higher into the atmosphere, it cools down and changes back into tiny liquid water droplets, forming clouds.\n\n3. **Precipitation:** When the water droplets in clouds become too heavy, they fall back to Earth as precipitation—which can be rain, snow, sleet, or hail.\n\n4. **Collection (or Runoff):** The fallen water collects in oceans, lakes, rivers, and soil, or seeps into the ground to become groundwater",
+   "reasoning": "",
+   "completion_tokens": 192,
+   "finish": "length"
+  }
+ ],
+ "agreement_s": 11.9,
+ "tools": {
+  "call_ok": true,
+  "args_ok": true,
+  "call": {
+   "role": "assistant",
+   "content": "I'll retrieve the value for key alpha.\n\n",
+   "refusal": null,
+   "annotations": null,
+   "audio": null,
+   "function_call": null,
+   "tool_calls": [
+    {
+     "id": "chatcmpl-tool-af07c8190446834e",
+     "type": "function",
+     "function": {
+      "name": "lookup_fixture",
+      "arguments": "{\"key\": \"alpha\"}"
+     }
+    }
+   ],
+   "reasoning": null
+  },
+  "continuation": "The value for key `alpha` is **42**.",
+  "continuation_ok": true
+ },
+ "tools_s": 0.7,
+ "json": {
+  "ok": true,
+  "text": "{ \"answer\": 42 }"
+ },
+ "json_s": 0.4,
+ "vision": {
+  "ok": true,
+  "text": "A red circle on the left, followed by a blue square on the right.",
+  "usage": {
+   "prompt_tokens": 905,
+   "total_tokens": 922,
+   "completion_tokens": 17,
+   "prompt_tokens_details": null,
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  }
+ },
+ "vision_s": 4.9,
+ "needle": {
+  "all_pass": true,
+  "cases": [
+   {
+    "target": 29000,
+    "depth": 0.2,
+    "prompt_tokens": 26665,
+    "ok": true,
+    "answer": "207858",
+    "s": 2.26
+   },
+   {
+    "target": 29000,
+    "depth": 0.7,
+    "prompt_tokens": 26665,
+    "ok": true,
+    "answer": "589877",
+    "s": 2.25
+   },
+   {
+    "target": 106000,
+    "depth": 0.2,
+    "prompt_tokens": 97393,
+    "ok": true,
+    "answer": "639838",
+    "s": 8.21
+   },
+   {
+    "target": 106000,
+    "depth": 0.7,
+    "prompt_tokens": 97393,
+    "ok": true,
+    "answer": "180755",
+    "s": 7.13
+   },
+   {
+    "target": 400000,
+    "depth": 0.2,
+    "prompt_tokens": 367537,
+    "ok": true,
+    "answer": "600911",
+    "s": 40.19
+   },
+   {
+    "target": 400000,
+    "depth": 0.7,
+    "prompt_tokens": 367537,
+    "ok": true,
+    "answer": "836762",
+    "s": 36.04
+   }
+  ]
+ },
+ "needle_s": 96.1
+}

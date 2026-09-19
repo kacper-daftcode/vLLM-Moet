@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
-"""Single-stream decode + prefill timing via OpenAI API (streaming to get TTFT)."""
+"""Single-stream decode + prefill timing via OpenAI API (streaming to get TTFT).
+
+usage: decode_bench.py BASE MODEL ['{"thinking": false}']   (API_KEY env -> Bearer header)
+"""
 import json
+import os
 import sys
 import time
 import urllib.request
 
 BASE, MODEL = sys.argv[1], sys.argv[2]
 THINK_KW = json.loads(sys.argv[3]) if len(sys.argv) > 3 else {}
+HEADERS = {"Content-Type": "application/json"}
+if os.environ.get("API_KEY"):
+    HEADERS["Authorization"] = "Bearer " + os.environ["API_KEY"]
 
 
 def run(prompt, max_tokens, label, ignore_eos=True):
@@ -21,8 +28,7 @@ def run(prompt, max_tokens, label, ignore_eos=True):
     }
     if THINK_KW:
         body["chat_template_kwargs"] = THINK_KW
-    req = urllib.request.Request(f"{BASE}/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+    req = urllib.request.Request(f"{BASE}/v1/chat/completions", data=json.dumps(body).encode(), headers=HEADERS)
     t0 = time.perf_counter()
     ttft = None
     usage = None

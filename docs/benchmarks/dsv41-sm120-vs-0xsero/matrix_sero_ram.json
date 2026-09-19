@@ -1,0 +1,1000 @@
+{
+ "label": "0xSero SGLang ram",
+ "base": "http://127.0.0.1:8010",
+ "model": "deepseek-v4.1-flash",
+ "output_tokens": 1024,
+ "ignore_eos": true,
+ "started": "2026-09-19T10:11:20",
+ "waves": [
+  {
+   "summary": {
+    "size": 512,
+    "concurrency": 1,
+    "ok": 1,
+    "errors": [],
+    "prefill_tok_s": 4032.1785782874986,
+    "ttft_median_s": 0.12697850307449698,
+    "window_s": 5.929886722937226,
+    "total_decode_tok_s": 172.51594301843284,
+    "decode_per_request_tok_s": 172.51594301843284,
+    "completion_tokens": [
+     1024
+    ],
+    "wall_s": 6.056865226011723,
+    "end_to_end_output_tok_s": 169.0643528936957,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0024701179936528206,
+     "first": 0.12697850307449698,
+     "end": 6.056865226011723,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to their"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 512,
+    "concurrency": 4,
+    "ok": 4,
+    "errors": [],
+    "prefill_tok_s": 7728.512708820452,
+    "ttft_median_s": 0.2645895080640912,
+    "window_s": 7.392775896936655,
+    "total_decode_tok_s": 537.9427868218335,
+    "decode_per_request_tok_s": 134.5874098657821,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 8.090398950967938,
+    "end_to_end_output_tok_s": 506.27911241755925,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.00035549793392419815,
+     "first": 0.2642394439317286,
+     "end": 7.657768668141216,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0009547751396894455,
+     "first": 0.264992771204561,
+     "end": 7.861836770083755,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to their corr"
+    },
+    {
+     "start": 0.0015066019259393215,
+     "first": 0.2646969030611217,
+     "end": 8.090398950967938,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a\ndoubly linked list combined with a dictionary for O(1) get/put/delete.\n\nDesign\n------\n- `_Node` holds a ke"
+    },
+    {
+     "start": 0.001972069963812828,
+     "first": 0.2644821130670607,
+     "end": 7.812381604220718,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache stores recently accessed entries. An implementation should maintain\nordering, handle re"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 512,
+    "concurrency": 8,
+    "ok": 8,
+    "errors": [],
+    "prefill_tok_s": 7476.795410056419,
+    "ttft_median_s": 0.40428544278256595,
+    "window_s": 9.692116869613528,
+    "total_decode_tok_s": 790.4361970725474,
+    "decode_per_request_tok_s": 98.43050933392641,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 11.090061533730477,
+    "end_to_end_output_tok_s": 738.6794000271316,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat",
+     "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently U"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0003384780138731003,
+     "first": 0.39395972387865186,
+     "end": 10.961392639670521,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a doubly linked list and a dictionary.\n\nDesign\n------\n- A `Node` holds a key, a val"
+    },
+    {
+     "start": 0.0007271557115018368,
+     "first": 0.3943937816657126,
+     "end": 10.84546065190807,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a\ndoubly linked list and a dictionary for O(1) get, put, and delete.\n\nThe cache maintains ordering from most"
+    },
+    {
+     "start": 0.001294642686843872,
+     "first": 0.3936927546747029,
+     "end": 11.090061533730477,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0017613517120480537,
+     "first": 0.3941765730269253,
+     "end": 10.780896661803126,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.00230293907225132,
+     "first": 0.4146966217085719,
+     "end": 10.7457881947048,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built from two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes, giv"
+    },
+    {
+     "start": 0.0028459657914936543,
+     "first": 0.4143879129551351,
+     "end": 10.326002398971468,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a doubly\nlinked list and a dictionary for O(1) get, put, and delete operations.\n\nThe cache maintains recency"
+    },
+    {
+     "start": 0.0032926537096500397,
+     "first": 0.4141771038994193,
+     "end": 10.239945153705776,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0037514008581638336,
+     "first": 0.5478282840922475,
+     "end": 10.672515037003905,
+     "prompt_tokens": 512,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a\ndoubly linked list and a dictionary for O(1) get, put, and delete\noperations.\n\nThe cache maintains recency"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 2048,
+    "concurrency": 1,
+    "ok": 1,
+    "errors": [],
+    "prefill_tok_s": 8733.711526918714,
+    "ttft_median_s": 0.2344936621375382,
+    "window_s": 5.968400767073035,
+    "total_decode_tok_s": 171.40237108348978,
+    "decode_per_request_tok_s": 171.40237108348978,
+    "completion_tokens": [
+     1024
+    ],
+    "wall_s": 6.202894429210573,
+    "end_to_end_output_tok_s": 165.08422183969392,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.00041002919897437096,
+     "first": 0.2344936621375382,
+     "end": 6.202894429210573,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThis module provides an `LRUCache` class backed by a hash map (dict) for O(1)\nlookups and a doubly lin"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 2048,
+    "concurrency": 4,
+    "ok": 4,
+    "errors": [],
+    "prefill_tok_s": 10291.635339190187,
+    "ttft_median_s": 0.6755877581890672,
+    "window_s": 6.953730662353337,
+    "total_decode_tok_s": 571.4916518118321,
+    "decode_per_request_tok_s": 141.8662942096381,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 8.018032351974398,
+    "end_to_end_output_tok_s": 510.84852494906454,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.00034032901749014854,
+     "first": 0.3966477205976844,
+     "end": 8.018032351974398,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0008950359188020229,
+     "first": 0.582880521658808,
+     "end": 7.93247330095619,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.0014762426726520061,
+     "first": 0.7682949947193265,
+     "end": 7.749716890975833,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0019859205931425095,
+     "first": 0.7959862286224961,
+     "end": 8.017846021801233,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 2048,
+    "concurrency": 8,
+    "ok": 8,
+    "errors": [],
+    "prefill_tok_s": 10297.865323103699,
+    "ttft_median_s": 1.050854355795309,
+    "window_s": 9.76095124008134,
+    "total_decode_tok_s": 808.7938735154925,
+    "decode_per_request_tok_s": 102.44557430711262,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 11.926162337884307,
+    "end_to_end_output_tok_s": 686.8932157645991,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0003962880000472069,
+     "first": 0.39732051687315106,
+     "end": 11.582491553854197,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0009910236112773418,
+     "first": 0.7701396299526095,
+     "end": 11.438061426859349,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache stores recently accessed entries. This implementation maintains\nordering (most-recently"
+    },
+    {
+     "start": 0.0015425118617713451,
+     "first": 0.5835535186342895,
+     "end": 11.926162337884307,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a hash map (dict) and a doubly linked list.\n\nDesign\n------\n- `_Node` is a doubly li"
+    },
+    {
+     "start": 0.0020773489959537983,
+     "first": 0.9562423429451883,
+     "end": 11.514143235050142,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0027674157172441483,
+     "first": 1.1454663686454296,
+     "end": 11.674806158989668,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a hash map (dict) and a doubly linked list.\n\nDesign\n------\n- `_Node` is a doubly li"
+    },
+    {
+     "start": 0.003414061851799488,
+     "first": 1.1777934739366174,
+     "end": 11.437827446963638,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.004056738689541817,
+     "first": 1.552006979007274,
+     "end": 11.675096598919481,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.004680235870182514,
+     "first": 1.5910093486309052,
+     "end": 11.351960588712245,
+     "prompt_tokens": 2048,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a\ndoubly linked list combined with a dictionary for O(1) get/put/delete.\n\nThe cache maintains ordering from "
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 8192,
+    "concurrency": 1,
+    "ok": 1,
+    "errors": [],
+    "prefill_tok_s": 10571.056718792575,
+    "ttft_median_s": 0.7749461778439581,
+    "window_s": 5.503333142027259,
+    "total_decode_tok_s": 185.88734746724023,
+    "decode_per_request_tok_s": 185.88734746724023,
+    "completion_tokens": [
+     1024
+    ],
+    "wall_s": 6.278279319871217,
+    "end_to_end_output_tok_s": 163.10201375701212,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0008285348303616047,
+     "first": 0.7749461778439581,
+     "end": 6.278279319871217,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 8192,
+    "concurrency": 4,
+    "ok": 4,
+    "errors": [],
+    "prefill_tok_s": 11046.760568662865,
+    "ttft_median_s": 2.030376604059711,
+    "window_s": 7.265417593996972,
+    "total_decode_tok_s": 537.7224219114373,
+    "decode_per_request_tok_s": 133.71154144407672,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 10.714692544192076,
+    "end_to_end_output_tok_s": 382.2788179041354,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least ",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0005461378023028374,
+     "first": 1.6660302649252117,
+     "end": 10.231717062182724,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.0013606729917228222,
+     "first": 0.9384770910255611,
+     "end": 10.590195562224835,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.0021640798076987267,
+     "first": 2.3947229431942105,
+     "end": 10.533013637177646,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.0030600042082369328,
+     "first": 2.9662994681857526,
+     "end": 10.714692544192076,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a hash map (dict) and a doubly linked list.\n\nDesign\n------\n- `_Node` is a doubly li"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 8192,
+    "concurrency": 8,
+    "ok": 8,
+    "errors": [],
+    "prefill_tok_s": 11059.069013696238,
+    "ttft_median_s": 3.490490409079939,
+    "window_s": 9.597296983934939,
+    "total_decode_tok_s": 823.0306932719564,
+    "decode_per_request_tok_s": 102.8376878947428,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 15.966193207073957,
+    "end_to_end_output_tok_s": 513.0841080120755,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat",
+     "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently U"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0007375860586762428,
+     "first": 1.6683577680960298,
+     "end": 15.523293097969145,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes"
+    },
+    {
+     "start": 0.0013943933881819248,
+     "first": 0.9401202253066003,
+     "end": 15.966193207073957,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a\ndoubly linked list combined with a dictionary for O(1) get/put/delete.\n\nDesign\n------\n- `_Node` holds a ke"
+    },
+    {
+     "start": 0.0022242781706154346,
+     "first": 2.398505841381848,
+     "end": 15.938247281126678,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.003185104113072157,
+     "first": 3.126257778145373,
+     "end": 15.881428621243685,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.0038773203268647194,
+     "first": 3.8547230400145054,
+     "end": 15.607437156140804,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.004725045990198851,
+     "first": 4.582440176978707,
+     "end": 15.756774350069463,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.005568601191043854,
+     "first": 5.160062343347818,
+     "end": 15.75650092214346,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.006285928189754486,
+     "first": 5.925996114034206,
+     "end": 15.684153103269637,
+     "prompt_tokens": 8192,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 32768,
+    "concurrency": 1,
+    "ok": 1,
+    "errors": [],
+    "prefill_tok_s": 11036.254442139576,
+    "ttft_median_s": 2.969123281072825,
+    "window_s": 5.739115830045193,
+    "total_decode_tok_s": 178.2502832801055,
+    "decode_per_request_tok_s": 178.2502832801055,
+    "completion_tokens": [
+     1024
+    ],
+    "wall_s": 8.708239111118019,
+    "end_to_end_output_tok_s": 117.58978904157955,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0014606029726564884,
+     "first": 2.969123281072825,
+     "end": 8.708239111118019,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes, pro"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 32768,
+    "concurrency": 4,
+    "ok": 4,
+    "errors": [],
+    "prefill_tok_s": 11171.388021796965,
+    "ttft_median_s": 7.513283946318552,
+    "window_s": 6.966439372859895,
+    "total_decode_tok_s": 561.5140369521063,
+    "decode_per_request_tok_s": 140.23861826360655,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 19.250947500113398,
+    "end_to_end_output_tok_s": 212.7687481343904,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least ",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0018955711275339127,
+     "first": 6.050377648323774,
+     "end": 18.85317576630041,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.00352680217474699,
+     "first": 3.127104160375893,
+     "end": 19.100472430232912,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.005301803350448608,
+     "first": 11.73283031117171,
+     "end": 18.699269684031606,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA complete LRU (Least Recently Used) cache implementation using a\ndoubly linked list combined with a dictionary for O(1) get/put/delete.\n\nDesign\n------\n- A `_Node` holds a "
+    },
+    {
+     "start": 0.007079564034938812,
+     "first": 8.97619024431333,
+     "end": 19.250947500113398,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 32768,
+    "concurrency": 8,
+    "ok": 8,
+    "errors": [],
+    "prefill_tok_s": 11159.765450419383,
+    "ttft_median_s": 13.383260180940852,
+    "window_s": 9.448012677952647,
+    "total_decode_tok_s": 793.78669361536,
+    "decode_per_request_tok_s": 98.42900165587949,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 33.828197988215834,
+    "end_to_end_output_tok_s": 242.16483546814143,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least ",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.0016681421548128128,
+     "first": 8.986056011170149,
+     "end": 32.938112103845924,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.003132173791527748,
+     "first": 3.132407823111862,
+     "end": 33.828197988215834,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a doubly linked list and a dictionary.\n\nDesign\n------\nThe cache stores recently acc"
+    },
+    {
+     "start": 0.0047234161756932735,
+     "first": 6.046170928049833,
+     "end": 33.74351903004572,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThis module provides an `LRUCache` class backed by a hash map (dict) for O(1)\nlookups and a doubly lin"
+    },
+    {
+     "start": 0.006213989108800888,
+     "first": 11.919707349035889,
+     "end": 33.50432495214045,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.008012938778847456,
+     "first": 14.846813012845814,
+     "end": 33.387923817150295,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.009920539800077677,
+     "first": 20.538330180104822,
+     "end": 33.57774432795122,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.011433621868491173,
+     "first": 17.770133108831942,
+     "end": 33.71105823619291,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a hash map (dict) and a doubly linked list.\n\nDesign\n------\n- `_Node` is a doubly li"
+    },
+    {
+     "start": 0.0132329729385674,
+     "first": 23.490099425893277,
+     "end": 33.80064286896959,
+     "prompt_tokens": 32768,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 131072,
+    "concurrency": 1,
+    "ok": 1,
+    "errors": [],
+    "prefill_tok_s": 10579.67715012651,
+    "ttft_median_s": 12.389035897795111,
+    "window_s": 5.802458435297012,
+    "total_decode_tok_s": 176.30441198163084,
+    "decode_per_request_tok_s": 176.30441198163084,
+    "completion_tokens": [
+     1024
+    ],
+    "wall_s": 18.191494333092123,
+    "end_to_end_output_tok_s": 56.290043096527974,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.005742852110415697,
+     "first": 12.389035897795111,
+     "end": 18.191494333092123,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a doubly linked list and a dictionary.\n\nDesign\n------\n- A dictionary maps keys to n"
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 131072,
+    "concurrency": 4,
+    "ok": 4,
+    "errors": [],
+    "prefill_tok_s": 10656.239257082958,
+    "ttft_median_s": 30.961548131192103,
+    "window_s": 7.608314820099622,
+    "total_decode_tok_s": 502.18798717292407,
+    "decode_per_request_tok_s": 127.54495254038034,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 57.595437629148364,
+    "end_to_end_output_tok_s": 71.11674411389598,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least ",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementat"
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.006070610135793686,
+     "first": 12.532588582020253,
+     "end": 57.37064601201564,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes, pro"
+    },
+    {
+     "start": 0.011223652865737677,
+     "first": 24.820097666233778,
+     "end": 56.841259623877704,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a hash map (dict) and a doubly linked list.\n\nDesign\n------\n- `_Node` is a doubly li"
+    },
+    {
+     "start": 0.016693335957825184,
+     "first": 37.10299859615043,
+     "end": 56.808411341160536,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThis module provides an `LRUCache` class backed by a hash map (dict) for O(1)\nlookups and a doubly lin"
+    },
+    {
+     "start": 0.022257756907492876,
+     "first": 49.200096521060914,
+     "end": 57.595437629148364,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    }
+   ]
+  },
+  {
+   "summary": {
+    "size": 131072,
+    "concurrency": 8,
+    "ok": 8,
+    "errors": [],
+    "prefill_tok_s": 10646.9247031505,
+    "ttft_median_s": 55.682436149800196,
+    "window_s": 10.052343764808029,
+    "total_decode_tok_s": 761.3901467699033,
+    "decode_per_request_tok_s": 95.1952542743065,
+    "completion_tokens": [
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024,
+     1024
+    ],
+    "wall_s": 109.64212144119665,
+    "end_to_end_output_tok_s": 74.71581078804226,
+    "heads": [
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least ",
+     "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least "
+    ]
+   },
+   "requests": [
+    {
+     "start": 0.005488112103193998,
+     "first": 24.84152805013582,
+     "end": 108.5386230647564,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.010586035903543234,
+     "first": 12.521932241041213,
+     "end": 109.09595345379785,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.015545750968158245,
+     "first": 37.24436152400449,
+     "end": 109.05533711891621,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThis module provides an `LRUCache` class backed by a hash map (dictionary)\nfor O(1) lookups and a doub"
+    },
+    {
+     "start": 0.022085807751864195,
+     "first": 49.53481114376336,
+     "end": 108.88218217575923,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThis module provides an `LRUCache` class backed by a hash map (dictionary)\nfor O(1) lookups and a doub"
+    },
+    {
+     "start": 0.02734543103724718,
+     "first": 61.83006115583703,
+     "end": 109.1225243289955,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a hash map (dict) and a doubly linked list.\n\nDesign\n------\nThe cache maintains two "
+    },
+    {
+     "start": 0.03333863103762269,
+     "first": 74.12134929280728,
+     "end": 109.64212144119665,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.038789312820881605,
+     "first": 86.38548125186935,
+     "end": 108.88195759709924,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality LRU (Least Recently Used) cache implementation.\n\nThe cache is built on top of two cooperating data structures:\n\n* A ``dict`` mapping keys to nodes for "
+    },
+    {
+     "start": 0.04459033301100135,
+     "first": 98.48627929994836,
+     "end": 109.09624927304685,
+     "prompt_tokens": 131072,
+     "completion_tokens": 1024,
+     "error": null,
+     "text_head": "```python\n\"\"\"\nlru_cache.py\n\nA production-quality implementation of a Least Recently Used (LRU) cache\nbuilt on top of a doubly linked list and a dictionary.\n\nDesign\n------\n- A doubly linked list mainta"
+    }
+   ]
+  }
+ ]
+}
