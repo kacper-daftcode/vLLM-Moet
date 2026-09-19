@@ -1,0 +1,51 @@
+# vLLM-Moet: Qwen3.8-Flash-Next-FP8 on SM120 (RTX PRO 6000 Blackwell / RTX 5090)
+#
+# Serving image = the official vllm/vllm-openai nightly that serves this model
+# (v0.1.dev20073+g8e685d198, pinned by digest below) with vLLM-Moet's decode fixes for
+# sm_120 baked in (tools/qwen38_sm120/, measured on 4x RTX PRO 6000, TP4, MTP k=3;
+# 65 -> 98.5 decode steps/s, prose 137 -> 243 and code 228 -> 346 tok/s single stream):
+#   1. patch_short_conv_attn.py     PLE short-conv metadata copies pinned + non-blocking
+#                                   (the pageable copies synchronized the stream every step)
+#   2. patch_low_latency_gemm.py    vLLM's own CuTe-DSL skinny GEMM for the ~480 BF16 decode
+#                                   GEMMs per step, upstream gated to sm_103, opened for sm_120
+#                                   with plans tuned on RTX PRO 6000 (VLLM_MOET_SM120_LL_GEMM=0
+#                                   reverts to cuBLAS)
+#   3. patch_fused_moe_sm120.py     FP8 [32,32] block-scaled MoE GEMV (mma.sync m16n8k32) for
+#                                   the routed experts at decode token counts + silu*up and the
+#                                   fp8 quantization fused into the down GEMV; replaces the
+#                                   Triton fused_moe_kernel for <= 320 (token, expert) pairs,
+#                                   bit-identical outputs (VLLM_MOET_SM120_MOE_GEMV=0 reverts)
+#   4. moe_configs/                 Triton fused_moe tile config for E=512,N=160,fp8,[32,32]
+#                                   (prefill / large batches; vLLM has none for this GPU)
+#   5. VLLM_PLE_CPU_OFFLOAD=0       the 51 GB n-gram PLE table TP-sharded on the GPUs
+#                                   (+12 GB/GPU) instead of the CPU offload worker, whose
+#                                   cuStreamWaitValue32 node stalled every decode step ~1.2 ms
+# The MoE GEMV extension is compiled here (nvcc 13 ships in the image) so no worker
+# JIT-builds it at start; TORCH_EXTENSIONS_DIR must stay identical at run time.
+#
+# Build (repo root):   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .
+# Serve:               docker/sm120/run-qwen38.sh   (all knobs and the validated arguments)
+# Notes:               tools/qwen38_sm120/README.md, docs/sm120-deploy.md
+
+ARG BASE_IMAGE=vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
+FROM ${BASE_IMAGE}
+
+COPY tools/qwen38_sm120/ /opt/vllm-moet/qwen38_sm120/
+
+# 1-3: anchored, idempotent patches of the installed vLLM package
+RUN python3 /opt/vllm-moet/qwen38_sm120/patch_short_conv_attn.py \
+    && python3 /opt/vllm-moet/qwen38_sm120/patch_low_latency_gemm.py \
+    && python3 /opt/vllm-moet/qwen38_sm120/patch_fused_moe_sm120.py
+
+# 3: MoE GEMV module location for the patched fused_moe.py + precompiled extension
+ENV VLLM_MOET_SM120_MOE_GEMV_DIR=/opt/vllm-moet/qwen38_sm120/moe_gemv \
+    TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
+RUN python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/qwen38_sm120/moe_gemv'); import fused_moe_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'fused_moe_gemv_act'); print('sm120 MoE GEMV extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_fused_moe_gemv_sm120/*.so
+
+# 4-5: MoE tile config for this GPU, PLE table on the GPUs
+ENV VLLM_TUNED_CONFIG_FOLDER=/opt/vllm-moet/qwen38_sm120/moe_configs \
+    VLLM_PLE_CPU_OFFLOAD=0
+
+LABEL org.opencontainers.image.title="vLLM-Moet Qwen3.8-Flash-Next-FP8 SM120" \
+      org.opencontainers.image.description="vllm/vllm-openai dev20073 + vLLM-Moet sm_120 decode fixes: PLE on GPU, CuTe-DSL skinny GEMM, FP8 MoE GEMV, tuned fused_moe config"
