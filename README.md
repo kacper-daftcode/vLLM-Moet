@@ -20,7 +20,7 @@ cannot even fit on. Three ideas carry it:
 
 **New (2026‑09): two more frontier models served from their *official* checkpoints and *official*
 vLLM images on 4× RTX PRO 6000, with the sm_120 gaps closed and the decode step rebuilt around
-small hand‑written kernels — [DeepSeek‑V4.1‑Flash](#deepseekv41flash-552b--196b-engram-on-8-rtx-pro-6000--official-checkpoint-official-image)
+small hand‑written kernels — [DeepSeek‑V4.1‑Flash](#deepseekv41flash-552b--196b-engram-on-4-rtx-pro-6000--official-checkpoint-official-image)
 (552B, vision, 512K context, 148 / 346 tok/s prose / code) and
 [Qwen3.8‑Flash‑Next‑FP8](#qwen38flashnextfp8-on-4-rtx-pro-6000--official-checkpoint-official-image-3-the-decode)
 (177B‑A6B, 243 / 346 tok/s — 3× the stock image). Both ship as self‑contained images with launchers
@@ -414,7 +414,7 @@ bias that degenerates GLM; an SM12x smem fix for dense‑MLA triton decode; a
 `merge_attn_states` stride fix for >64K chunked prefill):
 **[docs/kimi-k27-code.md](docs/kimi-k27-code.md)**.
 
-## DeepSeek‑V4.1‑Flash (552B + 196B Engram) on 8× RTX PRO 6000 — official checkpoint, official image
+## DeepSeek‑V4.1‑Flash (552B + 196B Engram) on 4× RTX PRO 6000 — official checkpoint, official image
 
 The **official FP8/MXFP4 checkpoint** served by the **official
 `vllm/vllm-openai:deepseekv41-flash-0909` image** (the vLLM recipe's NVIDIA pin), which does not
@@ -427,20 +427,23 @@ exactly those kernel instantiations (a new FlashInfer JIT TU + three DeepGEMM ho
 untouched), op‑validated **bit‑exact against the stock PBS=64 kernels on re‑paged data**
 (372/372, 8/8), and ships as **`Dockerfile.sm120-dsv41`**.
 
-Measured (TP8, 1M‑token window, fp8 KV, DSpark k=5, 2026‑09‑16): **150.9 tok/s** single‑stream
-decode (DSpark ~2.65 tok/step), ~8.9k tok/s prefill, needle retrieval **PASS at 31K and 116K
-prompt tokens**, KV pool **7.5M tokens** (7.16× concurrency at 1M), `17*19 → 323`, thinking,
-`deepseek_v41` tool calling and the vision path (carrots/corn) all verified. Details:
-**[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
+Served on **four** cards (TP4, 512K context, fp8 KV, DSpark k=5, vision on; the other four run
+Qwen3.8 below) after a decode optimisation pass on that deployment (2026‑09‑18/19): a tensor‑core
+MXFP8 GEMV for the ~250 decode‑shaped dense GEMMs per step (the CUTLASS 128‑row tile ran a 6‑row
+batch at 16 µs; 2.3–3.4× faster in isolation), the grouped o‑projection `wo_a` kept in MXFP8 on
+the same kernel (vLLM's sm_120 fallback was BF16 weights + cuBLAS bmm), NCCL over PCIe P2P in the
+KVM guest, and bit‑exact fixes to the DeepGEMM MoE glue kernels — **60 → 67 decode steps/s, prose
+114–135 → 148 and code 313 → 346 tok/s single stream**, 1.49M‑token KV pool (2.6× concurrency at
+512K), needle **PASS at 29K and 106K**, `17*19 → 323`, thinking, `deepseek_v41` tool calling and
+the vision path (carrots/corn) verified. Build/serve on a new host:
+**[docs/sm120-deploy.md](docs/sm120-deploy.md)** (`docker/sm120/run-dsv41.sh`, 4 GPUs by default).
 
-The **4× RTX PRO 6000 (TP4)** deployment of the same image then went through a decode
-optimisation pass (2026‑09‑18/19): a tensor‑core MXFP8 GEMV for the ~250 decode‑shaped dense GEMMs
-per step (the CUTLASS 128‑row tile ran a 6‑row batch at 16 µs; 2.3–3.4× faster in isolation), the
-grouped o‑projection `wo_a` kept in MXFP8 on the same kernel (vLLM's sm_120 fallback was BF16
-weights + cuBLAS bmm), NCCL over PCIe P2P in the KVM guest, and bit‑exact fixes to the DeepGEMM MoE
-glue kernels — **60 → 67 decode steps/s, prose 114–135 → 148 and code 313 → 346 tok/s single
-stream**, 512K context with a 1.49M‑token fp8 KV pool, vision on. Build/serve on a new host:
-**[docs/sm120-deploy.md](docs/sm120-deploy.md)**.
+The port was first brought up on all eight cards (TP8, **1M‑token window**, 2026‑09‑16: 150.9 tok/s
+single stream before the kernel work, ~8.9k tok/s prefill, 7.5M‑token KV pool = 7.16× concurrency
+at 1M, needle PASS at 31K/116K); the same image serves that configuration with `GPUS=0,…,7 TP=8
+MAX_MODEL_LEN=1048576`. TP4 fits thinly — weights take 81 GiB/GPU, so the 1M window on four cards
+is a KV trade‑off, not a default. Gap inventory, validation and the memory budget per
+configuration: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
 
 ## Qwen3.8‑Flash‑Next‑FP8 on 4× RTX PRO 6000 — official checkpoint, official image, 3× the decode
 

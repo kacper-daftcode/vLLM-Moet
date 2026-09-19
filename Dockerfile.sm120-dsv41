@@ -26,21 +26,17 @@
 # Build (from the repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41 -t vllm-moet-sm120:dsv41-0909 .
 #
-# Serve (official checkpoint, 8x RTX PRO 6000, TP8, DSpark k=5, 1M context):
-#   docker run -d --name ds41-flash --gpus '"device=0,1,2,3,4,5,7,8"' --network host --ipc host \
-#     --ulimit memlock=-1:-1 --ulimit stack=67108864 \
-#     -v /path/to/DeepSeek-V4.1-Flash:/model:ro \
-#     -e VLLM_ENGINE_READY_TIMEOUT_S=3600 -e NCCL_P2P_DISABLE=1 \
-#     vllm-moet-sm120:dsv41-0909 \
-#     --model /model --served-model-name deepseek-ai/DeepSeek-V4.1-Flash \
-#     --tensor-parallel-size 8 --tokenizer-mode deepseek_v41 \
-#     --reasoning-parser deepseek_v41 --tool-call-parser deepseek_v41 --enable-auto-tool-choice \
-#     --kv-cache-dtype fp8 --gpu-memory-utilization 0.90 --max-model-len 1048576 \
-#     --max-num-seqs 64 --max-num-batched-tokens 16384 \
-#     --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false}' \
-#     --host 0.0.0.0 --port 8000
-#   (enable_adaptive_verification must stay false: DeepseekV4IndexerBackend on this path
-#    does not support it - the same override the vLLM recipe applies on AMD.)
+# Serve (official checkpoint; 4x RTX PRO 6000, TP4, 512K context, DSpark k=5, vision on):
+#   MODEL_DIR=/path/to/DeepSeek-V4.1-Flash CACHE_DIR=/path/to/cache docker/sm120/run-dsv41.sh
+#   (GPUS=0,1,2,3 TP=4 PORT=8001 GPU_MEM_UTIL=0.94 MAX_MODEL_LEN=524288 by default; first start with
+#    an empty CACHE_DIR: GPU_MEM_UTIL=0.92, the FlashInfer autotune sweep needs the headroom.)
+#   Eight cards / 1M window, as in the 2026-09-16 bring-up:
+#   GPUS=0,1,2,3,4,5,6,7 TP=8 MAX_MODEL_LEN=1048576 GPU_MEM_UTIL=0.90 MAX_NUM_SEQS=64 \
+#   MAX_NUM_BATCHED_TOKENS=16384 MODEL_DIR=... CACHE_DIR=... docker/sm120/run-dsv41.sh
+#   The launcher passes --tokenizer-mode/--reasoning-parser/--tool-call-parser deepseek_v41,
+#   --kv-cache-dtype fp8 and the DSpark speculative config with enable_adaptive_verification=false
+#   (must stay false: DeepseekV4IndexerBackend on this path does not support it - the same override
+#   the vLLM recipe applies on AMD). Deploy guide: docs/sm120-deploy.md.
 #
 # Port notes, gap inventory and validation: docs/dsv41-sm120-port.md.
 

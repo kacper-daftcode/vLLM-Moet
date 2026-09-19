@@ -4,7 +4,10 @@
 [vLLM recipe](https://github.com/vllm-project/recipes/blob/main/models/deepseek-ai/DeepSeek-V4.1-Flash.yaml)
 pins for DeepSeek‑V4.1‑Flash on NVIDIA — serving the **official checkpoint**
 (`deepseek-ai/DeepSeek-V4.1-Flash` @ `dba1be0a`, 510 GB: MXFP8 dense, MXFP4 experts, UE8M0
-scales) on **8× RTX PRO 6000 Blackwell (sm_120)**. The recipe lists H200/GB200/GB300/MI350X as
+scales) on **RTX PRO 6000 Blackwell (sm_120)** — brought up on eight cards (TP8, 1M window, the
+measurements in the first half of this document), served since on **four** (TP4, 512K; the
+[TP4 section](#tp4-4-rtx-pro-6000--fits-thinly) and everything after it, and the default of
+`docker/sm120/run-dsv41.sh`). The recipe lists H200/GB200/GB300/MI350X as
 verified; on sm_120 the image fails at engine start. This port closes the gaps **kernel‑side**,
 in the style of the v0.24.0 port: the official image plus generated/idempotent patches on the
 two kernel libraries, precompiled into `Dockerfile.sm120-dsv41`. vLLM code is untouched — the
