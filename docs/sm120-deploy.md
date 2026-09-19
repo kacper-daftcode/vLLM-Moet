@@ -50,16 +50,18 @@ hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /srv/models/DeepSeek-V4.
 hf download Qwen/Qwen3.8-Flash-Next-FP8 --local-dir /srv/models/Qwen3.8-Flash-Next-FP8
 ```
 
-The build needs network access (base image pull, DeepGEMM clone); serving does not. The images
-were rebuilt from scratch (`docker build --no-cache`) from the committed tree on 2026-09-19 to
-confirm this. Without network, `docker load` the saved image tarballs instead (see Build).
+The build needs network access (base image pull, DeepGEMM clone); serving does not. Both images
+were rebuilt from scratch (`docker build --no-cache`) from the committed tree on 2026-09-19: the
+patched vLLM/FlashInfer files, the DeepGEMM `_C` and the compiled kernel extensions came out
+identical to the images serving on the reference host. Without network, `docker load` the saved
+image tarballs instead (see Build).
 
 ## Build
 
 ```bash
 git clone <this repo> && cd vllm-moet
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~20 min (DeepGEMM _C rebuild + JIT precompile)
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~3 min
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
 ```
 
 Both bases are pinned (`vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…`
