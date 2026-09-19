@@ -144,11 +144,161 @@ text‑only):
 | 0.94 | **4.44 GiB → 1.75M tokens** | 91.7 / 93.8 GB | C8 @17.5K 469 tok/s, 0 errors — recommended |
 | 0.95 | **5.39 GiB → 2.13M tokens** | 92.7 / **97.2 GB** | C8 @1.1K **773 tok/s**, C8 @17.5K 578, C1 289; 8×146K concurrent (1.17M populated) OK — 0.7 GB from the wall |
 
+`max_model_len` is a memory input, not only a limit. Measured on a second host (2026‑09‑17; 8× RTX
+PRO 6000 **Server Edition** in a VM, ECC on → 94.97 GiB usable per GPU against 95.59 on the
+Workstation cards; `NCCL_P2P_DISABLE=1`; same image and flags, GPUs 4–7):
+
+| util | ctx | KV | notes |
+|---|---|---|---|
+| 0.92 | 512K | 0.95 GiB | **does not start**: one 512K request needs 1.1 GiB; graphs 0.74 GiB (0.52 at 256K) and ~1.4 GiB more non‑KV overhead than at 256K |
+| 0.92 | 256K | 2.37 GiB → 934,666 tokens | first start (populates the autotune cache); 0.17 GiB under the Workstation cards = the ECC reserve |
+| 0.94 | 512K | **2.85 GiB → 1,352,583 tokens** (2.58× at 512K) | text‑only; idle 91.8 GB, 95.9 GB/GPU peak after a 106K‑token needle and C8 @7.7K (stable); needle PASS @29K/106K, prefill ~10.5k tok/s, decode C1 130 (prose) / 278 (code) tok/s |
+| 0.94 | 512K | **2.54 GiB → 1,206,953 tokens** (2.30× at 512K) | **with vision** (current); encoder +0.23 GiB weights per rank (replicated, not TP‑sharded) + encoder cache (4096‑token budget, profiled with 3 max‑size images) ≈ 0.3 GiB of KV; same decode/needle numbers, peak 96.2 GB/GPU; single/two‑image, image+tool and image+thinking prompts OK |
+
+Token counts are vLLM's hybrid‑allocator figures (SWA layers only hold a window per request), so
+they are not comparable across `max_model_len` values. With vision on, vLLM forces
+`--disable_chunked_mm_input`, and the DSpark drafter does not take multimodal embeddings (image
+prompts are drafted from text‑only inputs). Weights load from that host's XFS virtual
+disk in ~11–12 min (the 475 GiB checkpoint does not stay in page cache next to ~190 GiB of pinned
+Engram), so each restart costs ~17 min.
+
 So four cards work for ≤ ~2M total KV tokens without any offload machinery; the 1M‑token window
 is possible only by trading KV (KV/token at TP4 is ~2.6 KB/GPU). Headroom is the limiting factor, not fit: the vLLM‑Moet expert tiers (2‑bit base,
 FP4 delta, base cache) would halve the 259.5 GiB of experts and are the route to comfortable TP4
 or TP2, but they need a port of the `moe_w2` stack onto this vLLM base plus K=5120 / K=576·1152
 cubin families.
+
+## Where a decode step goes (TP4, DSpark k=5, 2026‑09‑18)
+
+Torch profile of the serving container on the 4× RTX PRO 6000 host (rank 0, single stream, prose + code,
+~70 target steps, 16.6 ms per step, GPU busy 95 %, **~2 090 kernel launches per step**). The
+step is latency‑bound: the weights that a step streams (~2 GB/GPU) would take ~1.2 ms.
+
+| share | ms/step | what |
+|---|---|---|
+| 27 % | 4.9 | MoE FP4 grouped GEMM (DeepGEMM `sm120_fp8_fp4_gemm_1d1d`): w13 83 µs + w2 36 µs per layer for M ≈ 36 rows — six verified tokens × top‑6 touch up to 36 experts, so the expert stream is ~6× a single token's; already ~75 % of bandwidth |
+| 21 % | 3.8 | dense MXFP8 GEMMs (FlashInfer CUTLASS SM120, 229 launches/step, avg 16 µs) + 175 activation‑quantize launches |
+| 13 % | 2.4 | BF16 cuBLAS (`cutlass_80_wmma` kernels): `wo_a` emulation bmm 26 µs × 43, lm_heads 234 µs × 3 |
+| 11 % | 2.0 | mHC: DeepGEMM TF32 pre‑norm GEMM 14 µs × 85 (4 µs in isolation — PDL overlap inflates it), TileLang pre/post 5 + 4 µs × 40 |
+| 10 % | 1.9 | NCCL allreduce 19 µs × 88 + allgather 37 µs × 4 |
+| 8 % | 1.4 | ~650 elementwise launches (norms, quant, silu, MoE scatter/gather, topk) |
+| 5 % | 0.9 | sparse‑MLA decode (FlashInfer SM120) |
+
+Both servers on that host (this one and Qwen3.8‑Flash‑Next on GPUs 0–3) run at ~60 steps/s
+regardless of model or context length; the 4‑rank NCCL allreduce costs 18–30 µs for 5–48 KiB over
+NCCL's default SHM transport in the VM, so the ~90 allreduces per step are a fixed ~1.8 ms.
+**NCCL refuses P2P by default on the PHB topology the hypervisor exposes, but P2P works**
+(`cudaDeviceCanAccessPeer` is true for every pair): with `NCCL_P2P_LEVEL=SYS` NCCL switches to
+`P2P/CUMEM` and the small allreduces drop to ~12 µs (16 MiB: 974 → 642 µs). `run.sh` now sets
+`NCCL_P2P_LEVEL=SYS` and `NCCL_P2P_DISABLE=0` by default; the earlier `NCCL_P2P_DISABLE=1` was a
+no‑op (SHM either way). vLLM's own custom one‑shot allreduce (refused by the ">2 PCIe‑only GPUs"
+heuristic in `custom_all_reduce.py`) was measured with the gate forced open
+(`tools/sm120_perf/allreduce_bench.py`): it is pull‑based — every rank reads its three peers'
+buffers — and PCIe P2P *reads* are latency‑bound in this VM, so 60 KiB costs 75 µs against NCCL's
+12.6 µs and the time grows linearly with size. The heuristic is right for this topology. vLLM
+dev20904 also lists a push‑based `FLASHINFER_PCIE_IPC` backend, but FlashInfer 0.6.18 does not
+ship `PcieIpcAllReduceWorkspace`, so it is not available in this image.
+
+**Small‑M MXFP8 GEMV (`tools/dsv41_sm120/sm120_gemv/`).** The CUTLASS SM120 blockscaled GEMM runs
+a 128‑row MMA tile for the 6‑row decode batch. The replacement keeps the exact same inputs
+(FlashInfer's activation quantization, F8_128x4 swizzled ue8m0 scales for both operands) and
+computes with `mma.sync.m16n8k32` (e4m3 × e4m3 → f32): a block owns 8 output columns, its 8 warps
+split the 32‑wide MX blocks, physical k is permuted inside each block so every lane's fragment
+bytes are contiguous (A and B identically, so the dot product is unchanged and every mma stays
+inside one scale block), and the per‑block result is scaled by 2^(sa+sb−254) before fp32
+accumulation. Cold‑L2 timings on RTX PRO 6000 (weights cycled through >128 MB so they stream from
+HBM, like in the server), M = 6:
+
+| shape (N←K) | CUTLASS | GEMV | speed‑up |
+|---|---|---|---|
+| q_a 1280←5120 | 25.6 µs | 11.1 µs | 2.3× |
+| q_b / indexer wq_b 4096←1280 | 23.6 µs | 7.3 µs | 3.2× |
+| kv_a 576←5120 | 14.4 µs | 7.9 µs | 1.8× |
+| wo_b 5120←2048 | 44.7 µs | 13.2 µs | 3.4× |
+| shared w13 1152←5120 / w2 5120←576 | 24.3 / 15.8 µs | 10.5 / 5.4 µs | 2.3× / 2.9× |
+
+Output error vs the fp32 reference on dequantized operands is identical to CUTLASS (bf16
+rounding, max rel 3.8e‑3). The vLLM hook (`patch_vllm_mxfp8_gemv.py`) is one dispatch branch in
+`FlashInferCutlassMxfp8LinearKernel.apply_weights` (M ≤ 16 and bf16 output → GEMV, else CUTLASS);
+`VLLM_MOET_SM120_GEMV=0` reverts at run time. A scalar (non‑tensor‑core) variant is kept behind
+`VLLM_MOET_GEMV_IMPL=scalar`; it is ~1.5× slower at M = 6 because the fp8→fp32 conversion and
+scalar FMAs, not the weight stream, set its pace.
+
+In the serving container (image `dsv41-0909` = 33bf6159, TP4, k=5) the GEMV averages 10.5 µs per
+call against CUTLASS's 16 µs (cold weights *and* cold scales, plus the launch tail every kernel
+pays inside a graph), the dense‑GEMM share of a step drops 3.8 → 2.8 ms and GPU time per step
+17.9 → 16.8 ms in the profiler; at the API the decode step went 16.3–16.6 → 16.0–16.4 ms
+(60–61 → 61–63 steps/s; prose 135, code 317 tok/s; needle, vision, tool calls, C8 unchanged).
+With NCCL on P2P as well (next paragraph) the step is 15.6–15.8 ms — **63–64 steps/s, prose 140
+and code 329 tok/s, +6 % over the 2026‑09‑17 baseline**.
+The lesson is the ratio: a kernel 2.6–4.6× faster in isolation buys ~1 ms of a 16.6 ms step,
+because with ~2 090 launches and 88 four‑rank allreduces per step the boundaries, not the
+kernel bodies, set the pace. The remaining levers are therefore launch‑count reductions —
+activation quantization fused into the GEMV (−185 launches), norm/quant fusion (torch.compile
+`-O3` is off for this model: `compilation_config.mode = NONE`), and fewer verified tokens when
+acceptance is low — rather than faster versions of the existing kernels.
+
+**`wo_a` on the same kernel (2026‑09‑18, second session).** The grouped output projection
+(`o_groups` 8, `o_lora_rank` 1024; two 1024←4096 groups per TP4 rank, `is_bmm`) ran the BF16
+emulation on sm_120 because `DeepGemmMxfp8BmmLinearKernel` is gated to sm_100: BF16 weights (2×
+the bytes) + cuBLAS bmm, 26 µs + 3 µs split‑K reduce per layer, 1.0 ms of the step. The GEMV
+kernel gained a grouped entry (`mxfp8_gemv_grouped`, `blockIdx.y` = head group) and two scale
+layouts: the checkpoint's row‑major `[N, K/32]` ue8m0 for the weight and DeepGEMM's packed
+MN‑major int32 layout that `fused_inv_rope_fp8_quant(tma_aligned_scales=True)` already writes
+for the sm_100 path for the activation — so the activation quantization stays inside the
+existing fused inverse‑RoPE kernel (1.4 µs vs 1.1 µs unquantized) and nothing new is launched.
+Rows are handled in m16 tiles up to 64 tokens; above that (prefill) the weight is dequantized on
+the fly and the original bf16 bmm runs. `Sm120GemvMxfp8BmmLinearKernel`
+(`sm120_gemv/vllm_sm120_gemv_bmm.py`, installed by `patch_vllm_wo_a_sm120.py`) is put first in
+`init_mxfp8_linear_kernel()`'s BMM list and `deep_gemm_fp8_o_proj` dispatches to it.
+
+Cold‑L2, RTX PRO 6000, per layer: T = 1: 13.6 → 7.8 µs; **T = 6: 25.8 → 9.0 µs (2.9×)**; T = 16:
+26.2 → 11.6; T = 32: 26.5 → 16.4; T = 48: 26.2 → 18.3; T = 64: 20.6 → 25.3 (the tile loop stops
+paying at 64, but dequant+bmm would cost more there, so the GEMV keeps the whole capture range).
+Numerics: bf16 rounding vs an fp32 reference on the same fp8 operands (max rel 3.9e‑3); relative
+to the emulation path the output differs by 2.7 % (Frobenius) — that is the MXFP8 activation
+quantization the sm_100 DeepGEMM path applies by design, i.e. sm_120 now matches the datacenter
+numerics instead of running the o‑projection in higher precision.
+
+In the serving container (TP4, k=5, image `dsv41-0909` = 73098d98): the grouped GEMV averages
+**9.5 µs per call against the bmm's 24.9 µs**, the BF16‑cuBLAS share drops 13 → 8 % and the
+NCCL share 10 → 8 % (13 µs per allreduce, less skew behind the o‑projection); weights per GPU
+81.46 → 81.12 GiB, KV 2.54 → 3.14 GiB (1.49M tokens). At the API: **63.6 → 66.3 steps/s (15.7 →
+15.1 ms), prose 140 → 146 tok/s, code 329 → 343 tok/s**, DSpark acceptance unchanged (2.21 / 5.17
+tok/step), needle PASS @29K/106K, vision + tool + thinking smoke unchanged, C8 @7.7K 242 tok/s
+aggregate with a 96.0 GB/GPU peak. The BF16 GEMMs that remain (12 per step in the target, ~40 µs
+each in 8 layers next to the Engram/compressor path, plus 5 per step in the DSpark drafter graph)
+are weights the checkpoint keeps in BF16 — cuBLAS already runs them at bandwidth, so the only
+lever there is weight‑only quantization, a quality decision rather than a kernel gap.
+
+A step of the *drafter* is now visible as its own 167‑kernel graph: 1.17 ms per target step (7 %),
+with 15 dense GEMVs, 7 allreduces and 6 mHC blocks.
+
+**MoE glue at decode (2026‑09‑19, `patch_vllm_moe_glue_sm120.py`).** DeepGEMM's sm_120 FP8×FP4
+grouped kernel only exists with BLOCK_M = 64, so every touched expert is padded to 64 rows
+(2304 rows per layer for 36 real pairs) and the FP4 GEMMs are at the weight‑stream floor
+(FC1 118 MB in 85 µs, FC2 59 MB in 36 µs; `tools/sm120_perf/dg_moe_blockm_bench.py`). What
+was left were the glue kernels around them: `_fwd_kernel_ep_scatter_2` ran one program per
+token with a chain of six dependent atomics (6.4 µs) — now one program per (token, expert)
+pair (3.5 µs); `_fwd_kernel_ep_gather`'s top‑k loop is unrolled so its loads overlap (3.6 →
+3.3 µs, same fp32 order); the fused silu·up + UE8M0 quant skips the padding rows via
+`m_indices` (4.0 → 3.3 µs). Bit‑exact (0 of 30720 MoE outputs differ in the bench), deployed
+first as bind‑mounts, now baked into `Dockerfile.sm120-dsv41`: **66.3 → 67.0 steps/s, prose 147 → 148, code
+344 → 346 tok/s**, needle @29K/@106K and the vision/tool/thinking smoke unchanged. The dense
+GEMV was re‑examined at the same time (v2 kernel: split‑K, one‑round loads, word‑wide scale
+loads, staged A) without gain — the findings are in `tools/dsv41_sm120/README.md`.
+
+**Tried and not kept.** (a) DSpark adaptive verification: DeepGEMM's varlen paged‑MQA logits do
+work on sm_120 (`patch_vllm_indexer_sm120.py` only widens vLLM's sm_100 gate; op‑level test
+`test_deepgemm_sm120_paged_mqa.py --only varlen`), but the varlen decode path adds ~0.5 ms/step
+(topk/indexer glue) and, with adaptive verification on, prose stayed at ~130 tok/s while code fell
+313 → 273 tok/s and the varlen decode cudagraphs cost 2 GiB of KV (util had to go to 0.95). Left as
+an experiment. (b) An fp32 GEMV for the mHC pre‑norm GEMM: DeepGEMM's TF32 kernel is 4.2 µs in
+isolation and the hand‑written one is not faster at M ≥ 6; the 14 µs in the profile is PDL
+overlap, not kernel time. (c) vLLM's custom one‑shot allreduce on PCIe P2P (see the NCCL
+paragraph): 6× slower than NCCL at 60 KiB, pull‑based reads do not suit this VM. (d) The dense
+GEMV above 16 rows: the m16‑tile loop is correct up to 64 rows but slower than CUTLASS from 32
+rows on (q_a M = 32: 18.0 vs 14.9 µs), so the dense dispatch keeps `M ≤ 16`.
 
 ## Apply / build / run
 
@@ -175,6 +325,7 @@ JIT when the AOT artifact fails to load) and the rebuilt `_C.so` over
   [vllm#57028](https://github.com/vllm-project/vllm/pull/57028) change the vLLM‑side page geometry
   instead; this port keeps vLLM stock and would be superseded by FlashInfer/DeepGEMM shipping the
   instantiations. Worth proposing there.
-- `EmulationMxfp8LinearKernel` still serves a few dense shapes (perf, not correctness).
+- `EmulationMxfp8LinearKernel` is no longer selected in the serving log (dense → FlashInfer
+  CUTLASS + GEMV, `wo_a` → grouped GEMV); the remaining BF16 GEMMs are BF16 checkpoint weights.
 - Bench recipe (`bench/recipes/`) for `deepseek-v4.1-flash/pro6000x8-tp8-dspark` not yet
   registered; the numbers above are single‑shot smoke measurements, not a release row.
