@@ -12,8 +12,16 @@
 #      accept the 128-row indexer pages of the compress_ratio=1 layers
 #      (tools/dsv41_sm120/patch_deepgemm.py); _C is rebuilt INSIDE the official image
 #      so the python/glibc/torch ABI matches by construction, like Dockerfile.sm120-v024.
-# vLLM itself is untouched: the model's page geometry stays identical to the
-# datacenter (SM100) path, only the kernels learned the shapes.
+#   3. Decode-shaped dense MXFP8 GEMMs (M <= 16 rows) run on the vLLM-Moet tensor-core
+#      GEMV (tools/dsv41_sm120/sm120_gemv/) instead of the CUTLASS 128-row tile
+#      (patch_vllm_mxfp8_gemv.py, one dispatch branch in
+#      FlashInferCutlassMxfp8LinearKernel.apply_weights, VLLM_MOET_SM120_GEMV=0 reverts),
+#      and the grouped o-projection `wo_a` keeps its MXFP8 weights and runs on the same
+#      kernel for decode batches (<= 64 tokens) instead of vLLM's sm_120 fallback of
+#      BF16 weights + cuBLAS bmm (patch_vllm_wo_a_sm120.py, VLLM_MOET_SM120_GEMV_BMM=0
+#      reverts). These are the only vLLM-side changes.
+# The model's page geometry stays identical to the datacenter (SM100) path; the
+# kernels learned the shapes.
 #
 # Build (from the repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41 -t vllm-moet-sm120:dsv41-0909 .
@@ -77,6 +85,26 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer.py \
     && FLASHINFER_CUDA_ARCH_LIST=12.0f python3 -c \
        "from flashinfer.jit.mla import gen_sparse_mla_sm120_module; s = gen_sparse_mla_sm120_module(); s.build(verbose=False); assert s.jit_library_path.exists(), s.jit_library_path; print('precompiled', s.jit_library_path)" \
     && python3 -c "import vllm.third_party.deep_gemm as dg; print('deep_gemm', dg.__version__, dg._C.__file__)"
+
+# 3. Decode-shaped dense MXFP8 GEMMs (M <= 16) go to the vLLM-Moet tensor-core GEMV
+#    (tools/dsv41_sm120/sm120_gemv/, 2.3-3.7x faster than the CUTLASS 128-row tile at
+#    M = 6 on RTX PRO 6000), and the grouped o-projection wo_a stays MXFP8 on the same
+#    kernel (2.9x faster than the BF16-weight cuBLAS bmm fallback at 6 tokens, half the
+#    weight bytes). The extension is compiled here so no worker JIT-builds it;
+#    TORCH_EXTENSIONS_DIR must stay identical at run time for the cache to hit.
+#    (patch_vllm_indexer_sm120.py is deliberately NOT applied: the DeepGEMM varlen
+#    indexer path costs ~0.5 ms/step on sm_120 and adaptive verification was a net
+#    loss in the 2026-09-18 measurements; see docs/dsv41-sm120-port.md.)
+#    patch_vllm_moe_glue_sm120.py (2026-09-19): DeepGEMM MoE glue kernels at decode token
+#    counts -- ep_scatter per (token, expert) pair, unrolled ep_gather, silu*up+quant
+#    skipping the 64-row padding -- bit-exact, ~5 us per layer. Until the image is rebuilt
+#    the serving host bind-mounts the same three patched files (run.sh GLUE_PATCH=1).
+ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
+RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_wo_a_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_glue_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120" \
       org.opencontainers.image.description="vllm/vllm-openai:deepseekv41-flash-0909 + DSV4.1 SM120 sparse-MLA instantiations (FlashInfer) + DeepGEMM 128-row paged MQA logits on sm_120"
