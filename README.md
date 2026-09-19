@@ -18,9 +18,9 @@ cannot even fit on. Three ideas carry it:
    bit‑deterministic), an **NVFP4 KV cache** (352 B/token), and agent‑ready tool/reasoning
    parsing.
 
-**New (2026‑09): two more frontier models served from their *official* checkpoints and *official*
-vLLM images on 4× RTX PRO 6000, with the sm_120 gaps closed and the decode step rebuilt around
-small hand‑written kernels — [DeepSeek‑V4.1‑Flash](#deepseekv41flash-552b--196b-engram-on-4-rtx-pro-6000--official-checkpoint-official-image)
+**Two more frontier models are served from their *official* checkpoints and *official* vLLM
+images on 4× RTX PRO 6000, with the sm_120 gaps closed and the decode step rebuilt around small
+hand‑written kernels — [DeepSeek‑V4.1‑Flash](#deepseekv41flash-552b--196b-engram-on-4-rtx-pro-6000--official-checkpoint-official-image)
 (552B, vision, 512K context, 148 / 346 tok/s prose / code) and
 [Qwen3.8‑Flash‑Next‑FP8](#qwen38flashnextfp8-on-4-rtx-pro-6000--official-checkpoint-official-image-3-the-decode)
 (177B‑A6B, 243 / 346 tok/s — 3× the stock image). Both ship as self‑contained images with launchers
@@ -417,46 +417,44 @@ bias that degenerates GLM; an SM12x smem fix for dense‑MLA triton decode; a
 ## DeepSeek‑V4.1‑Flash (552B + 196B Engram) on 4× RTX PRO 6000 — official checkpoint, official image
 
 The **official FP8/MXFP4 checkpoint** served by the **official
-`vllm/vllm-openai:deepseekv41-flash-0909` image** (the vLLM recipe's NVIDIA pin), which does not
-start on sm_120 as shipped: FlashInfer's SM120 sparse‑MLA kernels were instantiated for the
-V4‑Flash page geometry only (SWA page 64, compressed pages 64/2, rows ≤ 2048 — V4.1 pages its
-sliding window at 32, its ratio‑1 compressed cache at 128 states/page and pads every prefill row
-to 1152 for images), the single‑cache dispatcher silently ran 64‑page kernels over 32‑token
-pages, and DeepGEMM's SM120 paged MQA logits refused the indexer's 128‑row pages. The port adds
-exactly those kernel instantiations (a new FlashInfer JIT TU + three DeepGEMM host asserts, vLLM
-untouched), op‑validated **bit‑exact against the stock PBS=64 kernels on re‑paged data**
-(372/372, 8/8), and ships as **`Dockerfile.sm120-dsv41`**.
+`vllm/vllm-openai:deepseekv41-flash-0909` image** (the vLLM recipe's NVIDIA pin) on four RTX PRO
+6000: **TP4, 512K context, fp8 KV (1.49M‑token pool), DSpark k=5, vision on** — **148 tok/s prose
+and 346 tok/s code single stream** (67 decode steps/s), needle retrieval PASS at 29K and 106K
+prompt tokens, `17*19 → 323`, thinking, `deepseek_v41` tool calling and the vision path
+(carrots/corn) verified. Ships as **`Dockerfile.sm120-dsv41`** + `docker/sm120/run-dsv41.sh`;
+build/serve on a new host: **[docs/sm120-deploy.md](docs/sm120-deploy.md)**.
 
-Served on **four** cards (TP4, 512K context, fp8 KV, DSpark k=5, vision on; the other four run
-Qwen3.8 below) after a decode optimisation pass on that deployment (2026‑09‑18/19): a tensor‑core
-MXFP8 GEMV for the ~250 decode‑shaped dense GEMMs per step (the CUTLASS 128‑row tile ran a 6‑row
-batch at 16 µs; 2.3–3.4× faster in isolation), the grouped o‑projection `wo_a` kept in MXFP8 on
-the same kernel (vLLM's sm_120 fallback was BF16 weights + cuBLAS bmm), NCCL over PCIe P2P in the
-KVM guest, and bit‑exact fixes to the DeepGEMM MoE glue kernels — **60 → 67 decode steps/s, prose
-114–135 → 148 and code 313 → 346 tok/s single stream**, 1.49M‑token KV pool (2.6× concurrency at
-512K), needle **PASS at 29K and 106K**, `17*19 → 323`, thinking, `deepseek_v41` tool calling and
-the vision path (carrots/corn) verified. Build/serve on a new host:
-**[docs/sm120-deploy.md](docs/sm120-deploy.md)** (`docker/sm120/run-dsv41.sh`, 4 GPUs by default).
+The stock image does not start on sm_120: FlashInfer's SM120 sparse‑MLA kernels are instantiated
+for the V4‑Flash page geometry only (SWA page 64, compressed pages 64/2, rows ≤ 2048 — V4.1 pages
+its sliding window at 32, its ratio‑1 compressed cache at 128 states/page and pads every prefill
+row to 1152 for images), the single‑cache dispatcher silently runs 64‑page kernels over 32‑token
+pages, and DeepGEMM's SM120 paged MQA logits refuse the indexer's 128‑row pages. The image adds
+exactly those kernel instantiations (a FlashInfer JIT TU + three DeepGEMM host asserts, vLLM's
+model code untouched), op‑validated **bit‑exact against the stock PBS=64 kernels on re‑paged data**
+(372/372, 8/8).
 
-The port was first brought up on all eight cards (TP8, **1M‑token window**, 2026‑09‑16: 150.9 tok/s
-single stream before the kernel work, ~8.9k tok/s prefill, 7.5M‑token KV pool = 7.16× concurrency
-at 1M, needle PASS at 31K/116K); the same image serves that configuration with `GPUS=0,…,7 TP=8
-MAX_MODEL_LEN=1048576`. TP4 fits thinly — weights take 81 GiB/GPU, so the 1M window on four cards
-is a KV trade‑off, not a default. Gap inventory, validation and the memory budget per
-configuration: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
+The decode step is then rebuilt where vLLM's sm_120 fallbacks are slow, without touching numerics:
+a tensor‑core MXFP8 GEMV for the ~250 decode‑shaped dense GEMMs per step (the CUTLASS 128‑row tile
+runs a 6‑row batch at 16 µs; 2.3–3.4× faster), the grouped o‑projection `wo_a` kept in MXFP8 on the
+same kernel (vLLM's sm_120 fallback is BF16 weights + cuBLAS bmm), NCCL over PCIe P2P in the KVM
+guest, and bit‑exact fixes to the DeepGEMM MoE glue kernels — together **60 → 67 steps/s, prose
+114–135 → 148 and code 313 → 346 tok/s** against the same image without them. Four cards hold the
+model thinly (81 GiB/GPU of weights); the same image runs TP8 with a 1M window on eight
+(`GPUS=0,…,7 TP=8 MAX_MODEL_LEN=1048576`, 7.5M‑token KV pool). Gap inventory, validation and the
+memory budget per configuration: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
 
 ## Qwen3.8‑Flash‑Next‑FP8 on 4× RTX PRO 6000 — official checkpoint, official image, 3× the decode
 
 The official `vllm/vllm-openai` nightly serves this 177B‑A6B model on sm_120 out of the box, at
-~65 decode steps/s. Profiling the step (`tools/sm120_perf/`) found four things vLLM does not do
-for this GPU, none of which touches the model's numerics: the CPU‑offloaded n‑gram PLE table
-stalls every decode graph ~1.2 ms in a `cuStreamWaitValue32` node (keep the 51 GB table on the
-GPUs: +12 GB/GPU, −1.3 ms/step); vLLM's own CuTe‑DSL skinny GEMM for the ~480 BF16 decode GEMMs is
-gated to B300 but runs on sm_120 (opened + tuned: −1.3 ms); the Triton `fused_moe` had no tile
-config for this device and, with the block scales refined to [32,32], runs the routed experts at
-half the HBM bandwidth (an `mma.sync` FP8 MoE GEMV with the activation fused in, bit‑identical to
-Triton: −1.0 ms). Result on 4× RTX PRO 6000, TP4, MTP k=3: **65 → 98.5 steps/s, prose 137 → 243
-and code 228 → 346 tok/s single stream**, needle PASS at 27K/92K, 2.28M‑token KV at 256K context.
+~65 decode steps/s. The image fixes three things vLLM does not do for this GPU, none of which
+touches the model's numerics: the CPU‑offloaded n‑gram PLE table stalls every decode graph ~1.2 ms
+in a `cuStreamWaitValue32` node (the 51 GB table stays on the GPUs: +12 GB/GPU, −1.3 ms/step);
+vLLM's own CuTe‑DSL skinny GEMM for the ~480 BF16 decode GEMMs is gated to B300 but runs on sm_120
+(opened + tuned: −1.3 ms); the Triton `fused_moe` has no tile config for this device and, with the
+block scales refined to [32,32], runs the routed experts at half the HBM bandwidth (replaced by an
+`mma.sync` FP8 MoE GEMV with the activation fused in, bit‑identical to Triton: −1.0 ms). On 4× RTX
+PRO 6000, TP4, MTP k=3: **98.5 steps/s, prose 243 and code 346 tok/s single stream (stock image:
+65 steps/s, 137 / 228 tok/s)**, needle PASS at 27K/92K, 2.28M‑token KV at 256K context.
 Ships as **`Dockerfile.sm120-qwen38`** + `tools/qwen38_sm120/`; the write‑up is
 **[tools/qwen38_sm120/README.md](tools/qwen38_sm120/README.md)**.
 
@@ -474,11 +472,10 @@ a cold‑L2 benchmark against the kernel it replaces and an fp32 reference.
 | **`tools/dsv41_sm120/sm120_gemv/mxfp8_gemv_sm120.cu`** — MXFP8×MXFP8 GEMV, FlashInfer F8_128x4 swizzled ue8m0 scales; a block owns 8 output columns, its 8 warps split the K blocks, every lane issues all its 16‑byte weight loads before converting; `mxfp8_gemv_grouped` adds a head‑group dimension + the row‑major / DeepGEMM packed MN‑major scale layouts | CUTLASS SM120 block‑scaled GEMM (128‑row tile) for M ≤ 16; the BF16‑weight cuBLAS bmm fallback for the grouped `wo_a` | DeepSeek‑V4.1 dense projections at 6 verified tokens: 1280←5120, 4096←1280, 576←5120, 5120←2048, 1152←5120, 5120←576; `wo_a` 2 × [1024←4096] | 2.3–3.4× vs CUTLASS (e.g. `wo_b` 44.7 → 13.2 µs), 2.9× vs the bmm (25.8 → 9.0 µs); ~250 launches per decode step |
 | **`tools/qwen38_sm120/moe_gemv/fused_moe_gemv_sm120.cu`** — FP8 [32,32] block‑scaled MoE GEMV with vLLM's `fused_moe` contract (`sorted_token_ids` / `expert_ids` / `topk_weights`); one block per (token, expert) pair (or per 16‑row aligned block, A tile staged in smem); a `FUSE_ACT` variant computes silu(gate)·up and the UE8M0 per‑32 quantization of the down‑GEMM input in‑kernel | Triton `fused_moe_kernel` (`BLOCK_SIZE_K` capped at 32 by the block scales) + `act_and_mul` + `per_token_group_quant` | Qwen3.8‑Flash‑Next experts (E=512, TP4 shards 320/160 × 2560) for ≤ 320 (token, expert) pairs | per layer at 4 tokens 50 → 29 µs (gate/up at 1.6 TB/s), 3 launches → 1 for the down path; outputs 0 elements different from Triton's |
 
-The kernels were tuned with the tools in **`tools/sm120_perf/`** — torch‑trace anatomy per CUDA graph
-(the same tooling found the PLE stall), cold‑L2 kernel benches that rotate weights through > 128 MB
-so nothing hides in L2, and decode/needle/concurrency probes. Negative results are written up next
-to the positive ones (`tools/dsv41_sm120/README.md`: what did *not* speed up the dense GEMV, why
-DeepGEMM's BLOCK_M cannot go below 64 on sm_120).
+Tooling in **`tools/sm120_perf/`**: torch‑trace anatomy per CUDA graph, cold‑L2 kernel benches
+that rotate weights through > 128 MB so nothing hides in L2, and decode/needle/concurrency probes.
+Negative results are written up next to the positive ones (`tools/dsv41_sm120/README.md`: what does
+*not* speed up the dense GEMV, why DeepGEMM's BLOCK_M cannot go below 64 on sm_120).
 
 ## Benchmark results
 
