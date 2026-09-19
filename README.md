@@ -18,6 +18,15 @@ cannot even fit on. Three ideas carry it:
    bit‑deterministic), an **NVFP4 KV cache** (352 B/token), and agent‑ready tool/reasoning
    parsing.
 
+**New (2026‑09): two more frontier models served from their *official* checkpoints and *official*
+vLLM images on 4× RTX PRO 6000, with the sm_120 gaps closed and the decode step rebuilt around
+small hand‑written kernels — [DeepSeek‑V4.1‑Flash](#deepseekv41flash-552b--196b-engram-on-8-rtx-pro-6000--official-checkpoint-official-image)
+(552B, vision, 512K context, 148 / 346 tok/s prose / code) and
+[Qwen3.8‑Flash‑Next‑FP8](#qwen38flashnextfp8-on-4-rtx-pro-6000--official-checkpoint-official-image-3-the-decode)
+(177B‑A6B, 243 / 346 tok/s — 3× the stock image). Both ship as self‑contained images with launchers
+and a deploy guide: **[docs/sm120-deploy.md](docs/sm120-deploy.md)**; the kernels are described in
+[SM120 decode kernels](#sm120-decode-kernels-cuda-c-jit-compiled-in-the-images).
+
 ---
 
 ## GLM‑5.2 (753B) — the headline model
@@ -447,6 +456,26 @@ Triton: −1.0 ms). Result on 4× RTX PRO 6000, TP4, MTP k=3: **65 → 98.5 step
 and code 228 → 346 tok/s single stream**, needle PASS at 27K/92K, 2.28M‑token KV at 256K context.
 Ships as **`Dockerfile.sm120-qwen38`** + `tools/qwen38_sm120/`; the write‑up is
 **[tools/qwen38_sm120/README.md](tools/qwen38_sm120/README.md)**.
+
+## SM120 decode kernels (CUDA C++, JIT-compiled in the images)
+
+Two small tensor‑core kernels carry most of the decode gains above. Both use `mma.sync.m16n8k32`
+(e4m3 × e4m3 → f32) — the instruction sm_120 actually has (no `tcgen05`, no TMA multicast) — one
+MMA per 32‑wide scale block, fp32 accumulation, and the same summation formula as the kernels they
+replace, so their outputs are bit‑identical (MoE) or within one bf16 rounding (dense) of the
+reference. They are plain `torch.utils.cpp_extension` sources, precompiled at image build; each has
+a cold‑L2 benchmark against the kernel it replaces and an fp32 reference.
+
+| kernel | replaces | shape regime | measured |
+|---|---|---|---|
+| **`tools/dsv41_sm120/sm120_gemv/mxfp8_gemv_sm120.cu`** — MXFP8×MXFP8 GEMV, FlashInfer F8_128x4 swizzled ue8m0 scales; a block owns 8 output columns, its 8 warps split the K blocks, every lane issues all its 16‑byte weight loads before converting; `mxfp8_gemv_grouped` adds a head‑group dimension + the row‑major / DeepGEMM packed MN‑major scale layouts | CUTLASS SM120 block‑scaled GEMM (128‑row tile) for M ≤ 16; the BF16‑weight cuBLAS bmm fallback for the grouped `wo_a` | DeepSeek‑V4.1 dense projections at 6 verified tokens: 1280←5120, 4096←1280, 576←5120, 5120←2048, 1152←5120, 5120←576; `wo_a` 2 × [1024←4096] | 2.3–3.4× vs CUTLASS (e.g. `wo_b` 44.7 → 13.2 µs), 2.9× vs the bmm (25.8 → 9.0 µs); ~250 launches per decode step |
+| **`tools/qwen38_sm120/moe_gemv/fused_moe_gemv_sm120.cu`** — FP8 [32,32] block‑scaled MoE GEMV with vLLM's `fused_moe` contract (`sorted_token_ids` / `expert_ids` / `topk_weights`); one block per (token, expert) pair (or per 16‑row aligned block, A tile staged in smem); a `FUSE_ACT` variant computes silu(gate)·up and the UE8M0 per‑32 quantization of the down‑GEMM input in‑kernel | Triton `fused_moe_kernel` (`BLOCK_SIZE_K` capped at 32 by the block scales) + `act_and_mul` + `per_token_group_quant` | Qwen3.8‑Flash‑Next experts (E=512, TP4 shards 320/160 × 2560) for ≤ 320 (token, expert) pairs | per layer at 4 tokens 50 → 29 µs (gate/up at 1.6 TB/s), 3 launches → 1 for the down path; outputs 0 elements different from Triton's |
+
+The kernels were tuned with the tools in **`tools/sm120_perf/`** — torch‑trace anatomy per CUDA graph
+(the same tooling found the PLE stall), cold‑L2 kernel benches that rotate weights through > 128 MB
+so nothing hides in L2, and decode/needle/concurrency probes. Negative results are written up next
+to the positive ones (`tools/dsv41_sm120/README.md`: what did *not* speed up the dense GEMV, why
+DeepGEMM's BLOCK_M cannot go below 64 on sm_120).
 
 ## Benchmark results
 

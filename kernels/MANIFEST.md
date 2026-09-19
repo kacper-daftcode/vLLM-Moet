@@ -367,3 +367,14 @@ gap-fill) and the launcher stays single-stream.
 
 Validation (vs torch/Triton reference, rel ~1–3e‑3, deterministic): `tools/test_moe_w2_planes.py`,
 `tools/test_moe_w2_forward.py`, `tools/test_mqa_logits.py`.
+
+## CUDA C++ decode kernels for the official-image deployments (sm_120, JIT via torch cpp_extension)
+
+Not SASS/cubins: plain `.cu` sources compiled into the `Dockerfile.sm120-dsv41` / `Dockerfile.sm120-qwen38`
+images (`torch.utils.cpp_extension.load`, `TORCH_CUDA_ARCH_LIST=12.0`). `mma.sync.m16n8k32` e4m3 → f32,
+one MMA per 32-wide scale block, fp32 accumulation.
+
+| source | entry points | replaces | validation |
+|---|---|---|---|
+| `tools/dsv41_sm120/sm120_gemv/mxfp8_gemv_sm120.cu` | `mxfp8_gemv` (dense M ≤ 16, F8_128x4 scales), `mxfp8_gemv_grouped` (DeepSeek-V4 `wo_a`, T ≤ 64, row-major + DeepGEMM MN-packed scales); scalar fallback `VLLM_MOET_GEMV_IMPL=scalar`, experiment `=v2` | FlashInfer CUTLASS `mm_mxfp8` for decode shapes; BF16-weight cuBLAS bmm for `wo_a` | `sm120_gemv/test_mxfp8_gemv_sm120.py` (vs CUTLASS + fp32 ref, maxrel 3.8e-3 = CUTLASS), `test_wo_a_gemv_sm120.py`, integration tests |
+| `tools/qwen38_sm120/moe_gemv/fused_moe_gemv_sm120.cu` | `fused_moe_gemv` (vLLM `fused_moe_kernel` contract, naive + `moe_align_block_size` paths, routed weights), `fused_moe_gemv_act` (silu·up + UE8M0 per-32 quant fused, naive path) | Triton `fused_moe_kernel` at ≤ 320 (token, expert) pairs; `act_and_mul` + `per_token_group_quant_fp8` | `moe_gemv/test_fused_moe_gemv_sm120.py` (vs Triton: 0 differing elements, and fp32 ref), `test_fused_moe_integration.py` (dispatch + `TritonExperts.apply` with vLLM's workspace layout) |

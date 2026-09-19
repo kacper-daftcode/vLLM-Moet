@@ -31,6 +31,29 @@ What the images change relative to the official ones, and the measurements behin
   allreduce is pull-based and slower than NCCL on PCIe — leave it off (the launchers do not
   enable it).
 
+## What you need (nothing is patched by hand)
+
+Everything below the model weights is produced by the two Dockerfiles from public inputs:
+
+| input | where it comes from | pin |
+|---|---|---|
+| base image, DeepSeek | Docker Hub `vllm/vllm-openai:deepseekv41-flash-0909` (vLLM 0.30, FlashInfer 0.6.18, vendored DeepGEMM, nvcc 13.0, torch 2.13) | the vLLM recipe's NVIDIA tag |
+| base image, Qwen | Docker Hub `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` (= the `qwen38-flash-next` nightly, v0.1.dev20073+g8e685d198) | digest |
+| DeepGEMM source (rebuilt inside the DeepSeek image with three host-side asserts relaxed) | `github.com/deepseek-ai/DeepGEMM` | commit `8b1392b978f5a03c828dd1711090d7fb50958b8a` |
+| FlashInfer sparse-MLA sm_120 instantiations for the V4.1 geometry, dispatch hook | this repo, `tools/dsv41_sm120/` (installed into the image's FlashInfer by `patch_flashinfer.py`, precompiled) | — |
+| vLLM patches (anchored, refuse to apply to other versions) and the two CUDA kernels | this repo, `tools/dsv41_sm120/`, `tools/qwen38_sm120/` | — |
+| weights | Hugging Face `deepseek-ai/DeepSeek-V4.1-Flash` (MIT, ~510 GB), `Qwen/Qwen3.8-Flash-Next-FP8` (Apache-2.0, ~180 GB); no gating | the launchers read the directory you point them at |
+
+```bash
+pip install -U huggingface_hub
+hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /srv/models/DeepSeek-V4.1-Flash
+hf download Qwen/Qwen3.8-Flash-Next-FP8 --local-dir /srv/models/Qwen3.8-Flash-Next-FP8
+```
+
+The build needs network access (base image pull, DeepGEMM clone); serving does not. The images
+were rebuilt from scratch (`docker build --no-cache`) from the committed tree on 2026-09-19 to
+confirm this. Without network, `docker load` the saved image tarballs instead (see Build).
+
 ## Build
 
 ```bash
