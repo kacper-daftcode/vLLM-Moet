@@ -38,14 +38,15 @@ row), extra (compressed) top‑k 512, 8 query heads at TP8.
 | 2 | FlashInfer SM120 DSV4 prefill (single + dual) is PBS=64 only; dual admits extra pages {64, 2}; SWA rows {128..2048}, dual 128 only | ratio‑1 layers: `Unsupported sparse-MLA prefill configuration … page_block_size=32 … extra_page_block_size=128`; rows 1152 rejected everywhere | new TU `sparse_mla_sm120_dsv41.cu`: PBS=32 × TOPK {128, 192, 1152} single; PBS=32 × PBSX {64, 128} × TOPK {128, 192, 1152} dual (+ full‑tile 128); FP8 compute mode at 1152 like the stock ≥512 table |
 | 3 | `dispatch_dsv4_single` (and the dual PBSX=64 table) never looked at `page_block_size` | SWA‑only and ratio‑2 layers **silently ran the 64‑page kernel over 32‑token pages** (wrong addresses, no error) | orchestrator hook: `ModelType::DSV4 && page_block_size != 64` → DSV4.1 table or a loud failure |
 | 4 | small prefill batches (≤ 64 tokens) with 1152‑wide rows take the decode entry | `no decode kernel … topk=1152` | decode TOPK=1152 at PBS=32 (item 1) |
-| 5 | DeepGEMM SM120 FP8 paged MQA logits (indexer) + its metadata: `block_kv == 64` only | ratio‑1 indexer layers (128 states/page): `Assertion error attention.hpp:262: block_kv == 32 or block_kv == 64`, `:320 … block_kv == 64` | three host asserts admit 128 for the FP8 cache (`patch_deepgemm.py`); device kernel/scheduler are templated on `BLOCK_KV` (128 rows = one group of eight 16‑row MMA warps, `SPLIT_KV` stays 128, ~71 KB smem) |
+| 5 | DeepGEMM SM120 FP8 paged MQA logits (indexer) + its metadata: `block_kv == 64` only; the MXFP4 sibling `block_kv ∈ {32, 64}` | ratio‑1 indexer layers (128 states/page): `Assertion error attention.hpp:262: block_kv == 32 or block_kv == 64`, `:320 … block_kv == 64` | host asserts admit 128 for the FP8 and the MXFP4 cache (`patch_deepgemm.py`); device kernels/scheduler are templated on `BLOCK_KV` (128 rows = one group of eight 16‑row MMA warps, `SPLIT_KV` stays 128, ~71 KB smem for FP8, ~37 KB for MXFP4) |
+| 5b | vLLM gates `--attention-config '{"indexer_kv_dtype":"mxfp4"}'` on sm_10x | `indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs` | `patch_vllm_indexer_fp4_sm120.py` admits sm_120; see [the MXFP4 indexer section](#the-indexer-in-its-training-format-mxfp4-k-cache-on-sm_120-20260920) |
 | 6 | DSpark `enable_adaptive_verification:true` (recipe's NVIDIA default) | `DeepseekV4IndexerBackend … does not support` adaptive verification on this path | serve with `enable_adaptive_verification:false` (the recipe's AMD override); DSpark still drafts 5 tokens |
 
 Not gaps (verified working on sm_120 in this image): DeepGEMM MXFP4 MoE (`DEEPGEMM_MXFP4` /
 `DeepGemmFP4Experts`), MXFP8 dense GEMM (`FlashInferCutlassMxfp8LinearKernel`; a few shapes fall
 back to `EmulationMxfp8LinearKernel` — a perf item, not a blocker), `fp8_ds_mla` KV format, FP8
-indexer cache, Mega‑mHC TileLang kernels, Engram in pinned host RAM (2 × 11.8 GiB per rank),
-ViT with FLASH_ATTN, DSpark drafter, cudagraphs FULL_AND_PIECEWISE.
+indexer cache (and, with 5/5b, the MXFP4 one), Mega‑mHC TileLang kernels, Engram in pinned host
+RAM (2 × 11.8 GiB per rank), ViT with FLASH_ATTN, DSpark drafter, cudagraphs FULL_AND_PIECEWISE.
 
 ## The kernels
 
@@ -382,6 +383,64 @@ the checkpoint mounted, requires byte‑identical prompts to DeepSeek's encoder 
 and a 90‑case matrix (thinking/chat × 9 efforts × 5 conversations incl. tools, reasoning turns and a
 tool‑call round trip) — all identical after the patch. Worth a vLLM PR (the fix is the same three
 lines there).
+
+## The indexer in its training format: MXFP4 K cache on sm_120 (2026‑09‑20)
+
+The tech report quantizes the Lightning Indexer's Q and K to FP4 with UE8M0 block scales (32
+values per scale) — the format its top‑k selection was trained with (V4's QAT). vLLM has that path
+(`--attention-config '{"indexer_kv_dtype":"mxfp4"}'`, the recipe's Blackwell setting) but gates it
+on sm_10x with a message that names sm_120 unsupported. It is not: the gate was written before
+DeepGEMM `8b1392b9` shipped `sm120_fp4_paged_mqa_logits.cuh` / `sm120_fp4_mqa_logits.cuh`
+(head_dim 128, the indexer's), and everything else on the path is arch‑generic — the Q quantizer
+(CuTe DSL), the K store (Triton, `cvt.rn.satfinite.e2m1x2.f32`, which sm_120a has) and the prefill
+gather op (byte‑width generic). What stood in the way on sm_120 was the same thing as for the FP8
+cache: the DeepGEMM launchers' host asserts stop at 64‑key pages and V4.1 pages 128 keys on the
+compress_ratio‑1 layers. `patch_deepgemm.py` now admits 128 for the MXFP4 launcher too;
+`patch_vllm_indexer_fp4_sm120.py` widens the gate; the launcher takes `INDEXER_KV_DTYPE=mxfp4`.
+
+Per indexer key this is 68 B (64 B of e2m1 pairs + 4 UE8M0 bytes) instead of 132 (128 fp8 + one
+fp32 scale). Because vLLM packs every kv source's compressed page and indexer page into one
+physical block (block‑outermost layout `BLHNC`; `tools/sm120_perf/kv_layout_probe.py` runs
+vLLM's own `get_kv_cache_groups` on the model's specs offline and reproduces the served
+1,490,870‑token figure to 0.1 %), the block shrinks from 230 400 to 210 240 B: 3 × (37 440 + 4 608)
++ 74 880 + 9 216, i.e. +9.6 % KV tokens for the same bytes (the 43 SWA pages are packed into four
+groups of 11/11/11/10 × 19 008 B, just under that). The 210 240‑byte stride is 64‑B‑ but not
+512‑B‑aligned; DeepGEMM's TMA descriptors need 16 B, and the op‑level test lays its pages out at
+exactly these strides and offsets (`--packed-stride`).
+
+Validation, op level (RTX 5090, `test_deepgemm_sm120_paged_mqa.py --fmt mxfp4 --packed-stride`
+and `test_indexer_fp4_sm120.py`): DeepGEMM MXFP4 logits on 128‑key pages vs the fp4‑simulated
+reference 1.2e‑6, bit‑exact between 64‑ and 128‑key pagings of the same keys, native next_n 1/2/6
+and varlen (40/40 cases with FP8); the CuTe DSL Q quantizer and the Triton K store reproduce
+DeepSeek's quantizer (RNE e2m1, UE8M0 = 2^ceil(log2(amax/6))) on 16.8 M + 0.8 M values with zero
+off‑tie differences (the hardware keeps the sign of values that round to zero; exact midpoints round
+to even as expected), and DeepGEMM's logits on the kernel‑written cache match the dequantized
+reference. On Gaussian data the FP4 indexer's scores sit 1.4e‑2 (cosine `calc_diff`) from the
+fp32 ideal where the FP8 path sits at 7e‑4 — twenty times coarser, which is why the check that
+matters is the served one below.
+
+Served (4× RTX PRO 6000, TP4, `INDEXER_KV_DTYPE=mxfp4`, otherwise the production configuration):
+the greedy outputs are **identical** to the FP8‑indexer baseline on every probe of
+`quality_cmp.py` (24/24 agreement prompts, 12/12 raw coherence texts, arithmetic 5/5 with and
+without thinking, tools / JSON / vision PASS) and the needle answers at 26.7K, 97.4K and 367.5K
+tokens (both depths) are the same six numbers; GSM8K‑200 greedy C4 **193/200 = 96.5 %, the same
+as both FP8 runs, paired exact McNemar p = 1, flips 2/2** (the two FP8 runs flip 1/1 against each
+other — batching noise), completion tokens +0.5 %. Speed is unchanged (prose 149.9 tok/s at
+67.7 steps/s, code 347.8 at 67.9, fresh prefill 11.7k tok/s at 17K and 10.9k at 139K).
+
+KV: `Available KV cache memory` **4.39 GiB = 2,288,673 tokens (4.37× at 512K)** against 3.14 GiB
+= 1,490,870 (2.84×) — +53 %, of which the smaller indexer page explains +9.6 %; the rest comes from
+vLLM's start‑up accounting reporting **83.07 GiB consumed (weights + non‑torch) instead of the
+84.32–84.92 GiB of every FP8‑indexer start** (peak activation 1.81 GiB and CUDA graphs 0.42 GiB
+unchanged), i.e. ~1.25 GiB less non‑torch memory during the profile run, which vLLM hands to the
+KV cache. That memory is not gone at run time: under load the cards level off at **97 001 of
+97 887 MiB (886 MiB from the wall)** where the FP8 configuration peaked at ~96.0 GB, and stay
+there through the full battery — GSM8K C4, eight concurrent 126K‑token fresh prefills (0 errors),
+a fresh 139K prefill, the 367K needle and vision at the same time. The margin is therefore closer
+to the opt‑in 0.95/2048 profile's (716 MiB) than to the old default's (1.2–1.8 GB);
+`GPU_MEM_UTIL=0.93` with the MXFP4 indexer buys the old margin back at ~3.4 GiB of KV (~1.8M
+tokens, still +20 %). `INDEXER_KV_DTYPE=mxfp4` is the launcher default since 2026‑09‑20;
+`INDEXER_KV_DTYPE=fp8` restores the previous cache (no rebuild).
 
 ## Apply / build / run
 

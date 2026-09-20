@@ -8,10 +8,14 @@
 #      sparse_mla_sm120_dsv41.cu). The AOT sparse_mla_sm120.so is removed (it would
 #      be loaded INSTEAD of the patched JIT sources) and the module is precompiled
 #      into the JIT cache, so the first serve pays no JIT compile.
-#   2. DeepGEMM 8b1392b9 (the pin vendored in the image): SM120 FP8 paged MQA logits
-#      accept the 128-row indexer pages of the compress_ratio=1 layers
+#   2. DeepGEMM 8b1392b9 (the pin vendored in the image): SM120 FP8 and MXFP4 paged MQA
+#      logits accept the 128-row indexer pages of the compress_ratio=1 layers
 #      (tools/dsv41_sm120/patch_deepgemm.py); _C is rebuilt INSIDE the official image
 #      so the python/glibc/torch ABI matches by construction, like Dockerfile.sm120-v024.
+#      vLLM's sm_10x-only gate on the MXFP4 indexer cache is lifted
+#      (patch_vllm_indexer_fp4_sm120.py), so `--attention-config
+#      '{"indexer_kv_dtype":"mxfp4"}'` (launcher: INDEXER_KV_DTYPE=mxfp4) stores 68 instead
+#      of 132 B per indexer key; the default stays fp8.
 #   3. Decode-shaped dense MXFP8 GEMMs (M <= 16 rows) run on the vLLM-Moet tensor-core
 #      GEMV (tools/dsv41_sm120/sm120_gemv/) instead of the CUTLASS 128-row tile
 #      (patch_vllm_mxfp8_gemv.py, one dispatch branch in
@@ -104,14 +108,17 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer.py \
 #    patch_vllm_reasoning_effort.py (2026-09-20): official reasoning-effort tiers in the
 #    deepseek_v41 prompt encoder (see header, item 4); the test that follows asserts the
 #    default thinking-mode request renders budget 75 and fails the build otherwise.
+#    patch_vllm_indexer_fp4_sm120.py (2026-09-20): dsa_indexer_uses_fp4 admits sm_120 (header,
+#    item 2); a gate only -- the indexer cache format is still chosen per launch.
 ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
 RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_wo_a_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_glue_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120" \
-      org.opencontainers.image.description="vllm/vllm-openai:deepseekv41-flash-0909 + DSV4.1 SM120 sparse-MLA instantiations (FlashInfer) + DeepGEMM 128-row paged MQA logits on sm_120 + MXFP8 decode GEMV + official reasoning-effort tiers"
+      org.opencontainers.image.description="vllm/vllm-openai:deepseekv41-flash-0909 + DSV4.1 SM120 sparse-MLA instantiations (FlashInfer) + DeepGEMM 128-row paged MQA logits on sm_120 (FP8 and MXFP4 indexer cache) + MXFP8 decode GEMV + official reasoning-effort tiers"

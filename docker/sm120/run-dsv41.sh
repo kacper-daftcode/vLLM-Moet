@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, DSpark k=5, fp8 KV, 512K context -- the
-# validated deployment (docs/sm120-deploy.md, docs/dsv41-sm120-port.md). Image: Dockerfile.sm120-dsv41.
+# DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, DSpark k=5, fp8 KV, MXFP4 indexer cache, 512K
+# context -- the validated deployment (docs/sm120-deploy.md, docs/dsv41-sm120-port.md). Image: Dockerfile.sm120-dsv41.
 #
 # Required:  MODEL_DIR   directory with the official DeepSeek-V4.1-Flash checkpoint
 # Optional:  IMAGE (vllm-moet-sm120:dsv41-0909)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
@@ -11,6 +11,13 @@
 #            GPU_MEM_UTIL (0.94)     0.94 with a populated FlashInfer autotune cache; use 0.92 for
 #                        the very first start (the autotune sweep after KV allocation OOMs at 0.95)
 #            SPEC_TOKENS (5)         DSpark draft tokens; 0 disables the drafter (-2.4 GiB/GPU, ~106 tok/s)
+#            INDEXER_KV_DTYPE (mxfp4) indexer K cache: mxfp4 (68 B/key, the format the indexer was trained
+#                        with; validated 2026-09-20: greedy outputs, GSM8K-200 and needle identical to fp8,
+#                        2.29M instead of 1.49M KV tokens at 0.94) or fp8 (132 B/key, V3.2 layout, the
+#                        pre-2026-09-20 default). Passed as --attention-config '{"indexer_kv_dtype":...}';
+#                        mxfp4 needs the 2026-09-20 image (DeepGEMM sm120_fp4 paged logits on 128-key
+#                        pages + the lifted sm_10x gate). Peak GPU memory with mxfp4 at 0.94 is
+#                        97.0/97.9 GB (docs/sm120-deploy.md); GPU_MEM_UTIL=0.93 restores the fp8 margin.
 #            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
@@ -39,6 +46,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 SPEC_TOKENS="${SPEC_TOKENS:-5}"
+INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
 PROFILER="${PROFILER:-0}"
 PROFILE_DIR="${PROFILE_DIR:-$PWD/profiles-$NAME}"
@@ -55,6 +63,11 @@ if [[ "$SPEC_TOKENS" != "0" ]]; then
     "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
+case "$INDEXER_KV_DTYPE" in
+  fp8) ;;
+  mxfp4) ARGS+=(--attention-config "{\"indexer_kv_dtype\":\"mxfp4\"}") ;;
+  *) echo "INDEXER_KV_DTYPE must be fp8 or mxfp4, got $INDEXER_KV_DTYPE" >&2; exit 1 ;;
+esac
 MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$CACHE_DIR/deep_gemm:/root/.deep_gemm")
 if [[ "$PROFILER" == "1" ]]; then
   mkdir -p "$PROFILE_DIR"
@@ -95,4 +108,5 @@ docker run -d --name "$NAME" --restart no \
   --host 0.0.0.0 --port "$PORT"
 
 echo "container $NAME started; logs: docker logs -f $NAME ; API: http://${BIND:-0.0.0.0:}${PORT}/v1"
-echo "expect in the log: 'Using Sm120GemvMxfp8BmmLinearKernel for MXFP8 GEMM', 'wo_a stays MXFP8 on sm_120'"
+echo "expect in the log: 'Using Sm120GemvMxfp8BmmLinearKernel for MXFP8 GEMM', 'wo_a stays MXFP8 on sm_120',"
+echo "  'Using ${INDEXER_KV_DTYPE^^} indexer cache for Lightning Indexer'"

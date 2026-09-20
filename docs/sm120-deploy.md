@@ -76,7 +76,9 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
   'python3 /opt/vllm-moet/qwen38_sm120/moe_gemv/test_fused_moe_integration.py'
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-0909 -c \
   'python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 --shapes decode &&
-   python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py'
+   python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py &&
+   python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py --packed-stride &&
+   python3 /opt/vllm-moet/dsv41_sm120/test_indexer_fp4_sm120.py'
 ```
 
 ## Serve
@@ -84,7 +86,8 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
 ```bash
 # DeepSeek-V4.1-Flash, GPUs 0-3, port 8001 (first start ~25 min: FlashInfer autotune + DeepGEMM JIT fill CACHE_DIR; later ~17 min)
 MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash CACHE_DIR=/srv/cache/ds41 GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh
-# second start onwards: GPU_MEM_UTIL=0.94 (1.49M KV tokens); 0.95 OOMs during the autotune sweep on a cold cache
+# second start onwards: GPU_MEM_UTIL=0.94 (2.29M KV tokens with the default MXFP4 indexer cache, 1.49M with
+# INDEXER_KV_DTYPE=fp8); 0.95 OOMs during the autotune sweep on a cold cache
 
 # Qwen3.8-Flash-Next-FP8, GPUs 4-7, port 8000 (first start ~10 min: torch.compile + FlashInfer JIT; later ~4 min)
 MODEL_DIR=/srv/models/Qwen3.8-Flash-Next-FP8 CACHE_DIR=/srv/cache/qwen38 GPUS=4,5,6,7 docker/sm120/run-qwen38.sh
@@ -113,10 +116,12 @@ python3 tools/sm120_perf/needle_any.py http://127.0.0.1:8000 Qwen3.8-Flash-Next 
 python3 tools/sm120_perf/needle_any.py http://127.0.0.1:8001 deepseek-ai/DeepSeek-V4.1-Flash '{"chat_template_kwargs": {"thinking": false}}' 30000,100000
 ```
 
-Expected on 4× RTX PRO 6000 with P2P: DeepSeek 66–67 steps/s (prose ~2.2, code ~5.2 tok/step),
+Expected on 4× RTX PRO 6000 with P2P: DeepSeek 66–68 steps/s (prose ~2.2, code ~5.1 tok/step),
 Qwen 97–99 steps/s (prose ~2.5, code ~3.5 tok/step), needle PASS at both lengths. A first request
 after start is slower (warm-up). If steps/s are ~10 % low and the log shows NCCL on `SHM`, P2P is
-not available on the host — check IOMMU / ACS settings.
+not available on the host — check IOMMU / ACS settings. The DeepSeek log should say `Using MXFP4
+indexer cache for Lightning Indexer` (the default since 2026-09-20; `INDEXER_KV_DTYPE=fp8` gives the
+previous 132 B/key cache) and `GPU KV cache size: 2,28x,xxx tokens` at `GPU_MEM_UTIL=0.94`.
 
 The DeepSeek image renders the checkpoint's reasoning-effort tiers (`low` 50 / `high` 75 / `max`
 100, default `high`; see `docs/dsv41-sm120-port.md`). To confirm on a host without a GPU free:
@@ -137,12 +142,22 @@ consumed, same KV), so this is real allocation, not fragmentation. The 4.2M-toke
 EP4 SGLang recipe reports on the same cards come from its 72.6 GiB weight footprint, not from a
 knob on this side.
 
-Capacity profile, measured 2026-09-19: `GPU_MEM_UTIL=0.95 MAX_NUM_BATCHED_TOKENS=2048` gives
-**4.19 GiB KV = 2.21M tokens (+50 %, 4.2× concurrency at 512K)** at the same decode speed
-(67 steps/s, 147 / 347 tok/s), **−7 % prefill** (10.1–11.0k vs 11.0–11.9k tok/s) and a thinner
-margin: 716 MiB free at the peak of 8×131K-token streams + a 367K needle + vision (all passed).
-Use it only with the FlashInfer autotune cache already populated (the cold sweep OOMs at 0.95),
-and keep `0.94 / 4096` where prefill or margin matter more. Qwen with `--kv-cache-memory 32GiB` uses ~88 GB/GPU; vLLM's own
+Those numbers are the FP8 indexer cache. With the **MXFP4 indexer cache** (the default since
+2026-09-20, `docs/dsv41-sm120-port.md`) the same `0.94 / 4096` start reports **4.39 GiB KV =
+2.29M tokens (4.4× at 512K)**: the indexer page shrinks (+9.6 %) and vLLM's profile run counts
+1.25 GiB less non-torch memory, which it hands to the KV cache. Under load the cards then level
+off at **97 001 of 97 887 MiB (886 MiB from the wall)** — GSM8K C4, 8 concurrent fresh 126K
+prefills, a fresh 139K prefill, the 367K needle and vision all passed there, but the margin is the
+0.95-profile's, not the old default's; `GPU_MEM_UTIL=0.93` with MXFP4 gives ~3.4 GiB KV (~1.8M
+tokens) with the old ~1.9 GB margin.
+
+Capacity profile, measured 2026-09-19 with the FP8 indexer: `GPU_MEM_UTIL=0.95
+MAX_NUM_BATCHED_TOKENS=2048` gives **4.19 GiB KV = 2.21M tokens (+50 %, 4.2× concurrency at
+512K)** at the same decode speed (67 steps/s, 147 / 347 tok/s), **−7 % prefill** (10.1–11.0k vs
+11.0–11.9k tok/s) and a thinner margin: 716 MiB free at the peak of 8×131K-token streams + a 367K
+needle + vision (all passed). Use it only with the FlashInfer autotune cache already populated
+(the cold sweep OOMs at 0.95), and keep `0.94 / 4096` where prefill or margin matter more (not
+re-measured with the MXFP4 indexer). Qwen with `--kv-cache-memory 32GiB` uses ~88 GB/GPU; vLLM's own
 start-up estimate would give only 5.6 GiB of KV because the GPU-PLE profile run over-reports its
 peak activation (a compile-time transient), hence the explicit KV size. Image/video prompts on
 Qwen (it is a VL model) were not stress-tested for memory; drop `KV_CACHE_MEMORY` to 28 GiB if

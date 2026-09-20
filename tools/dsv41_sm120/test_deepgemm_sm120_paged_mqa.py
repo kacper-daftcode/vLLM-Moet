@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
-"""Op-level validation of DeepGEMM SM120 FP8 paged MQA logits on 128-row pages.
+"""Op-level validation of DeepGEMM SM120 paged MQA logits on 128-row pages (FP8 and MXFP4).
 
 DeepSeek-V4.1's indexer hands DeepGEMM 128-state pages on its compress_ratio=1
-layers; stock DeepGEMM 8b1392b9 admits only 64 on sm_120 (patch_deepgemm.py).
-For every case this script checks
+layers; stock DeepGEMM 8b1392b9 admits only 64 on sm_120 for the FP8 indexer
+cache and 32/64 for the MXFP4 one (patch_deepgemm.py lifts both). For every case
+this script checks
 
-  REF    - kernel logits vs the fp8-simulated torch reference (upstream
-           tests/test_attention.py::ref_paged_mqa_logits), relative diff
-           < 1e-3 exactly like upstream's FP8 gate, plus the self-consistency
-           re-run (bitwise identical across launches);
+  REF    - kernel logits vs the quantization-simulated torch reference (upstream
+           tests/test_attention.py::ref_paged_mqa_logits on the dequantized Q / K),
+           relative diff < 1e-3 exactly like upstream's FP8 gate, plus the
+           self-consistency re-run (bitwise identical across launches);
   PARITY - the same logical KV re-paged 64 vs 128 rows/page, same context
            lengths, block tables remapped: logits must agree bit-for-bit
            (the per-token math is independent of the page grouping).
@@ -18,11 +19,24 @@ Shapes follow vLLM's V4.1 indexer: 32 heads, head_dim 128, fp32 weights,
 varlen mode (`indices=`, one row per token, 1..6 tokens per request) that
 vLLM's SM100 decode path and adaptive verification rely on.
 
+Formats (`--fmt`): `fp8` = 128 fp8 + one fp32 scale per key (132 B, vLLM's
+default indexer cache); `mxfp4` = 64 B of e2m1 pairs + four UE8M0 scales per 32
+values (68 B, `--attention-config '{"indexer_kv_dtype":"mxfp4"}'`, the format
+the indexer was trained with). Both use DeepGEMM's segregated page layout
+(all keys' values, then all keys' scales).
+
+`--packed-stride` lays the pages out the way vLLM's block-outermost KV cache
+does for this model (the indexer page shares a physical block with the kv
+source's compressed page and the other kv sources': block stride 230400 B with
+the FP8 indexer, 210240 B with MXFP4 -- the latter is 64 B- but not 512 B-aligned)
+so the TMA descriptors see the served strides and offsets, not a dense array.
+
 Run inside the serving image on one SM120 GPU with the patched _C.so in place:
   python3 test_deepgemm_sm120_paged_mqa.py [--module vllm.third_party.deep_gemm]
+      [--fmt fp8|mxfp4|both] [--only native|varlen] [--packed-stride]
 
-ref_paged_mqa_logits / kv_cache_cast_to_fp8 / calc_diff are vendored from
-DeepGEMM tests (MIT, DeepSeek).
+ref_paged_mqa_logits / kv_cache_cast_to_fp8 / kv_cache_cast_to_mxfp4 / calc_diff
+are vendored from DeepGEMM tests (MIT, DeepSeek).
 """
 from __future__ import annotations
 
@@ -33,6 +47,15 @@ import sys
 import time
 
 import torch
+
+HEADS, DIM = 32, 128
+# vLLM 0909 block-outermost layout for DeepSeek-V4.1-Flash, block 128, fp8_ds_mla (per rank):
+# block stride and the byte offset inside the block of the indexer page of the compress_ratio=1
+# kv source (128 keys/page, layer 20) and of the first compress_ratio=2 one (64 keys/page, layer 2).
+PACKED_LAYOUT = {
+    "fp8": {"stride": 230400, "offset": {128: 213120, 64: 112320}},
+    "mxfp4": {"stride": 210240, "offset": {128: 201024, 64: 112320}},
+}
 
 
 def ref_paged_mqa_logits(q, kv_cache, weights, context_lens, block_tables, max_model_len, use_2d_context_lens):
@@ -76,6 +99,53 @@ def kv_cache_cast_to_fp8(x: torch.Tensor):
     return x_fp8.view(num_blocks, block_size, num_heads, head_dim + 4), x_cast_back.to(x.dtype)
 
 
+def kv_cache_cast_to_mxfp4(x: torch.Tensor, dgm):
+    """[num_blocks, block, 1, 128] bf16 -> ([num_blocks, block, 1, 68] uint8, dequantized bf16).
+
+    Page layout = DeepGEMM's / vLLM's indexer_k_norm_rope_store: block * 64 B of packed
+    e2m1 pairs, then block * 4 UE8M0 bytes (one int32 quad per key)."""
+    num_blocks, block_size, num_heads, head_dim = x.shape
+    assert num_heads == 1 and head_dim == 128
+    packed, sf = dgm.per_token_cast_to_fp4(x.view(-1, head_dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    x_cast_back = dgm.cast_back_from_fp4(packed, sf, gran_k=32, use_packed_ue8m0=True).view(num_blocks, block_size, 1, head_dim)
+    x_fp4 = torch.empty((num_blocks, block_size * (head_dim // 2 + 4)), device=x.device, dtype=torch.uint8)
+    x_fp4[:, : block_size * head_dim // 2] = packed.view(num_blocks, block_size * head_dim // 2).view(torch.uint8)
+    x_fp4[:, block_size * head_dim // 2:] = sf.view(num_blocks, block_size).view(torch.uint8)
+    return x_fp4.view(num_blocks, block_size, num_heads, head_dim // 2 + 4), x_cast_back.to(x.dtype)
+
+
+def quantize_q(q: torch.Tensor, fmt: str, dgm):
+    """bf16 [B, next_n, H, 128] -> (DeepGEMM q tuple, dequantized bf16 for the reference)."""
+    if fmt == "fp8":
+        q_in = q.to(torch.float8_e4m3fn)
+        return (q_in, None), q_in.to(torch.bfloat16)
+    bsz, next_n, heads, dim = q.shape
+    packed, sf = dgm.per_token_cast_to_fp4(q.view(-1, dim), use_ue8m0=True, gran_k=32, use_packed_ue8m0=True)
+    q_sim = dgm.cast_back_from_fp4(packed, sf, gran_k=32, use_packed_ue8m0=True).view(bsz, next_n, heads, dim).to(torch.bfloat16)
+    return (packed.view(bsz, next_n, heads, dim // 2), sf.view(bsz, next_n, heads)), q_sim
+
+
+def quantize_kv(kv_cache: torch.Tensor, fmt: str, dgm):
+    return kv_cache_cast_to_fp8(kv_cache) if fmt == "fp8" else kv_cache_cast_to_mxfp4(kv_cache, dgm)
+
+
+def repack_strided(kv_in: torch.Tensor, fmt: str, block_kv: int) -> torch.Tensor:
+    """Copy the dense [num_blocks, block, 1, W] pages into vLLM's packed-block layout:
+    each page sits at PACKED_LAYOUT offset inside a block-stride-wide block, the rest of
+    the block (the other layers' pages) is filled with noise."""
+    block_stride = PACKED_LAYOUT[fmt]["stride"]
+    page_offset = PACKED_LAYOUT[fmt]["offset"][block_kv]
+    num_blocks, bkv, _, width = kv_in.shape
+    assert bkv == block_kv
+    page_bytes = bkv * width
+    assert page_offset + page_bytes <= block_stride, (page_offset, page_bytes, block_stride)
+    pool = torch.randint(0, 256, (num_blocks, block_stride), device=kv_in.device, dtype=torch.uint8)
+    view = torch.as_strided(pool, size=(num_blocks, bkv, 1, width), stride=(block_stride, width, width, 1),
+                            storage_offset=page_offset)
+    view.copy_(kv_in)
+    return view
+
+
 def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
@@ -100,9 +170,17 @@ def paged_views(kv_tokens: torch.Tensor, seq_lens: torch.Tensor, block_kv: int, 
     return kv_cache, block_table
 
 
-def run_case(dg, bsz: int, next_n: int, avg_kv: int, device) -> dict:
+def _finish(res: dict, out_by_pbs: dict) -> dict:
+    res["parity_maxdiff"] = (out_by_pbs[64] - out_by_pbs[128]).abs().max().item()
+    res["parity"] = "BIT-EXACT" if torch.equal(out_by_pbs[64], out_by_pbs[128]) else f"maxdiff={res['parity_maxdiff']:.3e}"
+    res["ok"] = (res["ref_diff_64"] < 1e-3 and res["ref_diff_128"] < 1e-3 and res["self_consistent_64"]
+                 and res["self_consistent_128"] and res["parity_maxdiff"] <= 1e-3)
+    return res
+
+
+def run_case(dg, dgm, fmt: str, bsz: int, next_n: int, avg_kv: int, device, packed: bool) -> dict:
     torch.manual_seed(7)
-    heads, dim = 32, 128
+    heads, dim = HEADS, DIM
     max_model_len = ((int(1.3 * avg_kv) + 127) // 128) * 128
     context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (bsz,), device=device, dtype=torch.int32)
     context_lens[bsz // 2] = 0  # an empty request in the middle (scheduler skip path)
@@ -116,16 +194,17 @@ def run_case(dg, bsz: int, next_n: int, avg_kv: int, device) -> dict:
     positions = torch.arange(max_model_len, device=device).unsqueeze(0).expand(bsz * next_n, -1)
     neginf_mask = ~(positions < ctx2d.view(-1, 1))
 
-    q_in = q.to(torch.float8_e4m3fn)
-    q_sim = q_in.to(torch.bfloat16)
-    res = dict(case=f"bsz={bsz} next_n={next_n} avg_kv={avg_kv}")
+    q_in, q_sim = quantize_q(q, fmt, dgm)
+    res = dict(case=f"{fmt:5s} bsz={bsz} next_n={next_n} avg_kv={avg_kv}")
     out_by_pbs = {}
     for block_kv in (64, 128):
         kv_cache, block_table = paged_views(kv_tokens, context_lens, block_kv, max_model_len, device)
-        kv_in, kv_sim = kv_cache_cast_to_fp8(kv_cache)
+        kv_in, kv_sim = quantize_kv(kv_cache, fmt, dgm)
+        if packed:
+            kv_in = repack_strided(kv_in, fmt, block_kv)
         sim_logits = ref_paged_mqa_logits(q_sim, kv_sim, weights, context_lens, block_table, max_model_len, True)
         meta = dg.get_paged_mqa_logits_metadata(ctx2d, block_kv, dg.get_num_sms())
-        kw = dict(q=(q_in, None), kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=block_table,
+        kw = dict(q=q_in, kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=block_table,
                   schedule_meta=meta, max_context_len=max_model_len, clean_logits=False, logits_dtype=torch.float)
         logits = dg.fp8_fp4_paged_mqa_logits(**kw)
         torch.cuda.synchronize()
@@ -135,20 +214,16 @@ def run_case(dg, bsz: int, next_n: int, avg_kv: int, device) -> dict:
         res[f"self_consistent_{block_kv}"] = bool(torch.equal(lm, again.masked_fill(neginf_mask, 0)))
         res[f"ref_diff_{block_kv}"] = calc_diff(lm, sim_logits.masked_fill(neginf_mask, 0))
         out_by_pbs[block_kv] = lm
-    res["parity_maxdiff"] = (out_by_pbs[64] - out_by_pbs[128]).abs().max().item()
-    res["parity"] = "BIT-EXACT" if torch.equal(out_by_pbs[64], out_by_pbs[128]) else f"maxdiff={res['parity_maxdiff']:.3e}"
-    res["ok"] = (res["ref_diff_64"] < 1e-3 and res["ref_diff_128"] < 1e-3 and res["self_consistent_64"]
-                 and res["self_consistent_128"] and res["parity_maxdiff"] <= 1e-3)
-    return res
+    return _finish(res, out_by_pbs)
 
 
-def run_case_varlen(dg, bsz: int, max_tokens_per_seq: int, avg_kv: int, device) -> dict:
+def run_case_varlen(dg, dgm, fmt: str, bsz: int, max_tokens_per_seq: int, avg_kv: int, device, packed: bool) -> dict:
     """Varlen decode (vLLM's SM100 path, DeepGEMM `indices=`): every query row is one
     token; rows of the same request share its block-table row and see a causal context
     (ctx - t + 1 + j). This is the mode adaptive verification needs (device-side query
     lengths), so it is validated on sm_120 for both indexer page sizes."""
     torch.manual_seed(11)
-    heads, dim = 32, 128
+    heads, dim = HEADS, DIM
     max_model_len = ((int(1.3 * avg_kv) + max_tokens_per_seq + 127) // 128) * 128
     context_lens = torch.randint(int(0.7 * avg_kv), int(1.3 * avg_kv), (bsz,), device=device, dtype=torch.int32)
     context_lens[bsz // 2] = 0  # empty request in the middle
@@ -168,17 +243,18 @@ def run_case_varlen(dg, bsz: int, max_tokens_per_seq: int, avg_kv: int, device) 
     positions = torch.arange(max_model_len, device=device).unsqueeze(0).expand(rows, -1)
     neginf_mask = ~(positions < ctx2d)
 
-    q_in = q.to(torch.float8_e4m3fn)
-    q_sim = q_in.to(torch.bfloat16)
-    res = dict(case=f"varlen bsz={bsz} rows={rows} tps<={max_tokens_per_seq} avg_kv={avg_kv}")
+    q_in, q_sim = quantize_q(q, fmt, dgm)
+    res = dict(case=f"{fmt:5s} varlen bsz={bsz} rows={rows} tps<={max_tokens_per_seq} avg_kv={avg_kv}")
     out_by_pbs = {}
     for block_kv in (64, 128):
         kv_cache, block_table = paged_views(kv_tokens, context_lens, block_kv, max_model_len, device)
-        kv_in, kv_sim = kv_cache_cast_to_fp8(kv_cache)
+        kv_in, kv_sim = quantize_kv(kv_cache, fmt, dgm)
+        if packed:
+            kv_in = repack_strided(kv_in, fmt, block_kv)
         row_block_table = block_table[indices.long()].contiguous()  # one block-table row per query row
         sim_logits = ref_paged_mqa_logits(q_sim, kv_sim, weights, ctx_rows, row_block_table, max_model_len, True)
         meta = dg.get_paged_mqa_logits_metadata(ctx2d, block_kv, dg.get_num_sms(), indices=indices)
-        kw = dict(q=(q_in, None), kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=row_block_table,
+        kw = dict(q=q_in, kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=row_block_table,
                   schedule_meta=meta, max_context_len=max_model_len, clean_logits=False, logits_dtype=torch.float,
                   indices=indices)
         logits = dg.fp8_fp4_paged_mqa_logits(**kw)
@@ -189,39 +265,44 @@ def run_case_varlen(dg, bsz: int, max_tokens_per_seq: int, avg_kv: int, device) 
         res[f"self_consistent_{block_kv}"] = bool(torch.equal(lm, again.masked_fill(neginf_mask, 0)))
         res[f"ref_diff_{block_kv}"] = calc_diff(lm, sim_logits.masked_fill(neginf_mask, 0))
         out_by_pbs[block_kv] = lm
-    res["parity_maxdiff"] = (out_by_pbs[64] - out_by_pbs[128]).abs().max().item()
-    res["parity"] = "BIT-EXACT" if torch.equal(out_by_pbs[64], out_by_pbs[128]) else f"maxdiff={res['parity_maxdiff']:.3e}"
-    res["ok"] = (res["ref_diff_64"] < 1e-3 and res["ref_diff_128"] < 1e-3 and res["self_consistent_64"]
-                 and res["self_consistent_128"] and res["parity_maxdiff"] <= 1e-3)
-    return res
+    return _finish(res, out_by_pbs)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--module", default="vllm.third_party.deep_gemm")
     ap.add_argument("--only", choices=("native", "varlen"), default=None, help="run one family of cases")
+    ap.add_argument("--fmt", choices=("fp8", "mxfp4", "both"), default="both", help="indexer K cache format")
+    ap.add_argument("--packed-stride", action="store_true",
+                    help="lay the pages out with vLLM's packed block stride/offset instead of a dense array")
     args = ap.parse_args()
     dg = importlib.import_module(args.module)
+    dgm = importlib.import_module(args.module + ".utils.math")
     device = torch.device("cuda")
-    print(f"device={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)} deep_gemm={dg.__version__} from {dg.__file__}")
-    # native decode: (bsz, next_n, avg_kv); DSpark k=5 -> next_n 6 is the served shape on sm_120
-    cases = [("native",) + c for c in itertools.product((16, 256), (1, 2, 6), (2048, 8192))]
-    # varlen (indices=): (bsz, max_tokens_per_seq, avg_kv)
-    cases += [("varlen",) + c for c in itertools.product((16, 64), (1, 6), (2048, 8192))]
+    print(f"device={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)} deep_gemm={dg.__version__} from {dg.__file__}"
+          f" packed_stride={args.packed_stride}")
+    fmts = ("fp8", "mxfp4") if args.fmt == "both" else (args.fmt,)
+    cases = []
+    for fmt in fmts:
+        # native decode: (bsz, next_n, avg_kv); DSpark k=5 -> next_n 6 is the served shape on sm_120
+        cases += [("native", fmt) + c for c in itertools.product((16, 256), (1, 2, 6), (2048, 8192))]
+        # varlen (indices=): (bsz, max_tokens_per_seq, avg_kv)
+        cases += [("varlen", fmt) + c for c in itertools.product((16, 64), (1, 6), (2048, 8192))]
     if args.only:
         cases = [c for c in cases if c[0] == args.only]
     fails = 0
     t0 = time.time()
-    for kind, bsz, n, avg_kv in cases:
+    for kind, fmt, bsz, n, avg_kv in cases:
         try:
-            r = run_case(dg, bsz, n, avg_kv, device) if kind == "native" else run_case_varlen(dg, bsz, n, avg_kv, device)
+            r = (run_case(dg, dgm, fmt, bsz, n, avg_kv, device, args.packed_stride) if kind == "native"
+                 else run_case_varlen(dg, dgm, fmt, bsz, n, avg_kv, device, args.packed_stride))
         except Exception as e:  # noqa: BLE001
-            r = dict(case=f"{kind} bsz={bsz} n={n} avg_kv={avg_kv}", ok=False, err=repr(e)[:200])
+            r = dict(case=f"{fmt:5s} {kind} bsz={bsz} n={n} avg_kv={avg_kv}", ok=False, err=repr(e)[:300])
         fails += 0 if r["ok"] else 1
         if "err" in r:
-            print(f"[BAD] {r['case']:<44} ERROR {r['err']}")
+            print(f"[BAD] {r['case']:<50} ERROR {r['err']}")
         else:
-            print(f"[{'ok ' if r['ok'] else 'BAD'}] {r['case']:<44} ref64={r['ref_diff_64']:.2e} ref128={r['ref_diff_128']:.2e} "
+            print(f"[{'ok ' if r['ok'] else 'BAD'}] {r['case']:<50} ref64={r['ref_diff_64']:.2e} ref128={r['ref_diff_128']:.2e} "
                   f"selfc={int(r['self_consistent_64'])}{int(r['self_consistent_128'])} parity={r['parity']}")
         sys.stdout.flush()
     print(f"\n{len(cases) - fails}/{len(cases)} passed in {time.time() - t0:.0f}s")

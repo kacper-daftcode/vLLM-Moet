@@ -8,9 +8,10 @@ validation evidence: `docs/dsv41-sm120-port.md`; image: `Dockerfile.sm120-dsv41`
 |---|---|
 | `sparse_mla_sm120_dsv41.cu` | new FlashInfer JIT TU: SM120 sparse-MLA instantiations for the V4.1 geometry (SWA page 32, compressed page 128/64, SWA rows 128/192/1152) + `sparse_mla_prefill_dispatch_dsv41` |
 | `patch_flashinfer.py` | idempotent, anchored patcher for an installed flashinfer package (installs the TU, orchestrator hook, PBS=32 decode table, python dispatch) |
-| `patch_deepgemm.py` | DeepGEMM `8b1392b9` host asserts: SM120 FP8 paged MQA logits on 128-row pages |
+| `patch_deepgemm.py` | DeepGEMM `8b1392b9` host asserts: SM120 FP8 **and MXFP4** paged MQA logits on 128-row pages (the device kernels are templated on the page size; only the launchers' asserts stopped at 64) |
 | `test_sparse_mla_sm120_dsv41.py` | op-level validation: torch reference + bit-exact re-paging parity vs stock PBS=64 kernels |
-| `test_deepgemm_sm120_paged_mqa.py` | op-level validation: DeepGEMM reference + bit-exact parity block_kv 64 vs 128; native next_n 1/2/6 and the varlen (`indices=`) mode |
+| `test_deepgemm_sm120_paged_mqa.py` | op-level validation: DeepGEMM reference + bit-exact parity block_kv 64 vs 128; native next_n 1/2/6 and the varlen (`indices=`) mode; `--fmt fp8|mxfp4|both` (default both), `--packed-stride` lays the pages out with vLLM's block-outermost stride/offset for this model (230400 B / 210240 B blocks) |
+| `patch_vllm_indexer_fp4_sm120.py`, `test_indexer_fp4_sm120.py` | vLLM patch (one gate in `v1/attention/backends/mla/indexer.py`): `--attention-config '{"indexer_kv_dtype":"mxfp4"}'` is accepted on sm_120 (launcher `INDEXER_KV_DTYPE=mxfp4`). The MXFP4 indexer cache stores 64 B of e2m1 pairs + 4 UE8M0 scales per key (68 B instead of 132), the format the indexer was trained with; the packed KV block shrinks 230400 -> 210240 B (+9.6 % KV tokens). The test checks the Q quantizer (CuTe DSL), the K store (Triton, `cvt.rn.satfinite.e2m1x2.f32` on sm_120a) bit-for-bit against DeepSeek's fp4 quantizer (RNE, UE8M0 = 2^ceil(log2(amax/6))), and DeepGEMM's logits on the kernel-written 128-key pages (bit-exact 64/128 re-page) |
 | `sm120_gemv/mxfp8_gemv_sm120.cu` | tensor-core (mma.m16n8k32 e4m3) MXFP8 GEMV for decode shapes (M <= 16), F8_128x4 swizzled scales, plus a scalar fallback (`VLLM_MOET_GEMV_IMPL=scalar`) and the v2 experiment (`=v2`, see below; not faster); loaded via `sm120_gemv/mxfp8_gemv_sm120.py` (torch cpp_extension JIT, precompiled in the image) |
 | `patch_vllm_mxfp8_gemv.py` | vLLM patch: `FlashInferCutlassMxfp8LinearKernel.apply_weights` routes M <= 16 to the GEMV (`VLLM_MOET_SM120_GEMV=0` reverts) |
 | `sm120_gemv/vllm_sm120_gemv_bmm.py`, `patch_vllm_wo_a_sm120.py` | `Sm120GemvMxfp8BmmLinearKernel`: keeps the grouped o-projection `wo_a` (`is_bmm`, 2 head groups × [1024 <- 4096] per TP4 rank) in MXFP8 and runs decode batches (<= 64 tokens) on `mxfp8_gemv_grouped` with the FP8 activations + packed MN-major scales that `fused_inv_rope_fp8_quant` produces for the sm_100 DeepGEMM path; prefill dequantizes the weight on the fly and keeps the bf16 bmm. The patcher installs the module into vLLM, puts the kernel first in `init_mxfp8_linear_kernel()`'s BMM list and adds the dispatch to `deep_gemm_fp8_o_proj` (`VLLM_MOET_SM120_GEMV_BMM=0` reverts to the BF16 emulation) |
@@ -134,7 +135,8 @@ Run the tests inside the built image on one SM120 GPU:
 ```bash
 docker run --rm --gpus '"device=0"' --entrypoint bash vllm-moet-sm120:dsv41-0909 -c \
   'python3 /opt/vllm-moet/dsv41_sm120/test_sparse_mla_sm120_dsv41.py --quick &&
-   python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py &&
+   python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py --packed-stride &&
+   python3 /opt/vllm-moet/dsv41_sm120/test_indexer_fp4_sm120.py &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_vllm_integration.py &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_gemv_sm120.py &&
