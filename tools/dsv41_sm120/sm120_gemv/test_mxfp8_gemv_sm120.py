@@ -105,7 +105,7 @@ def main() -> int:
     torch.manual_seed(3)
     dev = torch.device("cuda")
     print(f"device={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}  "
-          f"VLLM_MOET_GEMV_IMPL={__import__('os').environ.get('VLLM_MOET_GEMV_IMPL', '(default: v1)')}")
+          f"VLLM_MOET_GEMV_IMPL={__import__('os').environ.get('VLLM_MOET_GEMV_IMPL', '(default: v3)')}")
     t0 = time.time()
     mxfp8_gemv(*[t for t in _dummy(dev)])  # trigger JIT build
     print(f"extension ready in {time.time()-t0:.0f}s")

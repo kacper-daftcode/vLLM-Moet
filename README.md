@@ -418,8 +418,8 @@ bias that degenerates GLM; an SM12x smem fix for dense‑MLA triton decode; a
 
 The **official FP8/MXFP4 checkpoint** served by the **official
 `vllm/vllm-openai:deepseekv41-flash-0909` image** (the vLLM recipe's NVIDIA pin) on four RTX PRO
-6000: **TP4, 512K context, fp8 KV (1.49M‑token pool), DSpark k=5, vision on** — **148 tok/s prose
-and 346 tok/s code single stream** (67 decode steps/s), needle retrieval PASS at 29K and 106K
+6000: **TP4, 512K context, fp8 KV (1.49M‑token pool), DSpark k=5, vision on** — **150 tok/s prose
+and 347 tok/s code single stream** (67.7 decode steps/s), needle retrieval PASS at 29K and 106K
 prompt tokens, `17*19 → 323`, thinking, `deepseek_v41` tool calling and the vision path
 (carrots/corn) verified. Ships as **`Dockerfile.sm120-dsv41`** + `docker/sm120/run-dsv41.sh`;
 build/serve on a new host: **[docs/sm120-deploy.md](docs/sm120-deploy.md)**.
@@ -437,8 +437,11 @@ The decode step is then rebuilt where vLLM's sm_120 fallbacks are slow, without 
 a tensor‑core MXFP8 GEMV for the ~250 decode‑shaped dense GEMMs per step (the CUTLASS 128‑row tile
 runs a 6‑row batch at 16 µs; 2.3–3.4× faster), the grouped o‑projection `wo_a` kept in MXFP8 on the
 same kernel (vLLM's sm_120 fallback is BF16 weights + cuBLAS bmm), NCCL over PCIe P2P in the KVM
-guest, and bit‑exact fixes to the DeepGEMM MoE glue kernels — together **60 → 67 steps/s, prose
-114–135 → 148 and code 313 → 346 tok/s** against the same image without them. Four cards hold the
+guest, and bit‑exact fixes to the DeepGEMM MoE glue kernels — together **60 → 67.7 steps/s, prose
+114–135 → 150 and code 313 → 347 tok/s** against the same image without them. What bounds the
+rest of the step (the MoE weight stream at the HBM floor, ~1 400 launches per step at the launch
+floor) and why a SASS‑level rewrite is not where the next millisecond is:
+[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md#what-limits-the-step-with-hardware-counters-2026091920). Four cards hold the
 model thinly (81 GiB/GPU of weights); the same image runs TP8 with a 1M window on eight
 (`GPUS=0,…,7 TP=8 MAX_MODEL_LEN=1048576`, 7.5M‑token KV pool). Gap inventory, validation and the
 memory budget per configuration: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.

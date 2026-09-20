@@ -43,6 +43,53 @@ GEMVs per step is ~0.3 ms (2 %), and it would need the activation quantization t
 replicated / interleaved form rather than kernel work. Register report: v2 UKT=1 uses 80–96
 registers (2 blocks/SM), UKT=5 ~180.
 
+## Dense MXFP8 GEMV v3: what the hardware counters said, and the rewrite (2026-09-19/20)
+
+Nsight Compute on v1 (RTX 5090, caches flushed, M = 6; `--clock-control none`): DRAM throughput
+**33–50 % of peak**, long-scoreboard stalls in **76–80 %** of the issue slots, 0.3 instructions
+issued per scheduler cycle, 3.6 M warp instructions for the 10 MB `5120×2048` weight, 16–58 %
+of the warp slots active. The reason is v1's byte movement, not its math: per MX block a lane
+issues one 8-byte weight load, two 8-byte A loads and four 1-byte swizzled scale loads, and one
+warp load touches eight 32-byte pieces of eight different rows. **v3** (`mxfp8_mma_gemv_v3_kernel`,
+the default since 2026-09-20; `VLLM_MOET_GEMV_IMPL=v1` restores the old kernel) keeps the block =
+8 columns / 8 K-splitting warps decomposition and changes the transport: K is cut into 128-byte
+units (one F8_128x4 scale word), each warp streams its units in rounds — all 16-byte weight and A
+loads of a round issued up front (one warp instruction = four rows × 128 contiguous bytes), parked
+in registers, written to the warp's smem tile, fragments read back with `LDS.64`, the next round's
+loads issued before the current round's mma — and every (row, unit) scale is one 32-bit load.
+
+| shape (N←K), M = 6, cold L2 | v1 | v3 (R = 1) | | ncu, v3 vs v1 |
+|---|---|---|---|---|
+| RTX 5090 (1.79 TB/s): q_a+kv_a 1792←5120 | 10.4 µs | **7.5 µs** | −28 % | DRAM 45.6 → 53.6 % |
+| q_b+indexer 8192←1280 | 9.0 | **8.3** | −8 % | 62 % |
+| wo_b 5120←2048 | 8.2 | 8.1 | −1 % | 50 → 65.5 % |
+| shared w13 1152←5120 | 8.9 | **5.5** | −38 % | 33 → 47.7 % |
+| indexer wq_b 4096←1280 | 5.4 | 5.2 | −4 % | |
+| lm_head-like 25600←5120 | 88.0 | 84.0 | −5 % | 1.49 → 1.56 TB/s |
+| RTX PRO 6000 (1.6 TB/s, shared with a serving job): 1792←5120 / 1152←5120 | 11.6 / 10.1 | 8.7 / 6.8 | −25 / −33 % | |
+| **in the server** (rank-0 trace, all dense shapes, cold weights+scales) | 10.8 µs avg | **10.0 µs avg** | dense GEMM share 20.9 → 19.1 %, **67.0 → 67.7 steps/s**, prose 148.5 → 149.7, code 346 → 347 tok/s | |
+
+What did *not* help, again: **split-K** (last-arriving block reduces; `VLLM_MOET_GEMV_V3_SPLITK_MAX`)
+makes the small-N shapes slower (1792←5120: 8.2 → 9.5 µs, 1152←5120: 5.8 → 6.8) — the grid is
+not the problem, per-warp stream continuity is; **R = 2 or 4 units per round** (`VLLM_MOET_GEMV_V3_R`)
+put more bytes in flight per round but pipeline fewer rounds and cost shared memory (R = 4 →
+one block per SM, 16 % warps active): 8.3 / 8.3 / 5.6 µs against R = 1's 7.5 / 8.3 / 5.5. `K = 576`
+(shared w2) is not a multiple of 128 and stays on v1 (3.7 µs, 0.8 TB/s).
+
+Where the last 30 % is: a 5–10 µs kernel pays ~2.5 µs of ramp (first DRAM round trip), tail (last
+wave) and reduction regardless of its inner loop — the 130 MB shape reaches 87 % of peak with the
+same code. The step-level effect (0.35 ms of 15.6) is therefore the ceiling for kernel-body work
+on these GEMVs; the remaining lever is launch count (fusing the three `mxfp8_quantize` launches
+per layer into the GEMV prologue), see `docs/dsv41-sm120-port.md`.
+
+SASS check with `cubit` (`cubit disassemble --frozen`): nvcc issues all eight 16-byte loads of the
+prologue in one burst before the first `STS.128`, the inner loop is `LDS.64 → QMMA.16832.F32.E4M3.E4M3
+→ FFMA` with 8-cycle stalls between dependent QMMAs, and nothing in the schedule explains the
+DRAM utilisation — consistent with the counters (memory latency + fixed costs, not issue). Two
+tool findings: cubit's SM120 table does not decode `LDG.E.128`/`.CONSTANT` (printed as
+`__raw__…981`) or `ENDCOLLECTIVE`, and `--clock-control base` (ncu's default) understates
+durations by ~30 % on this GPU — compare kernels with `--clock-control none`.
+
 ## DeepGEMM grouped MoE: BLOCK_M and padding (2026-09-19)
 
 `tools/sm120_perf/dg_moe_blockm_bench.py` runs vLLM's own permute → FC1 → silu·up+quant → FC2 →

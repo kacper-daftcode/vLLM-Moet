@@ -687,16 +687,18 @@ static int env_int(const char* name, int def) {
   return v == nullptr ? def : std::atoi(v);
 }
 
-// VLLM_MOET_GEMV_IMPL: "v1" (default -- the served kernel), "v2" (experiment above: no
-// gain on the served shapes, see tools/dsv41_sm120/README.md), "scalar".
+// VLLM_MOET_GEMV_IMPL: "v3" (default since 2026-09-19: the bandwidth rewrite of the dense
+// M <= 8 path below; grouped wo_a, M > 8 and K % 128 != 0 fall back to v1), "v1" (the kernel
+// served until then), "v2" (experiment: no gain, see tools/dsv41_sm120/README.md), "scalar".
 static int gemv_impl_version() {
   static const int v = [] {
     const char* s = std::getenv("VLLM_MOET_GEMV_IMPL");
-    if (s == nullptr) return 1;
+    if (s == nullptr) return 3;
     const std::string str(s);
+    if (str == "v1") return 1;
     if (str == "v2") return 2;
     if (str == "scalar") return 0;
-    return 1;
+    return 3;
   }();
   return v;
 }
@@ -834,6 +836,261 @@ static void launch_mma(const GemvArgs& p, int groups, cudaStream_t stream) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// v3 (2026-09-19): the bandwidth-oriented rewrite of the dense path (M <= 8, both operands
+// F8_128x4, K % 128 == 0). ncu on v1 (RTX 5090, cold L2, M = 6): DRAM at 17-50 % of peak,
+// long-scoreboard stalls in 70-80 % of the issue slots, 3.6 M warp instructions for a
+// 10 MB weight -- one 8-byte weight load, four 1-byte scale loads and two 8-byte A loads
+// per MX block per lane, every warp instruction touching eight 32-byte pieces of eight
+// different rows. v3 keeps v1's decomposition (a block owns 8 columns, its 8 warps split K)
+// and changes only how the bytes move:
+//   * K is cut into 128-byte units (4 MX blocks = one F8_128x4 scale word). Warp w owns the
+//     units u = w (mod 8) and streams them in rounds of R units. All weight bytes of a round
+//     (R x 8 rows x 128 B) are issued up front as 16-byte loads -- one warp instruction
+//     covers four rows x 128 contiguous bytes -- parked in registers, then written to the
+//     warp's shared-memory tile, from which the mma fragments are read. The loads of round
+//     r+1 are issued before the math of round r.
+//   * the round's slice of A (M rows x R x 128 B, L2-resident) is staged the same way.
+//   * scales: one 32-bit word per (row, unit), one LDG.32 per lane per round for the
+//     8 x R weight words and the M x R A words (double-buffered in smem).
+// R = 2 keeps the block at ~32 KB of shared memory (3 blocks / SM); R = 4 doubles the bytes
+// in flight per warp but leaves one block per SM.
+constexpr int kV3MaxM = 8;
+
+__device__ __forceinline__ uint32_t sf_word_index(int row, int kt, int num_k_tiles) {
+  const int mt = row >> 7, r = row & 127, a = r >> 5, b = r & 31;
+  return ((mt * num_k_tiles + kt) * 32 + b) * 4 + a;  // the 4 bytes kb = 4kt..4kt+3
+}
+
+template <int R>
+struct V3Smem {
+  static constexpr int kRoundK = R * 128;                 // k per round
+  static constexpr int kRoundKB = kRoundK / kBlockSize;   // MX blocks per round
+  static constexpr int kWTile = kMmaCols * kRoundK;       // weight bytes per warp per round
+  static constexpr int kATile = kV3MaxM * kRoundK;        // A bytes per warp per round
+  static constexpr int kSfWords = 2 * R * kMmaCols;       // per operand, 2 buffers
+  static constexpr int kPerWarp = kWTile + kATile + 2 * kSfWords * 4;
+  static constexpr size_t kBytes = (size_t)kWarps * kPerWarp;
+};
+
+template <int R>
+__global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvArgs p, const SplitKArgs sk) {
+  using S = V3Smem<R>;
+  extern __shared__ __align__(16) uint8_t v3_smem[];
+  __shared__ float s_red[kWarps][32][2];
+  __shared__ int s_last;
+
+  const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  const int g = lane >> 2, tig = lane & 3;
+  const int M = p.M, N = p.N, K = p.K, nkt = p.num_k_tiles;
+  const int n0 = blockIdx.x * kMmaCols;
+  // Split-K over 128-byte units: block (x, s) owns units [u_begin, u_begin + units).
+  const int units_all = K >> 7;
+  const int ups = (units_all + gridDim.y - 1) / gridDim.y;
+  const int u_begin = blockIdx.y * ups;
+  const int units = max(0, min(units_all - u_begin, ups));
+
+  uint8_t* s_w = v3_smem + (size_t)warp * S::kPerWarp;   // [8 rows][kRoundK]
+  uint8_t* s_a = s_w + S::kWTile;                         // [kV3MaxM rows][kRoundK]
+  uint32_t* s_bsf = reinterpret_cast<uint32_t*>(s_a + S::kATile);  // [2][R][8]
+  uint32_t* s_asf = s_bsf + S::kSfWords;                            // [2][R][8]
+
+  const int nu = units > warp ? (units - warp + kWarps - 1) / kWarps : 0;
+  const int rounds = (nu + R - 1) / R;
+
+  // Weight chunks of this lane per unit: rows lr0 / lr1 (0..7), 16-byte offset lo.
+  const int lr0 = lane >> 3, lr1 = lr0 + 4, lo = (lane & 7) << 4;
+  const bool r0_ok = n0 + lr0 < N, r1_ok = n0 + lr1 < N;
+  const uint8_t* b_row0 = p.B + (size_t)(n0 + (r0_ok ? lr0 : 0)) * K + lo;
+  const uint8_t* b_row1 = p.B + (size_t)(n0 + (r1_ok ? lr1 : 0)) * K + lo;
+  // A chunks of this lane per unit: the same (row, offset) pattern over kV3MaxM rows.
+  const bool a0_ok = lr0 < M, a1_ok = lr1 < M;
+  const uint8_t* a_row0 = p.A + (size_t)(a0_ok ? lr0 : 0) * K + lo;
+  const uint8_t* a_row1 = p.A + (size_t)(a1_ok ? lr1 : 0) * K + lo;
+  // Scale words: lanes 0..8R-1 load weight words (row lane&7, unit lane>>3), lanes
+  // 16..16+8R-1 load A words (row (lane-16)&7, unit (lane-16)>>3). R <= 2 keeps both
+  // inside one warp instruction each; for R = 4 the two sets alias, so two loads.
+  const uint32_t* b_sf32 = reinterpret_cast<const uint32_t*>(p.B_sf);
+  const uint32_t* a_sf32 = reinterpret_cast<const uint32_t*>(p.A_sf);
+  const int sl_row = lane & 7, sl_j = (lane >> 3) % R;
+  const bool sl_b = lane < 8 * R && n0 + sl_row < N;
+  const bool sl_a = lane < 8 * R && sl_row < M;
+
+  uint4 wreg[R][2], areg[R][2];
+  uint32_t sbw = 0u, saw = 0u;
+
+  auto issue_round = [&](int r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      const int i = r * R + j;
+      const bool ok = i < nu;
+      const size_t k0 = (size_t)(u_begin + warp + kWarps * i) << 7;
+      wreg[j][0] = (ok && r0_ok) ? __ldg(reinterpret_cast<const uint4*>(b_row0 + k0)) : make_uint4(0, 0, 0, 0);
+      wreg[j][1] = (ok && r1_ok) ? __ldg(reinterpret_cast<const uint4*>(b_row1 + k0)) : make_uint4(0, 0, 0, 0);
+      areg[j][0] = (ok && a0_ok) ? __ldg(reinterpret_cast<const uint4*>(a_row0 + k0)) : make_uint4(0, 0, 0, 0);
+      areg[j][1] = (ok && a1_ok) ? __ldg(reinterpret_cast<const uint4*>(a_row1 + k0)) : make_uint4(0, 0, 0, 0);
+    }
+    const int i = r * R + sl_j;
+    const int kt = u_begin + warp + kWarps * i;
+    const bool ok = i < nu;
+    sbw = (ok && sl_b) ? __ldg(b_sf32 + sf_word_index(n0 + sl_row, kt, nkt)) : 0u;
+    saw = (ok && sl_a) ? __ldg(a_sf32 + sf_word_index(sl_row, kt, nkt)) : 0u;
+  };
+
+  if (rounds > 0) issue_round(0);
+
+  float acc0 = 0.0f, acc1 = 0.0f;
+  const int c0 = n0 + tig * 2, c1 = c0 + 1;
+  const bool g_ok = g < M;
+
+  for (int r = 0; r < rounds; ++r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      *reinterpret_cast<uint4*>(s_w + (size_t)lr0 * S::kRoundK + j * 128 + lo) = wreg[j][0];
+      *reinterpret_cast<uint4*>(s_w + (size_t)lr1 * S::kRoundK + j * 128 + lo) = wreg[j][1];
+      *reinterpret_cast<uint4*>(s_a + (size_t)lr0 * S::kRoundK + j * 128 + lo) = areg[j][0];
+      *reinterpret_cast<uint4*>(s_a + (size_t)lr1 * S::kRoundK + j * 128 + lo) = areg[j][1];
+    }
+    const int buf = r & 1;
+    if (lane < 8 * R) {
+      s_bsf[(buf * R + sl_j) * kMmaCols + sl_row] = sbw;
+      s_asf[(buf * R + sl_j) * kMmaCols + sl_row] = saw;
+    }
+    __syncwarp();
+    if (r + 1 < rounds) issue_round(r + 1);
+
+    uint32_t sb0w[R], sb1w[R], saw_g[R];
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      sb0w[j] = s_bsf[(buf * R + j) * kMmaCols + tig * 2];
+      sb1w[j] = s_bsf[(buf * R + j) * kMmaCols + tig * 2 + 1];
+      saw_g[j] = s_asf[(buf * R + j) * kMmaCols + g];
+    }
+    const int nb = min(S::kRoundKB, (nu - r * R) * 4);
+#pragma unroll
+    for (int kb = 0; kb < S::kRoundKB; ++kb) {
+      if (kb >= nb) break;
+      const int j = kb >> 2, c = kb & 3;
+      const uint2 wb = *reinterpret_cast<const uint2*>(s_w + (size_t)g * S::kRoundK + kb * 32 + tig * 8);
+      const uint2 wa = g_ok ? *reinterpret_cast<const uint2*>(s_a + (size_t)g * S::kRoundK + kb * 32 + tig * 8)
+                            : make_uint2(0, 0);
+      const uint32_t afrag[4] = {wa.x, 0u, wa.y, 0u};
+      float d[4];
+      mma_m16n8k32_e4m3(d, afrag, wb.x, wb.y);
+      const float fb0 = ue8m0_to_float((sb0w[j] >> (8 * c)) & 0xffu);
+      const float fb1 = ue8m0_to_float((sb1w[j] >> (8 * c)) & 0xffu);
+      const float fa = ue8m0_to_float((saw_g[j] >> (8 * c)) & 0xffu);
+      acc0 = fmaf(d[0], fa * fb0, acc0);
+      acc1 = fmaf(d[1], fa * fb1, acc1);
+    }
+    __syncwarp();
+  }
+
+  s_red[warp][lane][0] = acc0;
+  s_red[warp][lane][1] = acc1;
+  __syncthreads();
+  if (gridDim.y == 1) {
+    if (warp == 0) {
+      float r0 = 0.0f, r1 = 0.0f;
+#pragma unroll
+      for (int w = 0; w < kWarps; ++w) {
+        r0 += s_red[w][lane][0];
+        r1 += s_red[w][lane][1];
+      }
+      if (g < M) {
+        if (c0 < N) p.C[(size_t)g * p.ldc + c0] = __float2bfloat16(r0);
+        if (c1 < N) p.C[(size_t)g * p.ldc + c1] = __float2bfloat16(r1);
+      }
+    }
+    return;
+  }
+  // Split-K: publish this block's [kV3MaxM][8] fp32 partial, the last-arriving block sums.
+  float* part = sk.partials + ((size_t)blockIdx.y * gridDim.x + blockIdx.x) * (kV3MaxM * kMmaCols);
+  if (warp == 0) {
+    float r0 = 0.0f, r1 = 0.0f;
+#pragma unroll
+    for (int w = 0; w < kWarps; ++w) {
+      r0 += s_red[w][lane][0];
+      r1 += s_red[w][lane][1];
+    }
+    part[g * kMmaCols + tig * 2] = r0;
+    part[g * kMmaCols + tig * 2 + 1] = r1;
+    __threadfence();
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) s_last = (atomicAdd(sk.counters + blockIdx.x, 1) == (int)gridDim.y - 1) ? 1 : 0;
+  __syncthreads();
+  if (!s_last) return;
+  __threadfence();
+  if (threadIdx.x < kV3MaxM * kMmaCols) {
+    const int m = threadIdx.x >> 3, col = threadIdx.x & 7;
+    float sum = 0.0f;
+    for (int q = 0; q < (int)gridDim.y; ++q)
+      sum += __ldcg(sk.partials + ((size_t)q * gridDim.x + blockIdx.x) * (kV3MaxM * kMmaCols) + m * kMmaCols + col);
+    if (m < M && n0 + col < N) p.C[(size_t)m * p.ldc + n0 + col] = __float2bfloat16(sum);
+  }
+  if (threadIdx.x == 0) sk.counters[blockIdx.x] = 0;  // ready for the next launch / graph replay
+}
+
+static int v3_units_per_round() { return env_int("VLLM_MOET_GEMV_V3_R", 1); }
+
+static int device_sm_count(int device) {
+  static std::mutex mu;
+  static std::unordered_map<int, int> sms;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = sms.find(device);
+  if (it != sms.end()) return it->second;
+  int n = 0;
+  cudaDeviceGetAttribute(&n, cudaDevAttrMultiProcessorCount, device);
+  return sms[device] = (n > 0 ? n : 128);
+}
+
+// Split K across blocks until the grid holds ~2 blocks per SM (the small-N shapes run 72-224
+// blocks otherwise), keeping >= 8 units (one per warp) in every split.
+static void launch_mma_v3(const GemvArgs& p, int device, cudaStream_t stream) {
+  const int col_blocks = (p.N + kMmaCols - 1) / kMmaCols;
+  const int units = p.K >> 7;
+  static const int target = env_int("VLLM_MOET_GEMV_V3_BLOCKS_PER_SM", 2);
+  static const int max_split = env_int("VLLM_MOET_GEMV_V3_SPLITK_MAX", 1);  // split-K measured slower (see README)
+  int S = 1;
+  if (max_split > 1) {
+    S = std::min(max_split, std::max(1, (target * device_sm_count(device) + col_blocks - 1) / col_blocks));
+    S = std::min(S, std::max(1, units / kWarps));
+  }
+  SplitKArgs sk{nullptr, nullptr, S};
+  if (S > 1) {
+    SplitKScratch* sc = splitk_scratch(stream, device, (int64_t)col_blocks,
+                                       (int64_t)S * col_blocks * kV3MaxM * kMmaCols);
+    if (sc == nullptr) {
+      sk.S = S = 1;
+    } else {
+      sk.partials = sc->partials.data_ptr<float>();
+      sk.counters = sc->counters.data_ptr<int>();
+    }
+  }
+  const dim3 grid(col_blocks, S);
+  // Units per round (VLLM_MOET_GEMV_V3_R): 1 measured best on every served shape (RTX 5090 and
+  // RTX PRO 6000, M = 6): one 128-byte unit per warp per round keeps the stream steady; 2 and 4
+  // put more bytes in flight per round but pipeline fewer rounds and cost shared memory.
+  int R = v3_units_per_round();
+  if (R <= 0) R = 1;
+  if (R >= 4) {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<4>;
+    set_dyn_smem(kfn, V3Smem<4>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<4>::kBytes, stream>>>(p, sk);
+  } else if (R == 2) {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<2>;
+    set_dyn_smem(kfn, V3Smem<2>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<2>::kBytes, stream>>>(p, sk);
+  } else {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<1>;
+    set_dyn_smem(kfn, V3Smem<1>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<1>::kBytes, stream>>>(p, sk);
+  }
+}
+
+static bool v3_applicable(int M, int K) { return M <= kV3MaxM && K % 128 == 0; }
+
 template <int MAXM, int CHUNK>
 static void launch(const uint8_t* A, const uint8_t* Asf, const uint8_t* B, const uint8_t* Bsf,
                    __nv_bfloat16* Cp, torch::Tensor& a, int M, int N, int K, int num_k_tiles,
@@ -885,6 +1142,8 @@ torch::Tensor mxfp8_gemv(torch::Tensor a, torch::Tensor a_sf, torch::Tensor b,
     p.M = M; p.N = N; p.K = K; p.num_k_tiles = num_k_tiles; p.ldc = N;
     if (impl == 2) {
       launch_mma_v2<SF_F8_128x4, SF_F8_128x4>(p, 1, a.get_device(), stream);
+    } else if (impl == 3 && v3_applicable(M, K)) {
+      launch_mma_v3(p, a.get_device(), stream);
     } else {
       launch_mma<SF_F8_128x4, SF_F8_128x4>(p, 1, stream);
     }

@@ -292,6 +292,55 @@ first as bind‑mounts, now baked into `Dockerfile.sm120-dsv41`: **66.3 → 67.0
 GEMV was re‑examined at the same time (v2 kernel: split‑K, one‑round loads, word‑wide scale
 loads, staged A) without gain — the findings are in `tools/dsv41_sm120/README.md`.
 
+## What limits the step, with hardware counters (2026‑09‑19/20)
+
+Rank‑0 torch trace of the served image (single stream, prose + code, 66 target steps, 15.6 ms per
+step, GPU busy 99 %, ~2 060 kernel launches per step) and Nsight Compute on the kernels in
+isolation (RTX 5090, caches flushed, real clocks):
+
+| ms/step | share | what | distance from its floor |
+|---|---|---|---|
+| 4.9 | 31 % | MoE FP8×FP4 grouped GEMM: FC1 83 µs (118 MB, 1.42 TB/s) + FC2 36 µs (59 MB) × 40 layers | **at the HBM floor** — six verified tokens × top‑6 touch up to 36 experts = 177 MB per layer, 7 GB per step |
+| 3.3 | 21 % | ~1 390 launches shorter than 5 µs (quantize, norm, scatter/gather, top‑k, fills, indexer glue, 2.4 µs average) | **at the launch floor** — a kernel inside a CUDA graph cannot take less than ~2 µs |
+| 3.3 → 2.9 | 21 → 19 % | dense MXFP8 GEMVs, 222 launches, 10.8 → 10.0 µs average | 50–65 % of peak bandwidth inside the kernel (v3 below); ~2.5 µs of every launch is ramp + tail |
+| 2.0 | 13 % | mHC: DeepGEMM TF32 pre‑norm GEMM 14.4 µs × 85 (4 µs of work, the rest is the PDL wait on its predecessor) + TileLang pre/post 5.1 + 3.7 µs | latency, not work |
+| 1.3 | 8 % | BF16 cuBLAS: `lm_head` 233 µs × 2 (331 MB at 1.43 TB/s), 17 small `wmma` GEMMs × 26 µs | `lm_head` at the floor |
+| 1.2 | 8 % | NCCL: 88 allreduces × 12.9 µs + 4 allgathers × 29 µs | pure latency (5–48 KiB payloads) |
+| 0.9 | 6 % | sparse‑MLA decode 14.5 µs × 39 + merge 2.8 µs | ~3× the KV‑byte floor (7 MB per layer) — a gather of scattered 32‑token pages |
+| 1.2 | 7 % | the DSpark drafter graph (167 kernels) | same mix as above |
+
+Two things follow. First, the largest item is already at the memory wall: the only way to shrink
+the 4.9 ms is to stream fewer expert bytes per step (fewer verified tokens when acceptance is low,
+or batching more sequences per step), not a faster kernel. Second, about a third of the step is
+made of kernels at or near the launch floor, where the body could be zero and the step would not
+notice; that share is addressed by fusion (fewer launches), not by scheduling.
+
+**Where SASS‑level work (`cubit`) would and would not pay.** A hand‑scheduled kernel beats nvcc
+when the body is issue‑ or latency‑bound *inside* a memory budget it does not fill. The counters
+say that describes none of the large kernels here: the MoE GEMMs are at the HBM floor, the
+`lm_head` GEMM is at the floor, and the dense GEMVs were bound by *how many bytes each load
+instruction moves and how many are in flight* — a structural property that a rewrite in CUDA
+fixed (v3: 16‑byte loads, four rows × 128 contiguous bytes per warp instruction, loads of the next
+round issued before the mma of the current one, one 32‑bit scale word per (row, 128 k)), after
+which `cubit disassemble --frozen` shows nvcc issuing the whole load burst before the first
+`STS.128` and an `LDS.64 → QMMA → FFMA` loop whose stalls are not the limiter. The team's own
+record on this GPU points the same way: the hand‑scheduled QMMA GEMV lineage topped out at
+745 GB/s while nvcc's k‑loop reached 1 164 GB/s (`cubit-internal/docs/sasstuning.md`). The
+candidates where a SASS kernel could still matter are the sparse‑MLA decode (3× above its floor;
+the cubit repo already holds a fused decode kernel for the V4 page geometry, 2.5× Triton, which
+would need the V4.1 layout — SWA pages of 32, compressed 128/64 — and FlashInfer's dispatch) and
+the mHC pre/post pair (SASS versions exist for V4; ~1 ms of latency‑bound TileLang per step).
+Both are multi‑day efforts for ≤ 0.5 ms each; the fusion and all‑reduce items above are cheaper
+per millisecond.
+
+**Dense GEMV v3 (shipped in `dsv41-0909` since 2026‑09‑20).** ncu on v1: DRAM 33–50 % of peak,
+long‑scoreboard stalls in 76–80 % of issue slots, 3.6 M warp instructions per 10 MB weight. v3
+cold‑L2 on the RTX 5090, M = 6: 1792←5120 10.4 → 7.5 µs, 1152←5120 8.9 → 5.5, 8192←1280 9.0 →
+8.3, 5120←2048 8.2 → 8.1; in the server 10.8 → 10.0 µs per launch, **67.0 → 67.7 steps/s, prose
+148.5 → 149.7 and code 346 → 347 tok/s**, needle/vision/tool smoke unchanged (`VLLM_MOET_GEMV_IMPL=v1`
+restores the previous kernel). Details and the negative results (split‑K again, larger rounds)
+in `tools/dsv41_sm120/README.md`.
+
 **Tried and not kept.** (a) DSpark adaptive verification: DeepGEMM's varlen paged‑MQA logits do
 work on sm_120 (`patch_vllm_indexer_sm120.py` only widens vLLM's sm_100 gate; op‑level test
 `test_deepgemm_sm120_paged_mqa.py --only varlen`), but the varlen decode path adds ~0.5 ms/step

@@ -16,7 +16,8 @@
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 # Runtime kill switches (env, no rebuild): VLLM_MOET_SM120_GEMV=0 (CUTLASS instead of the dense MXFP8
-# GEMV), VLLM_MOET_SM120_GEMV_BMM=0 (BF16 emulation for wo_a). enable_adaptive_verification must stay
+# GEMV), VLLM_MOET_GEMV_IMPL=v1 (the pre-2026-09-20 GEMV kernel instead of v3), VLLM_MOET_SM120_GEMV_BMM=0
+# (BF16 emulation for wo_a). enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
 set -euo pipefail
 
