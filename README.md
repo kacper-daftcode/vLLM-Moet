@@ -433,6 +433,13 @@ exactly those kernel instantiations (a FlashInfer JIT TU + three DeepGEMM host a
 model code untouched), op‑validated **bit‑exact against the stock PBS=64 kernels on re‑paged data**
 (372/372, 8/8).
 
+The image also serves the checkpoint's own reasoning‑effort tiers (`low` 50 / `high` 75 / `max` 100,
+default `high`): vLLM's vendored prompt encoder — including current main — carries a pre‑release
+table (25 / 50 / 75 / 100) under which a thinking‑mode request without an explicit effort renders
+`Reasoning Effort: 50`, the tier DeepSeek calls "low", instead of 75. Verified byte‑identical to
+DeepSeek's `encoding/encoding.py` on its goldens after the fix
+([docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md#the-prompt-encoder-reasoningeffort-tiers-20260920)).
+
 The decode step is then rebuilt where vLLM's sm_120 fallbacks are slow, without touching numerics:
 a tensor‑core MXFP8 GEMV for the ~250 decode‑shaped dense GEMMs per step (the CUTLASS 128‑row tile
 runs a 6‑row batch at 16 µs; 2.3–3.4× faster), the grouped o‑projection `wo_a` kept in MXFP8 on the
@@ -540,8 +547,9 @@ Quality release **`v2026.07.30-quality`** — dataset evals vs the committed **n
   cubins.
 - **`Dockerfile.sm120-dsv41`** + **`tools/dsv41_sm120/`** — DeepSeek‑V4.1‑Flash on sm_120: official
   `vllm/vllm-openai:deepseekv41-flash-0909` + the FlashInfer/DeepGEMM SM120 kernel instantiations
-  for the V4.1 page geometry, the MXFP8 decode GEMV and the MoE glue fixes, with their op‑level
-  tests; port notes in `docs/dsv41-sm120-port.md`.
+  for the V4.1 page geometry, the MXFP8 decode GEMV, the MoE glue fixes and the checkpoint's
+  reasoning‑effort tiers in the prompt encoder, with their tests; port notes in
+  `docs/dsv41-sm120-port.md`.
 - **`Dockerfile.sm120-qwen38`** + **`tools/qwen38_sm120/`** — Qwen3.8‑Flash‑Next‑FP8 on sm_120: the
   official nightly + the PLE/skinny‑GEMM/MoE‑GEMV decode fixes (anchored patchers, kernel, tuned
   MoE config, tests). **`docker/sm120/`** — the two launchers; **`docs/sm120-deploy.md`** — build,

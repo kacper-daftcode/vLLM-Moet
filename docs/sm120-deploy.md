@@ -118,6 +118,14 @@ Qwen 97–99 steps/s (prose ~2.5, code ~3.5 tok/step), needle PASS at both lengt
 after start is slower (warm-up). If steps/s are ~10 % low and the log shows NCCL on `SHM`, P2P is
 not available on the host — check IOMMU / ACS settings.
 
+The DeepSeek image renders the checkpoint's reasoning-effort tiers (`low` 50 / `high` 75 / `max`
+100, default `high`; see `docs/dsv41-sm120-port.md`). To confirm on a host without a GPU free:
+
+```bash
+docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-0909 \
+  /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py --model-dir /model
+```
+
 ## Memory headroom
 
 DeepSeek at `GPU_MEM_UTIL=0.94` peaks at ~96.0 GB/GPU under C8 with 7.7K-token prompts (1.2 GB from

@@ -19,6 +19,10 @@
 # GEMV), VLLM_MOET_GEMV_IMPL=v1 (the pre-2026-09-20 GEMV kernel instead of v3), VLLM_MOET_SM120_GEMV_BMM=0
 # (BF16 emulation for wo_a). enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
+# Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,
+# default high = 75; OpenAI aliases minimal 25 / medium 62 / xhigh 87 are accepted). Pin a
+# budget per request with chat_template_kwargs {"reasoning_effort": <1..100>} or the OpenAI
+# `reasoning_effort` field; "none" or {"thinking": false} turns thinking off.
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"

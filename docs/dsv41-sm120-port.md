@@ -353,6 +353,36 @@ paragraph): 6× slower than NCCL at 60 KiB, pull‑based reads do not suit this 
 GEMV above 16 rows: the m16‑tile loop is correct up to 64 rows but slower than CUTLASS from 32
 rows on (q_a M = 32: 18.0 vs 14.9 µs), so the dense dispatch keeps `M ≤ 16`.
 
+## The prompt encoder: reasoning‑effort tiers (2026‑09‑20)
+
+Not a kernel gap, but the one place where the served model deviated from DeepSeek's own
+deployment. The checkpoint ships its prompt encoder (`encoding/encoding.py`) and the tech report
+lists the public API tiers (Table 2): **`low` = 50, `high` = 75, `max` = 100, default `high`**,
+rendered as `Reasoning Effort: {budget} (range 1‑100, …)` in front of the system message whenever
+thinking is on. vLLM vendored its copy of that encoder from a pre‑release drop
+(`ds-code-260903`) whose table reads `low 25 / high 50 / xhigh 75 / max 100` — still so on vLLM
+main. Running both encoders in the image on the same messages: a thinking‑mode request without an
+explicit effort (the opencode default) rendered **`Reasoning Effort: 50`** — the tier DeepSeek
+calls "low" — where the reference renders **75**; `low` rendered 25, a budget the API does not
+expose; the OpenAI vocabulary `medium` / `minimal` failed with HTTP 400. Everything else in the
+prompt (tools, multi‑turn, chat mode, images) was already byte‑identical to the checkpoint's
+`encoding/tests` goldens; only the budget line differed. The report's Figure 9 puts most of the
+accuracy gain between effort 25 and 75 (eight reasoning benchmarks 67.1 → 76.3 %, DeepSWE
+66.0 → 74.2 % from 25 to 100), so the default request was leaving quality on the table. The
+quality numbers in these docs (GSM8K‑200, needle) were measured with thinking off and are not
+affected.
+
+`tools/dsv41_sm120/patch_vllm_reasoning_effort.py` (applied in `Dockerfile.sm120-dsv41`) puts the
+official table into `vllm/tokenizers/deepseek_v41_encoding.py` and keeps `minimal` / `medium` /
+`xhigh` as interpolated budgets (25 / 62 / 87 — not DeepSeek tiers; the report says intermediate
+values interpolate) so such requests do not fail; the wrapper's error message lists the accepted
+names. An integer in `chat_template_kwargs` (`{"reasoning_effort": 75}`) bypasses the table, as
+before. `test_reasoning_effort_encoding.py` runs at image build (tiers + default budget) and, with
+the checkpoint mounted, requires byte‑identical prompts to DeepSeek's encoder on its five goldens
+and a 90‑case matrix (thinking/chat × 9 efforts × 5 conversations incl. tools, reasoning turns and a
+tool‑call round trip) — all identical after the patch. Worth a vLLM PR (the fix is the same three
+lines there).
+
 ## Apply / build / run
 
 ```bash

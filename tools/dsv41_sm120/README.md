@@ -18,6 +18,7 @@ validation evidence: `docs/dsv41-sm120-port.md`; image: `Dockerfile.sm120-dsv41`
 | `sm120_gemv/test_wo_a_gemv_sm120.py`, `sm120_gemv/test_wo_a_integration.py` | grouped GEMV vs fp32 reference on the fp8 operands and vs the BF16 bmm path (cold-L2 timing, T = 1..64); end-to-end check of the patched kernel selection + `deep_gemm_fp8_o_proj` dispatch (GEMV for T <= 64, bit-identical bf16 fallback above) |
 | `patch_vllm_indexer_sm120.py` | **not applied in the image**: lets the DSA indexer use DeepGEMM's varlen / native multi-row paged MQA on sm_120 (prerequisite for DSpark adaptive verification). Validated at op level, but the varlen decode path cost ~0.5 ms/step and adaptive verification was a net loss on 2026-09-18 (docs/dsv41-sm120-port.md) |
 | `patch_vllm_moe_glue_sm120.py` | vLLM patch (three files, bit-exact data movement): DeepGEMM MoE glue at decode token counts — `_fwd_kernel_ep_scatter_2` one program per (token, expert) pair instead of per token (6 dependent atomics → 1), `_fwd_kernel_ep_gather` top-k loop unrolled (`tl.static_range`, same fp32 order), `silu_mul_quant_fp8_packed_triton(m_indices=)` skips the 63 padding rows per expert that DeepGEMM's 64-row contiguous layout adds (2304 rows, 36 real). Per layer in `tools/sm120_perf/dg_moe_blockm_bench.py`: permute 11.8 → 8.5 µs, act+quant 4.6 → 3.9, gather 4.6 → 4.0 (MoE output 0 of 30720 elements differ). Applied at image build (`Dockerfile.sm120-dsv41` step 3) since 2026-09-19; was first deployed as bind-mounts over the previous image |
+| `patch_vllm_reasoning_effort.py`, `test_reasoning_effort_encoding.py` | vLLM patch (two files in `vllm/tokenizers/`): the `deepseek_v41` prompt encoder's reasoning-effort tiers follow the released checkpoint — `low 50 / high 75 / max 100`, default `high` — instead of the pre-release table vLLM vendored (`low 25 / high 50 / xhigh 75 / max 100`, still on vLLM main), so a thinking-mode request without an explicit effort renders `Reasoning Effort: 75` like DeepSeek's `encoding/encoding.py` and the tech report's API tiers, not 50 (the tier DeepSeek calls "low"). OpenAI's `minimal` / `medium` / `xhigh` are accepted as interpolated budgets 25 / 62 / 87 instead of failing with HTTP 400; an integer in `chat_template_kwargs` bypasses the table. The test runs at image build (tiers + default) and, with `--model-dir`, requires byte-identical prompts to the checkpoint's encoder on its `encoding/tests` goldens and a 90-case thinking-mode × effort × tools × multi-turn matrix (all identical on 2026-09-20; before the patch only the budget line differed). Not a numerics change; the rest of the prompt grammar was already identical |
 
 ## Dense MXFP8 GEMV: what did *not* help (2026-09-19)
 
@@ -138,4 +139,12 @@ docker run --rm --gpus '"device=0"' --entrypoint bash vllm-moet-sm120:dsv41-0909
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_vllm_integration.py &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_gemv_sm120.py &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py'
+```
+
+The prompt-encoder check needs no GPU; with the checkpoint mounted it compares against DeepSeek's
+own encoder:
+
+```bash
+docker run --rm --entrypoint python3 -v /path/to/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-0909 \
+  /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py --model-dir /model
 ```
