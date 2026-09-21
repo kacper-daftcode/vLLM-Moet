@@ -442,6 +442,66 @@ to the opt‑in 0.95/2048 profile's (716 MiB) than to the old default's (1.2–1
 tokens, still +20 %). `INDEXER_KV_DTYPE=mxfp4` is the launcher default since 2026‑09‑20;
 `INDEXER_KV_DTYPE=fp8` restores the previous cache (no rebuild).
 
+## The compressed KV in its training format: FP4 records on sm_120 (2026‑09‑21)
+
+DeepSeek's own inference (`inference/model.py::_compress_kv`) keeps the compressed (main) KV as
+`fp4_act_quant(latent, 16, inplace=True, scale_dtype=e4m3)` of the RoPE'd latent: FP4 e2m1 values
+with one E4M3 scale per 16 dims, 288 B per state — the format the model was trained with (V4's
+QAT). vLLM 0909 stores the bf16 latent as `fp8_ds_mla` instead (448 fp8 with a UE8M0 scale per
+64 + 64 bf16 RoPE dims, 584 B), which is *more* precise than the reference but twice the bytes,
+and it is the biggest item of the KV budget: every kv source's compressed page and indexer page
+share one physical block, so the block goes 210 240 → 115 200 B with the FP4 record. FlashInfer's
+SM120 sparse‑MLA kernels read `fp8_ds_mla` only (there is no NVFP4 sparse MLA for SM120 in
+0.6.18; vLLM main's `nvfp4_ds_mla` decodes through FlashMLA on SM100), so this port keeps the
+kernels and feeds them a scratch:
+
+- **Record.** `tools/dsv41_sm120/nvfp4_kv/fp4_kv_quant.py` reproduces the checkpoint's quantizer
+  bit for bit (values, e2m1 codes, e4m3 scales, the 6·2⁻⁹ amax floor, −0; the two details that
+  matter are IEEE `div.rn` instead of Triton's `div.full` or `x·(1/s)` — either flips 0.04 % of
+  the codes at e2m1 ties — and keeping the sign of values that round to zero). The insert kernel
+  (`rope_quant_insert_packed`) writes upstream's `nvfp4_ds_mla` page layout (256 B of e2m1 pairs
+  per state, then 32 e4m3 bytes) after the same GPT‑J RoPE the fp8 kernel applies; the 528‑byte
+  V4.1 fp8 record (`act_quant(kv, 32, "ue8m0")`) is implemented alongside as the fallback format.
+- **Read side (variant A of the plan).** Before each SM120 sparse‑MLA call the attended states are
+  dequantized and re‑quantized into an `fp8_ds_mla` scratch — a 128‑state paged cache whose
+  indices replace the compressed indices — with vLLM's own fp8 recipe, so the kernel sees
+  `fp8(dequant(fp4(latent)))`. Decode gathers the rows' top‑512 records once per (kv source,
+  index set): the index‑source layer of each group computes it and its consumers reuse it (8
+  gathers per step instead of 38; 19 MB scratch). Prefill would gather 4096 × 512 records per
+  layer (1.8 GB per layer per chunk, −15 % prefill in the first version); instead the whole
+  compressed context of the step's prefill requests is dequantized in logical order into a pool
+  once per kv source (state *i* of request *k* → slot base_k + *i*) and addressed with the
+  request‑local top‑k indices plus the base — O(context) instead of O(rows × 512), 306 MB pool at
+  512K (`VLLM_MOET_KV_PREFILL_POOL_STATES`), per‑request dequant as the fallback when the step's
+  requests do not fit together. The pool and the scratch are reserved in vLLM's profile run
+  (`_reserve_empty_forward_workspace`), so they come out of the accounted budget, not the margin.
+- **Numerics, isolated first.** `patch_vllm_kv_fp4_fake.py` ("A0") applies the reference FP4
+  quantizer inside today's fp8 insert kernel — the same double quantization with today's storage
+  — so the quality of variant A could be measured before the storage side existed; the packed path
+  then reproduced A0's greedy outputs token for token (24/24, 12/12), and `test_nvfp4_kv_kernels.py`
+  proves it byte for byte (gather / context‑dequant scratch == A0 records; FlashInfer dual‑cache
+  attention on the scratch + remapped indices bit‑exact with the same kernel on a real cache).
+
+Served (4× RTX PRO 6000, TP4, `KV_RECORD=nvfp4`, MXFP4 indexer): GSM8K‑200 greedy C4 **194–195
+/200 in three runs against 193/200 with the fp8 record** (paired McNemar p = 1 / 0.5, flips
+0–1 / 1–2), needle 6/6 to 367K with the same answers, arithmetic / tools / JSON / vision PASS,
+coherence 0 degenerate. The greedy outputs themselves change — 8/24 agreement prompts and 5/12
+coherence texts identical to the fp8 record, where the fp8 record and 0xSero's SGLang stack
+(different kernels, same checkpoint) agree on 7/24 and 1/12 — i.e. the FP4 keys move the greedy
+path about as much as switching serving stacks does, with no measurable effect on correctness.
+Speed: 67.0–67.1 steps/s (fp8 record 67.7), prose 152.6 / code 343 tok/s, prefill 10.0k (16K) /
+11.6k (17K fresh) / 10.8k (139K fresh) tok/s against 10.3 / 11.7 / 10.9k — the gathers cost
+~1 % of the step and ~3 % of prefill. KV: **4.37 GiB = 3,453,349 tokens (6.6× at 512K)** before
+the profile‑run reservation, **3.87 GiB = 3,057,484 tokens (5.8×)** with it, against 2,288,673 with
+the fp8 record and 1,490,870 before the MXFP4 indexer; peak under the stress battery (8 concurrent
+fresh 126K prefills, fresh 139K, GSM8K C4, 367K needle, vision) **95 897 MiB of 97 887 — 1.99 GB
+of margin**, more than the fp8 record left at either indexer format, because the pool is now part
+of the accounted budget. `KV_RECORD=nvfp4`
+is the launcher default since 2026‑09‑21; `KV_RECORD=fp8_ds_mla` restores the previous record and
+`fp8_v41` selects the 528‑byte one (op‑level validated only), both without a rebuild.
+`tools/sm120_perf/kv_layout_probe.py --main-bytes 288` predicted the block and the capacity
+(115 200 B, 3.47M tokens) before any code ran.
+
 ## Apply / build / run
 
 ```bash

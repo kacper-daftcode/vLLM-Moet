@@ -30,6 +30,14 @@
 #      renders "Reasoning Effort: 75" as DeepSeek's own encoder does, not 50
 #      (patch_vllm_reasoning_effort.py; verified byte-identical to the checkpoint's
 #      encoding/encoding.py on its goldens by test_reasoning_effort_encoding.py).
+#   5. The compressed (main) KV cache can be stored in the checkpoint's own FP4 record
+#      (e2m1 + one e4m3 scale per 16 dims, 288 B/state instead of 584; launcher KV_RECORD=nvfp4,
+#      the default since 2026-09-21): the insert kernel quantizes like inference/kernel.py's
+#      fp4_act_quant (bit-exact), and the SM120 sparse-MLA kernels read an fp8_ds_mla scratch of the
+#      attended states (decode: one gather per kv source x index set; prefill: the requests'
+#      contexts dequantized once per kv source). 1.49M -> 3.06M KV tokens on 4x RTX PRO 6000,
+#      GSM8K-200 / needle unchanged, -1 % decode, -3 % prefill (tools/dsv41_sm120/nvfp4_kv/,
+#      patch_vllm_packed_kv_sm120.py; KV_RECORD=fp8_ds_mla restores today's record, no rebuild).
 # These are the only vLLM-side changes. The model's page geometry stays identical to the
 # datacenter (SM100) path; the kernels learned the shapes.
 #
@@ -110,15 +118,18 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer.py \
 #    default thinking-mode request renders budget 75 and fails the build otherwise.
 #    patch_vllm_indexer_fp4_sm120.py (2026-09-20): dsa_indexer_uses_fp4 admits sm_120 (header,
 #    item 2); a gate only -- the indexer cache format is still chosen per launch.
+#    nvfp4_kv/patch_vllm_packed_kv_sm120.py (2026-09-21): packed compressed-KV records (header,
+#    item 5); inert unless VLLM_MOET_KV_RECORD selects nvfp4 / fp8_v41 at launch.
 ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
 RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_wo_a_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_glue_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_packed_kv_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120" \
-      org.opencontainers.image.description="vllm/vllm-openai:deepseekv41-flash-0909 + DSV4.1 SM120 sparse-MLA instantiations (FlashInfer) + DeepGEMM 128-row paged MQA logits on sm_120 (FP8 and MXFP4 indexer cache) + MXFP8 decode GEMV + official reasoning-effort tiers"
+      org.opencontainers.image.description="vllm/vllm-openai:deepseekv41-flash-0909 + DSV4.1 SM120 sparse-MLA instantiations (FlashInfer) + DeepGEMM 128-row paged MQA logits on sm_120 (FP8 and MXFP4 indexer cache) + FP4 (nvfp4) compressed KV record + MXFP8 decode GEMV + official reasoning-effort tiers"

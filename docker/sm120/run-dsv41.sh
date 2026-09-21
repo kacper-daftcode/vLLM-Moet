@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, DSpark k=5, fp8 KV, MXFP4 indexer cache, 512K
-# context -- the validated deployment (docs/sm120-deploy.md, docs/dsv41-sm120-port.md). Image: Dockerfile.sm120-dsv41.
+# DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, DSpark k=5, FP4 compressed KV + fp8 SWA KV, MXFP4
+# indexer cache, 512K context -- the validated deployment (docs/sm120-deploy.md, docs/dsv41-sm120-port.md). Image: Dockerfile.sm120-dsv41.
 #
 # Required:  MODEL_DIR   directory with the official DeepSeek-V4.1-Flash checkpoint
 # Optional:  IMAGE (vllm-moet-sm120:dsv41-0909)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
@@ -18,6 +18,14 @@
 #                        mxfp4 needs the 2026-09-20 image (DeepGEMM sm120_fp4 paged logits on 128-key
 #                        pages + the lifted sm_10x gate). Peak GPU memory with mxfp4 at 0.94 is
 #                        97.0/97.9 GB (docs/sm120-deploy.md); GPU_MEM_UTIL=0.93 restores the fp8 margin.
+#            KV_RECORD (nvfp4)       compressed (main) KV record: nvfp4 (288 B/state: the checkpoint's own FP4
+#                        e2m1 + e4m3/16 format, validated 2026-09-21: GSM8K-200 / needle unchanged, greedy
+#                        outputs differ from fp8 the way two serving stacks differ, -1 % decode, -3 %
+#                        prefill, 3.06M instead of 2.29M KV tokens at 0.94), fp8_ds_mla (584 B, the stock
+#                        record served until 2026-09-21) or fp8_v41 (528 B, op-level validated only).
+#                        Needs the 2026-09-21 image (tools/dsv41_sm120/nvfp4_kv/); no rebuild to switch.
+#                        VLLM_MOET_KV_PREFILL_POOL_STATES (default MAX_MODEL_LEN states = 306 MB at 512K)
+#                        sizes the prefill dequant pool; VLLM_MOET_KV_GATHER_ROWS (64) the decode scratch.
 #            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
@@ -47,6 +55,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 SPEC_TOKENS="${SPEC_TOKENS:-5}"
 INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
+KV_RECORD="${KV_RECORD:-nvfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
 PROFILER="${PROFILER:-0}"
 PROFILE_DIR="${PROFILE_DIR:-$PWD/profiles-$NAME}"
@@ -63,6 +72,10 @@ if [[ "$SPEC_TOKENS" != "0" ]]; then
     "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
+case "$KV_RECORD" in
+  fp8_ds_mla|nvfp4|fp8_v41) ;;
+  *) echo "KV_RECORD must be fp8_ds_mla, nvfp4 or fp8_v41, got $KV_RECORD" >&2; exit 1 ;;
+esac
 case "$INDEXER_KV_DTYPE" in
   fp8) ;;
   mxfp4) ARGS+=(--attention-config "{\"indexer_kv_dtype\":\"mxfp4\"}") ;;
@@ -90,6 +103,7 @@ docker run -d --name "$NAME" --restart no \
   "${MOUNTS[@]}" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e NCCL_P2P_DISABLE=0 -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
+  -e VLLM_MOET_KV_RECORD="$KV_RECORD" \
   ${EXTRA_DOCKER_ARGS} \
   "$IMAGE" \
   --model /model --served-model-name "$SERVED_NAME" \

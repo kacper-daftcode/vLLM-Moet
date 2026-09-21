@@ -86,8 +86,8 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
 ```bash
 # DeepSeek-V4.1-Flash, GPUs 0-3, port 8001 (first start ~25 min: FlashInfer autotune + DeepGEMM JIT fill CACHE_DIR; later ~17 min)
 MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash CACHE_DIR=/srv/cache/ds41 GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh
-# second start onwards: GPU_MEM_UTIL=0.94 (2.29M KV tokens with the default MXFP4 indexer cache, 1.49M with
-# INDEXER_KV_DTYPE=fp8); 0.95 OOMs during the autotune sweep on a cold cache
+# second start onwards: GPU_MEM_UTIL=0.94 (3.06M KV tokens with the defaults KV_RECORD=nvfp4 + INDEXER_KV_DTYPE=mxfp4;
+# 2.29M with KV_RECORD=fp8_ds_mla, 1.49M with INDEXER_KV_DTYPE=fp8 as well); 0.95 OOMs during the autotune sweep on a cold cache
 
 # Qwen3.8-Flash-Next-FP8, GPUs 4-7, port 8000 (first start ~10 min: torch.compile + FlashInfer JIT; later ~4 min)
 MODEL_DIR=/srv/models/Qwen3.8-Flash-Next-FP8 CACHE_DIR=/srv/cache/qwen38 GPUS=4,5,6,7 docker/sm120/run-qwen38.sh
@@ -121,7 +121,9 @@ Qwen 97–99 steps/s (prose ~2.5, code ~3.5 tok/step), needle PASS at both lengt
 after start is slower (warm-up). If steps/s are ~10 % low and the log shows NCCL on `SHM`, P2P is
 not available on the host — check IOMMU / ACS settings. The DeepSeek log should say `Using MXFP4
 indexer cache for Lightning Indexer` (the default since 2026-09-20; `INDEXER_KV_DTYPE=fp8` gives the
-previous 132 B/key cache) and `GPU KV cache size: 2,28x,xxx tokens` at `GPU_MEM_UTIL=0.94`.
+previous 132 B/key cache) and `GPU KV cache size: 3,05x,xxx tokens` at `GPU_MEM_UTIL=0.94` with the
+default `KV_RECORD=nvfp4` (2,28x,xxx with `KV_RECORD=fp8_ds_mla`). Expect prefill ~3 % and decode ~1 %
+below the fp8-record figures with the FP4 record (`docs/dsv41-sm120-port.md`).
 
 The DeepSeek image renders the checkpoint's reasoning-effort tiers (`low` 50 / `high` 75 / `max`
 100, default `high`; see `docs/dsv41-sm120-port.md`). To confirm on a host without a GPU free:
@@ -142,9 +144,13 @@ consumed, same KV), so this is real allocation, not fragmentation. The 4.2M-toke
 EP4 SGLang recipe reports on the same cards come from its 72.6 GiB weight footprint, not from a
 knob on this side.
 
-Those numbers are the FP8 indexer cache. With the **MXFP4 indexer cache** (the default since
-2026-09-20, `docs/dsv41-sm120-port.md`) the same `0.94 / 4096` start reports **4.39 GiB KV =
-2.29M tokens (4.4× at 512K)**: the indexer page shrinks (+9.6 %) and vLLM's profile run counts
+Those numbers are the FP8 indexer cache and the fp8 compressed record. With the **MXFP4 indexer
+cache** (the default since 2026-09-20, `docs/dsv41-sm120-port.md`) the same `0.94 / 4096` start reports
+**4.39 GiB KV = 2.29M tokens (4.4× at 512K)**; with the **FP4 compressed record** on top
+(`KV_RECORD=nvfp4`, the default since 2026-09-21) the block shrinks 210 240 → 115 200 B and the same
+memory holds **3.87 GiB KV = 3.06M tokens (5.8× at 512K)** (the packed path reserves a 306 MB prefill
+pool and a 19 MB decode scratch in the profile run, so they are accounted for; peak under the stress
+battery 95 897 MiB — 1.99 GB of margin). The MXFP4-indexer-only figures: the indexer page shrinks (+9.6 %) and vLLM's profile run counts
 1.25 GiB less non-torch memory, which it hands to the KV cache. Under load the cards then level
 off at **97 001 of 97 887 MiB (886 MiB from the wall)** — GSM8K C4, 8 concurrent fresh 126K
 prefills, a fresh 139K prefill, the 367K needle and vision all passed there, but the margin is the

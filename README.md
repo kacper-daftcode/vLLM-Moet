@@ -418,7 +418,7 @@ bias that degenerates GLM; an SM12x smem fix for dense‑MLA triton decode; a
 
 The **official FP8/MXFP4 checkpoint** served by the **official
 `vllm/vllm-openai:deepseekv41-flash-0909` image** (the vLLM recipe's NVIDIA pin) on four RTX PRO
-6000: **TP4, 512K context, fp8 KV with the MXFP4 indexer cache (2.29M‑token pool), DSpark k=5, vision on** — **150 tok/s prose
+6000: **TP4, 512K context, the checkpoint's FP4 compressed‑KV record + MXFP4 indexer cache (3.06M‑token KV pool), DSpark k=5, vision on** — **150 tok/s prose
 and 347 tok/s code single stream** (67.7 decode steps/s), needle retrieval PASS at 29K and 106K
 prompt tokens, `17*19 → 323`, thinking, `deepseek_v41` tool calling and the vision path
 (carrots/corn) verified. Ships as **`Dockerfile.sm120-dsv41`** + `docker/sm120/run-dsv41.sh`;
@@ -436,6 +436,14 @@ trained with, which vLLM gates on sm_10x although DeepGEMM ships the sm_120 kern
 serves it by default: 68 instead of 132 B per indexer key, greedy outputs / GSM8K‑200 / needle
 identical to the FP8 cache, **1.49M → 2.29M KV tokens** on the same cards
 ([docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md#the-indexer-in-its-training-format-mxfp4-k-cache-on-sm_120-20260920)).
+The compressed (main) KV follows: DeepSeek stores it as FP4 e2m1 with an e4m3 scale per 16 dims
+(288 B per state; vLLM keeps a 584‑byte fp8 record), FlashInfer has no SM120 kernel for that
+record, so the image quantizes exactly like the checkpoint's `fp4_act_quant` (bit‑exact) and feeds
+the unchanged SM120 sparse‑MLA kernels an fp8 scratch of the attended states — one gather per kv
+source × index set in decode, one context dequant per kv source in prefill. GSM8K‑200 and needle
+unchanged, ~1 % decode and ~3 % prefill, **→ 3.06M KV tokens**
+([docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md#the-compressed-kv-in-its-training-format-fp4-records-on-sm_120-20260921));
+`KV_RECORD=fp8_ds_mla` restores the fp8 record without a rebuild.
 
 The image also serves the checkpoint's own reasoning‑effort tiers (`low` 50 / `high` 75 / `max` 100,
 default `high`): vLLM's vendored prompt encoder — including current main — carries a pre‑release
