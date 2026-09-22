@@ -31,23 +31,32 @@ Validated by test_deepgemm_sm120_paged_mqa.py (torch reference + parity of the
 same logical cache re-paged 64 vs 128; `--fmt mxfp4` for the FP4 kernel) on
 RTX 5090 / RTX PRO 6000.
 
-Idempotent; hard anchors (assert). Usage:
-  python3 patch_deepgemm.py /path/to/DeepGEMM   (checkout of deepseek-ai/DeepGEMM
-                                                 8b1392b978f5a03c828dd1711090d7fb50958b8a,
-                                                 the pin vendored in vllm-openai:deepseekv41-flash-0909)
+Idempotent; the anchors are regular expressions over the assert statements, so the
+same patcher fits the pin vendored in vllm-openai:deepseekv41-flash-0909
+(8b1392b978f5a03c828dd1711090d7fb50958b8a) and the pin of vLLM main / the nightly
+images (e1f418c2a4f20818221f6b0e578b4c2f634d4c3f, 2026-09-19: the metadata branch
+gained a varlen-indices assert, the launchers spell the arch check
+`jit->device.get_arch_major()`). Every anchor must match exactly once. Usage:
+  python3 patch_deepgemm.py /path/to/DeepGEMM
 """
 import pathlib
+import re
 import sys
 
+MARK = "DSV4.1 (vLLM-Moet)"
 
-def patch(path: pathlib.Path, old: str, new: str, count: int = 1):
+
+def patch(path: pathlib.Path, pattern: str, replacement, mark: str) -> None:
+    """Replace the single match of `pattern` (a re with DOTALL off) unless `mark` is already there."""
     s = path.read_text()
-    if new in s:
+    if mark in s:
         return
-    assert old in s, f"ANCHOR NOT FOUND in {path}:\n{old[:200]}"
-    assert s.count(old) == count, f"anchor x{s.count(old)} != {count} in {path}"
-    path.write_text(s.replace(old, new))
-    print(f"patched: {path.name}: {old.strip()[:70]!r}")
+    matches = list(re.finditer(pattern, s))
+    assert len(matches) == 1, f"anchor x{len(matches)} != 1 in {path}:\n{pattern}"
+    m = matches[0]
+    new = replacement(m) if callable(replacement) else m.expand(replacement)
+    path.write_text(s[: m.start()] + new + s[m.end() :])
+    print(f"patched: {path.name}: {m.group(0).strip()[:70]!r}")
 
 
 def main() -> None:
@@ -56,52 +65,50 @@ def main() -> None:
     host = root / "csrc/jit_kernels/impls/sm120_mqa_logits.hpp"
     assert attn.exists() and host.exists(), f"not a DeepGEMM checkout: {root}"
 
-    # 1. metadata: arch 12 admits the 128-row indexer page
+    # 1. metadata: arch 12 admits the 128-row indexer page (first assert of the arch-12 branch)
     patch(
         attn,
-        """    } else if (arch_major == 12) {
-        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
-        const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;""",
-        """    } else if (arch_major == 12) {
-        // DSV4.1 (vLLM-Moet): 128-row pages on the compress_ratio=1 indexer layers.
-        DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
-        const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;""",
+        r"(if \(arch_major == 12\) \{\n(?P<ind>[ \t]*))DG_HOST_ASSERT\(block_kv == 32 or block_kv == 64\);",
+        lambda m: (
+            f"{m.group(1)}// {MARK}: 128-row pages on the compress_ratio=1 indexer layers.\n"
+            f"{m.group('ind')}DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);"
+        ),
+        f"{MARK}: 128-row pages on the compress_ratio=1",
     )
     # 2. logits: arch 12 admits 128 for both the FP8 and the MXFP4 indexer cache
     patch(
         attn,
-        """        (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64)) or
-                               (not is_fp4 and block_kv == 64))));""",
-        """        (arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or
-                               (not is_fp4 and (block_kv == 64 or block_kv == 128)))));""",
+        r"\(arch_major == 12 and \(\(is_fp4 and \(block_kv == 32 or block_kv == 64\)\) or"
+        r"(?P<ws>\s+)\(not is_fp4 and block_kv == 64\)\)\)\);",
+        lambda m: (
+            f"(arch_major == 12 and ((is_fp4 and (block_kv == 32 or block_kv == 64 or block_kv == 128)) or"
+            f"{m.group('ws')}(not is_fp4 and (block_kv == 64 or block_kv == 128)))));  // {MARK}"
+        ),
+        f"(block_kv == 64 or block_kv == 128)))));  // {MARK}",
     )
     # 3. SM120 FP8 paged launcher: one 8-warp group per 128-row page
     patch(
         host,
-        """    const int num_groups = split_kv / block_kv;
-    const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
-    DG_HOST_ASSERT(block_kv == 64);
-    DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);""",
-        """    const int num_groups = split_kv / block_kv;
-    const int next_n_atom = (is_varlen or next_n >= 2) ? 2 : 1;
-    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
-    // DSV4.1 (vLLM-Moet): 128-row pages -> kNumGroups = 1 (eight 16-row MMA warps).
-    DG_HOST_ASSERT(block_kv == 64 or block_kv == 128);
-    DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);""",
+        r"(?P<ind>[ \t]*)DG_HOST_ASSERT\(block_kv == 64\);\n"
+        r"(?P=ind)DG_HOST_ASSERT\(split_kv == 128 and logits_stride % split_kv == 0\);",
+        lambda m: (
+            f"{m.group('ind')}// {MARK}: 128-row pages -> kNumGroups = 1 (eight 16-row MMA warps).\n"
+            f"{m.group('ind')}DG_HOST_ASSERT(block_kv == 64 or block_kv == 128);\n"
+            f"{m.group('ind')}DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);"
+        ),
+        f"{MARK}: 128-row pages -> kNumGroups = 1 (eight",
     )
     # 4. SM120 MXFP4 paged launcher: same warp grouping, 64 B rows + int32 UE8M0 quads
     patch(
         host,
-        """    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
-    DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
-    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64);
-    DG_HOST_ASSERT(head_dim == 128);""",
-        """    DG_HOST_ASSERT(device_runtime->get_arch_major() == 12);
-    DG_HOST_ASSERT(split_kv == 128 and logits_stride % split_kv == 0);
-    // DSV4.1 (vLLM-Moet): 128-row MXFP4 indexer pages -> kNumGroups = 1.
-    DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);
-    DG_HOST_ASSERT(head_dim == 128);""",
+        r"(?P<ind>[ \t]*)DG_HOST_ASSERT\(block_kv == 32 or block_kv == 64\);\n"
+        r"(?P=ind)DG_HOST_ASSERT\(head_dim == 128\);",
+        lambda m: (
+            f"{m.group('ind')}// {MARK}: 128-row MXFP4 indexer pages -> kNumGroups = 1.\n"
+            f"{m.group('ind')}DG_HOST_ASSERT(block_kv == 32 or block_kv == 64 or block_kv == 128);\n"
+            f"{m.group('ind')}DG_HOST_ASSERT(head_dim == 128);"
+        ),
+        f"{MARK}: 128-row MXFP4 indexer pages",
     )
     print("PATCH-DEEPGEMM-DSV41-DONE")
 

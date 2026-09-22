@@ -1,0 +1,101 @@
+# vLLM-Moet: DeepSeek-V4.1-Flash on SM120 (RTX PRO 6000 Blackwell / RTX 5090) -- vLLM main line.
+#
+# The rebase of Dockerfile.sm120-dsv41 (vllm-openai:deepseekv41-flash-0909 + our patches) onto
+# vllm/vllm-openai:nightly (vLLM main; the recipe marks 0909 "superseded") with FlashInfer's nightly
+# wheels (main; the DSv4.1 dual-cache sparse MLA of flashinfer-ai/flashinfer#5197 reads the FP4
+# compressed record directly). Same idea as the 0909 image: the official image plus the sm_120 gaps
+# closed, nothing else.
+#
+#   1. FlashInfer nightly (flashinfer-python / -jit-cache / -cubin 0.7.0.devYYYYMMDD from
+#      flashinfer.ai/whl/nightly): runtime page-size / head / top-k dispatch for the SM120 sparse MLA
+#      (the 0909 image needed our own instantiations + dispatch hook: tools/dsv41_sm120/patch_flashinfer.py
+#      and sparse_mla_sm120_dsv41.cu -- NOT applied here) and the DSv4.1 dual cache that reads the
+#      288-B NVFP4 compressed record with the 528-B V4.1 fp8 sliding-window record
+#      (`kv_cache_format="fp8_dsv41_fp4_ca"`), so the fp8_ds_mla scratch/pool of the 0909 image
+#      (nvfp4_kv/patch_vllm_packed_kv_sm120.py) is NOT applied either. The AOT jit-cache wheel carries
+#      the sm_120 modules; nothing JIT-compiles at boot.
+#   2. DeepGEMM at the commit vLLM main vendors (vllm-project/DeepGEMM e1f418c2): SM120 FP8 and MXFP4 paged MQA logits accept
+#      the 128-row indexer pages of the compress_ratio=1 layers (tools/dsv41_sm120/patch_deepgemm.py,
+#      regex anchors that fit both pins); _C is rebuilt INSIDE the official image. vLLM's sm_10x-only
+#      gate on the MXFP4 indexer cache is lifted (patch_vllm_indexer_fp4_sm120.py).
+#   3. Decode-shaped dense MXFP8 GEMMs (M <= 16) on the vLLM-Moet tensor-core GEMV and the grouped
+#      o-projection wo_a in MXFP8 on the same kernel (patch_vllm_mxfp8_gemv.py, patch_vllm_wo_a_sm120.py;
+#      VLLM_MOET_SM120_GEMV=0 / VLLM_MOET_SM120_GEMV_BMM=0 revert); DeepGEMM MoE glue at decode token
+#      counts (patch_vllm_moe_glue_sm120.py).
+#   4. Reasoning-effort tiers of the released checkpoint (patch_vllm_reasoning_effort.py; the build
+#      fails if the default thinking request does not render budget 75).
+#   5. `--kv-cache-dtype nvfp4_ds_mla` on sm_120 through FlashInfer (nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py
+#      = our vLLM PR, internal/upstream-dsv41-sm120-nvfp4-PR.md, until it is merged): the compressed
+#      cache in the checkpoint's FP4 record, the SWA cache in the V4.1 fp8 record; fp8_ds_mla keeps the
+#      V4 record and FlashInfer's DSV4 kernels (no keyword passed).
+#
+# Build (repo root):
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260922 .
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260922 KV_MODE=upstream
+#   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
+# Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
+
+ARG BASE_IMAGE=vllm/vllm-openai:nightly@sha256:42090442d73c265ebef3f571b95b53d243b53aff35b06ad29aea090fad4496f4
+
+# ---------------------------------------------------------------- deep_gemm
+FROM ${BASE_IMAGE} AS deepgemm-builder
+# vLLM main's pin (cmake/external_projects/deepgemm.cmake / tools/install_deepgemm.sh): the
+# vllm-project fork of DeepGEMM; e1f418c2 (2026-09-19) needs the cutlass and deep_jit submodules.
+ARG DEEPGEMM_REPO=https://github.com/vllm-project/DeepGEMM.git
+ARG DEEPGEMM_REF=e1f418c2a4f20818221f6b0e578b4c2f634d4c3f
+# libdw-dev: deep_jit's exception.hpp includes elfutils/libdwfl.h (compile-time only; the
+# vendored _C links neither libdw nor libelf).
+RUN apt-get update && apt-get install -y --no-install-recommends git libdw-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir --break-system-packages pybind11 wheel
+RUN git clone "$DEEPGEMM_REPO" /deepgemm \
+    && cd /deepgemm && git checkout "$DEEPGEMM_REF" \
+    && git submodule update --init --depth 1 third-party/cutlass third-party/deep_jit
+COPY tools/dsv41_sm120/patch_deepgemm.py /tmp/patch_deepgemm.py
+RUN python3 /tmp/patch_deepgemm.py /deepgemm
+RUN mkdir -p /tmp/linklibs \
+    && ln -sf /usr/local/lib/python3.12/dist-packages/nvidia/cu13/lib/libnvrtc.so.13 /tmp/linklibs/libnvrtc.so \
+    && ln -sf /usr/local/cuda/lib64/libcudart.so.13 /tmp/linklibs/libcudart.so \
+    && cd /deepgemm \
+    && CPATH=/usr/local/lib/python3.12/dist-packages/nvidia/cu13/include \
+       LIBRARY_PATH=/tmp/linklibs \
+       python3 setup.py build_ext --inplace \
+    && ls -la /deepgemm/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so
+
+# ---------------------------------------------------------------- final image
+FROM ${BASE_IMAGE}
+ARG FLASHINFER_NIGHTLY=0.7.0.dev20260922
+
+# 1. DeepGEMM _C with the SM120 block_kv=128 paged MQA path (the vendored JIT device sources are
+#    the same commit, so they stay as shipped).
+COPY --from=deepgemm-builder /deepgemm/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so \
+     /usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so
+
+# 2. FlashInfer nightly (main) with its AOT jit-cache and cubins, replacing the pinned 0.6.18.post1.
+RUN pip install --no-cache-dir --break-system-packages --no-deps \
+        "flashinfer-python==${FLASHINFER_NIGHTLY}" \
+        "flashinfer-jit-cache==${FLASHINFER_NIGHTLY}+cu130" \
+        "flashinfer-cubin==${FLASHINFER_NIGHTLY}" \
+        --index-url https://flashinfer.ai/whl/nightly/cu130 \
+        --extra-index-url https://flashinfer.ai/whl/nightly \
+    && python3 -c "import flashinfer.mla as m; assert hasattr(m, 'dsv41_fp4_quantize_pack_sparse_mla_cache'); import importlib.metadata as md; print('flashinfer', md.version('flashinfer-python'), md.version('flashinfer-jit-cache'), md.version('flashinfer-cubin'))" \
+    && python3 -c "import vllm.third_party.deep_gemm as dg; print('deep_gemm', dg.__version__, dg._C.__file__)"
+
+# 3. The vLLM-side patches (see header). patch_vllm_indexer_sm120.py (varlen indexer / adaptive
+#    verification) stays NOT applied: measured as a net loss on 2026-09-18 and 2026-09-22.
+COPY tools/dsv41_sm120/ /opt/vllm-moet/dsv41_sm120/
+ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
+RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_wo_a_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_glue_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
+
+# Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
+LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers" \
+      com.vllm-moet.kv-mode="upstream"

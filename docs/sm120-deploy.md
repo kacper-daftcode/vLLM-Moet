@@ -62,7 +62,14 @@ image tarballs instead (see Build).
 git clone <this repo> && cd vllm-moet
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
+# vLLM main line (candidate, under validation since 2026-09-22): vllm/vllm-openai:nightly (pinned digest) +
+# FlashInfer nightly wheels (DSv4.1 dual-cache sparse MLA reads the FP4 record; no TU/hook, no scratch/pool)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260922 .   # ~12 min (DeepGEMM _C at vLLM main's pin)
 ```
+
+The launcher picks the KV plumbing from the image label `com.vllm-moet.kv-mode` (`KV_MODE=auto`): the 0909 image
+keeps `--kv-cache-dtype fp8` + `VLLM_MOET_KV_RECORD`, the nightly image maps `KV_RECORD=nvfp4` to
+`--kv-cache-dtype nvfp4_ds_mla` (FlashInfer's own reader of the record) and `fp8_ds_mla` to `--kv-cache-dtype fp8_ds_mla`.
 
 Both bases are pinned (`vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…`
 = the `qwen38-flash-next` nightly, v0.1.dev20073); the patchers are anchored on those exact files

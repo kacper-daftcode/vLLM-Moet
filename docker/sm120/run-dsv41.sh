@@ -26,6 +26,12 @@
 #                        Needs the 2026-09-21 image (tools/dsv41_sm120/nvfp4_kv/); no rebuild to switch.
 #                        VLLM_MOET_KV_PREFILL_POOL_STATES (default MAX_MODEL_LEN states = 306 MB at 512K)
 #                        sizes the prefill dequant pool; VLLM_MOET_KV_GATHER_ROWS (64) the decode scratch.
+#            KV_MODE (auto)          how KV_RECORD reaches vLLM: "moet" = the 0909 image's plumbing
+#                        (--kv-cache-dtype fp8 + VLLM_MOET_KV_RECORD, our scratch/pool kernels);
+#                        "upstream" = the vLLM-main image (Dockerfile.sm120-dsv41-nightly): nvfp4 ->
+#                        --kv-cache-dtype nvfp4_ds_mla read by FlashInfer's DSv4.1 dual cache, fp8_ds_mla ->
+#                        --kv-cache-dtype fp8_ds_mla (fp8_v41 has no upstream equivalent). "auto" reads the
+#                        image label com.vllm-moet.kv-mode and falls back to "moet".
 #            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
@@ -76,6 +82,24 @@ case "$KV_RECORD" in
   fp8_ds_mla|nvfp4|fp8_v41) ;;
   *) echo "KV_RECORD must be fp8_ds_mla, nvfp4 or fp8_v41, got $KV_RECORD" >&2; exit 1 ;;
 esac
+KV_MODE="${KV_MODE:-auto}"
+if [[ "$KV_MODE" == "auto" ]]; then
+  KV_MODE="$(docker image inspect --format '{{index .Config.Labels "com.vllm-moet.kv-mode"}}' "$IMAGE" 2>/dev/null || true)"
+  KV_MODE="${KV_MODE:-moet}"
+fi
+KV_ENV=()
+case "$KV_MODE" in
+  moet)
+    KV_CACHE_DTYPE=fp8
+    KV_ENV=(-e VLLM_MOET_KV_RECORD="$KV_RECORD") ;;
+  upstream)
+    case "$KV_RECORD" in
+      nvfp4) KV_CACHE_DTYPE=nvfp4_ds_mla ;;
+      fp8_ds_mla) KV_CACHE_DTYPE=fp8_ds_mla ;;
+      *) echo "KV_RECORD=$KV_RECORD has no upstream (vLLM main) equivalent; use nvfp4 or fp8_ds_mla" >&2; exit 1 ;;
+    esac ;;
+  *) echo "KV_MODE must be auto, moet or upstream, got $KV_MODE" >&2; exit 1 ;;
+esac
 case "$INDEXER_KV_DTYPE" in
   fp8) ;;
   mxfp4) ARGS+=(--attention-config "{\"indexer_kv_dtype\":\"mxfp4\"}") ;;
@@ -103,7 +127,7 @@ docker run -d --name "$NAME" --restart no \
   "${MOUNTS[@]}" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e NCCL_P2P_DISABLE=0 -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
-  -e VLLM_MOET_KV_RECORD="$KV_RECORD" \
+  "${KV_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
   "$IMAGE" \
   --model /model --served-model-name "$SERVED_NAME" \
@@ -111,7 +135,7 @@ docker run -d --name "$NAME" --restart no \
   --tokenizer-mode deepseek_v41 \
   --reasoning-parser deepseek_v41 \
   --tool-call-parser deepseek_v41 --enable-auto-tool-choice \
-  --kv-cache-dtype fp8 \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" \
   --gpu-memory-utilization "$GPU_MEM_UTIL" \
   --max-model-len "$MAX_MODEL_LEN" \
   --max-num-seqs "$MAX_NUM_SEQS" \

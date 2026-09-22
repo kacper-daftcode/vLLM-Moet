@@ -154,11 +154,18 @@ def main() -> int:
     dev = torch.device("cuda")
     print(f"device={torch.cuda.get_device_name(0)} cc={torch.cuda.get_device_capability(0)}")
 
-    from vllm.models.deepseek_v4_1.common.ops import (
-        MXFP4_BLOCK_SIZE,
-        fused_indexer_q_rope_quant,
-        indexer_k_norm_rope_store,
-    )
+    try:  # vLLM main (2026-09) renamed the package deepseek_v4_1 -> deepseek_v41
+        from vllm.models.deepseek_v41.common.ops import (
+            MXFP4_BLOCK_SIZE,
+            fused_indexer_q_rope_quant,
+            indexer_k_norm_rope_store,
+        )
+    except ModuleNotFoundError:
+        from vllm.models.deepseek_v4_1.common.ops import (
+            MXFP4_BLOCK_SIZE,
+            fused_indexer_q_rope_quant,
+            indexer_k_norm_rope_store,
+        )
     from vllm.utils.import_utils import has_cutedsl
 
     assert MXFP4_BLOCK_SIZE == 32
