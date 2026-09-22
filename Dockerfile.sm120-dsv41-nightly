@@ -15,9 +15,11 @@
 #      (nvfp4_kv/patch_vllm_packed_kv_sm120.py) is NOT applied either. The AOT jit-cache wheel carries
 #      the sm_120 modules; nothing JIT-compiles at boot.
 #   2. DeepGEMM at the commit vLLM main vendors (vllm-project/DeepGEMM e1f418c2): SM120 FP8 and MXFP4 paged MQA logits accept
-#      the 128-row indexer pages of the compress_ratio=1 layers (tools/dsv41_sm120/patch_deepgemm.py,
-#      regex anchors that fit both pins); _C is rebuilt INSIDE the official image. vLLM's sm_10x-only
-#      gate on the MXFP4 indexer cache is lifted (patch_vllm_indexer_fp4_sm120.py).
+#      the 128-row indexer pages of the compress_ratio=1 layers, and the SM120 per-group BLOCK_M of the
+#      contiguous grouped layout is restored (the fork's port of the SM120 kernels kept upstream's SM100-only
+#      heuristic: vLLM padded every routed expert to 128 rows and the MoE grouped GEMM took 2x at decode)
+#      (tools/dsv41_sm120/patch_deepgemm.py, regex anchors that fit both pins); _C is rebuilt INSIDE the
+#      official image. vLLM's sm_10x-only gate on the MXFP4 indexer cache is lifted (patch_vllm_indexer_fp4_sm120.py).
 #   3. Decode-shaped dense MXFP8 GEMMs (M <= 16) on the vLLM-Moet tensor-core GEMV and the grouped
 #      o-projection wo_a in MXFP8 on the same kernel (patch_vllm_mxfp8_gemv.py, patch_vllm_wo_a_sm120.py;
 #      VLLM_MOET_SM120_GEMV=0 / VLLM_MOET_SM120_GEMV_BMM=0 revert); DeepGEMM MoE glue at decode token
@@ -30,8 +32,8 @@
 #      V4 record and FlashInfer's DSV4 kernels (no keyword passed).
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260922 .
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260922 KV_MODE=upstream
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923 .
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923 KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 

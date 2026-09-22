@@ -64,7 +64,7 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
 # vLLM main line (candidate, under validation since 2026-09-22): vllm/vllm-openai:nightly (pinned digest) +
 # FlashInfer nightly wheels (DSv4.1 dual-cache sparse MLA reads the FP4 record; no TU/hook, no scratch/pool)
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260922 .   # ~12 min (DeepGEMM _C at vLLM main's pin)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923 .   # ~12 min (DeepGEMM _C at vLLM main's pin, SM120 per-group BLOCK_M restored)
 ```
 
 The launcher picks the KV plumbing from the image label `com.vllm-moet.kv-mode` (`KV_MODE=auto`): the 0909 image

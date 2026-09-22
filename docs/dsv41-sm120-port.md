@@ -541,6 +541,63 @@ already +12 % on the same shapes, the FP4 conversion adds +9 %). Net for this de
 of KV (no pool / scratch, ≈ +8 % tokens), ≈ +1 % decode, ≈ −3 % prefill until upstream's V4.1 dual
 prefill gets the MG path — a scoped kernel contribution with a measured target.
 
+## The vLLM main line as a candidate image (2026‑09‑22)
+
+`Dockerfile.sm120-dsv41-nightly` builds the same idea on `vllm/vllm-openai:nightly` (vLLM main
+0961bbae, pinned digest; the recipe marks 0909 "superseded") with FlashInfer's nightly wheels
+(0.7.0.dev20260922, #5197 included: the DSv4.1 dual cache reads the FP4 record — no TU / dispatch
+hook, no scratch / pool) and DeepGEMM `_C` rebuilt at vLLM main's pin (`vllm-project/DeepGEMM`
+e1f418c2). The patchers above apply unchanged (all anchors hold on main); our vLLM PR rides along as
+`nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py` (`--kv-cache-dtype nvfp4_ds_mla` on sm_120 through
+`kv_cache_format="fp8_dsv41_fp4_ca"`), and the launcher reads the image label to pick that plumbing.
+
+First serve (4× RTX PRO 6000, TP4, 512K, DSpark k=5, MXFP4 indexer): quality identical to the 0909
+image (GSM8K‑200 195/200, needle 6/6 to 367K with the same answers), prefill as predicted (−1…−3 %),
+but decode **−3 % single‑stream to −10 % at eight streams**. The op‑level MoE bench
+(`tools/sm120_perf/moe_backends_bench.py`, RTX 5090, this model's per‑rank geometry) found the
+cause without a server: vLLM's DeepGEMM chain took **2×** in the main‑line image — 98 → 186 µs at
+6 tokens, 576 → 1101 µs at 48 — and printed `align 128` where the 0909 image prints `align 64`.
+The vllm‑project fork's port of the SM120 kernels (its #4) kept upstream's
+`get_theoretical_mk_alignment_for_contiguous_layout`, which knows SM100 (256) and answers the
+legacy 128 for every other arch and has no `num_groups` argument; nv_dev's version (the 0909 pin)
+shrinks BLOCK_M on SM120 to the smallest tile covering the per‑expert M (BLOCK_M ∈ {64, 128}:
+kMWarps(4) × MMA_M(16)). vLLM's MoE glue calls it with `(M·top_k, local_num_experts)`, falls back
+to the one‑argument form on `TypeError`, gets 128, pads every routed expert to 128 rows and caps
+the kernel at BLOCK_M=128 — tiles of 128 rows on 1–6 real rows, and the grouped GEMM no longer
+reaches the HBM floor. `patch_deepgemm.py` (patches 5–6, skipped on the nv_dev pin) restores the
+policy before `_C` is rebuilt; the chain is back to 97 / 575 µs and the `_C` still passes the paged
+MQA (40/40) and MXFP4 indexer tests. The same two‑file change is the upstream PR to the fork
+(`internal/upstream-deepgemm-sm120-mk-alignment-*`). Served numbers of the fixed image
+(`dsv41-nightly-20260923`): see the table below.
+
+Served on the same 4× RTX PRO 6000 (TP4, 512K, DSpark k=5, MXFP4 indexer, FP4 compressed KV,
+`GPU_MEM_UTIL=0.94`, warm caches; `tools/sm120_perf/spec_matrix.py`, 512 output tokens, two waves
+per cell, thinking off; steps/s = engine steps per second of one stream):
+
+| | 0909 image (served) | main line, DeepGEMM fork as shipped | main line + BLOCK_M fix (`dsv41-nightly-20260923`) |
+|---|---|---|---|
+| KV capacity at 0.94 | 3.87 GiB = 3,057,484 tokens | (0.92: 2.5 GiB = 1,983,987) | **4.35 GiB = 3,454,536 tokens (+13 %)** |
+| prose, 1 stream | 152–154 tok/s, 67 steps/s | 150–161, 64–65 | **163–164, 73.5–73.9 (+10 %)** |
+| prose, 4 streams | 365–367 tok/s, 41 steps/s | 340–351, 39 | 371–380, 43.7 |
+| prose, 8 streams | 553–557 tok/s, 31 steps/s | 502–511, 28 | 554–568, 31.5–32.0 |
+| code, 1 stream | 349–371 tok/s, 68.8 steps/s | 346–350, 67 | **383–387, 75.6** |
+| code, 4 streams | 943–961 tok/s, 45–47 steps/s | 826–849, 40–41 | 904–977, 43–46 |
+| code, 8 streams | 1377–1397 tok/s, 34 steps/s | 1237–1263, 30 | 1372–1428, 33.4–34.6 |
+| fresh prefill 19K / 163K | 11.4k / 10.5k tok/s | 11.1k / 10.4k | 11.4–11.5k / 10.6k |
+| GSM8K‑200, thinking off | 195/200 | 195/200 | 194/200 |
+| needle (27K, 92K, 184K, 367K × 2 depths) | 6/6 to 367K | 6/6, same answers | 8/8, same answers at 367K |
+| probes (arith ×2, tools, JSON, vision, coherence) | PASS | — | PASS; greedy agreement 8/24 vs 0909 (the FP4 route's own numerics, as between two stacks) |
+| 8 × 126K‑token requests, peak GPU memory | 97,001 / 97,887 MiB | — | 96,491 / 97,887 MiB |
+
+Where the +10 % of a single stream comes from (rank 0 traces, `profile_capture.py` + `trace_agg.py`,
+per decode step; 0909 15.9 ms of GPU time, main line 13.9 ms): the MoE grouped GEMM is identical
+again (4.94 → 4.91 ms; FC1 83.5 → 83.1 µs per launch), **mHC 2.0 → 1.0 ms** (main runs one
+`mhc_fused_tilelang_kernel` of 6 µs where 0909 ran the TF32 prenorm GEMM 14.4 µs + `mhc_post`
+3.7 µs), **NCCL 1.8 → 1.3 ms** (13.4 vs 19.0 µs per bf16 ring all‑reduce at 6 tokens; 58.8 vs
+87.5 µs at 48), elementwise 1.3 → 1.0 ms (−160 launches per step), sparse MLA 0.9 → 0.8 ms (the
+DSv4.1 mixed‑cache decode kernel, no gather). At eight streams the per‑step GPU time is 33.3 →
+30.7 ms with the same composition (the MoE at 48 tokens +2 %: 213 vs 208 µs per FC1 launch).
+
 ## Apply / build / run
 
 ```bash
@@ -571,6 +628,10 @@ JIT when the AOT artifact fails to load) and the rebuilt `_C.so` over
   select `nvfp4_ds_mla` through FlashInfer's `fp8_dsv41_fp4_ca` once the pin carries #5197) and,
   in FlashInfer, a multi‑group BF16‑QK prefill for the V4.1 dual cache (today's SG kernel is +21 %
   on the 4096‑row chunk).
+- Upstream, DeepGEMM: the vllm‑project fork's SM120 port needs nv_dev's per‑group BLOCK_M policy
+  back (`get_theoretical_mk_alignment_for_contiguous_layout(expected_m, num_groups)` → 64 on
+  SM120 when the per‑expert M is ≤ 64); until then every vLLM main build pads MoE decode batches to
+  128 rows per expert on sm_120 and the grouped GEMM takes 2×. `patch_deepgemm.py` carries the fix.
 - `EmulationMxfp8LinearKernel` is no longer selected in the serving log (dense → FlashInfer
   CUTLASS + GEMV, `wo_a` → grouped GEMV); the remaining BF16 GEMMs are BF16 checkpoint weights.
 - Bench recipe (`bench/recipes/`) for `deepseek-v4.1-flash/pro6000x8-tp8-dspark` not yet
