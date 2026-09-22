@@ -11,7 +11,7 @@ validation evidence: `docs/dsv41-sm120-port.md`; image: `Dockerfile.sm120-dsv41`
 | `patch_deepgemm.py` | DeepGEMM `8b1392b9` host asserts: SM120 FP8 **and MXFP4** paged MQA logits on 128-row pages (the device kernels are templated on the page size; only the launchers' asserts stopped at 64) |
 | `test_sparse_mla_sm120_dsv41.py` | op-level validation: torch reference + bit-exact re-paging parity vs stock PBS=64 kernels |
 | `test_deepgemm_sm120_paged_mqa.py` | op-level validation: DeepGEMM reference + bit-exact parity block_kv 64 vs 128; native next_n 1/2/6 and the varlen (`indices=`) mode; `--fmt fp8|mxfp4|both` (default both), `--packed-stride` lays the pages out with vLLM's block-outermost stride/offset for this model (230400 B / 210240 B blocks) |
-| `nvfp4_kv/` | the compressed (main) KV in the checkpoint's FP4 record on sm_120 (`KV_RECORD=nvfp4`, default since 2026-09-21): `fp4_kv_quant.py` (bit-exact port of `inference/kernel.py::fp4_act_quant(x, 16, e4m3)`), `nvfp4_kv_kernels.py` (insert into the 288-B / 528-B records, gather + re-quantize into an `fp8_ds_mla` scratch for decode, whole-context dequant into a pool for prefill), `patch_vllm_packed_kv_sm120.py` (installs the merged module into vLLM and patches the spec, the insert dispatch and the SM120 attention's decode / prefill / workspace reservation; inert unless `VLLM_MOET_KV_RECORD` selects a packed record), `patch_vllm_kv_fp4_fake.py` (experiment "A0": the same numerics with today's storage, not applied in the image); tests `test_fp4_kv_quant.py` (vs the checkpoint's TileLang quantizer), `test_kv_fp4_fake_insert.py`, `test_nvfp4_kv_kernels.py` (records vs the reference, scratch == A0 records, FlashInfer dual-cache attention bit-exact on the scratch), `test_packed_kv_glue.py` (sharing across layers, pool layout, fallback) — all need `--model-dir` (the checkpoint's `inference/` for the reference) except the glue test |
+| `nvfp4_kv/` | the compressed (main) KV in the checkpoint's FP4 record on sm_120 (`KV_RECORD=nvfp4`, default since 2026-09-21): `fp4_kv_quant.py` (bit-exact port of `inference/kernel.py::fp4_act_quant(x, 16, e4m3)`), `nvfp4_kv_kernels.py` (insert into the 288-B / 528-B records, gather + re-quantize into an `fp8_ds_mla` scratch for decode, whole-context dequant into a pool for prefill), `patch_vllm_packed_kv_sm120.py` (installs the merged module into vLLM and patches the spec, the insert dispatch and the SM120 attention's decode / prefill / workspace reservation; inert unless `VLLM_MOET_KV_RECORD` selects a packed record), `patch_vllm_kv_fp4_fake.py` (experiment "A0": the same numerics with today's storage, not applied in the image); tests `test_fp4_kv_quant.py` (vs the checkpoint's TileLang quantizer), `test_kv_fp4_fake_insert.py`, `test_nvfp4_kv_kernels.py` (records vs the reference, scratch == A0 records, FlashInfer dual-cache attention bit-exact on the scratch), `test_packed_kv_glue.py` (sharing across layers, pool layout, fallback) — all need `--model-dir` (the checkpoint's `inference/` for the reference) except the glue test; `test_flashinfer_dsv41_fp4_extra.py` runs FlashInfer `main`'s own reader of this record ([#5197](https://github.com/flashinfer-ai/flashinfer/pull/5197): V4.1 dual cache, `kv_cache_format="fp8_dsv41_fp4_ca"`) on vLLM's V4.1 geometry — our writers vs upstream's byte for byte, attention vs the fp32 reference and vs today's scratch path, CUDA‑graph timings of both paths (needs flashinfer ≥ 0.7.0 built from `main` ≥ eb5f05be; no checkpoint) |
 | `patch_vllm_indexer_fp4_sm120.py`, `test_indexer_fp4_sm120.py` | vLLM patch (one gate in `v1/attention/backends/mla/indexer.py`): `--attention-config '{"indexer_kv_dtype":"mxfp4"}'` is accepted on sm_120 (launcher `INDEXER_KV_DTYPE=mxfp4`). The MXFP4 indexer cache stores 64 B of e2m1 pairs + 4 UE8M0 scales per key (68 B instead of 132), the format the indexer was trained with; the packed KV block shrinks 230400 -> 210240 B (+9.6 % KV tokens). The test checks the Q quantizer (CuTe DSL), the K store (Triton, `cvt.rn.satfinite.e2m1x2.f32` on sm_120a) bit-for-bit against DeepSeek's fp4 quantizer (RNE, UE8M0 = 2^ceil(log2(amax/6))), and DeepGEMM's logits on the kernel-written 128-key pages (bit-exact 64/128 re-page) |
 | `sm120_gemv/mxfp8_gemv_sm120.cu` | tensor-core (mma.m16n8k32 e4m3) MXFP8 GEMV for decode shapes (M <= 16), F8_128x4 swizzled scales, plus a scalar fallback (`VLLM_MOET_GEMV_IMPL=scalar`) and the v2 experiment (`=v2`, see below; not faster); loaded via `sm120_gemv/mxfp8_gemv_sm120.py` (torch cpp_extension JIT, precompiled in the image) |
 | `patch_vllm_mxfp8_gemv.py` | vLLM patch: `FlashInferCutlassMxfp8LinearKernel.apply_weights` routes M <= 16 to the GEMV (`VLLM_MOET_SM120_GEMV=0` reverts) |
@@ -158,7 +158,25 @@ docker run --rm --gpus '"device=0"' --entrypoint bash -v /path/to/DeepSeek-V4.1-
 ```
 
 (the image's `fused_compress_quant_cache.py` already carries the packed-record dispatch; the A0 patcher
-adds its switch on top of it.) The prompt-encoder check needs no GPU; with the checkpoint mounted it
+adds its switch on top of it.)
+
+FlashInfer `main`'s reader of the FP4 record (not in the image, which pins 0.6.18) is checked from a
+source checkout mounted into the image — an editable install replaces the packaged FlashInfer inside
+that container only, and the 0.6.18 `flashinfer-cubin` / `flashinfer-jit-cache` must go so the version
+check passes and the `sparse_mla_sm120` module is JIT‑built from the checkout (about 30 s):
+
+```bash
+git clone https://github.com/flashinfer-ai/flashinfer.git /path/to/flashinfer-main   # >= eb5f05be (#5197)
+git -C /path/to/flashinfer-main submodule update --init 3rdparty/cutlass 3rdparty/spdlog 3rdparty/cccl
+docker run --rm --gpus '"device=0"' --entrypoint bash \
+  -v /path/to/flashinfer-main:/fi -v "$PWD/tools/dsv41_sm120":/dsv41:ro vllm-moet-sm120:dsv41-0909 -c \
+  'pip install -q --no-build-isolation --no-deps -e /fi && pip uninstall -q -y flashinfer-cubin flashinfer-jit-cache &&
+   cd /dsv41/nvfp4_kv && python3 test_flashinfer_dsv41_fp4_extra.py --quick --precisions'
+```
+
+(`--quick` = 24 geometry cases and two timed shapes; the full run is 324 cases and six shapes, `--perf-only`
+skips the checks, `--precisions` also times the `default` / `fp8` / `bf16` compute routes through the
+wrapper API.) The prompt-encoder check needs no GPU; with the checkpoint mounted it
 compares against DeepSeek's own encoder:
 
 ```bash

@@ -502,6 +502,32 @@ is the launcher default since 2026‑09‑21; `KV_RECORD=fp8_ds_mla` restores th
 `tools/sm120_perf/kv_layout_probe.py --main-bytes 288` predicted the block and the capacity
 (115 200 B, 3.47M tokens) before any code ran.
 
+**Upstream reads the record now (checked 2026‑09‑21).** FlashInfer `main` since
+[#5197](https://github.com/flashinfer-ai/flashinfer/pull/5197) (merged 2026‑09‑18, not in 0.7.0rc3
+or `release-v0.7.0`) has a DeepSeek‑V4.1 dual‑cache sparse MLA for SM120/121 that takes the 528‑byte
+V4.1 fp8 sliding‑window record as the main cache and exactly this 288‑byte FP4 record as the extra
+cache (`kv_cache_format="fp8_dsv41_fp4_ca"` on `trtllm_batch_decode_sparse_mla_dsv4`; the FP4 rows
+are converted to fp8/UE8M0‑32 tiles on chip, or dequantized to bf16 on the `compute_precision="bf16"`
+route), with runtime page sizes (32‑token SWA pages included) and cache writers
+(`dsv41_fp4_quantize_pack/append_sparse_mla_cache`). It is the pairing vLLM `main` calls
+`nvfp4_ds_mla` (SM100‑only there today) — so the scratch/pool above becomes unnecessary once the
+port moves to a FlashInfer release carrying #5197 and vLLM lets sm_120 pick that format.
+`tools/dsv41_sm120/nvfp4_kv/test_flashinfer_dsv41_fp4_extra.py` runs upstream's kernel on this
+port's geometry against our writers and references (RTX 5090, FlashInfer main 6870e3ff, CUDA 13.0):
+our 288‑byte writer produces upstream's bytes exactly (both page sizes, floor/ceiling groups), the
+528‑byte writer matches the V4.1 reference; 324/324 cases pass FlashInfer's tolerance — SWA page 32,
+compressed page 128 / 64, 8 / 16 / 64 heads, SWA top‑k 128 / 192 / 1152 with −1 padding and per‑row
+lengths, sinks, decode and prefill entries, vLLM's block‑strided cache views — with the same distance
+from the fp32 reference as today's scratch path (max 2.4e‑3 both). Per call, CUDA‑graph timed, cold
+256K‑token pools, 16 heads: decode 6 / 24 / 48 rows × (192 + 512) 14.5 / 18.8 / 31.0 µs against
+today's DSV4 kernel + gather 21.5 / 29.2 / 43.7 µs (**−30 %**, the `bf16` route is as fast at 6 rows
+and 8× closer to the reference); prefill 4096 rows × (128 + 512) **1408 µs against 1151** and
+× (1152 + 512) 3221 against 2671 (**+21 %**): the V4.1 family only has the single‑group FP8 prefill
+kernel, while the DSV4 dual cache runs the multi‑group BF16‑QK kernel (the all‑fp8 V4.1 cache is
+already +12 % on the same shapes, the FP4 conversion adds +9 %). Net for this deployment: +325 MB
+of KV (no pool / scratch, ≈ +8 % tokens), ≈ +1 % decode, ≈ −3 % prefill until upstream's V4.1 dual
+prefill gets the MG path — a scoped kernel contribution with a measured target.
+
 ## Apply / build / run
 
 ```bash
@@ -526,7 +552,12 @@ JIT when the AOT artifact fails to load) and the rebuilt `_C.so` over
   [vllm#56509](https://github.com/vllm-project/vllm/pull/56509),
   [vllm#57028](https://github.com/vllm-project/vllm/pull/57028) change the vLLM‑side page geometry
   instead; this port keeps vLLM stock and would be superseded by FlashInfer/DeepGEMM shipping the
-  instantiations. Worth proposing there.
+  instantiations. FlashInfer `main` ships them since
+  [#5197](https://github.com/flashinfer-ai/flashinfer/pull/5197) (runtime page sizes, V4.1 dual
+  cache with the FP4 record — measured above); what remains upstream is the vLLM side (let sm_120
+  select `nvfp4_ds_mla` through FlashInfer's `fp8_dsv41_fp4_ca` once the pin carries #5197) and,
+  in FlashInfer, a multi‑group BF16‑QK prefill for the V4.1 dual cache (today's SG kernel is +21 %
+  on the 4096‑row chunk).
 - `EmulationMxfp8LinearKernel` is no longer selected in the serving log (dense → FlashInfer
   CUTLASS + GEMV, `wo_a` → grouped GEMV); the remaining BF16 GEMMs are BF16 checkpoint weights.
 - Bench recipe (`bench/recipes/`) for `deepseek-v4.1-flash/pro6000x8-tp8-dspark` not yet
