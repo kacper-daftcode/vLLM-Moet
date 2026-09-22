@@ -347,7 +347,20 @@ work on sm_120 (`patch_vllm_indexer_sm120.py` only widens vLLM's sm_100 gate; op
 `test_deepgemm_sm120_paged_mqa.py --only varlen`), but the varlen decode path adds ~0.5 ms/step
 (topk/indexer glue) and, with adaptive verification on, prose stayed at ~130 tok/s while code fell
 313 → 273 tok/s and the varlen decode cudagraphs cost 2 GiB of KV (util had to go to 0.95). Left as
-an experiment. (b) An fp32 GEMV for the mHC pre‑norm GEMM: DeepGEMM's TF32 kernel is 4.2 µs in
+an experiment; **re‑measured on the served image on 2026‑09‑22** (same client, same day, k = 5,
+`tools/sm120_perf/spec_matrix.py`: prose / code × concurrency 1 / 4 / 8, 512 tokens each): the
+FULL cudagraphs of the varlen path take 2.46 GiB instead of 0.41 (**KV 3.87 → 1.92 GiB, 3.06M →
+1.52M tokens**); the verifier trims the drafts (prose 2.3 → 2.0 accepted tokens per step, 67 → 75
+steps/s), which is a wash for a single prose stream (153 → 149 tok/s) and **+15 % at eight prose
+streams (555 → 640 tok/s)**, but **code loses 14 % single‑stream (360 → 308 tok/s) and 8 % at four
+streams (950 → 872)** — the trimmed drafts would have been accepted. Against the plan's criterion
+(prose C1 ≥ +5 %, code ≥ −2 %, KV ≥ −5 %) it fails on all three; the topic is closed for this
+image. The cheaper knob, a shorter draft (`SPEC_TOKENS=3`, measured the same way): prose
+unchanged single‑stream and **+13 % at four and eight streams (366 → 413, 555 → 625 tok/s)**, KV
++6 % (3.06M → 3.23M tokens; smaller drafter graphs), but **code −24 % single‑stream (360 → 276)
+and −16 % at eight streams** — code accepts 4.2 of 5 drafts, so the cap at 3 costs directly. k = 5
+stays the default for the mixed agent workload; a prose‑only deployment would take k = 3.
+(b) An fp32 GEMV for the mHC pre‑norm GEMM: DeepGEMM's TF32 kernel is 4.2 µs in
 isolation and the hand‑written one is not faster at M ≥ 6; the 14 µs in the profile is PDL
 overlap, not kernel time. (c) vLLM's custom one‑shot allreduce on PCIe P2P (see the NCCL
 paragraph): 6× slower than NCCL at 60 KiB, pull‑based reads do not suit this VM. (d) The dense
