@@ -568,7 +568,8 @@ reaches the HBM floor. `patch_deepgemm.py` (patches 5–6, skipped on the nv_dev
 policy before `_C` is rebuilt; the chain is back to 97 / 575 µs and the `_C` still passes the paged
 MQA (40/40) and MXFP4 indexer tests. The same two‑file change is the upstream PR to the fork
 (`internal/upstream-deepgemm-sm120-mk-alignment-*`). Served numbers of the fixed image
-(`dsv41-nightly-20260923`): see the table below.
+(`dsv41-nightly-20260923`): the table below. **It is the served image since 2026‑09‑23**; the 0909
+image stays as the rollback (`IMAGE=vllm-moet-sm120:dsv41-0909`).
 
 Served on the same 4× RTX PRO 6000 (TP4, 512K, DSpark k=5, MXFP4 indexer, FP4 compressed KV,
 `GPU_MEM_UTIL=0.94`, warm caches; `tools/sm120_perf/spec_matrix.py`, 512 output tokens, two waves

@@ -416,13 +416,17 @@ bias that degenerates GLM; an SM12x smem fix for dense‑MLA triton decode; a
 
 ## DeepSeek‑V4.1‑Flash (552B + 196B Engram) on 4× RTX PRO 6000 — official checkpoint, official image
 
-The **official FP8/MXFP4 checkpoint** served by the **official
-`vllm/vllm-openai:deepseekv41-flash-0909` image** (the vLLM recipe's NVIDIA pin) on four RTX PRO
-6000: **TP4, 512K context, the checkpoint's FP4 compressed‑KV record + MXFP4 indexer cache (3.06M‑token KV pool), DSpark k=5, vision on** — **150 tok/s prose
-and 347 tok/s code single stream** (67.7 decode steps/s), needle retrieval PASS at 29K and 106K
-prompt tokens, `17*19 → 323`, thinking, `deepseek_v41` tool calling and the vision path
-(carrots/corn) verified. Ships as **`Dockerfile.sm120-dsv41`** + `docker/sm120/run-dsv41.sh`;
-build/serve on a new host: **[docs/sm120-deploy.md](docs/sm120-deploy.md)**.
+The **official FP8/MXFP4 checkpoint** served from the **official vLLM images** on four RTX PRO
+6000: **TP4, 512K context, the checkpoint's FP4 compressed‑KV record + MXFP4 indexer cache, DSpark
+k=5, vision on**. Served since 2026‑09‑23 by the vLLM main line (**`Dockerfile.sm120-dsv41-nightly`**:
+`vllm/vllm-openai:nightly` + FlashInfer's nightly wheels, whose DSv4.1 dual‑cache sparse MLA reads the
+FP4 record itself, + DeepGEMM at main's pin with its SM120 MoE tile policy restored) — **163 tok/s
+prose and 385 tok/s code single stream** (74 decode steps/s), **3.45M‑token KV pool**, GSM8K‑200
+194/200, needle retrieval PASS to 367K prompt tokens, `17*19 → 323`, thinking, `deepseek_v41` tool
+calling and the vision path verified. The recipe's `vllm/vllm-openai:deepseekv41-flash-0909` image with
+the same fixes (**`Dockerfile.sm120-dsv41`**: 150 / 347 tok/s at 67.7 steps/s, 3.06M‑token KV) stays as
+the rollback; one launcher, `docker/sm120/run-dsv41.sh`, serves either. Build/serve on a new host:
+**[docs/sm120-deploy.md](docs/sm120-deploy.md)**.
 
 The stock image does not start on sm_120: FlashInfer's SM120 sparse‑MLA kernels are instantiated
 for the V4‑Flash page geometry only (SWA page 64, compressed pages 64/2, rows ≤ 2048 — V4.1 pages
@@ -557,11 +561,14 @@ Quality release **`v2026.07.30-quality`** — dataset evals vs the committed **n
   inventory and source fingerprint. Goes with the pins above.
 - **`Dockerfile.sm120-v024`** — the image: official `vllm/vllm-openai:v0.24.0` + patch + pins +
   cubins.
-- **`Dockerfile.sm120-dsv41`** + **`tools/dsv41_sm120/`** — DeepSeek‑V4.1‑Flash on sm_120: official
-  `vllm/vllm-openai:deepseekv41-flash-0909` + the FlashInfer/DeepGEMM SM120 kernel instantiations
-  for the V4.1 page geometry, the MXFP8 decode GEMV, the MoE glue fixes and the checkpoint's
-  reasoning‑effort tiers in the prompt encoder, with their tests; port notes in
-  `docs/dsv41-sm120-port.md`.
+- **`Dockerfile.sm120-dsv41-nightly`**, **`Dockerfile.sm120-dsv41`** + **`tools/dsv41_sm120/`** —
+  DeepSeek‑V4.1‑Flash on sm_120. The served image (vLLM main line): `vllm/vllm-openai:nightly` +
+  FlashInfer nightly (reads the FP4 KV record) + DeepGEMM at main's pin with the SM120 per‑group
+  BLOCK_M restored, the MXFP8 decode GEMV, the MoE glue fixes, the checkpoint's reasoning‑effort
+  tiers and `--kv-cache-dtype nvfp4_ds_mla` on sm_120 (our vLLM PR as a patcher). The 0909 image:
+  official `vllm/vllm-openai:deepseekv41-flash-0909` + the FlashInfer/DeepGEMM SM120 kernel
+  instantiations for the V4.1 page geometry and the same fixes on its pins, with their tests; port
+  notes in `docs/dsv41-sm120-port.md`.
 - **`Dockerfile.sm120-qwen38`** + **`tools/qwen38_sm120/`** — Qwen3.8‑Flash‑Next‑FP8 on sm_120: the
   official nightly + the PLE/skinny‑GEMM/MoE‑GEMV decode fixes (anchored patchers, kernel, tuned
   MoE config, tests). **`docker/sm120/`** — the two launchers; **`docs/sm120-deploy.md`** — build,

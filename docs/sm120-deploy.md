@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-0909` | `Dockerfile.sm120-dsv41` | `docker/sm120/run-dsv41.sh` | 67 steps/s, prose 148 / code 346 tok/s (DSpark k=5), 1.49M-token fp8 KV at 512K context |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923` (served since 2026-09-23; `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 74 steps/s, prose 163 / code 385 tok/s (DSpark k=5), 3.45M-token FP4 KV at 512K context (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -37,7 +37,8 @@ Everything below the model weights is produced by the two Dockerfiles from publi
 
 | input | where it comes from | pin |
 |---|---|---|
-| base image, DeepSeek | Docker Hub `vllm/vllm-openai:deepseekv41-flash-0909` (vLLM 0.30, FlashInfer 0.6.18, vendored DeepGEMM, nvcc 13.0, torch 2.13) | the vLLM recipe's NVIDIA tag |
+| base image, DeepSeek (served) | Docker Hub `vllm/vllm-openai:nightly@sha256:42090442…` (vLLM main 0961bbae, torch 2.13+cu130) + FlashInfer nightly wheels `0.7.0.dev20260922` (`flashinfer.ai/whl/nightly`) + `vllm-project/DeepGEMM` e1f418c2 | digest / version pins in `Dockerfile.sm120-dsv41-nightly` |
+| base image, DeepSeek (0909, rollback) | Docker Hub `vllm/vllm-openai:deepseekv41-flash-0909` (vLLM 0.30, FlashInfer 0.6.18, vendored DeepGEMM, nvcc 13.0, torch 2.13) | the vLLM recipe's NVIDIA tag |
 | base image, Qwen | Docker Hub `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` (= the `qwen38-flash-next` nightly, v0.1.dev20073+g8e685d198) | digest |
 | DeepGEMM source (rebuilt inside the DeepSeek image with three host-side asserts relaxed) | `github.com/deepseek-ai/DeepGEMM` | commit `8b1392b978f5a03c828dd1711090d7fb50958b8a` |
 | FlashInfer sparse-MLA sm_120 instantiations for the V4.1 geometry, dispatch hook | this repo, `tools/dsv41_sm120/` (installed into the image's FlashInfer by `patch_flashinfer.py`, precompiled) | — |
@@ -60,28 +61,30 @@ image tarballs instead (see Build).
 
 ```bash
 git clone <this repo> && cd vllm-moet
+# DeepSeek, served image: vLLM main line -- vllm/vllm-openai:nightly (pinned digest) + FlashInfer nightly wheels (the DSv4.1
+# dual-cache sparse MLA reads the FP4 KV record itself; no TU/hook, no scratch/pool) + DeepGEMM _C at vLLM main's pin with
+# the SM120 per-group BLOCK_M restored (docs/dsv41-sm120-port.md, "The vLLM main line as a candidate image")
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923 .   # ~12 min
+# DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
-# vLLM main line (candidate, under validation since 2026-09-22): vllm/vllm-openai:nightly (pinned digest) +
-# FlashInfer nightly wheels (DSv4.1 dual-cache sparse MLA reads the FP4 record; no TU/hook, no scratch/pool)
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923 .   # ~12 min (DeepGEMM _C at vLLM main's pin, SM120 per-group BLOCK_M restored)
 ```
 
 The launcher picks the KV plumbing from the image label `com.vllm-moet.kv-mode` (`KV_MODE=auto`): the 0909 image
 keeps `--kv-cache-dtype fp8` + `VLLM_MOET_KV_RECORD`, the nightly image maps `KV_RECORD=nvfp4` to
 `--kv-cache-dtype nvfp4_ds_mla` (FlashInfer's own reader of the record) and `fp8_ds_mla` to `--kv-cache-dtype fp8_ds_mla`.
 
-Both bases are pinned (`vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…`
-= the `qwen38-flash-next` nightly, v0.1.dev20073); the patchers are anchored on those exact files
-and refuse to apply to anything else. To move a host without rebuilding, `docker save` / `docker load`
-the two tags (~30 GB each).
+All bases are pinned (`vllm/vllm-openai:nightly@sha256:42090442…` + FlashInfer `0.7.0.dev20260922`,
+`vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…` = the `qwen38-flash-next`
+nightly, v0.1.dev20073); the patchers are anchored on those exact files and refuse to apply to anything
+else. To move a host without rebuilding, `docker save` / `docker load` the tags (~30–40 GB each).
 
 Run the in-image tests once per build (one GPU, ~2 min each):
 
 ```bash
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:qwen38-20073 -c \
   'python3 /opt/vllm-moet/qwen38_sm120/moe_gemv/test_fused_moe_integration.py'
-docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-0909 -c \
+docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923 -c \
   'python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 --shapes decode &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py &&
    python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py --packed-stride &&
@@ -136,7 +139,7 @@ The DeepSeek image renders the checkpoint's reasoning-effort tiers (`low` 50 / `
 100, default `high`; see `docs/dsv41-sm120-port.md`). To confirm on a host without a GPU free:
 
 ```bash
-docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-0909 \
+docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-nightly-20260923 \
   /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py --model-dir /model
 ```
 
