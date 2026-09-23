@@ -39,11 +39,17 @@
 #      ~1.7x fresh prefill of long prompts; VLLM_MOET_DECODER_REPLAY=0 turns it off at runtime). An
 #      approximation by design, served since 2026-09-23 after its quality gate; --build-arg VLLM_PR_58132=0
 #      leaves it out.
+#   8. The MoE input quantization fused with the permutation into DeepGEMM's grouped layout at decode
+#      token counts (patch_vllm_moe_quant_scatter_sm120.py + moe_quant_scatter/): one launch instead of
+#      the seven vLLM runs per MoE layer between the router and FC1, bit-identical fp8 rows / UE8M0
+#      scales written straight into DeepGEMM's packed layout; VLLM_MOET_MOE_QUANT_SCATTER=0 turns it off
+#      at runtime (quantization back in prepare()). Prefill keeps vLLM's kernels.
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-ced .
-#   (... --build-arg VLLM_PR_58132=0 -t ...-kvdedup: without step 7; dsv41-nightly-20260923: without steps 6-7)
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-ced KV_MODE=upstream
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-moeqs .
+#   (... --build-arg VLLM_PR_58132=0 -t ...: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
+#    dsv41-nightly-20260923: steps 1-5)
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-moeqs KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
@@ -113,8 +119,14 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
 ARG VLLM_PR_58132=1
 RUN if [ "$VLLM_PR_58132" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_decoder_replay.py; fi
 
+# 8. MoE input quantization + DeepGEMM grouped-layout permutation in one kernel at decode shapes (header);
+#    the extension is compiled here so nothing JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
+RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_quant_scatter'); import moe_quant_scatter_sm120 as q; e = q._ext(); assert hasattr(e, 'moe_quant_scatter'); print('sm120 moe quant+scatter extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_quant_scatter_sm120/*.so
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.decoder-replay="${VLLM_PR_58132}"

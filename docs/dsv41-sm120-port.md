@@ -787,6 +787,65 @@ above before it was switched on: **served since 2026‑09‑23 21:19Z** (image
 `EXTRA_DOCKER_ARGS="-e VLLM_MOET_DECODER_REPLAY=0"`; without it in the image: the `-kvdedup` tag
 (`--build-arg VLLM_PR_58132=0`).
 
+## MoE glue in one launch: the input quantization fused with the permutation (2026‑09‑23/24)
+
+The first of the launch fusions from the 2026‑09‑22 inventory ("Where a decode step goes": the
+inductor fusions are off for this model, so they are done by hand). Between the router and FC1 every
+MoE layer ran seven kernels at decode: `per_token_group_quant_8bit` (bf16 → fp8 e4m3 per 128‑group with
+UE8M0 scales, in `prepare()`), two fills (`m_indices = −1`, scales = 0), `_count_expert_num_tokens`,
+`_fwd_kernel_ep_scatter_1` (expert offsets, m_indices), `_fwd_kernel_ep_scatter_2` (the row copy) and,
+inside the DeepGEMM call, `transpose_and_pack_fp32_into_ue8m0` (the fp32 scales into DeepGEMM's packed
+int32 MN‑major layout) — 8.6–9.4 µs per layer, 11.9 µs of kernel time in the 2026‑09‑22 profile, for a
+few hundred bytes of routing and 36 rows of 5120.
+
+`tools/dsv41_sm120/moe_quant_scatter/moe_quant_scatter_sm120.cu` does it in one launch. One CTA per
+(token, expert) pair, two barriers: the CTA issues its token's row loads first (they do not depend on
+the routing), rebuilds the routing table from `topk_ids` in shared memory (per‑expert counts — thread
+*t* counts expert *t* itself up to 64 pairs, a shared‑memory histogram above that), and one block
+reduction yields the rows of the experts before its expert (BLOCK_M‑aligned regions in expert order),
+its rank among the earlier pairs of the same expert, the expert's count and the rows in use. The slot is
+a pure function of `topk_ids` (vLLM's scatter assigns slots in atomic order; the gather undoes either).
+It then quantizes the row exactly as vLLM's kernel does (same absmax with the same eps, same
+`exp2f(ceilf(log2f()))` scale — compiled without fast‑math like vLLM's — round‑to‑nearest‑even e4m3
+with the clamp before the conversion) into its slot and writes the UE8M0 exponent byte straight into
+the packed scale tensor DeepGEMM accepts as is; the expert's rank‑0 pair writes the expert's
+`m_indices` region, all CTAs fill the tail with −1. vLLM side (`patch_vllm_moe_quant_scatter_sm120.py`,
+one file): `DeepGemmFP4Experts.expects_unquantized_inputs` → the bf16 rows reach `apply()`, where the
+fused kernel takes ≤ 1024 pairs (TP without EP, UE8M0 format); anything else — prefill, mixed steps
+above 170 tokens — runs vLLM's `per_token_group_quant_fp8` there and the unchanged permute, i.e. the
+same kernels as before, only moved. `VLLM_MOET_MOE_QUANT_SCATTER=0` restores the quantization in
+`prepare()`.
+
+Bit‑exact by construction and by test (`test_moe_quant_scatter_sm120.py`, RTX 5090): per pair the same
+fp8 row bytes and scale bytes as vLLM's kernels through each path's own inverse permutation, identical
+`m_indices`, the hardware e4m3 conversion identical to c10's software one (what vLLM instantiates) on
+every finite bf16 value under 81 scale exponents, and the MoE output of the full DeepGEMM chain
+bit‑identical at 1–64 tokens; the integration test drives the patched class the way
+`FusedMoEModularKernel` does (fused ≤ 1024 pairs, the deferred fallback above, the switch off) with
+identical outputs. Per layer in a CUDA graph on the RTX 5090 (E = 384, K = 5120, top‑6; DeepGEMM's pack
+kernel counted with FC1): quant + permute **7.9 + 1.6 → 3.8 µs at 6 tokens**, 6.6 + 1.0 → 3.1 at 1,
+7.9 + 1.9 → 3.5 at 12, 9.6 + 3.7 → 5.5 at 48, 10.0 + 4.3 → 6.8 at 64; on the RTX PRO 6000 (next to a
+serving Qwen) 11.7 + 1.7 → 5.2 at 6 tokens, 14.2 + 4.8 → 8.0 at 64. Step 8 of
+`Dockerfile.sm120-dsv41-nightly` (tag `…-moeqs`).
+
+Served configuration (TP4, DSpark k=5, FP4 KV, MXFP4 indexer, vision, KV offload, CED), the `-ced` image
+against the same plus this step, same day:
+
+| | `-ced` (23.09 21:37Z–22:55Z) | `-moeqs` |
+|---|---:|---:|
+| decode, prose / code, one stream | 157–172 / 377–391 tok/s, 73.8–74.1 / 74.4–74.8 steps/s | 158–193 / 394–417 tok/s, **75.7–77.9 / 77.4–77.8 steps/s** |
+| decode, eight streams | 559–564 / 1397–1410 tok/s, 31.3–31.9 / 33.8 steps/s | 567–573 / 1421–1422, 31.7–32.0 / 34.6–34.7 |
+| fresh prefill 19.4K / 163K / 391K | 1.05 / 9.2 / 24.8 s | 1.03 / 9.15 / 24.7 s |
+| greedy agreement (24 short prompts), raw 128‑token completions | — | 24/24 and 12/12 identical to the `-ced` window |
+| GSM8K‑200, thinking off | 193/200 | 193/200 (McNemar p = 1; 1 / 1 flips) |
+| needle 27K–367K (6) | 6/6 | 6/6, the same answers |
+| 8 × 122K fresh prompts at once | 53.8 s, 0 errors | 52.2 s, 0 errors |
+| GPU KV pool | 3,412,407 tokens | 3,414,187 |
+| a C1 decode step's trace (rank 0) | 7 glue kernels × 43 MoE layers | `moe_quant_scatter_kernel` × 43 (40 target + 3 drafter layers), 3.9 µs each; none of the seven |
+
+**Served since 2026‑09‑23 23:15Z** (the launcher's default image). `EXTRA_DOCKER_ARGS="-e
+VLLM_MOET_MOE_QUANT_SCATTER=0"` turns it off on the same image, `IMAGE=…-ced` is the image without it.
+
 ## Apply / build / run
 
 ```bash
