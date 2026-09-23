@@ -753,8 +753,7 @@ prefill compute goes away. vLLM main does not do it yet; vllm#58132 (open, head 
 metadata of its own, eagerly inside the breakable piecewise graphs, while decode steps keep their FULL
 graphs untouched. Its base has no change under `vllm/models/deepseek_v41/` after our pin and none of our
 patchers touches its files, so `tools/dsv41_sm120/patch_vllm_decoder_replay.py` applies it as a patch
-(`Dockerfile.sm120-dsv41-nightly --build-arg VLLM_PR_58132=1` → `…-ced`; runtime switch
-`VLLM_MOET_DECODER_REPLAY=0`). Its gates (no sequence‑parallel MoE, no Engram layer after the cut,
+(step 7 of `Dockerfile.sm120-dsv41-nightly`, tag `…-ced`; runtime switch `VLLM_MOET_DECODER_REPLAY=0`). Its gates (no sequence‑parallel MoE, no Engram layer after the cut,
 breakable graphs, a drafter window no wider than the target's) all pass on the served configuration:
 the log says `Decoder SWA bounded replay: layers 21-39 prefill only each request's last 128 tokens`.
 Its unit tests pass on the RTX 5090 (11/11).
@@ -782,8 +781,11 @@ fresh output without it (the same 12 prompts as in "What a prefix hit costs in f
 diverges after 8.5 tokens (median; |Δlogprob| over the common prefix 0.039), where two fresh prefills
 without it diverge after 14 (0.031), a prefix hit after 8.5 (0.030) and moved chunk boundaries give
 0.054; the first token differs in 5 of 12 either way. Prompts of ≤ 128 tokens are exact by construction.
-Not served yet: it changes what a prefill computes and the code is an open upstream PR — the switch is
-`IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-ced` (the served launcher and configuration otherwise).
+It changes what a prefill computes and the code is an open upstream PR, so it went through the gate
+above before it was switched on: **served since 2026‑09‑23 21:19Z** (image
+`vllm-moet-sm120:dsv41-nightly-20260923-ced`, the launcher's default). Without it, same image:
+`EXTRA_DOCKER_ARGS="-e VLLM_MOET_DECODER_REPLAY=0"`; without it in the image: the `-kvdedup` tag
+(`--build-arg VLLM_PR_58132=0`).
 
 ## Apply / build / run
 

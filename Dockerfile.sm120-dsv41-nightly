@@ -34,16 +34,16 @@
 #      (patch_vllm_offload_replicated_mla.py: vLLM's replicated-MLA gate looks at the offloaded groups
 #      instead of requiring a single MLA group; the build fails unless test_offload_replicated_mla.py
 #      passes on the V4.1 cache layout).
-#   7. Optional (--build-arg VLLM_PR_58132=1): the decoder side of the report's SWA bounded replay - in prefill
-#      the layers after the last KV source run on each request's last 128 tokens only (vllm#58132 as a patch,
-#      patch_vllm_decoder_replay.py; ~1.7x fresh prefill of long prompts; VLLM_MOET_DECODER_REPLAY=0 turns it
-#      off at runtime). Not in the default build: an approximation by design, waiting for the owner's decision.
+#   7. The decoder side of the report's SWA bounded replay - in prefill the layers after the last KV source
+#      run on each request's last 128 tokens only (vllm#58132 as a patch, patch_vllm_decoder_replay.py;
+#      ~1.7x fresh prefill of long prompts; VLLM_MOET_DECODER_REPLAY=0 turns it off at runtime). An
+#      approximation by design, served since 2026-09-23 after its quality gate; --build-arg VLLM_PR_58132=0
+#      leaves it out.
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-kvdedup .
-#   (dsv41-nightly-20260923 = the same without step 6)
-#   ... --build-arg VLLM_PR_58132=1 -t vllm-moet-sm120:dsv41-nightly-20260923-ced .   (step 7 on top)
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-kvdedup KV_MODE=upstream
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-ced .
+#   (... --build-arg VLLM_PR_58132=0 -t ...-kvdedup: without step 7; dsv41-nightly-20260923: without steps 6-7)
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-ced KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
@@ -109,8 +109,8 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
-# 7. Optional decoder-side SWA bounded replay (header).
-ARG VLLM_PR_58132=0
+# 7. Decoder-side SWA bounded replay (header).
+ARG VLLM_PR_58132=1
 RUN if [ "$VLLM_PR_58132" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_decoder_replay.py; fi
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.

@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-kvdedup` (served since 2026-09-23; `dsv41-nightly-20260923` = the same with one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 74 steps/s, prose 163 / code 385 tok/s (DSpark k=5), 3.45M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-ced` (served since 2026-09-23; `-kvdedup` = the same without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 75 steps/s, prose 166 / code 395 tok/s (DSpark k=5), fresh prefill 18k tok/s (CED), 3.41M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -64,8 +64,9 @@ git clone <this repo> && cd vllm-moet
 # DeepSeek, served image: vLLM main line -- vllm/vllm-openai:nightly (pinned digest) + FlashInfer nightly wheels (the DSv4.1
 # dual-cache sparse MLA reads the FP4 KV record itself; no TU/hook, no scratch/pool) + DeepGEMM _C at vLLM main's pin with
 # the SM120 per-group BLOCK_M restored (docs/dsv41-sm120-port.md, "The vLLM main line as a candidate image") + one host copy
-# of the TP-replicated KV in the offload tiers ("KV outside HBM")
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-kvdedup .   # ~12 min
+# of the TP-replicated KV in the offload tiers ("KV outside HBM") + the CED prefill ("Decoder SWA bounded replay";
+# --build-arg VLLM_PR_58132=0 leaves it out -> the -kvdedup tag)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-ced .   # ~12 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -94,13 +95,12 @@ before its workers clean up), so the launcher deletes regions no process maps be
 also hits the previous answer. The served deployment runs all three (64 GiB, a disk directory, 0);
 `docs/dsv41-sm120-port.md`, "KV outside HBM".
 
-The report's CED prefill (the layers after the last KV-source layer run on each prompt's last 128 tokens
-only; vllm#58132, not merged yet) is an optional build step: `--build-arg VLLM_PR_58132=1` and a
-`-ced` tag, served with the same launcher (`IMAGE=…-ced`). Fresh prefill of long prompts is ~1.7×
-faster (19K / 163K / 391K tokens: 1.63 / 1.68 / 1.75×), decode unchanged, GPU KV −1.2 %, the quality
-gate passed (`docs/dsv41-sm120-port.md`, "Decoder SWA bounded replay"); it changes what a prefill
-computes, which is why it is not the default. `EXTRA_DOCKER_ARGS="-e VLLM_MOET_DECODER_REPLAY=0"`
-turns it off without another image.
+The image also runs the report's CED prefill: the layers after the last KV-source layer run on each
+prompt's last 128 tokens only (vllm#58132, not merged yet, applied as a patch). Fresh prefill of long
+prompts is ~1.7× faster (19K / 163K / 391K tokens: 1.63 / 1.68 / 1.75×), decode unchanged, GPU KV
+−1.2 %, and the quality gate passed (`docs/dsv41-sm120-port.md`, "Decoder SWA bounded replay"); it
+changes what a prefill computes, so it has a switch: `EXTRA_DOCKER_ARGS="-e VLLM_MOET_DECODER_REPLAY=0"`
+(same image) or the `-kvdedup` tag (`--build-arg VLLM_PR_58132=0`).
 
 All bases are pinned (`vllm/vllm-openai:nightly@sha256:42090442…` + FlashInfer `0.7.0.dev20260922`,
 `vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…` = the `qwen38-flash-next`
@@ -112,12 +112,13 @@ Run the in-image tests once per build (one GPU, ~2 min each):
 ```bash
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:qwen38-20073 -c \
   'python3 /opt/vllm-moet/qwen38_sm120/moe_gemv/test_fused_moe_integration.py'
-docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-kvdedup -c \
+docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-ced -c \
   'python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 --shapes decode &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py &&
    python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py --packed-stride &&
    python3 /opt/vllm-moet/dsv41_sm120/test_indexer_fp4_sm120.py &&
-   python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py'
+   python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py &&
+   cd /opt/vllm-moet/dsv41_sm120/decoder_replay && python3 -m pytest tests/models -q --noconftest'
 ```
 
 ## Serve
@@ -168,7 +169,7 @@ The DeepSeek image renders the checkpoint's reasoning-effort tiers (`low` 50 / `
 100, default `high`; see `docs/dsv41-sm120-port.md`). To confirm on a host without a GPU free:
 
 ```bash
-docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-nightly-20260923-kvdedup \
+docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-nightly-20260923-ced \
   /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py --model-dir /model
 ```
 

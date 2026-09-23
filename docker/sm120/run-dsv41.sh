@@ -41,7 +41,7 @@
 #                        group (compressed MLA + indexer) is offloaded; the 128-token SWA window is replayed
 #                        on a hit. Measured 2026-09-23 (4x RTX PRO 6000): 179K-token context restored in
 #                        0.49 s instead of a 17.3 s prefill, decode and prefill unchanged. Host RAM per token:
-#                        896 B (one copy of the TP-replicated KV: the -kvdedup image,
+#                        896 B (one copy of the TP-replicated KV: the -kvdedup and -ced images,
 #                        patch_vllm_offload_replicated_mla.py; 64 GiB = 76.7M tokens), 3.58 KB on the plain
 #                        vLLM-main image (one copy per rank). Needs the vLLM-main image (Dockerfile.sm120-dsv41-nightly).
 #            KV_OFFLOAD_FS_DIR ("")  with KV_OFFLOAD_GIB > 0: a disk tier behind the host-RAM tier (spec
@@ -50,7 +50,7 @@
 #                        hash, so the KV outlives evictions from RAM and server restarts. vLLM never deletes
 #                        these files: run docker/sm120/kvcache-ttl.sh from cron. Measured 2026-09-23: a
 #                        221K-token context read back from disk (virtio on this KVM host) in 1.6 s instead of
-#                        a 22 s prefill, 896 B/token on disk (-kvdedup image), prefill unchanged while the
+#                        a 22 s prefill, 896 B/token on disk (-kvdedup / -ced), prefill unchanged while the
 #                        writes run. INDEXER_KV_DTYPE other than mxfp4 writes to DIR/indexer-<dtype>: vLLM's
 #                        directory name does not cover the indexer format.
 #            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (offload_prompt_only=false), so the
@@ -63,7 +63,8 @@
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 # Runtime kill switches (env, no rebuild): VLLM_MOET_SM120_GEMV=0 (CUTLASS instead of the dense MXFP8
 # GEMV), VLLM_MOET_GEMV_IMPL=v1 (the pre-2026-09-20 GEMV kernel instead of v3), VLLM_MOET_SM120_GEMV_BMM=0
-# (BF16 emulation for wo_a). enable_adaptive_verification must stay
+# (BF16 emulation for wo_a), VLLM_MOET_DECODER_REPLAY=0 (the -ced image prefills layers 21-39 on every
+# prompt token again instead of the last 128). enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,
 # default high = 75; OpenAI aliases minimal 25 / medium 62 / xhigh 87 are accepted). Pin a
@@ -72,7 +73,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-kvdedup}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-ced}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
