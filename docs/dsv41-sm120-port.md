@@ -613,10 +613,11 @@ the ones that are prefix‑cacheable), skips the eight 32‑token SWA groups and
 (`prefix_cacheable=False` under the default `swa_bounded_replay=True`), and on a hit the scheduler
 replays the 128‑token SWA window exactly as it does for a GPU prefix‑cache hit. The packed
 block‑outermost layout is handled by copying whole packed blocks (`offloading/worker.py`, "Packed
-layouts (e.g. DSv4)"); the connector's preferred `LBHNC` layout is dropped with a warning. What is
-missing upstream: TP de‑duplication of the replicated MLA latent (`replicated_layout` needs a
-single KV group), so the host holds four copies at TP4 — and so does the disk tier below, which
-writes what the RAM tier holds; `canonical_layout` (topology‑free pages) refuses packed layouts.
+layouts (e.g. DSv4)"); the connector's preferred `LBHNC` layout is dropped with a warning. vLLM
+main's de‑duplication of TP‑replicated MLA KV (`replicated_layout`) admits only a single MLA group,
+so on the plain main image the host holds four copies at TP4 — and so does the disk tier below,
+which writes what the RAM tier holds; the served image keeps one ("One copy instead of four"
+below). `canonical_layout` (topology‑free pages) refuses packed layouts.
 
 Measured on the served image (TP4, `--kv-offloading-size 64`, GPU KV limited to 1.25 GiB = 992K
 tokens so that eviction is quick; `tools/sm120_perf/kv_offload_probe.py`, greedy, thinking off):
@@ -629,14 +630,14 @@ tokens so that eviction is quick; `tools/sm120_perf/kv_offload_probe.py`, greedy
 | the first prompt again (evicted from the GPU) | **0.49 s** | **offload hit**: 641 MB loaded host → GPU, `external_prefix_cache_hits` 178,944, needle answered correctly |
 
 Host cost 3.58 KB per token (four TP copies of 896 B/token/rank; 64 GiB ≈ 19M tokens, 128 GiB ≈
-38M). Decode and prefill with the connector on and 6.5 GB stored: prose 165–180 tok/s at 74–75
+38M; one copy since the same evening: 896 B, 64 GiB ≈ 76.7M). Decode and prefill with the connector on and 6.5 GB stored: prose 165–180 tok/s at 74–75
 steps/s, eight streams 559–572, code 386–402 / 1409–1442, fresh prefill 11.5k / 10.6k tok/s — the same
 as without it. Startup +0 s (the region is pre‑faulted in a few seconds). The launcher exposes it as
 `KV_OFFLOAD_GIB` (default 0).
 
 **Disk tier.** `spec_name: TieringOffloadingSpec` with `secondary_tiers: [{type: fs, root_dir: DIR}]`
 puts a filesystem tier behind the RAM tier: every block stored to RAM is also written to DIR (one
-file per 128‑token block, named by the block's content hash, 448 KiB = the four TP copies, O_DIRECT
+file per 128‑token block, named by the block's content hash, 448 KiB = the four TP copies (112 KiB with one), O_DIRECT
 on XFS); a lookup that misses RAM checks the files, and a hit is read into RAM and loaded to the GPU
 from there. Measured with the GPU pool at 992K tokens and the RAM tier at 4 GiB (1.2M tokens), so both
 evict within a few long prompts; the disk is a virtio volume of the KVM guest (the report's deployment
@@ -691,12 +692,55 @@ approximation disappears in that spread; the note was answered correctly in all 
 (candidates: split reductions with atomics; top‑k tie‑breaking over the MXFP4 indexer logits once the
 context exceeds the top‑k).
 
-**Served** since 2026‑09‑23: the 64 GiB RAM tier (19M tokens), the disk tier with the hourly retention
-script, `KV_OFFLOAD_PROMPT_ONLY=0`; decode unchanged (prose 164–170 / 570–579 tok/s at one / eight
-streams, code 387–395 / 1416–1451, 73.6–75.7 steps/s single stream). A region its server did not
-remove on exit stays in `/dev/shm` (host RAM) until deleted — the test server with the disk tier left
-its 4 GiB behind after `docker stop` — so the launcher removes regions no process maps before it
-starts a server.
+**One copy instead of four.** vLLM main de‑duplicates TP‑replicated MLA KV (vllm#48906, #50301: one
+slot per chunk in the shared region, rank 0 stores, every rank loads the same bytes, and the disk tier
+names that copy TP‑independently), but the gate admits only a single bare `MLAAttentionSpec` group,
+and V4.1 has ten: eight bounded‑replay `SlidingWindowMLASpec` groups, the compressed group and the
+compressor ring (a `CircularBufferSpec`). Only the compressed group is offloaded, and it is all MLA —
+one latent KV head per layer that every rank computes in full; all 18,219 block files the per‑rank
+layout had written (three server processes, prompts up to 227K tokens, generated tokens included)
+held four byte‑identical rank slots (`tools/sm120_perf/tp_copies_check.py`).
+`tools/dsv41_sm120/patch_vllm_offload_replicated_mla.py` gates the de‑duplication on the offloaded
+groups (vllm#57652 widens the gate to multi‑group MLA but still counts the ring, which V4.0 keeps as a
+`SlidingWindowMLASpec`; the one‑line narrowing and a V4.1 test case go to its review). Same probe and
+GPU pool (992K tokens) as the disk‑tier table above, RAM tier 2 GiB (2.4M tokens with one copy), image
+`dsv41-nightly-20260923-kvdedup`:
+
+| | one copy per rank | one copy |
+|---|---:|---:|
+| host RAM and disk per token | 3.58 KB | 896 B |
+| 64 GiB RAM tier | 149,796 chunks = 19.2M tokens | 599,186 chunks = 76.7M tokens |
+| disk file per 128‑token block | 448 KiB | 112 KiB |
+| stored per 209–221K‑token prompt | 749 MB | 198 MB (1.8 s of disk writes) |
+| fresh prefill of the evicting prompts, stores running | 10.2–10.3k tok/s | 10.2–10.3k tok/s |
+| hit from host RAM, GPU pool evicted | 0.49 s (179K tokens) | 0.63 s (221K tokens, 1,726 chunks) |
+| hit from disk, GPU pool and RAM tier evicted | 2.53 s (209K; 749 MB read in 1.9 s) | **1.62 s** (221K; 198 MB read in 0.97 s) |
+| turn 2 from disk (104K‑token prompt + ~1.4K generated) | 1.29 s (377 MB) | **0.77 s** (94 MB; 105,461 of 105,479 tokens) |
+| 174K‑token prompt stored by the previous server process | 3.20 s (623 MB) | **1.47 s** (156 MB read in 0.78 s; the test server wrote it, the production server read it) |
+
+The needle was answered after every hit. With one copy, rank 0 alone copies GPU → host (the same
+bytes per link as before) and each rank loads the shared slot; the disk tier moves to a new
+directory on its own (`FileMapper` adds `replicated_layout` to the namespace and drops the TP size),
+so a file of the four‑copy layout is never read as a one‑copy row — the old tree ages out through
+the retention script.
+
+Two things the tier does not guard against. vLLM's directory name covers the model path, TP, KV dtype
+and the offloaded layer names, not the indexer format, and a block file is read up to the block size
+whatever its length (`tiering/fs/io.py`, `csrc/fs_io.cpp`): a file written with the other
+`INDEXER_KV_DTYPE` would load as garbage, so the launcher puts `INDEXER_KV_DTYPE=fp8` into
+`DIR/indexer-fp8`. And the host‑RAM region outlives the server: vLLM's default shutdown
+(`--shutdown-timeout 0`, "mode=abort") kills EngineCore right after SIGTERM, before the creating worker
+unlinks `/dev/shm/vllm_offload_<engine id>.mmap`, and `TieringOffloadingSpec` — unlike the plain
+CPU spec — does not unlink it early, because the scheduler maps it after the workers. Every
+`docker stop` (exit code 0) left the whole region behind (64 GiB after the production server,
+2 GiB after the test server); the launcher deletes regions no process maps before it starts one
+(upstream: vllm#57303, fixes in review #57313 / #57422).
+
+**Served** since 2026‑09‑23: the 64 GiB RAM tier (one copy since 18:57Z: 76.7M tokens), the disk tier
+with the hourly retention script, `KV_OFFLOAD_PROMPT_ONLY=0`; decode unchanged (prose 164–170 /
+570–579 tok/s at one / eight streams, code 387–395 / 1416–1451, 73.6–75.7 steps/s single stream; with
+one copy 166 / 559–564 and 380–387 / 1397–1410 at the same 73.7 / 75.7 steps/s — the tok/s spread is
+the drafts' acceptance).
 
 ## Apply / build / run
 

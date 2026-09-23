@@ -40,15 +40,19 @@
 #                        the container runs with --ipc host, so /dev/shm is the host's). Only the block-128
 #                        group (compressed MLA + indexer) is offloaded; the 128-token SWA window is replayed
 #                        on a hit. Measured 2026-09-23 (4x RTX PRO 6000): 179K-token context restored in
-#                        0.49 s instead of a 17.3 s prefill, 3.58 KB of host RAM per token (4 TP copies),
-#                        decode and prefill unchanged. Needs the vLLM-main image (Dockerfile.sm120-dsv41-nightly).
+#                        0.49 s instead of a 17.3 s prefill, decode and prefill unchanged. Host RAM per token:
+#                        896 B (one copy of the TP-replicated KV: the -kvdedup image,
+#                        patch_vllm_offload_replicated_mla.py; 64 GiB = 76.7M tokens), 3.58 KB on the plain
+#                        vLLM-main image (one copy per rank). Needs the vLLM-main image (Dockerfile.sm120-dsv41-nightly).
 #            KV_OFFLOAD_FS_DIR ("")  with KV_OFFLOAD_GIB > 0: a disk tier behind the host-RAM tier (spec
 #                        TieringOffloadingSpec, secondary tier "fs", bind-mounted at the same path). Every block
 #                        stored to RAM is also written there, one file per 128-token block named by its content
 #                        hash, so the KV outlives evictions from RAM and server restarts. vLLM never deletes
 #                        these files: run docker/sm120/kvcache-ttl.sh from cron. Measured 2026-09-23: a
-#                        209K-token context read back from disk (virtio on this KVM host) in 2.5 s instead of
-#                        a 20 s prefill, 3.58 KB/token on disk, prefill unchanged while the writes run.
+#                        221K-token context read back from disk (virtio on this KVM host) in 1.6 s instead of
+#                        a 22 s prefill, 896 B/token on disk (-kvdedup image), prefill unchanged while the
+#                        writes run. INDEXER_KV_DTYPE other than mxfp4 writes to DIR/indexer-<dtype>: vLLM's
+#                        directory name does not cover the indexer format.
 #            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (offload_prompt_only=false), so the
 #                        next turn also hits the previous answer. The V4.1 encoder keeps earlier reasoning and
 #                        tool calls in the history when the request has tools (agents) and drops the reasoning
@@ -68,7 +72,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-kvdedup}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -111,7 +115,12 @@ if [[ "$KV_OFFLOAD_GIB" != "0" ]]; then
   ARGS+=(--kv-offloading-size "$KV_OFFLOAD_GIB")
   OFFLOAD_EXTRA=""
   [[ "$KV_OFFLOAD_PROMPT_ONLY" == "0" ]] && OFFLOAD_EXTRA="\"offload_prompt_only\":false"
-  [[ -n "$KV_OFFLOAD_FS_DIR" ]] && OFFLOAD_EXTRA="\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KV_OFFLOAD_FS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16,\"locality\":\"LOCAL\"}]${OFFLOAD_EXTRA:+,$OFFLOAD_EXTRA}"
+  # The fs tier's directory name covers the model path, TP, KV dtype and layer names but not the indexer
+  # format, and a block file is read up to the block size whatever its length: files written with the other
+  # INDEXER_KV_DTYPE would load as garbage, so that format gets its own subdirectory.
+  FS_ROOT="$KV_OFFLOAD_FS_DIR"
+  [[ "$INDEXER_KV_DTYPE" != "mxfp4" ]] && FS_ROOT="$KV_OFFLOAD_FS_DIR/indexer-$INDEXER_KV_DTYPE"
+  [[ -n "$KV_OFFLOAD_FS_DIR" ]] && OFFLOAD_EXTRA="\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$FS_ROOT\",\"n_read_threads\":16,\"n_write_threads\":16,\"locality\":\"LOCAL\"}]${OFFLOAD_EXTRA:+,$OFFLOAD_EXTRA}"
   [[ -n "$OFFLOAD_EXTRA" ]] && ARGS+=(--kv-transfer-config
     "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$OFFLOAD_EXTRA}}")
 fi

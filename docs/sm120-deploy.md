@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923` (served since 2026-09-23; `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 74 steps/s, prose 163 / code 385 tok/s (DSpark k=5), 3.45M-token FP4 KV at 512K context + KV offload (64 GiB host RAM, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-kvdedup` (served since 2026-09-23; `dsv41-nightly-20260923` = the same with one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 74 steps/s, prose 163 / code 385 tok/s (DSpark k=5), 3.45M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -63,8 +63,9 @@ image tarballs instead (see Build).
 git clone <this repo> && cd vllm-moet
 # DeepSeek, served image: vLLM main line -- vllm/vllm-openai:nightly (pinned digest) + FlashInfer nightly wheels (the DSv4.1
 # dual-cache sparse MLA reads the FP4 KV record itself; no TU/hook, no scratch/pool) + DeepGEMM _C at vLLM main's pin with
-# the SM120 per-group BLOCK_M restored (docs/dsv41-sm120-port.md, "The vLLM main line as a candidate image")
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923 .   # ~12 min
+# the SM120 per-group BLOCK_M restored (docs/dsv41-sm120-port.md, "The vLLM main line as a candidate image") + one host copy
+# of the TP-replicated KV in the offload tiers ("KV outside HBM")
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-kvdedup .   # ~12 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -76,13 +77,19 @@ keeps `--kv-cache-dtype fp8` + `VLLM_MOET_KV_RECORD`, the nightly image maps `KV
 
 `KV_OFFLOAD_GIB=N` (vLLM-main image only) adds `--kv-offloading-size N`: evicted KV of the compressed
 cache and the indexer is kept in N GiB of pinned host RAM (one `/dev/shm` region; the container runs
-with `--ipc host`) and restored on a prefix hit instead of being recomputed — a 179K-token context
-comes back in 0.5 s instead of a 17 s prefill, 3.6 KB of host RAM per token at TP4, decode and
-prefill unchanged. `KV_OFFLOAD_FS_DIR=DIR` adds a disk tier behind it: every offloaded block is also
-written to DIR as a file named by its content hash, read back on a hit that misses RAM (a 209K-token
-context in 2.5 s from a virtio disk) and still valid after a restart (174K tokens in 3.2 s instead of
-16.7 s). vLLM never deletes the files — run `docker/sm120/kvcache-ttl.sh DIR` hourly from cron (files
-unread for 72 h, then the least recently read above 200 GB; `TTL_HOURS` / `MAX_GB`).
+with `--ipc host`) and restored on a prefix hit instead of being recomputed — a 221K-token context
+comes back in 0.6 s instead of a 22 s prefill, decode and prefill unchanged. The image keeps one
+host copy of that KV for all TP ranks (it is the same bytes on every rank): 896 B of host RAM per
+token, so 64 GiB hold 76.7M tokens (the plain vLLM-main build stores one copy per rank, 3.6 KB per
+token at TP4). `KV_OFFLOAD_FS_DIR=DIR` adds a disk tier behind it: every offloaded block is also
+written to DIR as a file named by its content hash (112 KiB per 128 tokens), read back on a hit that
+misses RAM (a 221K-token context in 1.6 s from a virtio disk) and still valid after a restart (174K
+tokens in 1.5 s instead of a 16.5 s prefill). vLLM never deletes the files — run `docker/sm120/kvcache-ttl.sh DIR`
+hourly from cron (files unread for 72 h, then the least recently read above 200 GB; `TTL_HOURS` /
+`MAX_GB`). With `INDEXER_KV_DTYPE=fp8` the launcher uses `DIR/indexer-fp8`: vLLM's directory name
+does not cover the indexer format, and a file of the other format would load as garbage. The
+host-RAM region is not removed when the server stops (vLLM's default shutdown kills the engine
+before its workers clean up), so the launcher deletes regions no process maps before it starts.
 `KV_OFFLOAD_PROMPT_ONLY=0` offloads generated tokens too, so the next turn of an agent conversation
 also hits the previous answer. The served deployment runs all three (64 GiB, a disk directory, 0);
 `docs/dsv41-sm120-port.md`, "KV outside HBM".
@@ -97,11 +104,12 @@ Run the in-image tests once per build (one GPU, ~2 min each):
 ```bash
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:qwen38-20073 -c \
   'python3 /opt/vllm-moet/qwen38_sm120/moe_gemv/test_fused_moe_integration.py'
-docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923 -c \
+docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-kvdedup -c \
   'python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 --shapes decode &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py &&
    python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py --packed-stride &&
-   python3 /opt/vllm-moet/dsv41_sm120/test_indexer_fp4_sm120.py'
+   python3 /opt/vllm-moet/dsv41_sm120/test_indexer_fp4_sm120.py &&
+   python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py'
 ```
 
 ## Serve
@@ -152,7 +160,7 @@ The DeepSeek image renders the checkpoint's reasoning-effort tiers (`low` 50 / `
 100, default `high`; see `docs/dsv41-sm120-port.md`). To confirm on a host without a GPU free:
 
 ```bash
-docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-nightly-20260923 \
+docker run --rm --entrypoint python3 -v /srv/models/DeepSeek-V4.1-Flash:/model:ro vllm-moet-sm120:dsv41-nightly-20260923-kvdedup \
   /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py --model-dir /model
 ```
 

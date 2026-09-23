@@ -30,10 +30,15 @@
 #      = our vLLM PR, internal/upstream-dsv41-sm120-nvfp4-PR.md, until it is merged): the compressed
 #      cache in the checkpoint's FP4 record, the SWA cache in the V4.1 fp8 record; fp8_ds_mla keeps the
 #      V4 record and FlashInfer's DSV4 kernels (no keyword passed).
+#   6. KV offload keeps one host copy of the TP-replicated V4.1 KV instead of one per rank
+#      (patch_vllm_offload_replicated_mla.py: vLLM's replicated-MLA gate looks at the offloaded groups
+#      instead of requiring a single MLA group; the build fails unless test_offload_replicated_mla.py
+#      passes on the V4.1 cache layout).
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923 .
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923 KV_MODE=upstream
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-kvdedup .
+#   (dsv41-nightly-20260923 = the same without step 6)
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-kvdedup KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
@@ -93,11 +98,13 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_offload_replicated_mla.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py \
     && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload" \
       com.vllm-moet.kv-mode="upstream"
