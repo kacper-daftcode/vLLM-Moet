@@ -94,6 +94,14 @@ before its workers clean up), so the launcher deletes regions no process maps be
 also hits the previous answer. The served deployment runs all three (64 GiB, a disk directory, 0);
 `docs/dsv41-sm120-port.md`, "KV outside HBM".
 
+The report's CED prefill (the layers after the last KV-source layer run on each prompt's last 128 tokens
+only; vllm#58132, not merged yet) is an optional build step: `--build-arg VLLM_PR_58132=1` and a
+`-ced` tag, served with the same launcher (`IMAGE=…-ced`). Fresh prefill of long prompts is ~1.7×
+faster (19K / 163K / 391K tokens: 1.63 / 1.68 / 1.75×), decode unchanged, GPU KV −1.2 %, the quality
+gate passed (`docs/dsv41-sm120-port.md`, "Decoder SWA bounded replay"); it changes what a prefill
+computes, which is why it is not the default. `EXTRA_DOCKER_ARGS="-e VLLM_MOET_DECODER_REPLAY=0"`
+turns it off without another image.
+
 All bases are pinned (`vllm/vllm-openai:nightly@sha256:42090442…` + FlashInfer `0.7.0.dev20260922`,
 `vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…` = the `qwen38-flash-next`
 nightly, v0.1.dev20073); the patchers are anchored on those exact files and refuse to apply to anything

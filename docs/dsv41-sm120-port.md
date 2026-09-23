@@ -742,6 +742,49 @@ with the hourly retention script, `KV_OFFLOAD_PROMPT_ONLY=0`; decode unchanged (
 one copy 166 / 559–564 and 380–387 / 1397–1410 at the same 73.7 / 75.7 steps/s — the tok/s spread is
 the drafts' acceptance).
 
+## Decoder SWA bounded replay: the CED prefill, measured (2026‑09‑23)
+
+The report's Causal Encoder‑Decoder (§2.2, §3.2.2) projects the decoder layers' global KV from the
+encoder output, so the only thing a prefill needs the upper layers for is their own sliding‑window KV —
+and "Decoder SWA Bounded Replay" builds that from the prompt's last `n_win` = 128 tokens only, with the
+window clamped to that segment (an approximation the model was post‑trained with): nearly half of the
+prefill compute goes away. vLLM main does not do it yet; vllm#58132 (open, head 9a86c2c9) does: layers
+21–39 (those after the last KV‑source layer, 20) run on each prefill's last 128 rows as a sub‑batch with
+metadata of its own, eagerly inside the breakable piecewise graphs, while decode steps keep their FULL
+graphs untouched. Its base has no change under `vllm/models/deepseek_v41/` after our pin and none of our
+patchers touches its files, so `tools/dsv41_sm120/patch_vllm_decoder_replay.py` applies it as a patch
+(`Dockerfile.sm120-dsv41-nightly --build-arg VLLM_PR_58132=1` → `…-ced`; runtime switch
+`VLLM_MOET_DECODER_REPLAY=0`). Its gates (no sequence‑parallel MoE, no Engram layer after the cut,
+breakable graphs, a drafter window no wider than the target's) all pass on the served configuration:
+the log says `Decoder SWA bounded replay: layers 21-39 prefill only each request's last 128 tokens`.
+Its unit tests pass on the RTX 5090 (11/11).
+
+Served configuration (TP4, DSpark k=5, FP4 KV, MXFP4 indexer, vision, KV offload) with and without it,
+same image otherwise, same day (GSM8K and the fresh needles without it: the same image line on
+2026‑09‑22):
+
+| | without | with the decoder replay |
+|---|---:|---:|
+| fresh prefill, 19.4K tokens | 1.71 s (11.3k tok/s) | 1.05 s (18.4k tok/s), **1.63×** |
+| fresh prefill, 163K tokens | 15.4 s (10.5k tok/s) | 9.2 s (17.6k tok/s), **1.68×** |
+| fresh prefill, 391K tokens | 43.5 s (9.0k tok/s) | 24.8 s (15.8k tok/s), **1.75×** |
+| 8 × 122K‑token fresh prompts at once | — | 53.8 s, 0 errors, peak 96,437 / 97,887 MiB (96,491 without, PERF10) |
+| GPU KV pool | 3,454,536 tokens | 3,412,407 (−1.2 %: the sub‑batch buffers) |
+| GSM8K‑200, thinking off | 194/200 | 193/200 (McNemar p = 1; 2 / 1 flips) |
+| greedy agreement (24 short chat prompts), raw 128‑token completions | — | 24/24 and 12/12 identical |
+| needle 27K–367K (8 fresh), 29K–400K (6, from the disk tier) | 8/8, 6/6 | 8/8, 6/6, the same answers |
+| 12 prompts of 3K–96K (code, docs; `prefix_hit_probe.py`), note in turn 2 | 36/36 | 36/36 |
+| decode, prose / code, one stream | 166 / 380–387 tok/s, 73.7 / 75.7 steps/s | 166–171 / 395–399, 75.3–75.5 / 75.5–75.6 |
+| decode, eight streams | 559–564 / 1397–1410 | 559–561 / 1377–1403 |
+
+On the long prompts the replay's deviation is the stack's own: its fresh greedy output against the
+fresh output without it (the same 12 prompts as in "What a prefix hit costs in fidelity") first
+diverges after 8.5 tokens (median; |Δlogprob| over the common prefix 0.039), where two fresh prefills
+without it diverge after 14 (0.031), a prefix hit after 8.5 (0.030) and moved chunk boundaries give
+0.054; the first token differs in 5 of 12 either way. Prompts of ≤ 128 tokens are exact by construction.
+Not served yet: it changes what a prefill computes and the code is an open upstream PR — the switch is
+`IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-ced` (the served launcher and configuration otherwise).
+
 ## Apply / build / run
 
 ```bash
