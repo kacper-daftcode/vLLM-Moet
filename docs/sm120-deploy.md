@@ -74,6 +74,12 @@ The launcher picks the KV plumbing from the image label `com.vllm-moet.kv-mode` 
 keeps `--kv-cache-dtype fp8` + `VLLM_MOET_KV_RECORD`, the nightly image maps `KV_RECORD=nvfp4` to
 `--kv-cache-dtype nvfp4_ds_mla` (FlashInfer's own reader of the record) and `fp8_ds_mla` to `--kv-cache-dtype fp8_ds_mla`.
 
+`KV_OFFLOAD_GIB=N` (vLLM-main image only) adds `--kv-offloading-size N`: evicted KV of the compressed
+cache and the indexer is kept in N GiB of pinned host RAM (one `/dev/shm` region; the container runs
+with `--ipc host`) and restored on a prefix hit instead of being recomputed — a 179K-token context
+comes back in 0.5 s instead of a 17 s prefill, 3.6 KB of host RAM per token at TP4, decode and
+prefill unchanged (`docs/dsv41-sm120-port.md`, "KV outside HBM").
+
 All bases are pinned (`vllm/vllm-openai:nightly@sha256:42090442…` + FlashInfer `0.7.0.dev20260922`,
 `vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…` = the `qwen38-flash-next`
 nightly, v0.1.dev20073); the patchers are anchored on those exact files and refuse to apply to anything

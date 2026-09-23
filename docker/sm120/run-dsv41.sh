@@ -35,6 +35,13 @@
 #                        --kv-cache-dtype nvfp4_ds_mla read by FlashInfer's DSv4.1 dual cache, fp8_ds_mla ->
 #                        --kv-cache-dtype fp8_ds_mla (fp8_v41 has no upstream equivalent). "auto" reads the
 #                        image label com.vllm-moet.kv-mode and falls back to "moet".
+#            KV_OFFLOAD_GIB (0)      > 0 = --kv-offloading-size N: vLLM main's native OffloadingConnector keeps
+#                        evicted KV in pinned host RAM (a /dev/shm region of N GiB, total over the TP ranks;
+#                        the container runs with --ipc host, so /dev/shm is the host's). Only the block-128
+#                        group (compressed MLA + indexer) is offloaded; the 128-token SWA window is replayed
+#                        on a hit. Measured 2026-09-23 (4x RTX PRO 6000): 179K-token context restored in
+#                        0.49 s instead of a 17.3 s prefill, 3.58 KB of host RAM per token (4 TP copies),
+#                        decode and prefill unchanged. Needs the vLLM-main image (Dockerfile.sm120-dsv41-nightly).
 #            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
@@ -66,6 +73,7 @@ SPEC_TOKENS="${SPEC_TOKENS:-5}"
 INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
 KV_RECORD="${KV_RECORD:-nvfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
+KV_OFFLOAD_GIB="${KV_OFFLOAD_GIB:-0}"
 PROFILER="${PROFILER:-0}"
 PROFILE_DIR="${PROFILE_DIR:-$PWD/profiles-$NAME}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
@@ -81,6 +89,7 @@ if [[ "$SPEC_TOKENS" != "0" ]]; then
     "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
+[[ "$KV_OFFLOAD_GIB" != "0" ]] && ARGS+=(--kv-offloading-size "$KV_OFFLOAD_GIB")
 case "$KV_RECORD" in
   fp8_ds_mla|nvfp4|fp8_v41) ;;
   *) echo "KV_RECORD must be fp8_ds_mla, nvfp4 or fp8_v41, got $KV_RECORD" >&2; exit 1 ;;

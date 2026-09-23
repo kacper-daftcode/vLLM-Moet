@@ -604,6 +604,39 @@ again (4.94 → 4.91 ms; FC1 83.5 → 83.1 µs per launch), **mHC 2.0 → 1.0 ms
 DSv4.1 mixed‑cache decode kernel, no gather). At eight streams the per‑step GPU time is 33.3 →
 30.7 ms with the same composition (the MoE at 48 tokens +2 %: 213 vs 208 µs per FC1 launch).
 
+## KV outside HBM: the host‑RAM tier (2026‑09‑23)
+
+vLLM main's native `OffloadingConnector` (`--kv-offloading-size N`, GiB of pinned host RAM shared by the
+TP ranks as one `/dev/shm` region) takes the DeepSeek‑V4.1 hybrid KV layout as it is: of the ten KV
+cache groups it offloads only the block‑128 group (the compressed MLA states and the indexer K cache —
+the ones that are prefix‑cacheable), skips the eight 32‑token SWA groups and the compressor ring
+(`prefix_cacheable=False` under the default `swa_bounded_replay=True`), and on a hit the scheduler
+replays the 128‑token SWA window exactly as it does for a GPU prefix‑cache hit. The packed
+block‑outermost layout is handled by copying whole packed blocks (`offloading/worker.py`, "Packed
+layouts (e.g. DSv4)"); the connector's preferred `LBHNC` layout is dropped with a warning. What is
+missing upstream: TP de‑duplication of the replicated MLA latent (`replicated_layout` needs a
+single KV group), so the host holds four copies at TP4; `canonical_layout` (topology‑free pages)
+refuses packed layouts; the filesystem tier's namespace is per rank.
+
+Measured on the served image (TP4, `--kv-offloading-size 64`, GPU KV limited to 1.25 GiB = 992K
+tokens so that eviction is quick; `tools/sm120_perf/kv_offload_probe.py`, greedy, thinking off):
+
+| step | wall | what happened |
+|---|---:|---|
+| 179K‑token prompt with a needle, fresh | 17.28 s (10.4k tok/s) | 641 MB stored GPU → host |
+| same prompt again | 0.56 s | GPU prefix‑cache hit (178,944 of 179,037 tokens) |
+| 8 distinct 179–189K‑token prompts | 17.0–18.0 s each (10.5k tok/s) | stores of 640–680 MB each, no prefill slowdown |
+| the first prompt again (evicted from the GPU) | **0.49 s** | **offload hit**: 641 MB loaded host → GPU, `external_prefix_cache_hits` 178,944, needle answered correctly |
+
+Host cost 3.58 KB per token (four TP copies of 896 B/token/rank; 64 GiB ≈ 19M tokens, 128 GiB ≈
+38M). Decode and prefill with the connector on and 6.5 GB stored: prose 165–180 tok/s at 74–75
+steps/s, eight streams 559–572, code 386–402 / 1409–1442, fresh prefill 11.5k / 10.6k tok/s — the same
+as without it. Startup +0 s (the region is pre‑faulted in a few seconds). The launcher exposes it as
+`KV_OFFLOAD_GIB` (default 0). Not yet measured: the filesystem tier (`spec_name:
+TieringOffloadingSpec`, `secondary_tiers: [{type: fs, root_dir: …}]` — the NVMe of the report's
+deployment; on this host the disk is virtio), `offload_prompt_only=false` (also offload generated
+tokens), and hits with a realistic multi‑session agent load.
+
 ## Apply / build / run
 
 ```bash
