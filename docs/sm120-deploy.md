@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923` (served since 2026-09-23; `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 74 steps/s, prose 163 / code 385 tok/s (DSpark k=5), 3.45M-token FP4 KV at 512K context (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923` (served since 2026-09-23; `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 74 steps/s, prose 163 / code 385 tok/s (DSpark k=5), 3.45M-token FP4 KV at 512K context + KV offload (64 GiB host RAM, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -78,7 +78,14 @@ keeps `--kv-cache-dtype fp8` + `VLLM_MOET_KV_RECORD`, the nightly image maps `KV
 cache and the indexer is kept in N GiB of pinned host RAM (one `/dev/shm` region; the container runs
 with `--ipc host`) and restored on a prefix hit instead of being recomputed — a 179K-token context
 comes back in 0.5 s instead of a 17 s prefill, 3.6 KB of host RAM per token at TP4, decode and
-prefill unchanged (`docs/dsv41-sm120-port.md`, "KV outside HBM").
+prefill unchanged. `KV_OFFLOAD_FS_DIR=DIR` adds a disk tier behind it: every offloaded block is also
+written to DIR as a file named by its content hash, read back on a hit that misses RAM (a 209K-token
+context in 2.5 s from a virtio disk) and still valid after a restart (174K tokens in 3.2 s instead of
+16.7 s). vLLM never deletes the files — run `docker/sm120/kvcache-ttl.sh DIR` hourly from cron (files
+unread for 72 h, then the least recently read above 200 GB; `TTL_HOURS` / `MAX_GB`).
+`KV_OFFLOAD_PROMPT_ONLY=0` offloads generated tokens too, so the next turn of an agent conversation
+also hits the previous answer. The served deployment runs all three (64 GiB, a disk directory, 0);
+`docs/dsv41-sm120-port.md`, "KV outside HBM".
 
 All bases are pinned (`vllm/vllm-openai:nightly@sha256:42090442…` + FlashInfer `0.7.0.dev20260922`,
 `vllm/vllm-openai:deepseekv41-flash-0909`, `vllm/vllm-openai@sha256:fc120ece…` = the `qwen38-flash-next`

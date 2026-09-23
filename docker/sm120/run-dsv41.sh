@@ -42,6 +42,17 @@
 #                        on a hit. Measured 2026-09-23 (4x RTX PRO 6000): 179K-token context restored in
 #                        0.49 s instead of a 17.3 s prefill, 3.58 KB of host RAM per token (4 TP copies),
 #                        decode and prefill unchanged. Needs the vLLM-main image (Dockerfile.sm120-dsv41-nightly).
+#            KV_OFFLOAD_FS_DIR ("")  with KV_OFFLOAD_GIB > 0: a disk tier behind the host-RAM tier (spec
+#                        TieringOffloadingSpec, secondary tier "fs", bind-mounted at the same path). Every block
+#                        stored to RAM is also written there, one file per 128-token block named by its content
+#                        hash, so the KV outlives evictions from RAM and server restarts. vLLM never deletes
+#                        these files: run docker/sm120/kvcache-ttl.sh from cron. Measured 2026-09-23: a
+#                        209K-token context read back from disk (virtio on this KVM host) in 2.5 s instead of
+#                        a 20 s prefill, 3.58 KB/token on disk, prefill unchanged while the writes run.
+#            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (offload_prompt_only=false), so the
+#                        next turn also hits the previous answer. The V4.1 encoder keeps earlier reasoning and
+#                        tool calls in the history when the request has tools (agents) and drops the reasoning
+#                        otherwise; the dropped blocks only take room in the tiers.
 #            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
@@ -74,6 +85,8 @@ INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
 KV_RECORD="${KV_RECORD:-nvfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
 KV_OFFLOAD_GIB="${KV_OFFLOAD_GIB:-0}"
+KV_OFFLOAD_FS_DIR="${KV_OFFLOAD_FS_DIR:-}"
+KV_OFFLOAD_PROMPT_ONLY="${KV_OFFLOAD_PROMPT_ONLY:-1}"
 PROFILER="${PROFILER:-0}"
 PROFILE_DIR="${PROFILE_DIR:-$PWD/profiles-$NAME}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
@@ -89,7 +102,19 @@ if [[ "$SPEC_TOKENS" != "0" ]]; then
     "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
-[[ "$KV_OFFLOAD_GIB" != "0" ]] && ARGS+=(--kv-offloading-size "$KV_OFFLOAD_GIB")
+case "$KV_OFFLOAD_PROMPT_ONLY" in
+  0|1) ;;
+  *) echo "KV_OFFLOAD_PROMPT_ONLY must be 0 or 1, got $KV_OFFLOAD_PROMPT_ONLY" >&2; exit 1 ;;
+esac
+if [[ "$KV_OFFLOAD_GIB" != "0" ]]; then
+  # --kv-offloading-size adds cpu_bytes_to_use to the connector's extra config given here.
+  ARGS+=(--kv-offloading-size "$KV_OFFLOAD_GIB")
+  OFFLOAD_EXTRA=""
+  [[ "$KV_OFFLOAD_PROMPT_ONLY" == "0" ]] && OFFLOAD_EXTRA="\"offload_prompt_only\":false"
+  [[ -n "$KV_OFFLOAD_FS_DIR" ]] && OFFLOAD_EXTRA="\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$KV_OFFLOAD_FS_DIR\",\"n_read_threads\":16,\"n_write_threads\":16,\"locality\":\"LOCAL\"}]${OFFLOAD_EXTRA:+,$OFFLOAD_EXTRA}"
+  [[ -n "$OFFLOAD_EXTRA" ]] && ARGS+=(--kv-transfer-config
+    "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$OFFLOAD_EXTRA}}")
+fi
 case "$KV_RECORD" in
   fp8_ds_mla|nvfp4|fp8_v41) ;;
   *) echo "KV_RECORD must be fp8_ds_mla, nvfp4 or fp8_v41, got $KV_RECORD" >&2; exit 1 ;;
@@ -118,6 +143,10 @@ case "$INDEXER_KV_DTYPE" in
   *) echo "INDEXER_KV_DTYPE must be fp8 or mxfp4, got $INDEXER_KV_DTYPE" >&2; exit 1 ;;
 esac
 MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$CACHE_DIR/deep_gemm:/root/.deep_gemm")
+if [[ "$KV_OFFLOAD_GIB" != "0" && -n "$KV_OFFLOAD_FS_DIR" ]]; then
+  mkdir -p "$KV_OFFLOAD_FS_DIR"
+  MOUNTS+=(-v "$KV_OFFLOAD_FS_DIR:$KV_OFFLOAD_FS_DIR")
+fi
 if [[ "$PROFILER" == "1" ]]; then
   mkdir -p "$PROFILE_DIR"
   MOUNTS+=(-v "$PROFILE_DIR:/profiles")
@@ -129,6 +158,14 @@ if docker ps -q -f name="^${NAME}$" -f status=running | grep -q .; then
   echo "container $NAME already running - stop it first (docker stop -t 60 $NAME)"; exit 0
 fi
 docker rm -f "$NAME" >/dev/null 2>&1 || true
+if [[ "$KV_OFFLOAD_GIB" != "0" ]]; then
+  # An offload region its server did not remove on exit stays in the host's /dev/shm (RAM) until deleted;
+  # drop the ones no process maps any more.
+  for region in /dev/shm/vllm_offload_*.mmap; do
+    [[ -e "$region" ]] || continue
+    grep -qs -- "$region" /proc/[0-9]*/maps || { echo "removing stale offload region $region"; rm -f "$region"; }
+  done
+fi
 
 # shellcheck disable=SC2086
 docker run -d --name "$NAME" --restart no \

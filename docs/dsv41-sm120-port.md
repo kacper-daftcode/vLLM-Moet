@@ -604,7 +604,7 @@ again (4.94 → 4.91 ms; FC1 83.5 → 83.1 µs per launch), **mHC 2.0 → 1.0 ms
 DSv4.1 mixed‑cache decode kernel, no gather). At eight streams the per‑step GPU time is 33.3 →
 30.7 ms with the same composition (the MoE at 48 tokens +2 %: 213 vs 208 µs per FC1 launch).
 
-## KV outside HBM: the host‑RAM tier (2026‑09‑23)
+## KV outside HBM: host‑RAM and disk tiers (2026‑09‑23)
 
 vLLM main's native `OffloadingConnector` (`--kv-offloading-size N`, GiB of pinned host RAM shared by the
 TP ranks as one `/dev/shm` region) takes the DeepSeek‑V4.1 hybrid KV layout as it is: of the ten KV
@@ -615,8 +615,8 @@ replays the 128‑token SWA window exactly as it does for a GPU prefix‑cache h
 block‑outermost layout is handled by copying whole packed blocks (`offloading/worker.py`, "Packed
 layouts (e.g. DSv4)"); the connector's preferred `LBHNC` layout is dropped with a warning. What is
 missing upstream: TP de‑duplication of the replicated MLA latent (`replicated_layout` needs a
-single KV group), so the host holds four copies at TP4; `canonical_layout` (topology‑free pages)
-refuses packed layouts; the filesystem tier's namespace is per rank.
+single KV group), so the host holds four copies at TP4 — and so does the disk tier below, which
+writes what the RAM tier holds; `canonical_layout` (topology‑free pages) refuses packed layouts.
 
 Measured on the served image (TP4, `--kv-offloading-size 64`, GPU KV limited to 1.25 GiB = 992K
 tokens so that eviction is quick; `tools/sm120_perf/kv_offload_probe.py`, greedy, thinking off):
@@ -632,10 +632,71 @@ Host cost 3.58 KB per token (four TP copies of 896 B/token/rank; 64 GiB ≈ 19M 
 38M). Decode and prefill with the connector on and 6.5 GB stored: prose 165–180 tok/s at 74–75
 steps/s, eight streams 559–572, code 386–402 / 1409–1442, fresh prefill 11.5k / 10.6k tok/s — the same
 as without it. Startup +0 s (the region is pre‑faulted in a few seconds). The launcher exposes it as
-`KV_OFFLOAD_GIB` (default 0). Not yet measured: the filesystem tier (`spec_name:
-TieringOffloadingSpec`, `secondary_tiers: [{type: fs, root_dir: …}]` — the NVMe of the report's
-deployment; on this host the disk is virtio), `offload_prompt_only=false` (also offload generated
-tokens), and hits with a realistic multi‑session agent load.
+`KV_OFFLOAD_GIB` (default 0).
+
+**Disk tier.** `spec_name: TieringOffloadingSpec` with `secondary_tiers: [{type: fs, root_dir: DIR}]`
+puts a filesystem tier behind the RAM tier: every block stored to RAM is also written to DIR (one
+file per 128‑token block, named by the block's content hash, 448 KiB = the four TP copies, O_DIRECT
+on XFS); a lookup that misses RAM checks the files, and a hit is read into RAM and loaded to the GPU
+from there. Measured with the GPU pool at 992K tokens and the RAM tier at 4 GiB (1.2M tokens), so both
+evict within a few long prompts; the disk is a virtio volume of the KVM guest (the report's deployment
+has NVMe):
+
+| step | wall | what happened |
+|---|---:|---|
+| 209K‑token prompt with a needle, fresh | 20.25 s (10.3k tok/s) | 749 MB stored to RAM and written to disk in the background (3.9 s of write time) |
+| 8 distinct 209–227K‑token prompts | 20.3–22.2 s each (10.2–10.3k tok/s) | 750–810 MB each stored and written; the GPU pool and the RAM tier both evict the first prompt |
+| the first prompt again | **2.53 s** | **disk hit**: 1,633 chunks, 749 MB read in 1.9 s, promoted to RAM, loaded to the GPU; needle answered |
+| turn 2 of a conversation evicted the same way (turn 1: 104K‑token prompt + 1,347 generated) | 1.29 s | 105,344 of its 105,394 tokens from disk (377 MB) |
+
+The writes do not slow the prefill down (10.2–10.3k tok/s is the no‑offload rate at 209–227K tokens).
+The files are named by the content hash of the token chain (sha256 with a fixed seed), so they stay
+valid for any later server with the same model, TP size, KV dtype and group layout: **after a
+restart** (new process, empty GPU pool and RAM tier) the first request for a 174K‑token prompt stored
+by the previous process took **3.20 s instead of 16.7 s** — 1,359 chunks read from disk (623 MB in
+1.5 s), needle answered. vLLM never deletes these files; `docker/sm120/kvcache-ttl.sh DIR` (hourly from
+cron) removes the ones not read for 72 h — the retention the V4.1 report gives its SSD tier — and then
+the least recently read ones above 200 GB. A deleted file is a miss for the server, so the script is
+safe while it serves. The launcher exposes the tier as `KV_OFFLOAD_FS_DIR`.
+
+**Generated tokens.** `offload_prompt_only` (default true) keeps a request's generated tokens out of
+the tiers, while the GPU prefix cache keeps them. In the conversation above, turn 2 repeats turn 1's
+prompt *and* its 1,347 generated ids token for token (thinking off; the V4.1 encoder also keeps earlier
+reasoning and tool calls in the history whenever the request has tools, as agents' requests do, and
+drops earlier reasoning otherwise). With `offload_prompt_only=false` the disk hit covered all of it;
+the default would have stopped at the 104,029 prompt tokens. Launcher: `KV_OFFLOAD_PROMPT_ONLY=0`.
+
+**What a prefix hit costs in fidelity.** Every hit — GPU or offloaded — recomputes the hit's last 128
+tokens with the SWA window clamped to them (`swa_bounded_replay`, vLLM main's default with model
+runner V2; it is also what lets the tiers skip the SWA cache), so what follows a hit attends to an
+approximate window. `tools/sm120_perf/prefix_hit_probe.py` compared, on 12 prompts of 3K–96K tokens
+(code and docs, a 6‑digit note right before the question; greedy, thinking off, 128 tokens, served
+image), a fresh prefill against the same prompt served as a GPU hit, the same fresh prefill repeated,
+and a fresh prefill whose chunk boundaries a queued request moves, plus a second turn fresh vs hit
+(first‑token TV = total variation between the two top‑5 distributions):
+
+| against the fresh prefill | identical 128 tokens | first token identical | first‑token TV (mean) |
+|---|---:|---:|---:|
+| GPU prefix hit (with the replay) | 0/12 | 7/12 | 0.31 |
+| the same fresh prefill again | 1/12 | 7/12 | 0.27 |
+| fresh, chunk boundaries moved | 1/12 | 6/12 | 0.30 |
+| turn 2: hit vs fresh | 0/12 | 9/12 | 0.14 |
+| turn 2: moved vs fresh | 1/12 | 10/12 | 0.15 |
+
+A hit is as far from the fresh prefill as the fresh prefill is from itself. The served stack is not
+deterministic from run to run once a prompt is longer than a few hundred tokens (identical requests
+on an idle server: 12–17‑token prompts identical 3/3, 494 tokens 1/3, 2K tokens 0/3), and the replay's
+approximation disappears in that spread; the note was answered correctly in all 36 second turns.
+`swa_bounded_replay` stays on. Where the run‑to‑run spread comes from is not localized yet
+(candidates: split reductions with atomics; top‑k tie‑breaking over the MXFP4 indexer logits once the
+context exceeds the top‑k).
+
+**Served** since 2026‑09‑23: the 64 GiB RAM tier (19M tokens), the disk tier with the hourly retention
+script, `KV_OFFLOAD_PROMPT_ONLY=0`; decode unchanged (prose 164–170 / 570–579 tok/s at one / eight
+streams, code 387–395 / 1416–1451, 73.6–75.7 steps/s single stream). A region its server did not
+remove on exit stays in `/dev/shm` (host RAM) until deleted — the test server with the disk tier left
+its 4 GiB behind after `docker stop` — so the launcher removes regions no process maps before it
+starts a server.
 
 ## Apply / build / run
 
