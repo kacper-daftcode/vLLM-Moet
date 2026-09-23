@@ -25,7 +25,7 @@ step goes"), `tools/qwen38_sm120/README.md`.
 | `trace_step_skew.py DIR [gap_us] [min_kernels]` | per rank: steps (kernel runs separated by idle gaps), first-NCCL-of-step vs rest, idle before step; across ranks: step-start skew and first-NCCL duration per rank |
 | `trace_gaps.py TRACE.json.gz [gap_us] [n]` | GPU idle gaps: classes by (kernel before → kernel after), whether the gap sits inside one `cudaGraphLaunch` |
 | `trace_gap_context.py TRACE.json.gz BEFORE_PREFIX [gap_us] [n] [ctx]` | kernels, CPU runtime calls and ops around gaps of one class |
-| `allreduce_bench.py` (torchrun, 4 ranks, inside the vLLM image) | pynccl vs vLLM `CustomAllreduce` one-shot with the "fully connected" gate forced open, eager and in a CUDA graph |
+| `allreduce_bench.py` (torchrun, 4 ranks, inside the vLLM image) | pynccl vs vLLM `CustomAllreduce` one-shot with the "fully connected" gate forced open vs FlashInfer's PCIe CUDA-IPC all-reduce (`PcieIpcAllReduceWorkspace`, tuned per batch like vLLM's `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1` does), eager and in a CUDA graph |
 | `skinny_tune.py [shapes] [Ms]` (inside the qwen38 image) | grid-tunes vLLM's CuTe-DSL `SkinnyGemmConfig` per (N, K, M) against cuBLAS, cold L2; prints the plan dict consumed by `tools/qwen38_sm120/patch_low_latency_gemm.py` |
 | `moe_tune.py OUT.json [Ms]` (inside the qwen38 image) | small-grid Triton `fused_moe` tuning for E=512,N=160,fp8 [32,32] via `benchmark_moe.benchmark_config` (ray stubbed out); writes the vLLM config JSON with decode entries + default-equivalent large-M entries |
 | `trace_graphs.py TRACE.json.gz [--graph N] [--order]` | kernels grouped by `cudaGraphLaunch` (correlation id): clusters of launches by kernel count (decode graph, drafter graph, prefill pieces), per-cluster kernel composition and launch order — how the DSpark drafter graph (167 kernels, 1.18 ms) was broken down |
@@ -39,8 +39,14 @@ CUDA graph between `_hc_combine_kernel` and the next kernel — i.e. a non-kerne
 `cuStreamWaitValue32` node as the only candidate. Moving the PLE table onto the GPUs removed
 the gap (see `tools/qwen38_sm120/README.md`).
 
-`allreduce_bench.py` result on the KVM host (PCIe P2P, no NVLink): vLLM's one-shot custom
-all-reduce is *pull*-based (every rank reads its peers' buffers) and PCIe P2P reads are
-latency-bound here — 60 KiB takes 75 µs vs 12.6 µs for NCCL LL over P2P, growing linearly with
-size. Not usable on this topology; the FlashInfer PCIe-IPC backend (`PcieIpcAllReduceWorkspace`,
-push-based) is what vLLM `>=` dev20904 would prefer, but FlashInfer 0.6.18 does not ship it.
+`allreduce_bench.py` result on the KVM host (PCIe P2P, no NVLink; FlashInfer's topology probe
+says `rootcplx-noswitch`): vLLM's one-shot custom all-reduce is *pull*-based (every rank reads its
+peers' buffers) and PCIe P2P reads are latency-bound here — 60 KiB takes 75–85 µs vs 12.8 µs for
+NCCL LL over P2P, growing linearly with size. FlashInfer's *push*-based PCIe IPC all-reduce (the
+nightly wheels ship it; vLLM main enables it with `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`),
+tuned on this host, in a CUDA graph, per call: 1 token × 5120 bf16 **5.3 µs vs NCCL 10.4**, 2 tokens
+7.8 vs 12.1, 4 tokens 13.1 vs 12.4, **6 tokens (DSpark k=5 decode) 16.5 vs 12.8**, 12 tokens 18.8 vs
+16.9, 24 tokens 25.3 vs 26.0, 48 tokens 43.4 vs 44.3, 64 tokens 49.5 vs 58.1. It wins only below
+4 tokens per step; at this deployment's shapes NCCL LL is at the PCIe latency floor, so the
+backend stays off (2026‑09‑23; the 88 all-reduces per step cost 1.3 ms at one stream, 5.7 ms at
+eight — the remaining lever there is fewer all-reduces, not a faster one).

@@ -200,9 +200,14 @@ no‑op (SHM either way). vLLM's own custom one‑shot allreduce (refused by the
 heuristic in `custom_all_reduce.py`) was measured with the gate forced open
 (`tools/sm120_perf/allreduce_bench.py`): it is pull‑based — every rank reads its three peers'
 buffers — and PCIe P2P *reads* are latency‑bound in this VM, so 60 KiB costs 75 µs against NCCL's
-12.6 µs and the time grows linearly with size. The heuristic is right for this topology. vLLM
-dev20904 also lists a push‑based `FLASHINFER_PCIE_IPC` backend, but FlashInfer 0.6.18 does not
-ship `PcieIpcAllReduceWorkspace`, so it is not available in this image.
+12.6 µs and the time grows linearly with size. The heuristic is right for this topology. The
+push‑based `FLASHINFER_PCIE_IPC` backend (FlashInfer's `PcieIpcAllReduceWorkspace`, shipped by the
+nightly wheels of the served image, opt‑in through `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`) was
+measured on 2026‑09‑23 with the same bench, tuned on this host: 5.3 µs against NCCL's 10.4 at one
+token, but **16.5 against 12.8 at the 6 tokens of a DSpark k=5 decode step** and a tie from 24 to
+48 tokens — it stays off. NCCL LL over P2P is the floor for this `rootcplx-noswitch` topology;
+what is left on the all‑reduce line (1.3 ms per step at one stream, 5.7 ms at eight) is the
+number of all‑reduces, not their speed.
 
 **Small‑M MXFP8 GEMV (`tools/dsv41_sm120/sm120_gemv/`).** The CUTLASS SM120 blockscaled GEMM runs
 a 128‑row MMA tile for the 6‑row decode batch. The replacement keeps the exact same inputs

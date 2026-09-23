@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 """4-rank all-reduce latency on PCIe-only GPUs: NCCL (pynccl, P2P) vs vLLM CustomAllreduce
-one-shot with the "fully connected" gate forced open.
+one-shot with the "fully connected" gate forced open vs FlashInfer's PCIe CUDA-IPC all-reduce
+(push-based; `PcieIpcAllReduceWorkspace`, FlashInfer >= 0.7.0 nightlies; vLLM enables it with
+VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1 for decode-shaped [tokens, hidden] tensors).
 
-    torchrun --nproc_per_node=4 car_bench.py [--iters 100] [--sizes 2560,20480,...]
+    torchrun --nproc_per_node=4 allreduce_bench.py [--iters 100] [--sizes 2560,20480,...] [--hidden 5120]
 
 Numbers are per call; "graph" rows replay ITERS captured calls per replay (the in-situ
 usage pattern of both servers), "eager" rows include the memcpy into the IPC buffer
-(custom AR) or a plain ncclAllReduce (pynccl).
+(custom AR) or a plain ncclAllReduce (pynccl). The FlashInfer column is measured only for
+sizes that are whole [batch, --hidden] tensors (its workspace is tuned per batch and
+sized to the largest one, as vLLM sizes it to the largest CUDA-graph capture size); tuning
+runs once per process (--fi-tune-cache persists it like vLLM's autotune dir does).
 """
 import argparse
 import os
@@ -38,6 +43,10 @@ def main():
         help="element counts (bf16)",
     )
     ap.add_argument("--max-size", type=int, default=512 * 1024, help="custom AR max bytes")
+    ap.add_argument("--hidden", type=int, default=5120, help="hidden size for the FlashInfer PCIe IPC column")
+    ap.add_argument("--skip-fi", action="store_true", help="skip the FlashInfer PCIe IPC column")
+    ap.add_argument("--fi-tune-cache", default="", help="tune cache file for the FlashInfer workspace (persisted)")
+    ap.add_argument("--fi-no-tune", action="store_true", help="use FlashInfer's seed launch configs (no tune())")
     args = ap.parse_args()
 
     dist.init_process_group("gloo")
@@ -59,6 +68,42 @@ def main():
     assert not nccl.disabled
 
     sizes = [int(s) for s in args.sizes.split(",")]
+
+    # --- FlashInfer PCIe IPC workspace: one per process, sized to the largest [batch, hidden] ---
+    fi_ws = None
+    fi_batches = sorted({n // args.hidden for n in sizes if n % args.hidden == 0 and n // args.hidden > 0})
+    if not args.skip_fi and fi_batches:
+        try:
+            import flashinfer.comm as fi_comm
+
+            if not hasattr(fi_comm, "PcieIpcAllReduceWorkspace"):
+                raise RuntimeError("this FlashInfer has no PcieIpcAllReduceWorkspace")
+            t0 = time.perf_counter()
+            fi_ws = fi_comm.PcieIpcAllReduceWorkspace(
+                group=gloo_group,
+                max_numel=fi_batches[-1] * args.hidden,
+                dtype=torch.bfloat16,
+                tune_batches=fi_batches,
+                tune_cache=args.fi_tune_cache or None,
+            )
+            torch.cuda.synchronize()
+            fi_ws.rebind_stream()
+            if not args.fi_no_tune:
+                fi_ws.tune([args.hidden], dtype=torch.bfloat16, tune_group=gloo_group)
+            fi_ws.prepare([(b, args.hidden) for b in fi_batches], dtype=torch.bfloat16)
+            torch.cuda.synchronize()
+            fi_ws.rebind_stream()
+            if rank == 0:
+                print(
+                    f"flashinfer PCIe IPC workspace: profile={fi_ws.profile!r} memop={fi_ws.memop_supported} "
+                    f"batches={fi_batches} hidden={args.hidden} setup {time.perf_counter()-t0:.1f}s "
+                    f"(tune={'off' if args.fi_no_tune else 'on'})"
+                )
+        except Exception as e:  # noqa: BLE001
+            if rank == 0:
+                print("flashinfer PCIe IPC unavailable:", repr(e)[:300])
+            fi_ws = None
+
     rows = []
     for n in sizes:
         nbytes = n * 2
@@ -123,7 +168,49 @@ def main():
             t_ca_graph = timeit(ca_graph, args.iters)
             del g_ca
         del g_nccl
-        rows.append((nbytes, t_nccl_eager, t_nccl_graph, ok_nccl_graph, use_ca, t_ca_eager, t_ca_graph, ok_ca_eager, ok_ca_graph))
+
+        # --- FlashInfer PCIe IPC eager / graph (2-D [batch, hidden] only) ---
+        t_fi_eager = t_fi_graph = float("nan")
+        ok_fi_eager = ok_fi_graph = None
+        use_fi = fi_ws is not None and n % args.hidden == 0
+        if use_fi:
+            x2 = x.view(n // args.hidden, args.hidden)
+            use_fi = bool(fi_ws.supports(x2))
+        if use_fi:
+            torch.cuda.synchronize()
+            fi_ws.rebind_stream()
+            y = fi_ws.all_reduce(x2)
+            torch.cuda.synchronize()
+            ok_fi_eager = torch.equal(y.view(-1), ref)
+
+            def fi_eager(iters):
+                for _ in range(iters):
+                    fi_ws.all_reduce(x2)
+
+            t_fi_eager = timeit(fi_eager, args.iters)
+
+            # capture on stream s: the workspace serves one stream, so re-bind around the capture
+            # (vLLM does the same in FlashInferPcieIpcAllReduce.capture())
+            torch.cuda.synchronize()
+            fi_ws.rebind_stream()
+            g_fi = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g_fi, stream=s):
+                for _ in range(args.iters):
+                    y_fi = fi_ws.all_reduce(x2)
+            torch.cuda.synchronize()
+            fi_ws.rebind_stream()
+            dist.barrier()
+            g_fi.replay()
+            torch.cuda.synchronize()
+            ok_fi_graph = torch.equal(y_fi.view(-1), ref)
+
+            def fi_graph(iters):
+                g_fi.replay()
+
+            t_fi_graph = timeit(fi_graph, args.iters)
+            del g_fi
+        rows.append((nbytes, t_nccl_eager, t_nccl_graph, ok_nccl_graph, use_ca, t_ca_eager, t_ca_graph, ok_ca_eager,
+                     ok_ca_graph, use_fi, t_fi_eager, t_fi_graph, ok_fi_eager, ok_fi_graph))
 
     # gather per-rank timings, report rank 0 and the max over ranks (skew-free lockstep)
     all_rows = [None] * ws
@@ -131,17 +218,27 @@ def main():
     if rank == 0:
         print(
             f"world={ws} iters={args.iters} NCCL_P2P_LEVEL={os.environ.get('NCCL_P2P_LEVEL')} "
-            f"NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE')} custom max_size={args.max_size}"
+            f"NCCL_P2P_DISABLE={os.environ.get('NCCL_P2P_DISABLE')} custom max_size={args.max_size} "
+            f"flashinfer PCIe IPC={'on' if fi_ws is not None else 'off'} hidden={args.hidden}"
         )
-        print(f"{'bytes':>9} | {'nccl eager':>10} {'nccl graph':>10} | {'CA eager':>9} {'CA graph':>9} | ok(nccl-g, ca-e, ca-g) | max-over-ranks CA graph")
+        print(
+            f"{'bytes':>9} | {'nccl eager':>10} {'nccl graph':>10} | {'CA eager':>9} {'CA graph':>9} | "
+            f"{'FI eager':>9} {'FI graph':>9} | ok(nccl-g, ca-e, ca-g, fi-e, fi-g) | max-over-ranks CA graph, FI graph"
+        )
         for i, r in enumerate(rows):
-            nbytes, te, tg, okg, use_ca, ce, cg, oke, okc = r
+            nbytes, te, tg, okg, use_ca, ce, cg, oke, okc, use_fi, fe, fg, okfe, okfg = r
             cg_max = max(rr[i][6] for rr in all_rows)
+            fg_max = max(rr[i][11] for rr in all_rows)
             print(
-                f"{nbytes/1024:7.1f}KiB | {te:10.1f} {tg:10.1f} | {ce:9.1f} {cg:9.1f} | {okg!s:>6} {oke!s:>6} {okc!s:>6} | {cg_max:8.1f}"
+                f"{nbytes/1024:7.1f}KiB | {te:10.1f} {tg:10.1f} | {ce:9.1f} {cg:9.1f} | {fe:9.1f} {fg:9.1f} | "
+                f"{okg!s:>6} {oke!s:>6} {okc!s:>6} {okfe!s:>6} {okfg!s:>6} | {cg_max:8.1f} {fg_max:8.1f}"
             )
     type(current_platform).is_fully_connected = fc_orig
     ca.close() if hasattr(ca, "close") else None
+    if fi_ws is not None:
+        torch.cuda.synchronize()
+        dist.barrier()
+        fi_ws.destroy()
     dist.destroy_process_group()
 
 
