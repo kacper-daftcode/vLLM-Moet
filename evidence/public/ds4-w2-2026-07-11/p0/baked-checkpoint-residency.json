@@ -1,0 +1,36 @@
+{
+  "cgroup": {
+    "anon": 517152768,
+    "current": 555065344,
+    "events": {
+      "high": 0,
+      "low": 0,
+      "max": 0,
+      "oom": 0,
+      "oom_group_kill": 0,
+      "oom_kill": 0,
+      "sock_throttled": 0
+    },
+    "file": 106496,
+    "file_mapped": 4096,
+    "high_available": null,
+    "known": true,
+    "limited": true,
+    "max_available": 1592418304,
+    "swap_current": 0,
+    "swap_limit": 0,
+    "version": 2
+  },
+  "checksum": 2949120,
+  "file_bytes": 134217816,
+  "probe": "checkpoint-residency",
+  "provenance": {
+    "captured_at": "2026-07-12T03:16:41.750930+00:00",
+    "image": "vllm-moet-sm120:v024-w2union-241ba984b1c5",
+    "image_id": "sha256:fc6e1244d60855fe45ccc0236daaaa722abcb8d354200eb92aca104bd954d3f2",
+    "kernel": "7.0.0-14-generic"
+  },
+  "resident_after_immediate": 0,
+  "resident_after_retry": 0,
+  "resident_before_dontneed": 134221824
+}

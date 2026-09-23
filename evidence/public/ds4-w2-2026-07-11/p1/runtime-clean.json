@@ -1,0 +1,122 @@
+{
+  "schema_version": "ds4-w2-p1-public-runtime-clean-v2",
+  "log_snapshot": {
+    "scope": "complete server log through the final 30K context case and last pre-stop health check",
+    "line_count": 17610,
+    "byte_count": 4047543,
+    "sha256": "c35886a6e262f8cbe754c60314f3fbee8d16e2a91fd70fa0a59baecdcbdb6a63"
+  },
+  "http_response_scan": {
+    "health_200": 2362,
+    "chat_200": 163,
+    "tokenize_200": 43,
+    "non_200": 0
+  },
+  "exact_pattern_scan": {
+    "replay_skipped": 0,
+    "gate_skipped": 0,
+    "draft_prefetch_skipped": 0,
+    "unrestored_experts": 0,
+    "pool_too_tight": 0,
+    "pool_too_small": 0,
+    "fixed_point_replay_hit_maximum": 0,
+    "error_severity": 0,
+    "error_substring": 0,
+    "traceback": 0,
+    "actionable_or_nonzero_oom": 0,
+    "abort_substring": 0
+  },
+  "wording_caveats": {
+    "oom_event_fields": {
+      "matching_lines": 230,
+      "all_values_zero": true,
+      "values": {
+        "oom": 0,
+        "oom_kill": 0,
+        "oom_group_kill": 0
+      },
+      "interpretation": "These are repeated zero-valued cgroup telemetry fields, not OOM events."
+    },
+    "generic_skipped": {
+      "matching_lines": 45,
+      "persistent_quantization_staging_notices": 2,
+      "per_layer_boot_from_pack_requant_notices": 43,
+      "replay_or_gate_skips": 0,
+      "interpretation": "Every generic skipped line is an expected persistent-quantization boot fast path; none reports a serving replay or gate failure."
+    },
+    "startup_warnings": {
+      "uppercase_warning_lines": 25,
+      "deprecated_model_option": 1,
+      "custom_or_build_environment_keys": 16,
+      "compile_pipeline_disabled_notices": 4,
+      "generation_config_override": 1,
+      "first_shape_jit_notices": 3,
+      "serving_correctness_or_safety_failures": 0
+    }
+  },
+  "base_kpi_windows": {
+    "window_count": 156,
+    "steps_per_window": 64,
+    "windows_with_fp_residue": 156,
+    "windows_with_unrestored_experts": 0,
+    "replay_percent": {
+      "min": 42.2,
+      "max": 100.0,
+      "mean": 97.747
+    },
+    "fp_residue_steps": {
+      "min": 27,
+      "max": 64,
+      "mean": 62.558
+    },
+    "reported_average_residual_pairs": {
+      "min": 19,
+      "max": 40,
+      "mean_of_window_reports": 27.423
+    },
+    "final_window": {
+      "replay_percent": 42.2,
+      "cumulative_replay_percent": 97.8,
+      "cumulative_steps": 9984,
+      "fp_residue_steps": 27,
+      "average_residual_pairs": 40,
+      "base_pool_slots": 1213,
+      "base_expert_coverage_percent": 11.0
+    }
+  },
+  "memory_watchdog": {
+    "samples": 2080,
+    "elapsed_seconds": 2120.5,
+    "trace_byte_count": 525459,
+    "trace_sha256": "a37bdca9341b2d5dd59f8da018de45cdc87d663d8a3d5a489e2d0f950932ed35",
+    "host_mem_available_min_bytes": 109256560640,
+    "cgroup_memory_current_max_bytes": 103080009728,
+    "cgroup_memory_peak_bytes": 103082889216,
+    "cgroup_anon_max_bytes": 3689418752,
+    "cgroup_file_max_bytes": 99536830464,
+    "cgroup_file_mapped_max_bytes": 4124221440,
+    "cgroup_hard_max_bytes": 107374182400,
+    "cgroup_hard_headroom_min_bytes": 4294172672,
+    "cgroup_soft_high_bytes": 103079215104,
+    "cgroup_soft_high_headroom_min_bytes": -794624,
+    "samples_above_soft_high": 13,
+    "soft_high_event_delta": 64122,
+    "cgroup_swap_current_max_bytes": 0,
+    "hard_max_event_delta": 0,
+    "oom_event_delta": 0,
+    "oom_kill_event_delta": 0,
+    "host_swap_in_pages_delta": 0,
+    "host_swap_out_pages_delta": 0,
+    "host_oom_kill_delta": 0,
+    "psi_full_avg10_max": 0.49,
+    "psi_nonzero_samples": 66,
+    "interpretation": "The quality and context lane stayed above its hard fail-closed floor with no swap, hard-limit, or OOM event. File-cache growth briefly crossed memory.high and caused observable soft reclaim and pressure; those events are not reported as zero."
+  },
+  "kpi_semantics": {
+    "window_boundary": "base_fp_residue_steps is the count in the latest 64-step KPI window, not a cumulative counter.",
+    "residue_boundary": "Residue records second-order misses exposed after the mandatory first-order fetch and replay. Under the throughput-oriented default, those experts are fetched for later steps while their current-step contribution remains zero.",
+    "unrestored_boundary": "Zero unrestored experts establishes fetch/store liveness. It does not establish a miss-free forward, bit-identical logits, or identical token streams across boots.",
+    "policy_boundary": "The final quality policy observed residue and replay but did not reject on either metric. A separate strict zero-residue diagnostic failed before scoring."
+  },
+  "sanitization_note": "Topology-specific and private runtime provenance identifiers are intentionally omitted."
+}
