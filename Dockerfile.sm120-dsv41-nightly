@@ -44,6 +44,10 @@
 #      the seven vLLM runs per MoE layer between the router and FC1, bit-identical fp8 rows / UE8M0
 #      scales written straight into DeepGEMM's packed layout; VLLM_MOET_MOE_QUANT_SCATTER=0 turns it off
 #      at runtime (quantization back in prepare()). Prefill keeps vLLM's kernels.
+#   9. (optional, --build-arg VLLM_PR_57679=1; not served yet) vllm#57679 as a patch
+#      (patch_vllm_query_quant_gate.py): restores vLLM's own fused q/kv RMSNorm + MXFP8 quantization of
+#      the query - its gate reads an attribute #53793 renamed, so every layer ran the BF16 norm and a
+#      standalone quantize; bit-identical (test_query_quant_gate.py), one launch less per layer.
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-moeqs .
@@ -125,8 +129,13 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_quant_scatter'); import moe_quant_scatter_sm120 as q; e = q._ext(); assert hasattr(e, 'moe_quant_scatter'); print('sm120 moe quant+scatter extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_quant_scatter_sm120/*.so
 
+# 9. vllm#57679: the fused query RMSNorm + MXFP8 quantization gate (header); off until served.
+ARG VLLM_PR_57679=0
+RUN if [ "$VLLM_PR_57679" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_query_quant_gate.py; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter" \
       com.vllm-moet.kv-mode="upstream" \
-      com.vllm-moet.decoder-replay="${VLLM_PR_58132}"
+      com.vllm-moet.decoder-replay="${VLLM_PR_58132}" \
+      com.vllm-moet.query-quant-gate="${VLLM_PR_57679}"

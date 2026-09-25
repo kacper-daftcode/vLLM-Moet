@@ -846,6 +846,37 @@ against the same plus this step, same day:
 **Served since 2026‑09‑23 23:15Z** (the launcher's default image). `EXTRA_DOCKER_ARGS="-e
 VLLM_MOET_MOE_QUANT_SCATTER=0"` turns it off on the same image, `IMAGE=…-ced` is the image without it.
 
+### Where the served step goes now, and what the next fusions measured (2026‑09‑24)
+
+Rank‑0 trace of a one‑stream decode step on the `-moeqs` image (torch profiler, 2026‑09‑24;
+40 layers, 254 µs each on the critical path, ~12.9 ms per step with the DSpark drafter's 1.04 ms):
+FC1 + FC2 of the routed experts 110 µs per layer (118 + 59 MB of FP4 weights — the bandwidth floor),
+the two all‑reduces 24, the two mHC TileLang kernel pairs 21 (5.3–6.4 + 4.7 µs per sublayer), the four
+dense MXFP8 GEMVs 36 (38.6 MB at ~1.07 TB/s), sparse MLA + merge 15, the router 11 (cuBLAS bf16 GEMM
+4.9 + split‑K reduce 2.7 + `_dsv4_topk` 3.4), the activation quantizers on the critical path ~6, the
+remaining small kernels ~20, and ~36 launch gaps of ~0.35 µs. The shared expert runs on the aux
+stream behind FC1. cuBLAS BF16 small‑M GEMMs (12 × 25.6 µs, 41 × 5.2 µs and 44 split‑K reduces per
+step, 0.65 ms; the drafter's single `s16816gemm_relu` 229 µs) are the largest not yet examined item.
+
+Three fusions were then built and measured on the RTX 5090 (all in `tools/dsv41_sm120/`):
+
+- **vllm#57679** (`patch_vllm_query_quant_gate.py`): vLLM's own fused q/kv RMSNorm + MXFP8 quantization
+  of the query has been unreachable since vllm#53793 renamed the attribute its gate reads; the
+  one‑line fix restores it. Bit‑identical to the separate norm + quantize (FP8 bytes, swizzled scale
+  bytes, normalized KV; 1–170 tokens) and the GEMV consumer gives the same output. One launch less
+  per layer (≈ 1.6 µs + a gap). Step 9 of the Dockerfile behind `--build-arg VLLM_PR_57679=1`,
+  **not served yet** (to be bundled with the next image).
+- **Fused router** (`moe_gate_topk/`): gate GEMV + sqrtsoftplus + bias + top‑6 + renorm in one launch,
+  bit‑exact against `dsv4_topk` — and not faster with cold gate weights (8.6 vs 8.1 µs at 6 tokens):
+  the last‑CTA hand‑off serializes ~2 µs the three kernels overlap; upstream's `ll_bf16_gemm` (CuTe
+  DSL, gated off sm_120) runs here but loses to cuBLAS above 4 tokens. Not applied.
+- **mHC pre epilogue** (`mhc_pre_norm/`): the TileLang `mhc_pre_big_fuse_with_norm` (split sums,
+  Sinkhorn, collapse, RMSNorm, aux) as one CUDA kernel with 32 + H/8 threads per token, bit‑identical
+  on every output (its reduction orders reproduced from the generated CUDA) — but 4.5 µs vs 3.5:
+  both are bound by warp 0's 20 Sinkhorn iterations (~93 ns each), ours carries ~1 µs of unexplained
+  overhead. Not applied; the starting point for a fused sm_120 mHC (DeepGEMM's `mega_mhc` needs
+  tcgen05/TMEM/TMA, i.e. sm_100).
+
 ## Apply / build / run
 
 ```bash
