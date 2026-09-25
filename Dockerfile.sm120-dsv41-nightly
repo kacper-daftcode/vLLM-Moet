@@ -44,16 +44,25 @@
 #      the seven vLLM runs per MoE layer between the router and FC1, bit-identical fp8 rows / UE8M0
 #      scales written straight into DeepGEMM's packed layout; VLLM_MOET_MOE_QUANT_SCATTER=0 turns it off
 #      at runtime (quantization back in prepare()). Prefill keeps vLLM's kernels.
-#   9. (optional, --build-arg VLLM_PR_57679=1; not served yet) vllm#57679 as a patch
+#   9. (--build-arg VLLM_PR_57679=1, default since the -mhc tag) vllm#57679 as a patch
 #      (patch_vllm_query_quant_gate.py): restores vLLM's own fused q/kv RMSNorm + MXFP8 quantization of
 #      the query - its gate reads an attribute #53793 renamed, so every layer ran the BF16 norm and a
 #      standalone quantize; bit-identical (test_query_quant_gate.py), one launch less per layer.
+#  10. The mHC sublayer boundary off the decode critical path (patch_vllm_mhc_overlap_sm120.py + mhc_overlap/):
+#      upstream's side-stream design (`mhc_pre_delayed_overlap`, SM100-only) enabled on sm_120 with our
+#      kernels - post-mix + collapse + RMSNorm + draft aux in one launch on the model stream, the fn
+#      projection (one CTA per split x 4 tokens) and the Sinkhorn coefficients on the side stream behind
+#      the sublayer, the sublayer's all-reduce moved in front of the kernel (upstream's fuse_mhc_all_reduce,
+#      a plain all-reduce here); bit-identical to the TileLang pair (test_mhc_post_norm_sm120.py,
+#      test_mhc_overlap_integration.py); served since 2026-09-25. VLLM_MOET_MHC_OVERLAP=0 turns it off at
+#      runtime.
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-moeqs .
-#   (... --build-arg VLLM_PR_58132=0 -t ...: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
-#    dsv41-nightly-20260923: steps 1-5)
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-moeqs KV_MODE=upstream
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-mhc .
+#   (... --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 -t ...-moeqs: steps 1-8 (the served
+#    image before the -mhc tag); --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7;
+#    -kvdedup: steps 1-6; dsv41-nightly-20260923: steps 1-5)
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-mhc KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
@@ -129,13 +138,21 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_quant_scatter'); import moe_quant_scatter_sm120 as q; e = q._ext(); assert hasattr(e, 'moe_quant_scatter'); print('sm120 moe quant+scatter extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_quant_scatter_sm120/*.so
 
-# 9. vllm#57679: the fused query RMSNorm + MXFP8 quantization gate (header); off until served.
-ARG VLLM_PR_57679=0
+# 9. vllm#57679: the fused query RMSNorm + MXFP8 quantization gate (header).
+ARG VLLM_PR_57679=1
 RUN if [ "$VLLM_PR_57679" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_query_quant_gate.py; fi
+
+# 10. The mHC boundary off the decode critical path (header); the extension is compiled here so nothing
+#     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
+ARG VLLM_MOET_MHC_OVERLAP=1
+RUN if [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_overlap_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert hasattr(e, 'mhc_post_norm') and hasattr(e, 'mhc_proj'); print('sm120 mhc overlap extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_mhc_post_norm_sm120/*.so; fi
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.decoder-replay="${VLLM_PR_58132}" \
-      com.vllm-moet.query-quant-gate="${VLLM_PR_57679}"
+      com.vllm-moet.query-quant-gate="${VLLM_PR_57679}" \
+      com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}"

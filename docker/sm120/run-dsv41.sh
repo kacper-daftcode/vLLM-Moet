@@ -6,7 +6,7 @@
 # picks the right KV plumbing for either.
 #
 # Required:  MODEL_DIR   directory with the official DeepSeek-V4.1-Flash checkpoint
-# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-20260923-moeqs)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-20260923-mhc)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1: only local; "" = all interfaces)
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm
 #                        (FlashInfer autotune + JIT, DeepGEMM JIT; first start ~25 min, later ~17 min)
@@ -66,7 +66,9 @@
 # (BF16 emulation for wo_a), VLLM_MOET_DECODER_REPLAY=0 (the -ced image prefills layers 21-39 on every
 # prompt token again instead of the last 128), VLLM_MOET_MOE_QUANT_SCATTER=0 (the -moeqs image quantizes
 # the MoE input in prepare() and permutes it with vLLM's kernels again instead of one fused launch at
-# decode shapes). Pass them with EXTRA_DOCKER_ARGS="-e VAR=0". enable_adaptive_verification must stay
+# decode shapes), VLLM_MOET_MHC_OVERLAP=0 (the -mhc image runs the mHC boundary as the TileLang pair on
+# the model stream again, all-reduce back in the linear layers; sub-options VLLM_MOET_MHC_FUSE_ALLREDUCE=0,
+# VLLM_MOET_MHC_PDL=0, VLLM_MOET_MHC_PROJ=fused|tf32). Pass them with EXTRA_DOCKER_ARGS="-e VAR=0". enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,
 # default high = 75; OpenAI aliases minimal 25 / medium 62 / xhigh 87 are accepted). Pin a
@@ -75,7 +77,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-moeqs}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-mhc}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"

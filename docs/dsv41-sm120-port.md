@@ -877,6 +877,124 @@ Three fusions were then built and measured on the RTX 5090 (all in `tools/dsv41_
   overhead. Not applied; the starting point for a fused sm_120 mHC (DeepGEMM's `mega_mhc` needs
   tcgen05/TMEM/TMA, i.e. sm_100).
 
+## The mHC boundary off the critical path (2026‑09‑25)
+
+Between two sublayers the served step runs two TileLang kernels back to back on the model stream:
+`mhc_fused_tilelang` (the post‑mapping of the four residual streams fused with the fn projection,
+grid [T, 12, 8] × 128, 5.3–6.4 µs) and `mhc_pre_big_fuse_with_norm` (split sums, sigmoids, the 4×4
+Sinkhorn × 20, the collapse with the carried pre‑mix, RMSNorm, the draft aux; [T] × 96, 4.7 µs) —
+10.5 µs per boundary, 80 boundaries per step. Reading what the next sublayer actually needs changes
+the picture: it consumes the collapsed, normalized input, which depends on the post‑mapped streams
+and on the pre‑mix the *previous* boundary produced (shifted mHC). This boundary's own projection
+and Sinkhorn produce the post mix, the residual mix and the next pre‑mix, and those are first read
+at the *next* boundary — after the whole sublayer. Upstream has exactly that split for GB200
+(`mhc_pre_delayed_overlap` in `models/deepseek_v41/nvidia/ops/mhc.py`: the input collapse on the
+model stream, the projection + coefficients on `mhc_stream`, joined after the sublayer), gated to
+SM100 + DeepGEMM's TF32 prenorm GEMM.
+
+`tools/dsv41_sm120/mhc_overlap/` puts that design on sm_120 with two kernels
+(`mhc_post_norm_sm120.cu`) and one patcher (`patch_vllm_mhc_overlap_sm120.py`, one file:
+`ops/mhc.py`):
+
+- **`mhc_post_norm`** — the critical path in one launch, one CTA of H/8 threads per token: the
+  post‑mix in fp32, the bf16 streams, the collapse of the rounded streams with the carried pre‑mix,
+  TileLang's sum of squares (64 threads × 16 positions per 1024‑block, the 0,8,1,9,… summation, the
+  64‑wide butterfly), the RMSNorm, the stream mean for the drafter. Bit‑identical to the TileLang
+  pair on every output for 1–64 tokens — the post‑mix reproduces the contraction nvcc chose for
+  TileLang's `pm * x + Σ cm · r` (the first product rounded, `pm * x` fused into it, one fma per
+  remaining stream; the test's `--modes` shows the two other candidates off by a bit), and the
+  streams equal `mhc_post_tilelang`'s (the >32‑token path) too. 3.3 µs on the RTX 5090 against the
+  pair's 7.4 (upstream's own split, `mhc_post` + `pre_norm[input]`, would be 4.9). Launched with
+  PDL optionally (`pdl=`): no gain in a graph here (+0.5 µs behind a small kernel), off by default.
+- **`mhc_proj`** — the projection for the side stream: `mhc_fused_tilelang`'s split partials
+  (`mixes[8, T, 24]`, `sqrsum[8, T]`, the fp32 post‑mix recomputed from the same inputs) from one
+  CTA per (split, block of 4 tokens) holding all 24 outputs, the fn slice read once per block: 8 ×
+  ⌈T/4⌉ CTAs instead of 96 T. Bit‑identical (same position‑to‑thread mapping, same fma chains per
+  token and output, TileLang's warp butterfly 16..1, the cross‑warp sum 0..3 in order). Alone it is
+  slower than the TileLang kernel (7 vs 4 µs at 6 tokens) — it runs behind the sublayer, where what
+  counts is how few SM slots it holds: with the served TileLang kernel on the side stream the
+  boundary still cost +8.7 µs next to a weight‑streaming stand‑in (its 576 CTAs at 6 tokens take the
+  SMs the GEMVs need), with this kernel +4.8.
+- The coefficients themselves stay TileLang's: `mhc_pre_big_fuse_with_norm` in its `"stats"` split
+  mode (3.2 µs, [T] × 96), bit‑identical to the fused epilogue. Above 32 tokens the side stream
+  runs the served path's DeepGEMM TF32 prenorm GEMM on the bf16 streams the kernel wrote (the same
+  bits as today above 32), then the same stats kernel.
+- The patch makes `supports_mhc_overlap` true on sm_120 (hidden 5120, hc 4, DeepGEMM, no ubatching,
+  the extension loads), raises `MHC_OVERLAP_MAX_TOKENS` from 16 to 64 there (every captured decode
+  batch; `VLLM_MOET_MHC_OVERLAP_MAX_TOKENS`), and routes `mhc_shifted_post_pre(stream=…)` to the
+  path above; the first layer's `mhc_pre` and the two Engram layers' `mhc_post` + `mhc_pre` take
+  upstream's overlap code unchanged (its TF32 GEMM + `input`/`stats` epilogues are the same kernels
+  as today's, so the same bits). Decode only: the decoder layer disables the side stream outside
+  FULL‑graph capture and above the token limit. `VLLM_MOET_MHC_OVERLAP=0` restores the pair;
+  `VLLM_MOET_MHC_PROJ=fused|tf32` swaps the side‑stream projection for the TileLang kernel or the
+  TF32 GEMM (the latter not bit‑identical below 33 tokens).
+
+Measured on the RTX 5090 (`test_mhc_overlap_integration.py --bench`: one boundary followed by a
+stand‑in for the sublayer, the join after it as in the decoder layer; the served path is the
+TileLang pair in front of the same stand‑in):
+
+| tokens | stand‑in | served boundary | overlapped (`ours`) | with the TileLang projection on the side stream |
+|---:|---|---:|---:|---:|
+| 1 | weight‑streaming GEMVs | +5.9 µs | **+2.7** | +8.2 |
+| 6 | weight‑streaming GEMVs | +10.2 | **+4.8** | +8.8 |
+| 6 | compute‑bound GEMM | +9.8 | **+4.2** | +8.7 |
+| 16 | weight‑streaming GEMVs | +16.1 | **+9.0** | +15.2 |
+| 32 | weight‑streaming GEMVs | +20.7 | **+11.8** | +20.6 |
+| 48 | weight‑streaming GEMVs | +23.8 | **+7.6** (TF32 path) | — |
+
+At the served shape (6 tokens) the boundary costs the step ~5 µs less than the pair; 78 boundaries
+take the shifted path (the first layer and the two Engram layers keep upstream's), so the expected
+gain was ~0.4 ms of a 12.9 ms step on the 5090 numbers. The drafter's three layers are built without
+`mhc_stream` and keep the pair (6 boundaries, ~30 µs).
+
+**In the served graph (4× RTX PRO 6000, TP4, window 5, 2026‑09‑25).** Three server starts, each
+bit‑identical to the `-moeqs` window (greedy agreement 24/24, raw completions 12/12, needle 6/6 the
+same answers, GSM8K‑200 193 = 193 with 0 flips), prefill unchanged (1.03 / 9.2 / 24.7 s at 19K /
+163K / 391K), 8 × 122K stress 0 errors, KV 3,414,865 tokens:
+
+| variant | decode graph span (rank 0, 6 tokens) | C1 prose / code steps/s | C8 prose / code |
+|---|---:|---|---|
+| `-moeqs` (window 4) | 11,152 µs | 75.7–77.9 / 77.4–77.8 | 31.7–32.0 / 34.6–34.7 |
+| a. as measured on the 5090: `record_stream`, PDL launch, fork before the kernel | 10,883 | 77.3–78.9 / 79.1–79.2 | 33.2 / 36.4 |
+| b. references instead of `record_stream`, PDL off | 10,899 | 78.0–79.6 / 79.3–79.7 | 33.0–33.1 / 36.3–36.4 |
+| c. + fork after the kernel | 10,803 | 78.1–80.2 / 79.8–80.0 | 33.6 / 36.1–36.2 |
+| **d. + the all‑reduce in front of the kernel (`fuse_mhc_all_reduce`), PDL on — served** | **10,681** | **79.0–80.6 / 80.7–80.9** | **33.4–33.7 / 36.9–37.4** |
+
+What the rank‑0 traces (`run19..22_*` in the profiles directory) showed, boundary by boundary:
+
+- The boundary kernel takes 3.8 µs (4.4 with PDL) where the pair took 5.9 + 4.7; the projection runs
+  12–16 µs on the side stream (7 alone) behind the first GEMVs, the stats kernel 5 µs behind the
+  second, both done ~30 µs into a 87 µs attention sublayer. Their bytes are not free: the first
+  GEMV and the quantizer next to them run ~0.5–1 µs longer, i.e. of the 6.9 µs the pair leaves the
+  critical path, ~1.5 come back as contention (the fn read, 1.97 MB per boundary, has to happen
+  either way; behind a bandwidth‑bound sublayer it costs its bandwidth).
+- **The kernel starts 2.2 µs after the all‑reduce ends, where the TileLang kernel started 0.2 µs
+  after it** — 77 × 2 µs ≈ 160 µs per step. Not PDL (the same gap with it on and off) and not the
+  fork order (the same after moving the fork behind the kernel — although a micro‑benchmark of the
+  captured pattern does show a kernel captured as a sibling of the side branch starting 8 µs late
+  on the RTX PRO 6000, so the order is kept). What the kernel has that the TileLang kernel had not
+  is the second parent: the decoder layer joins the side stream right before it, so in the graph
+  the kernel depends on the all‑reduce *and* on the stats kernel of the previous boundary, and a
+  node behind an NCCL node loses its fast path when it has another parent. Variant d moves the
+  join onto the all‑reduce itself through upstream's `fuse_mhc_all_reduce` (the all‑reduce leaves
+  `wo_b` / the MoE and runs in `mhc_shifted_post_pre`, right before the kernel; on sm_120 a plain
+  `all_reduce`, not the MNNVL kernel the GB200 path uses): the kernel's gap drops to 0.19 µs, the
+  all‑reduce's own gap stays at its 2.8 µs (unchanged from `-moeqs`), the attention sublayer goes
+  from 91.4 to 83.6 µs and the step from 11,152 to 10,681 µs (−4.2 %). The same all‑reduce kernel
+  on the same operands, so the bits are the same (agreement 24/24, raw 12/12).
+- `record_stream` under graph capture keeps every recorded block allocated until the capture ends:
+  +0.15 GiB of graph memory and +0.14 GiB of "peak activation" per rank, −3.2 % KV tokens
+  (3,303,226). Holding Python references on the stream object until the next boundary — by which
+  point the decoder layer has joined the stream — costs nothing and gives the KV back (3,414,865;
+  3,412,830 with PDL's slightly larger graphs).
+
+Served since 2026‑09‑25 20:50Z (`vllm-moet-sm120:dsv41-nightly-20260923-mhc`, also carrying
+vllm#57679 — step 9 — whose `_q_kv_norm_quant_kernel` replaces the norm + quantize pair in every
+attention sublayer). Left on the table: the drafter's six boundaries (its layers have no
+`mhc_stream`), an A/B of the PDL launch inside variant d (`VLLM_MOET_MHC_PDL=0`: the kernel would
+be 0.5 µs shorter if its gap stayed at 0.2 µs), and the projection's bandwidth behind the GEMVs
+(fn in fp32 is 157 MB per step; the checkpoint's fn is fp32, so bf16 storage would change bits).
+
 ## Apply / build / run
 
 ```bash
