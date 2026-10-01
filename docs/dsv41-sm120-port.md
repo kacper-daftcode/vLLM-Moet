@@ -995,6 +995,94 @@ attention sublayer). Left on the table: the drafter's six boundaries (its layers
 be 0.5 µs shorter if its gap stayed at 0.2 µs), and the projection's bandwidth behind the GEMVs
 (fn in fp32 is 157 MB per step; the checkpoint's fn is fp32, so bf16 storage would change bits).
 
+## The small-M BF16 GEMMs with cuBLAS's bits (2026‑10‑01)
+
+The checkpoint keeps a handful of projections in BF16; at decode token counts vLLM runs them on
+cuBLAS. In the served graph (`run22_mhc_fusear_pdl_c1`, rank 0, 6 tokens, 12,544 µs per step:
+decode graph 10,738 + drafter graph 1,046 + eager 586 + host) they cost:
+
+| projection | where | per step | what the trace shows |
+|---|---|---:|---|
+| indexer `weights_proj` 5120 → 32 (bf16) | aux stream 1, 8 index‑source layers | ~210 µs of main‑stream stall | cuBLAS picks a 16×16 kernel on **2 CTAs of one warp** (no split‑K): 33–40 µs next to the main stream's GEMVs; the main stream finishes `wqa_wkv` ~21 µs into the sublayer and waits until the projection is done before `_q_kv_norm_quant` — 24.6–26.9 µs in each of layers 2, 8, 20, 24, 28, 32, 36 (layer 14, with Engram, 51) |
+| MoE router 5120 → 384 (fp32) | main stream, 40 layers | 40 × ~9.4 µs | GEMM `[8,3,16]` (16 split‑K slices) 4.9 µs + `splitKreduce` 4.1 µs, then `_dsv4_topk`; 12.4 µs from the boundary kernel to `moe_quant_scatter` |
+| compressor `fused_wkv_wgate` 5120 → 1024 / 512 (fp32) | aux stream 0, layers 2/8/14 and 20 | hidden behind the stall above | `[8,4,27]` 13.3 µs + reduce 2.6 µs, `[8,4,16]` 10.4 µs |
+| indexer `wk` 512 → 128 (bf16) | main stream, 4 kv‑source layers | 4 × 4.3 µs | `[8,1,1]` |
+| drafter LM head 5120 → 32,320 / rank, target LM head | drafter graph / eager | 231 + 235 µs | 331 MB of BF16 per rank at 1.43 TB/s — **at the bandwidth floor**, nothing to win |
+| drafter Markov bias 256 → 129,280 | drafter graph, 5 sequential positions | 122 µs | 66 MB: 45 µs from DRAM, then 19 µs each from L2 — at the floor |
+
+**What decides cuBLAS's bits.** Its kernels at these shapes (`cutlass_80_wmma` 16×16 / 32×32,
+`tensorop_s16816` 64×64 / 128×64) compute every output as a chain of `mma.m16n8k16` over K inside
+each split‑K slice, in k order, starting from zero; `splitKreduce` then adds the slice partials in
+ascending slice order in fp32 (for a bf16 output it reads partials rounded to bf16). The slices are
+`gridDim.z` of one width — K / S, or ⌈K / S⌉ rounded up to 16 or 32 — the last one shorter. A
+probe that replays that model matched cuBLAS bit for bit in **every** tensor‑core case on both
+GPUs (fp32 outputs, and bf16 outputs over ≥ 60k values); two `m16n8k8` steps per 16 k do not
+match, and permuting k inside one 16‑wide step (the same for A and B) changes nothing — zero of
+637k outputs on data spread over 2^±12 — so each lane may load four consecutive k. The slice count
+is cuBLAS's choice and differs per GPU and token count; at 6 tokens:
+
+| shape | RTX PRO 6000 (188 SMs) | RTX 5090 (170 SMs) |
+|---|---|---|
+| `weights_proj` 5120 → 32 | no split | no split |
+| router 5120 → 384 | 16 × 320 | 16 × 320 |
+| compressor 5120 → 1024 | 27 × 192 | 16 × 320 |
+| compressor 5120 → 512 | 16 × 320 | 9 × 576 |
+| drafter router 5120 → 128 | 27 × 192 | 9 × 576 |
+
+**The kernels** (`tools/dsv41_sm120/bf16_gemm/`): `chain` for the no‑split case (one warp per 8
+output columns copies the 8 weight rows into shared memory in 16 `cp.async` groups and runs the
+320‑step chain while later groups are still in flight — the 320 dependent `mma`s, not the loads,
+set its pace), `split` (one CTA per 8 columns, one warp per slice holding
+its fragments in registers, partials summed in shared memory) and `spread` (the same work over all
+SMs: up to 4 slice warps per CTA, partials in an L2 workspace, the CTA that increments the tile's
+counter last does the ascending sum and resets the counter). A thread‑block cluster with
+distributed shared memory was the first idea for the cross‑CTA reduction; on sm_120 it measured
+slower than both (router on the RTX 5090: rank‑0 DSMEM loads 5.0 µs, remote stores into rank 0
+11.7 µs, cuBLAS 4.3).
+`spread`'s workspace is per stream (two calls of a shape only overlap from different streams) and
+per graph capture (one first touched inside a capture is zeroed by a node of that graph alone, so
+no other graph — which might replay first — can see it uninitialized). Configurations that ptxas
+spills are left out (`*_supported`), and the split‑K kernels are used up to 8 rows: above that the
+second row tile doubles the fragments and cuBLAS wins (compressor 5120 → 1024 at 12 tokens: 16.9 vs
+12.1 µs).
+
+**Calibration** (`bf16_replica_gemm_sm120.py`): at the first eager call of a weight shape — vLLM's
+profile run, 4096 tokens, which itself stays on cuBLAS — every token count 2..16 is tried against
+cuBLAS with that weight and wide‑range random activations, slice widths from no split to 32
+slices, and the first width that reproduces cuBLAS bit for bit on ≥ 60k outputs is kept; token
+counts without a match (1: cuBLAS's GEMV kernels), or outside the kernels' range, stay on cuBLAS.
+`wk` is first called inside graph capture (the profile run skips `_produce_k`;
+`cudagraph_num_of_warmups` is 0), so the indexer registers its shape at construction and it is
+calibrated on a random weight at the first eager call of any site. During capture only calibrated
+cases take the kernels — a captured graph computes cuBLAS's bits either way.
+
+Op level (cold weights cycled through > 3× L2, 20 calls in a CUDA graph, every case bit‑identical
+to cuBLAS):
+
+| 6 tokens | RTX PRO 6000 cuBLAS → kernel | 12 tokens |
+|---|---|---|
+| `weights_proj` (chain) | 19.9 → **7.8 µs** | 20.7 → 9.0 |
+| `wk` (chain) | 3.3 → **1.75** | 3.4 → 1.95 |
+| compressor 5120 → 1024 (split) | 11.8 → **9.9** | cuBLAS |
+| compressor 5120 → 512 (spread) | 5.3 → 5.1 | cuBLAS |
+| router (spread, opt‑in) | 5.2 → 4.9 | cuBLAS |
+| drafter router (spread, opt‑in) | 4.6 → **3.3** | cuBLAS |
+
+The router is the one place where the isolated numbers undersell the served graph (there cuBLAS's
+GEMM + reduce takes 9.4 µs next to the shared expert's kernels, not 5.2) and also the one where the
+kernel barely wins in isolation, so it is opt‑in (`VLLM_MOET_BF16_GEMM_SITES=indexer,wk,compressor,router`)
+until a served trace decides. The patch (`patch_vllm_bf16_gemm_sm120.py`, step 11, `-bf16` tag)
+replaces the compressor's and the router's `torch.mm(out_dtype=float32)` and, for `weights_proj` and
+`wk`, the `ReplicatedLinear` call where it would run `F.linear` (no bias, default unquantized GEMM,
+no `VLLM_BATCH_INVARIANT`). `VLLM_MOET_BF16_GEMM=0` turns all of it off. Not served yet; the expected
+gain is the indexer stall (~210 µs per step, if the 7.8 µs kernel still lands before the join next
+to the main stream's GEMVs) plus ~10 µs from `wk`.
+
+Found on the way and not part of this patch: the two Engram layers (1, 14) run `wkv` (MXFP8,
+6144 → 25,600, 157 MB) as a `ReplicatedLinear` — every TP rank streams the whole matrix, 2 × 125.6 µs
+per step on the main stream; a column‑parallel `wkv` with an all‑gather of the output would read a
+quarter per rank.
+
 ## Apply / build / run
 
 ```bash

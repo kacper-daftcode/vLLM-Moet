@@ -56,12 +56,19 @@
 #      a plain all-reduce here); bit-identical to the TileLang pair (test_mhc_post_norm_sm120.py,
 #      test_mhc_overlap_integration.py); served since 2026-09-25. VLLM_MOET_MHC_OVERLAP=0 turns it off at
 #      runtime.
+#  11. The small-M BF16 GEMMs of the decode step with cuBLAS's bits from one launch (patch_vllm_bf16_gemm_sm120.py
+#      + bf16_gemm/): the indexer's weights_proj (cuBLAS ran it on 2 CTAs; the main stream waited ~26 us for it in
+#      every index-source layer), the indexer's wk and the compressor projection; the MoE router optionally
+#      (VLLM_MOET_BF16_GEMM_SITES). cuBLAS's split-K slice width per shape and token count is calibrated against
+#      cuBLAS at load time, so the results are bit-identical (test_bf16_replica_gemm_sm120.py,
+#      test_bf16_gemm_integration.py). VLLM_MOET_BF16_GEMM=0 turns it off at runtime.
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-mhc .
-#   (... --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 -t ...-moeqs: steps 1-8 (the served
-#    image before the -mhc tag); --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7;
-#    -kvdedup: steps 1-6; dsv41-nightly-20260923: steps 1-5)
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .
+#   (... --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-mhc: steps 1-10 (the served image);
+#    --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-moeqs:
+#    steps 1-8; --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
+#    dsv41-nightly-20260923: steps 1-5)
 # Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-mhc KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
@@ -149,10 +156,18 @@ RUN if [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm1
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert hasattr(e, 'mhc_post_norm') and hasattr(e, 'mhc_proj'); print('sm120 mhc overlap extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mhc_post_norm_sm120/*.so; fi
 
+# 11. The small-M BF16 GEMMs with cuBLAS's bits (header); the extension is compiled here so nothing JIT-compiles at
+#     boot. GPU tests: tools/dsv41_sm120/README.md.
+ARG VLLM_MOET_BF16_GEMM=1
+RUN if [ "$VLLM_MOET_BF16_GEMM" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_bf16_gemm_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/bf16_gemm'); import bf16_replica_gemm_sm120 as b; e = b._ext(); assert hasattr(e, 'chain_out') and hasattr(e, 'spread_out'); print('sm120 bf16 gemm extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_bf16_replica_gemm_sm120/*.so; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.decoder-replay="${VLLM_PR_58132}" \
       com.vllm-moet.query-quant-gate="${VLLM_PR_57679}" \
-      com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}"
+      com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}" \
+      com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}"
