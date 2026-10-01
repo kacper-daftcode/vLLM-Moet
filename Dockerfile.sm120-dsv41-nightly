@@ -58,18 +58,19 @@
 #      runtime.
 #  11. The small-M BF16 GEMMs of the decode step with cuBLAS's bits from one launch (patch_vllm_bf16_gemm_sm120.py
 #      + bf16_gemm/): the indexer's weights_proj (cuBLAS ran it on 2 CTAs; the main stream waited ~26 us for it in
-#      every index-source layer), the indexer's wk and the compressor projection; the MoE router optionally
+#      every index-source layer), the indexer's wk and the MoE router; the compressor projection optionally
 #      (VLLM_MOET_BF16_GEMM_SITES). cuBLAS's split-K slice width per shape and token count is calibrated against
 #      cuBLAS at load time, so the results are bit-identical (test_bf16_replica_gemm_sm120.py,
-#      test_bf16_gemm_integration.py). VLLM_MOET_BF16_GEMM=0 turns it off at runtime.
+#      test_bf16_gemm_integration.py); served since 2026-10-01 (decode graph 10,707 -> 10,518 us per step).
+#      VLLM_MOET_BF16_GEMM=0 turns it off at runtime.
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .
-#   (... --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-mhc: steps 1-10 (the served image);
+#   (the served image; ... --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-mhc: steps 1-10 (served 2026-09-25 .. 10-01);
 #    --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-moeqs:
 #    steps 1-8; --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
 #    dsv41-nightly-20260923: steps 1-5)
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-mhc KV_MODE=upstream
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-bf16 KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 

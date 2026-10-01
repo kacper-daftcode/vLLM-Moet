@@ -1063,20 +1063,48 @@ to cuBLAS):
 |---|---|---|
 | `weights_proj` (chain) | 19.9 → **7.8 µs** | 20.7 → 9.0 |
 | `wk` (chain) | 3.3 → **1.75** | 3.4 → 1.95 |
-| compressor 5120 → 1024 (split) | 11.8 → **9.9** | cuBLAS |
-| compressor 5120 → 512 (spread) | 5.3 → 5.1 | cuBLAS |
-| router (spread, opt‑in) | 5.2 → 4.9 | cuBLAS |
-| drafter router (spread, opt‑in) | 4.6 → **3.3** | cuBLAS |
+| compressor 5120 → 1024 (split, opt‑in) | 11.8 → **9.9** | cuBLAS |
+| compressor 5120 → 512 (spread, opt‑in) | 5.3 → 5.1 | cuBLAS |
+| router (spread) | 5.2 → 4.9 | cuBLAS |
+| drafter router (spread) | 4.6 → **3.3** | cuBLAS |
 
-The router is the one place where the isolated numbers undersell the served graph (there cuBLAS's
-GEMM + reduce takes 9.4 µs next to the shared expert's kernels, not 5.2) and also the one where the
-kernel barely wins in isolation, so it is opt‑in (`VLLM_MOET_BF16_GEMM_SITES=indexer,wk,compressor,router`)
-until a served trace decides. The patch (`patch_vllm_bf16_gemm_sm120.py`, step 11, `-bf16` tag)
-replaces the compressor's and the router's `torch.mm(out_dtype=float32)` and, for `weights_proj` and
-`wk`, the `ReplicatedLinear` call where it would run `F.linear` (no bias, default unquantized GEMM,
-no `VLLM_BATCH_INVARIANT`). `VLLM_MOET_BF16_GEMM=0` turns all of it off. Not served yet; the expected
-gain is the indexer stall (~210 µs per step, if the 7.8 µs kernel still lands before the join next
-to the main stream's GEMVs) plus ~10 µs from `wk`.
+The patch (`patch_vllm_bf16_gemm_sm120.py`, step 11, `-bf16` tag) replaces the compressor's and the
+router's `torch.mm(out_dtype=float32)` and, for `weights_proj` and `wk`, the `ReplicatedLinear` call
+where it would run `F.linear` (no bias, default unquantized GEMM, no `VLLM_BATCH_INVARIANT`);
+`VLLM_MOET_BF16_GEMM_SITES` picks the sites, `VLLM_MOET_BF16_GEMM=0` turns all of it off.
+
+**Served (window 6, 2026‑10‑01, two starts on 4× RTX PRO 6000; rank‑0 traces `run23_bf16a_c1`,
+`run24_bf16b_c1` against the `-mhc` trace `run22`).** Calibration runs in the profile run in about a
+second, the same table on all four ranks as on the op‑level test. Both starts are bit‑identical to
+the `-mhc` window: agreement 24/24, raw completions 12/12, needle 6/6 with the same answers, GSM8K‑200
+194 vs 194 (b: 0 flips; a: 1 + 1, the C4 run‑to‑run floor), prefill unchanged, 8 × 122K stress and
+the offload probe clean. Per step, median of 10 graph replays:
+
+| decode graph (6 tokens) | attention sublayers | FFN sublayers | span | wait before `_q_kv_norm_quant` |
+|---|---:|---:|---:|---:|
+| `-mhc` | 4,506.7 µs | 5,916.1 | 10,707.5 | 263 µs |
+| a: indexer, wk, compressor | 4,332.2 | 5,914.7 | 10,526.2 | 113 |
+| **b: indexer, wk, router — served** | **4,321.4** | **5,906.2** | **10,518.1** | **98** |
+
+Single stream b gives 80.2–81.8 / 81.9–82.1 steps/s (prose / code; `-mhc` 79.0–80.6 / 80.7–80.9),
+eight streams 33.2–33.6 / 37.3–37.8 (33.4–33.7 / 36.9–37.4); GPU KV 3,401,132 tokens (−0.34 %; the
+spread kernel keeps one workspace per graph capture). What the traces show:
+
+- The gain is the indexer: in every index‑source layer the main stream waited ~26 µs for
+  `weights_proj`; with the chain kernel it waits ~6 µs (layers 24–36), ~0 in layer 2, 7.5–9.8 in
+  layers 8 and 20 (layer 14, with Engram, 29). The chain is not at its isolated 7.7 µs there but
+  12.5–15.5 (22.9 next to `split`): one dependent `mma.m16n8k16` costs 35.8 cycles and a warp cannot
+  issue them faster than ~32 cycles apart even when independent (measured on the RTX 5090), so its
+  320 steps are ~4.3 µs at best, and the main stream's GEMV warps share the SMs' tensor pipes. A ring that brings the
+  activations through shared memory too (56 instead of 188 registers, bit‑identical) is not faster
+  alone; whether it holds up better next to the GEMVs is the next served measurement.
+- The compressor is faster alone (11.8 → 9.9 µs) and slower served: the split kernel's CTAs are 27
+  warps at 64 registers, almost a whole SM each, so they start only when SMs drain (12.6 µs into the
+  sublayer instead of 5.3) and end after cuBLAS would have — it stays on cuBLAS.
+- The router saves 1.5 µs per layer between the boundary kernel and `moe_quant_scatter` (12.6 →
+  11.1 µs), but the FFN sublayers shrink by 10 µs per step in total, not 60: the FFN is bound by the
+  routed experts' and the shared expert's weight bytes (FC1 / FC2 on the main stream, the shared
+  expert on its aux stream), and an earlier FC1 only overlaps more with the shared expert.
 
 Found on the way and not part of this patch: the two Engram layers (1, 14) run `wkv` (MXFP8,
 6144 → 25,600, 157 MB) as a `ReplicatedLinear` — every TP rank streams the whole matrix, 2 × 125.6 µs

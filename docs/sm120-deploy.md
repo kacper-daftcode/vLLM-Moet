@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-mhc` (served since 2026-09-25 20:50Z; `-moeqs` = the same without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 79–80.6 steps/s, prose 170–183 / code 413–423 tok/s (DSpark k=5; `-moeqs`: 76–78 steps/s), fresh prefill 18k tok/s (CED), 3.41M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-bf16` (served since 2026-10-01 17:33Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-mhc` = the same without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 80.2–81.8 / 81.9–82.1 steps/s (prose / code), 170–187 / 420–433 tok/s (DSpark k=5; `-mhc`: 79–80.6 / 80.7–80.9), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -68,11 +68,11 @@ git clone <this repo> && cd vllm-moet
 # --build-arg VLLM_PR_58132=0 leaves it out) + the MoE input quantization fused with the DeepGEMM permutation at decode
 # shapes ("MoE glue in one launch") + vllm#57679 (the fused query norm + quantization; --build-arg VLLM_PR_57679=0 leaves
 # it out) + the mHC sublayer boundary off the decode critical path ("The mHC boundary off the critical path";
-# --build-arg VLLM_MOET_MHC_OVERLAP=0 leaves it out)
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly --build-arg VLLM_MOET_BF16_GEMM=0 -t vllm-moet-sm120:dsv41-nightly-20260923-mhc .   # ~12 min
-# DeepSeek, candidate (not served yet): the same + the small-M BF16 GEMMs with cuBLAS's bits from one launch
-# ("The small-M BF16 GEMMs with cuBLAS's bits"; step 11)
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .
+# --build-arg VLLM_MOET_MHC_OVERLAP=0 leaves it out) + the small-M BF16 GEMMs with cuBLAS's bits from one launch
+# ("The small-M BF16 GEMMs with cuBLAS's bits"; --build-arg VLLM_MOET_BF16_GEMM=0 leaves it out = the -mhc tag).
+# Images built before the commit that served it default to VLLM_MOET_BF16_GEMM_SITES=indexer,wk,compressor:
+# pass -e VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router to those
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .   # ~12 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -118,7 +118,7 @@ Run the in-image tests once per build (one GPU, ~2 min each):
 ```bash
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:qwen38-20073 -c \
   'python3 /opt/vllm-moet/qwen38_sm120/moe_gemv/test_fused_moe_integration.py'
-docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-mhc -c \
+docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-bf16 -c \
   'python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 --shapes decode &&
    python3 /opt/vllm-moet/dsv41_sm120/sm120_gemv/test_wo_a_integration.py &&
    python3 /opt/vllm-moet/dsv41_sm120/test_deepgemm_sm120_paged_mqa.py --packed-stride &&
@@ -129,11 +129,9 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
    python3 /opt/vllm-moet/dsv41_sm120/test_query_quant_gate.py &&
    python3 /opt/vllm-moet/dsv41_sm120/mhc_overlap/test_mhc_post_norm_sm120.py &&
    python3 /opt/vllm-moet/dsv41_sm120/mhc_overlap/test_mhc_overlap_integration.py &&
+   python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_replica_gemm_sm120.py &&
+   python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_gemm_integration.py &&
    cd /opt/vllm-moet/dsv41_sm120/decoder_replay && python3 -m pytest tests/models -q --noconftest'
-# the -bf16 candidate, in addition
-docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-bf16 -c \
-  'python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_replica_gemm_sm120.py &&
-   python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_gemm_integration.py'
 ```
 
 ## Serve
@@ -163,7 +161,7 @@ Runtime kill switches (env through `EXTRA_DOCKER_ARGS="-e …"`, no rebuild): `V
 back in the linear layers), `VLLM_MOET_MHC_FUSE_ALLREDUCE=0` / `VLLM_MOET_MHC_PDL=0` /
 `VLLM_MOET_MHC_PROJ=fused|tf32` (the boundary's sub-options, see the port doc),
 `VLLM_MOET_BF16_GEMM=0` (`-bf16` image: the small-M BF16 GEMMs back on cuBLAS; `VLLM_MOET_BF16_GEMM_SITES`
-picks the sites, default `indexer,wk,compressor`, `router` opt-in),
+picks the sites, served `indexer,wk,router`, `compressor` opt-in),
 `VLLM_MOET_SM120_MOE_GEMV=0` (Qwen MoE GEMV → Triton), `VLLM_MOET_SM120_MOE_GEMV_FUSE_ACT=0`,
 `VLLM_MOET_SM120_LL_GEMM=0` (Qwen skinny GEMM → cuBLAS; changes the compiled graph, so use a fresh
 `CACHE_DIR`), `VLLM_PLE_CPU_OFFLOAD=1` (Qwen PLE table in a CPU worker; then `KV_CACHE_MEMORY=`).

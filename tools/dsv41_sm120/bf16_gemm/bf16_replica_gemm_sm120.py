@@ -14,12 +14,13 @@ Shapes that are first called inside a CUDA-graph capture (the indexer's wk: the 
 up front and calibrated on a random weight at the first eager call of any site. During capture only calibrated cases
 take the kernels, so a captured graph computes the same bits as the cuBLAS one either way.
 
-Sites (VLLM_MOET_BF16_GEMM_SITES, comma-separated; default indexer,wk,compressor):
+Sites (VLLM_MOET_BF16_GEMM_SITES, comma-separated; default indexer,wk,router = the served set):
   indexer     lightning-indexer weights_proj 5120 -> 32, bf16 out (cuBLAS runs it on 2 CTAs: ~35 us on the side
               stream in the served graph, the main stream waits ~26 us for it in every index-source layer)
   wk          indexer K projection 512 -> 128, bf16 out
-  compressor  compressor fused_wkv_wgate 5120 -> 1024 / 512, fp32 out
   router      MoE gate (GateLinear tier 4) 5120 -> 384, drafter 5120 -> 128, fp32 out
+  compressor  compressor fused_wkv_wgate 5120 -> 1024 / 512, fp32 out - opt-in: faster alone, slower in the served
+              graph (the split kernel's 864-thread CTAs wait for whole SMs next to the main stream's GEMVs)
 VLLM_MOET_BF16_GEMM=0 turns all of it off (checked by the patched call sites). Where cuBLAS splits K the kernels
 are used up to VLLM_MOET_BF16_GEMM_SPLITK_MAX_M rows (8; above that they lose to cuBLAS), the one-slice chain up to 16.
 
@@ -45,7 +46,7 @@ SPLITK_MAX_M = int(os.environ.get("VLLM_MOET_BF16_GEMM_SPLITK_MAX_M", "8"))
 MIN_OUTPUTS = 60_000
 MAX_TRIALS = 256
 SPREAD_WARPS = 4
-DEFAULT_SITES = "indexer,wk,compressor"
+DEFAULT_SITES = "indexer,wk,router"
 # kernel tried first when cuBLAS splits K (the other one if the first cannot take the case); measured on the
 # RTX PRO 6000 with cold weights: compressor split 9.2 vs spread 9.7 us (cuBLAS 11.8), router spread 5.1 vs split 5.7
 SPLIT_ORDER = {"compressor": ("split", "spread"), "router": ("spread", "split")}

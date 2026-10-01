@@ -20,7 +20,7 @@ The indexer / wk layers take the kernels only when they would run F.linear (no b
 VLLM_BATCH_INVARIANT); otherwise, and whenever the module is off or a token count is not calibrated, the original
 op runs.
 Runtime switches: VLLM_MOET_BF16_GEMM=0 (all sites on cuBLAS), VLLM_MOET_BF16_GEMM_SITES (default
-indexer,wk,compressor; add router), VLLM_MOET_BF16_GEMM_SPLITK_MAX_M (8).
+indexer,wk,router; compressor opt-in), VLLM_MOET_BF16_GEMM_SPLITK_MAX_M (8).
 
 Idempotent, anchor-based. Usage:
     python3 patch_vllm_bf16_gemm_sm120.py [--attention-file PATH] [--gate-file PATH] [--kernel-dir DIR] [--check]
