@@ -98,7 +98,8 @@ does not cover the indexer format, and a file of the other format would load as 
 host-RAM region is not removed when the server stops (vLLM's default shutdown kills the engine
 before its workers clean up), so the launcher deletes regions no process maps before it starts.
 `KV_OFFLOAD_PROMPT_ONLY=0` offloads generated tokens too, so the next turn of an agent conversation
-also hits the previous answer. The served deployment runs all three (64 GiB, a disk directory, 0);
+also hits the previous answer. The served deployment runs all three (64 GiB, a disk directory, 0) and
+keeps disk files for 7 days (`TTL_HOURS=168` in the cron line: with 72 h a weekend without requests emptied the tier);
 `docs/dsv41-sm120-port.md`, "KV outside HBM".
 
 The image also runs the report's CED prefill: the layers after the last KV-source layer run on each
