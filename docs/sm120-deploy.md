@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-bf16` (served since 2026-10-01 17:33Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-mhc` = the same without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 80.2–81.8 / 81.9–82.1 steps/s (prose / code), 170–187 / 420–433 tok/s (DSpark k=5; `-mhc`: 79–80.6 / 80.7–80.9), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-engram` (served since 2026-10-02 18:23Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-bf16` = the same without the Engram wkv split, served 2026-10-01..02; `-mhc` = also without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 80.7–83.4 / 82.8–83.2 steps/s (prose / code), 169–195 / 420–433 tok/s (DSpark k=5; `-bf16`: 80.2–81.8 / 81.9–82.1), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -74,8 +74,8 @@ git clone <this repo> && cd vllm-moet
 # pass -e VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router to those
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 \
   -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .   # ~12 min
-# DeepSeek, candidate (not served yet): the same + Engram's wkv split over the TP ranks at decode token counts
-# ("The Engram wkv split at decode"; Dockerfile step 12)
+# DeepSeek, served image since 2026-10-02: the same + Engram's wkv split over the TP ranks at decode token counts
+# ("The Engram wkv split at decode"; Dockerfile step 12); the line above is the -bf16 tag served before it
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-engram .
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
@@ -137,7 +137,7 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
    python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_replica_gemm_sm120.py &&
    python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_gemm_integration.py &&
    cd /opt/vllm-moet/dsv41_sm120/decoder_replay && python3 -m pytest tests/models -q --noconftest'
-# the -engram candidate in addition (one GPU, then four):
+# the -engram image in addition (one GPU, then four):
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-engram -c \
   'python3 /opt/vllm-moet/dsv41_sm120/test_engram_wkv_tp.py'
 docker run --rm --gpus '"device=0,1,2,3"' --ipc host -e NCCL_P2P_LEVEL=SYS --entrypoint bash \

@@ -1173,8 +1173,28 @@ the result. A `ColumnParallelLinear` would also free 236 MB of weights per rank 
 prefill chunk pay the output all‑gather (+1.8 ms per layer at 4096 tokens). Only ModelOpt's MXFP8
 method on `FlashInferCutlassMxfp8LinearKernel` splits; TP = 1, sequence parallelism (the ranks hold
 different tokens) and any other linear method run `wkv(x)`. `VLLM_MOET_ENGRAM_WKV_TP=0` turns it off.
-Expected in the served graph: ~2 × 75 µs per step at one stream (~1.4 % of the decode graph), ~2 ×
-36 µs at eight; not served yet.
+
+**Served (window 7, 2026‑10‑02 18:23Z, one start on 4× RTX PRO 6000; rank‑0 trace `run25_engram_c1`
+against `run24_bf16b_c1`).** The log line `Engram wkv split over TP=4 up to 64 tokens (6400 of 25600
+output columns per rank …)` appears at the first decode‑sized warmup. Bit‑identical to the `-bf16`
+window: agreement 24/24, raw completions 12/12, needle 6/6 with the same answers, GSM8K‑200 194 vs
+194 (0 flips), prefill unchanged (163K 9.06–9.10 s, 391K 24.6 s), 8 × 122K stress and the offload
+probe clean; GPU KV 3,398,081 tokens (−0.09 %: the graphs' all‑gather buffers). Per step, median of 10
+graph replays:
+
+| decode graph (6 tokens) | attention sublayers | FFN sublayers | span |
+|---|---:|---:|---:|
+| `-bf16` | 4,321.4 µs | 5,906.2 | 10,518.1 |
+| **`-engram` — served** | **4,207.4** | **5,942.4** | **10,437.2** |
+
+The two segments with Engram shrink by 65.3 and 60.6 µs: the slice GEMV runs [800,1,1] in 31–32 µs
+(125 before), followed by a ~5.6 µs gap — the graph executor puts the NCCL node on another branch —
+the output all‑gather (16–18 µs, 4 channels), its layout copy (2.0) and the post kernel (3.3). The FFN
+right after each Engram layer is 7–9 µs slower in this start (FC1 74 → 85 µs, the shared expert's
+GEMV 45 → 53 next to it) and the other FFN segments +0.9 µs each (run‑to‑run): the step is −81 µs
+(−0.8 %), not the −150 the isolated forward predicted. Decode: one stream 80.7–83.4 / 82.8–83.2
+steps/s (prose / code; `-bf16` 80.2–81.8 / 81.9–82.1), eight streams 33.3–33.9 / 36.2–39.7 (33.2–33.6 /
+37.3–37.8; the code runs at eight scatter by ±5 % in this window).
 
 ## Apply / build / run
 

@@ -6,7 +6,7 @@
 # picks the right KV plumbing for either.
 #
 # Required:  MODEL_DIR   directory with the official DeepSeek-V4.1-Flash checkpoint
-# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-20260923-bf16)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-20260923-engram)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1: only local; "" = all interfaces)
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm
 #                        (FlashInfer autotune + JIT, DeepGEMM JIT; first start ~25 min, later ~17 min)
@@ -70,7 +70,7 @@
 # the model stream again, all-reduce back in the linear layers; sub-options VLLM_MOET_MHC_FUSE_ALLREDUCE=0,
 # VLLM_MOET_MHC_PDL=0, VLLM_MOET_MHC_PROJ=fused|tf32), VLLM_MOET_BF16_GEMM=0 (the -bf16 image runs the small-M
 # BF16 GEMMs on cuBLAS again; VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router[,compressor] picks the sites),
-# VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram candidate runs Engram's wkv replicated at decode again).
+# VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram image runs Engram's wkv replicated at decode again).
 # Pass them with EXTRA_DOCKER_ARGS="-e VAR=0". enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,
@@ -80,7 +80,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-bf16}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-engram}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
