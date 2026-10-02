@@ -1111,6 +1111,71 @@ Found on the way and not part of this patch: the two Engram layers (1, 14) run `
 per step on the main stream; a column‑parallel `wkv` with an all‑gather of the output would read a
 quarter per rank.
 
+## The Engram wkv split at decode (2026‑10‑02)
+
+Engram's value/key projection `wkv` (MXFP8, 6144 → 25,600, 157 MB, layers 1 and 14) is a
+`ReplicatedLinear`, so every TP rank streams the whole matrix. In the served graph (`run24_bf16b_c1`,
+rank 0, 6 tokens) each Engram layer runs on the main stream: the all‑gather of the hash‑head rows
+(`ncclDevKernel_AllGather_RING_LL`, 8.9 µs) and its layout copy (2.0), the MXFP8 quantization (1.5),
+**`mxfp8_mma_gemv_v3_kernel<1>` [3200,1,1] 122.9 µs** (median of 78; ~1.28 TB/s, the floor for a
+replica) and the post‑wkv kernel (3.4). The input is the same on every rank after the first
+all‑gather, so a rank can compute a quarter of the output columns and all‑gather the rest.
+
+**Why the split is exact.** Both kernels behind vLLM's MXFP8 linear compute an output column in one
+block over the full K, whatever N is: the vLLM‑Moet GEMV (v3 up to 8 rows, v1 up to 16; 8 columns
+per block, K strided over the block's 8 warps the same way for every N, no split‑K at the default
+`VLLM_MOET_GEMV_V3_SPLITK_MAX=1`) and FlashInfer's SM120 CUTLASS GEMM above 16 rows (persistent
+scheduler over whole output tiles, 128 × 32/64/128 with and without swap‑AB — 6 tactics, none with
+split‑K or stream‑K). The F8_128x4 scale layout is stored tile by tile (128 rows × all K blocks), so
+the swizzled scales of a rank's 6400 rows (50 tiles) are one contiguous byte range of the full
+layer's, and the rank's weight is a view of its rows. `test_engram_wkv_tp.py` (RTX 5090 and RTX PRO
+6000; synthetic weights and the checkpoint's layers 1 and 14): the full weight against `cat` of its
+four row slices on the GEMV (1–16 tokens) and on each CUTLASS tactic and vLLM's `mm_mxfp8` call
+(1–64 tokens, prefill sizes up to 4096), 562 (tokens, kernel) cases per weight — **0 differing
+outputs**, and the 6 tactics agree with each other bit for bit (FlashInfer's autotuner may pick a
+different one for the slice than for the full shape). The same through the real `ReplicatedLinear`
+loaded from checkpoint‑format tensors, eagerly and from CUDA graphs. `test_engram_wkv_tp4.py` runs the
+patched `Engram` (lookup, row all‑gather, `wkv`, post kernel) on four real ranks with NCCL against the
+replicated path: identical for 1–4096 tokens, eagerly and with the all‑gather captured in a graph.
+
+**Where the split pays.** RTX PRO 6000, cold weights, 20 calls in a graph, per layer:
+
+| tokens | kernel | 25,600 columns | 6,400 columns |
+|---:|---|---:|---:|
+| 1 | GEMV | 107.8 µs | 29.5 µs |
+| 6 | GEMV | 108.9 | **30.7** |
+| 12 | GEMV | 115.8 | 36.0 |
+| 48 | CUTLASS | 136.9 | 49.7 |
+| 4096 | CUTLASS | 3,402 | 857 |
+
+Four RTX PRO 6000 (the serving host's GPUs 0–3, next to an idle Qwen3.8 server), the all‑gather of the
+[T, 6400] slices and the whole Engram forward:
+
+| tokens | all‑gather | Engram forward, replicated → split |
+|---:|---:|---:|
+| 1 (graph) | 10.5 µs | 125.6 → 37.5 µs |
+| 6 (graph) | 20.9 | **131.8 → 56.5** |
+| 12 (graph) | 35.0 | 140.6 → 81.7 |
+| 24 (graph) | 43.3 | 168.5 → 118.3 |
+| 48 (graph) | 67.9 | 194.9 → 159.8 |
+| 64 (graph) | 84.8 | 207.7 → 187.2 |
+| 65 (eager) | 92 | 340 → 363 |
+| 128 (eager) | 164 | 336 → 374 |
+| 4096 (eager) | 4,461 | 5,025 → 6,820 |
+
+The all‑gather grows by ~1.1 µs per token (35 GB/s per rank at 4096 tokens), more than the ~0.6 µs
+per token the GEMM saves, so the split loses above ~64 tokens. The patch
+(`patch_vllm_engram_wkv_tp.py`, step 12, `-engram` tag) therefore keeps `wkv` replicated — the
+weights, the profile run and every prefill chunk are unchanged — and splits only up to
+`VLLM_MOET_ENGRAM_WKV_TP_MAX_TOKENS` = 64 tokens (every decode graph of this deployment):
+`_moet_engram_wkv` runs the layer's own `quant_method.apply` on the rank's views and all‑gathers
+the result. A `ColumnParallelLinear` would also free 236 MB of weights per rank but make every
+prefill chunk pay the output all‑gather (+1.8 ms per layer at 4096 tokens). Only ModelOpt's MXFP8
+method on `FlashInferCutlassMxfp8LinearKernel` splits; TP = 1, sequence parallelism (the ranks hold
+different tokens) and any other linear method run `wkv(x)`. `VLLM_MOET_ENGRAM_WKV_TP=0` turns it off.
+Expected in the served graph: ~2 × 75 µs per step at one stream (~1.4 % of the decode graph), ~2 ×
+36 µs at eight; not served yet.
+
 ## Apply / build / run
 
 ```bash

@@ -69,7 +69,8 @@
 # decode shapes), VLLM_MOET_MHC_OVERLAP=0 (the -mhc image runs the mHC boundary as the TileLang pair on
 # the model stream again, all-reduce back in the linear layers; sub-options VLLM_MOET_MHC_FUSE_ALLREDUCE=0,
 # VLLM_MOET_MHC_PDL=0, VLLM_MOET_MHC_PROJ=fused|tf32), VLLM_MOET_BF16_GEMM=0 (the -bf16 image runs the small-M
-# BF16 GEMMs on cuBLAS again; VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router[,compressor] picks the sites).
+# BF16 GEMMs on cuBLAS again; VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router[,compressor] picks the sites),
+# VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram candidate runs Engram's wkv replicated at decode again).
 # Pass them with EXTRA_DOCKER_ARGS="-e VAR=0". enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,

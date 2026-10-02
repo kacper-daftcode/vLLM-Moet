@@ -63,10 +63,17 @@
 #      cuBLAS at load time, so the results are bit-identical (test_bf16_replica_gemm_sm120.py,
 #      test_bf16_gemm_integration.py); served since 2026-10-01 (decode graph 10,707 -> 10,518 us per step).
 #      VLLM_MOET_BF16_GEMM=0 turns it off at runtime.
+#  12. Engram's wkv (MXFP8 6144 -> 25600, 157 MB, layers 1 and 14) split by output columns over the TP ranks at
+#      decode token counts (patch_vllm_engram_wkv_tp.py): vLLM replicates it, so every rank streamed the whole
+#      weight (123 us per layer in the served decode graph); up to 64 tokens a rank now runs the same kernel on its
+#      6400 rows of the loaded weight and an all-gather rebuilds the output - bit-identical (test_engram_wkv_tp.py,
+#      test_engram_wkv_tp4.py). Above that the all-gather costs more than it saves, so prefill and the weights stay
+#      as they were. VLLM_MOET_ENGRAM_WKV_TP=0 turns it off at runtime.
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .
-#   (the served image; ... --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-mhc: steps 1-10 (served 2026-09-25 .. 10-01);
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-engram .
+#   (... --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 -t ...-bf16: steps 1-11 (the served image);
+#    --build-arg VLLM_MOET_BF16_GEMM=0 --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 -t ...-mhc: steps 1-10 (served 2026-09-25 .. 10-01);
 #    --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-moeqs:
 #    steps 1-8; --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
 #    dsv41-nightly-20260923: steps 1-5)
@@ -164,11 +171,17 @@ RUN if [ "$VLLM_MOET_BF16_GEMM" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/bf16_gemm'); import bf16_replica_gemm_sm120 as b; e = b._ext(); assert hasattr(e, 'chain_out') and hasattr(e, 'spread_out'); print('sm120 bf16 gemm extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_bf16_replica_gemm_sm120/*.so; fi
 
+# 12. Engram's wkv split by output columns (header); no extension. GPU test: tools/dsv41_sm120/README.md.
+ARG VLLM_MOET_ENGRAM_WKV_TP=1
+RUN if [ "$VLLM_MOET_ENGRAM_WKV_TP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_engram_wkv_tp.py \
+    && python3 -c "import vllm.models.deepseek_v41.common.engram as e; assert hasattr(e, '_moet_engram_wkv'); print('engram wkv split patched')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.decoder-replay="${VLLM_PR_58132}" \
       com.vllm-moet.query-quant-gate="${VLLM_PR_57679}" \
       com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}" \
-      com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}"
+      com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}" \
+      com.vllm-moet.engram-wkv-tp="${VLLM_MOET_ENGRAM_WKV_TP}"

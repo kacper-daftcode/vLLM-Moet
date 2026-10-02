@@ -72,7 +72,11 @@ git clone <this repo> && cd vllm-moet
 # ("The small-M BF16 GEMMs with cuBLAS's bits"; --build-arg VLLM_MOET_BF16_GEMM=0 leaves it out = the -mhc tag).
 # Images built before the commit that served it default to VLLM_MOET_BF16_GEMM_SITES=indexer,wk,compressor:
 # pass -e VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router to those
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .   # ~12 min
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 \
+  -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .   # ~12 min
+# DeepSeek, candidate (not served yet): the same + Engram's wkv split over the TP ranks at decode token counts
+# ("The Engram wkv split at decode"; Dockerfile step 12)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-engram .
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -133,6 +137,11 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
    python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_replica_gemm_sm120.py &&
    python3 /opt/vllm-moet/dsv41_sm120/bf16_gemm/test_bf16_gemm_integration.py &&
    cd /opt/vllm-moet/dsv41_sm120/decoder_replay && python3 -m pytest tests/models -q --noconftest'
+# the -engram candidate in addition (one GPU, then four):
+docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120:dsv41-nightly-20260923-engram -c \
+  'python3 /opt/vllm-moet/dsv41_sm120/test_engram_wkv_tp.py'
+docker run --rm --gpus '"device=0,1,2,3"' --ipc host -e NCCL_P2P_LEVEL=SYS --entrypoint bash \
+  vllm-moet-sm120:dsv41-nightly-20260923-engram -c 'torchrun --nproc_per_node=4 /opt/vllm-moet/dsv41_sm120/test_engram_wkv_tp4.py'
 ```
 
 ## Serve
@@ -163,6 +172,8 @@ back in the linear layers), `VLLM_MOET_MHC_FUSE_ALLREDUCE=0` / `VLLM_MOET_MHC_PD
 `VLLM_MOET_MHC_PROJ=fused|tf32` (the boundary's sub-options, see the port doc),
 `VLLM_MOET_BF16_GEMM=0` (`-bf16` image: the small-M BF16 GEMMs back on cuBLAS; `VLLM_MOET_BF16_GEMM_SITES`
 picks the sites, served `indexer,wk,router`, `compressor` opt-in),
+`VLLM_MOET_ENGRAM_WKV_TP=0` (`-engram` image: Engram's wkv replicated at every token count again;
+`VLLM_MOET_ENGRAM_WKV_TP_MAX_TOKENS`, default 64, is the largest token count that splits),
 `VLLM_MOET_SM120_MOE_GEMV=0` (Qwen MoE GEMV → Triton), `VLLM_MOET_SM120_MOE_GEMV_FUSE_ACT=0`,
 `VLLM_MOET_SM120_LL_GEMM=0` (Qwen skinny GEMM → cuBLAS; changes the compiled graph, so use a fresh
 `CACHE_DIR`), `VLLM_PLE_CPU_OFFLOAD=1` (Qwen PLE table in a CPU worker; then `KV_CACHE_MEMORY=`).
