@@ -16,6 +16,10 @@ GEMM takes it as is. Same fp8 bytes and scales as vLLM's kernels; the slot each 
 pair gets inside its expert's block is deterministic here and atomic-ordered in vLLM (the
 per-row GEMM results and the gathered output do not depend on it).
 
+The kernel is launched with programmatic stream serialization (VLLM_MOET_MOE_QUANT_SCATTER_PDL, default 1; 0 = the
+plain launch): it starts while the router's top-k kernel (PDL, releases its dependents before its stores) drains and
+waits for it before its first load, and it releases DeepGEMM's FC1 (PDL) right after that wait. Same bytes either way.
+
 The first import compiles the extension with torch.utils.cpp_extension.load (~30 s, cached under
 $TORCH_EXTENSIONS_DIR or ~/.cache/torch_extensions).
 """
@@ -32,6 +36,8 @@ _HERE = Path(__file__).resolve().parent
 GROUP_SIZE = 128
 FP8_MIN, FP8_MAX = -448.0, 448.0  # torch.float8_e4m3fn
 EPS = 1e-10  # per_token_group_quant_fp8 default
+# Programmatic dependent launch (the default of `pdl=`); tests may set it.
+PDL = os.environ.get("VLLM_MOET_MOE_QUANT_SCATTER_PDL", "1") == "1"
 
 
 @functools.lru_cache(maxsize=None)
@@ -90,9 +96,12 @@ def fused_quant_permute(
     align: int,
     aq_out: torch.Tensor | None = None,
     software_cvt: bool = False,
+    pdl: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns (aq [M_sum, K] e4m3, aq_scale int32 [M_sum, ceil(K/128/4)] strides (1, M_sum),
     expert_ids int32 [M_sum] (-1 = padding), inv_perm int32 [M, topk])."""
+    if pdl is None:
+        pdl = PDL
     M, K = x.shape
     dev = x.device
     if aq_out is None:
@@ -104,6 +113,6 @@ def fused_quant_permute(
     inv_perm = torch.empty(topk_ids.shape, device=dev, dtype=torch.int32)
     _ext().moe_quant_scatter(
         x, topk_ids, aq_out, aq_scale, expert_ids, inv_perm, local_num_experts, align, EPS, FP8_MIN, FP8_MAX,
-        software_cvt,
+        software_cvt, bool(pdl),
     )
     return aq_out, aq_scale, expert_ids, inv_perm

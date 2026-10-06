@@ -23,6 +23,13 @@ Sites (VLLM_MOET_BF16_GEMM_SITES, comma-separated; default indexer,wk,router = t
               graph (the split kernel's 864-thread CTAs wait for whole SMs next to the main stream's GEMVs)
 VLLM_MOET_BF16_GEMM=0 turns all of it off (checked by the patched call sites). Where cuBLAS splits K the kernels
 are used up to VLLM_MOET_BF16_GEMM_SPLITK_MAX_M rows (8; above that they lose to cuBLAS), the one-slice chain up to 16.
+VLLM_MOET_BF16_CHAIN=v2 takes the ring variant of the one-slice chain (the activations through shared memory too;
+calibrated like the rest - a token count it does not reproduce falls back to v1, then to cuBLAS); v1 is the default.
+VLLM_MOET_BF16_GEMM_PDL lists the sites whose kernels launch with programmatic stream serialization (they start while
+the kernel before them drains, only the weights in flight before griddepcontrol.wait): default router - in the served
+graph the router follows the PDL-launched mHC boundary kernel on the same branch and starts during it; the chains
+gain nothing (weights_proj sits on its own graph branch, wk's predecessor releases nothing early). 1 / all = every
+site, 0 = plain launches. Neither switch changes a bit of the result.
 
 The first import compiles the extension with torch.utils.cpp_extension.load (~60 s, cached under
 $TORCH_EXTENSIONS_DIR or ~/.cache/torch_extensions; the serving image compiles it at build time).
@@ -50,6 +57,27 @@ DEFAULT_SITES = "indexer,wk,router"
 # kernel tried first when cuBLAS splits K (the other one if the first cannot take the case); measured on the
 # RTX PRO 6000 with cold weights: compressor split 9.2 vs spread 9.7 us (cuBLAS 11.8), router spread 5.1 vs split 5.7
 SPLIT_ORDER = {"compressor": ("split", "spread"), "router": ("spread", "split")}
+# The one-slice chain: "chain" (v1, weights through shared memory, activations prefetched into registers) or "ring"
+# (v2, both through a shared-memory ring). Read when a shape is calibrated; tests may set it.
+CHAIN = "ring" if os.environ.get("VLLM_MOET_BF16_CHAIN", "v1") == "v2" else "chain"
+
+
+def _pdl_setting(value: str) -> bool | frozenset[str]:
+    value = value.strip()
+    if value in ("1", "all"):
+        return True
+    if value in ("0", ""):
+        return False
+    return frozenset(s.strip() for s in value.split(",") if s.strip())
+
+
+# Programmatic dependent launch: True (every site), False (none) or the sites that use it. Read at every launch;
+# tests may set it.
+PDL = _pdl_setting(os.environ.get("VLLM_MOET_BF16_GEMM_PDL", "router"))
+
+
+def pdl_for(site: str | None) -> bool:
+    return PDL if isinstance(PDL, bool) else site in PDL
 
 try:
     from vllm.logger import init_logger
@@ -90,16 +118,17 @@ def cublas_mm(x: torch.Tensor, w: torch.Tensor, out_f32: bool) -> torch.Tensor:
 
 @dataclass(frozen=True)
 class Case:
-    kind: str  # "chain" (one slice), "split" or "spread"
-    step: int  # slice width (k); == K for "chain"
+    kind: str  # "chain" / "ring" (one slice: chain v1 / v2), "split" or "spread"
+    step: int  # slice width (k); == K for the chains
     pbf16: bool  # partials rounded to bf16 before the reduction (cuBLAS's bf16-workspace splitKreduce)
 
 
 class Shape:
     """Calibrated cases of one weight shape / output dtype / activation row stride on one device."""
 
-    def __init__(self, n: int, k: int, out_f32: bool, ldx: int, device: torch.device):
+    def __init__(self, n: int, k: int, out_f32: bool, ldx: int, device: torch.device, site: str | None = None):
         self.n, self.k, self.out_f32, self.ldx, self.device = n, k, out_f32, ldx, device
+        self.site = site  # the site that calibrated it (its PDL setting applies when a call names no site)
         self.cases: dict[int, Case] = {}
         # (slice count, stream, capture) -> (partials, tile counters) of the spread kernel. Per stream: two calls of
         # one shape run concurrently only from different streams (also as nodes of a captured graph). Per capture:
@@ -120,7 +149,12 @@ class Shape:
         runs: list[list] = []
         for m in range(1, MAX_M + 1):
             c = self.cases.get(m)
-            label = "cuBLAS" if c is None else (c.kind if c.kind == "chain" else f"{c.kind} {self.k // c.step + (self.k % c.step > 0)}x{c.step}")
+            if c is None:
+                label = "cuBLAS"
+            elif c.kind in ("chain", "ring"):
+                label = "chain" if c.kind == "chain" else "chain v2"
+            else:
+                label = f"{c.kind} {self.k // c.step + (self.k % c.step > 0)}x{c.step}"
             if runs and runs[-1][2] == label:
                 runs[-1][1] = m
             else:
@@ -151,23 +185,24 @@ def _candidates(k: int):
 
 def _supported(kind: str, m: int, n: int, k: int, step: int) -> bool:
     ext = _ext()
-    if kind == "chain":
+    if kind in ("chain", "ring"):
         return step == k and ext.chain_supported(m, n, k)
     if kind == "split":
         return ext.split_supported(m, n, k, step)
     return ext.spread_supported(m, n, k, step)
 
 
-def _run(shape: Shape, case: Case, x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
+def _run(shape: Shape, case: Case, x: torch.Tensor, w: torch.Tensor, out: torch.Tensor, site: str | None = None) -> None:
     ext = _ext()
-    if case.kind == "chain":
-        ext.chain_out(x, w, out)
+    pdl = pdl_for(site or shape.site)
+    if case.kind in ("chain", "ring"):
+        ext.chain_out(x, w, out, case.kind == "ring", pdl)
     elif case.kind == "split":
-        ext.split_out(x, w, out, case.step, case.pbf16)
+        ext.split_out(x, w, out, case.step, case.pbf16, pdl)
     else:
         slices = -(-shape.k // case.step)
         ws, cnt = shape.workspace(slices)
-        ext.spread_out(x, w, out, case.step, case.pbf16, ws, cnt, SPREAD_WARPS)
+        ext.spread_out(x, w, out, case.step, case.pbf16, ws, cnt, SPREAD_WARPS, pdl)
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -189,7 +224,7 @@ def _random_x(m: int, k: int, ldx: int, device: torch.device, seed: int) -> torc
 def calibrate(w: torch.Tensor, out_f32: bool, ldx: int, site: str) -> Shape:
     """Find, for every token count 2..16, the slice width that reproduces cuBLAS's bits for this weight shape."""
     n, k = w.shape
-    shape = Shape(n, k, out_f32, ldx, w.device)
+    shape = Shape(n, k, out_f32, ldx, w.device, site)
     order = ("chain",) + SPLIT_ORDER.get(site, ("spread", "split"))
     for m in range(2, MAX_M + 1):
         trials = max(2, min(MAX_TRIALS, -(-MIN_OUTPUTS // (m * n))))
@@ -198,29 +233,33 @@ def calibrate(w: torch.Tensor, out_f32: bool, ldx: int, site: str) -> Shape:
         found = None
         for step in _candidates(k):
             slices = -(-k // step)
-            kinds = ("chain",) if slices == 1 else (order[1:] if m <= SPLITK_MAX_M else ())
-            kind = next((kd for kd in kinds if _supported(kd, m, n, k, step)), None)
-            if kind is None:
-                continue
-            for pb in (False,) if (out_f32 or slices == 1) else (False, True):
-                case = Case(kind, step, pb)
-                out = torch.empty(m, n, device=w.device, dtype=torch.float32 if out_f32 else torch.bfloat16)
-                ok = True
-                for sd, ref in zip(seeds, refs):
-                    _run(shape, case, _random_x(m, k, ldx, w.device, sd), w, out)
-                    if not torch.equal(_bits(out), ref):
-                        ok = False
+            if slices == 1:  # the configured chain, v1 if that one does not reproduce cuBLAS
+                kinds = tuple(kd for kd in dict.fromkeys((CHAIN, "chain")) if _supported(kd, m, n, k, step))
+            else:  # the first split-K kernel that can take the case
+                kinds = order[1:] if m <= SPLITK_MAX_M else ()
+                kinds = tuple(kd for kd in kinds if _supported(kd, m, n, k, step))[:1]
+            for kind in kinds:
+                for pb in (False,) if (out_f32 or slices == 1) else (False, True):
+                    case = Case(kind, step, pb)
+                    out = torch.empty(m, n, device=w.device, dtype=torch.float32 if out_f32 else torch.bfloat16)
+                    ok = True
+                    for sd, ref in zip(seeds, refs):
+                        _run(shape, case, _random_x(m, k, ldx, w.device, sd), w, out)
+                        if not torch.equal(_bits(out), ref):
+                            ok = False
+                            break
+                    if ok:
+                        found = case
                         break
-                if ok:
-                    found = case
+                if found is not None:
                     break
             if found is not None:
                 break
         if found is not None:
             shape.cases[m] = found
     _logger.info(
-        "vllm-moet sm_120 BF16 GEMM %d->%d %s (%s): %s",
-        k, n, "fp32" if out_f32 else "bf16", site, shape.describe(),
+        "vllm-moet sm_120 BF16 GEMM %d->%d %s (%s): %s%s",
+        k, n, "fp32" if out_f32 else "bf16", site, shape.describe(), " (PDL launch)" if pdl_for(site) else "",
     )
     return shape
 
@@ -267,7 +306,7 @@ def replica_mm(x: torch.Tensor, w: torch.Tensor, out_f32: bool, site: str) -> to
     if case is None or x.data_ptr() % 16 or w.data_ptr() % 16 or x.stride(0) % 8:
         return cublas_mm(x, w, out_f32)
     out = torch.empty(x.shape[0], n, device=x.device, dtype=torch.float32 if out_f32 else torch.bfloat16)
-    _run(shape, case, x, w, out)
+    _run(shape, case, x, w, out, site)
     return out
 
 

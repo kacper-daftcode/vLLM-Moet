@@ -70,11 +70,31 @@
 #      test_engram_wkv_tp4.py). Above that the all-gather costs more than it saves, so prefill and the weights stay
 #      as they were; served since 2026-10-02 (decode graph 10,518 -> 10,437 us per step). VLLM_MOET_ENGRAM_WKV_TP=0
 #      turns it off at runtime.
+#  13. NCCL's serialEvent record nodes reduced to the last one per event in every captured graph
+#      (nccl_graph/patch_vllm_nccl_graph_records.py + nccl_graph_records.py): with graph mixing on (NCCL's default)
+#      NCCL records its communicator's event after every captured collective, and the graph executor starts each
+#      NCCL kernel ~2.8 us after its predecessor, on another stream (80 all-reduces per decode step). Only the last
+#      record matters, so the GPU model runner's FULL graphs, the breakable PIECEWISE segments and CUDAGraphWrapper
+#      are captured with keep_graph=True, rewritten and instantiated - NCCL's default mode and semantics,
+#      bit-identical (test_nccl_graph_records_tp4.py). VLLM_MOET_NCCL_GRAPH_RECORDS=0 captures as before.
+#  14. FC2's padding rows out of L2 without a write-back at decode token counts (patch_vllm_moe_fc2_discard_sm120.py
+#      + moe_l2/): DeepGEMM's grouped FC2 writes whole 64-row tiles, so at 6 tokens ~2268 of its 2304 output rows
+#      (23 MB per MoE layer) are padding nobody reads, and the next FC1 paid for their write-back. Right after FC2
+#      their lines are invalidated (discard.global.L2) - bit-identical (test_moe_l2_discard_sm120.py); 2..64 tokens
+#      (VLLM_MOET_MOE_FC2_DISCARD_MIN_TOKENS / _MAX_TOKENS). VLLM_MOET_MOE_FC2_DISCARD=0 turns it off at runtime.
+#  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
+#  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
+#  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
+#  boundary kernel's PDL variant (VLLM_MOET_MHC_PDL) reads only its norm weight before griddepcontrol.wait - and the
+#  indexer's one-slice chain has an opt-in ring variant (VLLM_MOET_BF16_CHAIN=v2). All bit-identical; =0 restores
+#  the plain launches.
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-engram .
-#   (the served image; ... --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 -t ...-bf16: steps 1-11 (served 2026-10-01 .. 10-02);
-#    --build-arg VLLM_MOET_BF16_GEMM=0 --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 -t ...-mhc: steps 1-10 (served 2026-09-25 .. 10-01);
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-pdl .
+#   (candidate, not served yet; the served -engram image is this file's steps 1-12 at commit f7cc6d9 - on this tree
+#    the -pdl image with VLLM_MOET_GEMV_PDL=0 VLLM_MOET_BF16_GEMM_PDL=0 VLLM_MOET_MOE_QUANT_SCATTER_PDL=0
+#    VLLM_MOET_NCCL_GRAPH_RECORDS=0 VLLM_MOET_MOE_FC2_DISCARD=0 launches the same kernels; older tags: steps 1-11 =
+#    -bf16 (served 2026-10-01 .. 10-02); 1-10 = -mhc (served 2026-09-25 .. 10-01);
 #    --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-moeqs:
 #    steps 1-8; --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
 #    dsv41-nightly-20260923: steps 1-5)
@@ -177,12 +197,27 @@ ARG VLLM_MOET_ENGRAM_WKV_TP=1
 RUN if [ "$VLLM_MOET_ENGRAM_WKV_TP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_engram_wkv_tp.py \
     && python3 -c "import vllm.models.deepseek_v41.common.engram as e; assert hasattr(e, '_moet_engram_wkv'); print('engram wkv split patched')"; fi
 
+# 13. NCCL's per-collective serialEvent record nodes reduced to the last one in every captured graph (header); no extension.
+ARG VLLM_MOET_NCCL_GRAPH_RECORDS=1
+RUN if [ "$VLLM_MOET_NCCL_GRAPH_RECORDS" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/nccl_graph/patch_vllm_nccl_graph_records.py \
+    && python3 -c "import vllm.v1.worker.gpu.cudagraph_utils as c, vllm.compilation.breakable_cudagraph as b, vllm.compilation.cuda_graph as w; assert all(hasattr(m, '_moet_nccl') for m in (c, b, w)); print('nccl graph records patched')"; fi
+
+# 14. FC2's padding rows out of L2 at decode token counts (header); the extension is compiled here so nothing
+#     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
+ARG VLLM_MOET_MOE_FC2_DISCARD=1
+RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_fc2_discard_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_l2'); import moe_l2_discard_sm120 as l; e = l._ext(); assert hasattr(e, 'discard_padding_rows'); print('sm120 moe l2 discard extension built')" \
+    && python3 -c "import vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe as d; assert hasattr(d, '_moet_drop_padding_rows'); print('moe fc2 discard patched')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_l2_discard_sm120/*.so; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.decoder-replay="${VLLM_PR_58132}" \
       com.vllm-moet.query-quant-gate="${VLLM_PR_57679}" \
       com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}" \
       com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}" \
-      com.vllm-moet.engram-wkv-tp="${VLLM_MOET_ENGRAM_WKV_TP}"
+      com.vllm-moet.engram-wkv-tp="${VLLM_MOET_ENGRAM_WKV_TP}" \
+      com.vllm-moet.nccl-graph-records="${VLLM_MOET_NCCL_GRAPH_RECORDS}" \
+      com.vllm-moet.moe-fc2-discard="${VLLM_MOET_MOE_FC2_DISCARD}"

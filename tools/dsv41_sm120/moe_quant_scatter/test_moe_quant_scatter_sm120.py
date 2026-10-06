@@ -14,9 +14,16 @@ scales zero in both; the gathered MoE output bit-identical. Shapes: the served d
 (E=384, K=5120, I=640, top-6, 1..64 tokens) plus edge cases (one expert for everything, invalid
 -1 routing slots, K/128 not a multiple of 4, fp16, zero rows, huge rows).
 
+The fused kernel runs with the launch the environment selects (VLLM_MOET_MOE_QUANT_SCATTER_PDL); then, whatever
+the environment, its PDL launch behind a predecessor that releases its dependents at once and only ~20 us later
+writes the rows or the routing (or reads the fp8 workspace): the same bytes as the plain launch on the final inputs,
+the workspace's old contents seen by the predecessor - eagerly and inside a CUDA graph.
+
 Run inside the ds41 image on one sm_120 GPU:
     python3 test_moe_quant_scatter_sm120.py            # correctness
     python3 test_moe_quant_scatter_sm120.py --bench    # + per-stage CUDA-graph timings / profile
+    --chain-experts N: experts of the full DeepGEMM chain check (default the served 384; fewer = less memory,
+    e.g. next to a serving job)
 """
 
 from __future__ import annotations
@@ -45,6 +52,107 @@ from vllm.utils.deep_gemm import (  # noqa: E402
     m_grouped_fp8_fp4_gemm_nt_contiguous,
     mk_alignment_scope,
 )
+
+
+# A predecessor for the PDL checks: releases its programmatic dependents at once, spins, then copies src -> dst.
+RACER_SRC = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+__global__ void racer_kernel(const int* src, int* dst, int n, long long spin_ns) {
+  asm volatile("griddepcontrol.launch_dependents;");
+  long long t0, t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < spin_ns);
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+void racer(torch::Tensor src, torch::Tensor dst, int64_t spin_ns) {
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous() && src.nbytes() == dst.nbytes() && src.nbytes() % 4 == 0);
+  racer_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream().stream()>>>(
+      (const int*)src.data_ptr(), (int*)dst.data_ptr(), (int)(src.nbytes() / 4), spin_ns);
+}
+"""
+SPIN_NS = 20_000
+
+
+def racer():
+    if not hasattr(racer, "ext"):
+        from torch.utils.cpp_extension import load_inline
+
+        racer.ext = load_inline("vllm_moet_test_pdl_racer", cpp_sources="void racer(torch::Tensor, torch::Tensor, int64_t);",
+                                cuda_sources=RACER_SRC, functions=["racer"], extra_cuda_cflags=["-O3"])
+    return racer.ext.racer
+
+
+def check_pdl(dev) -> int:
+    """The PDL launch against the plain one on the final inputs, behind a predecessor that releases its dependents at
+    once and writes the rows / the routing ~20 us later (RAW) or reads the fp8 workspace then (WAR)."""
+    E, K, TOPK = 384, 5120, 6
+    race = racer()
+    block_m = get_mk_alignment_for_contiguous_layout()[0]
+    fails, n_checks = 0, 0
+
+    def outputs(res):
+        # the packed scales of the tail after the last expert region are never written (DeepGEMM skips those rows)
+        aq, s, eid, inv = res
+        real = (eid >= 0).nonzero()
+        total = (int(real.max()) + 1 + align - 1) // align * align if real.numel() else 0
+        return [aq.view(torch.uint8), s.contiguous()[:total], eid, inv]
+
+    torch.manual_seed(11)
+    for M in (1, 6, 7, 48, 64, 170):
+        M_sum, align = compute_aligned_M_and_alignment(M, TOPK, E, block_m, None)
+        x_new = torch.randn(M, K, device=dev, dtype=torch.bfloat16)
+        t_new = torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(M)]).to(torch.int32)
+        pattern = torch.randint(0, 256, (M_sum, K), device=dev, dtype=torch.uint8)
+        ref = outputs(fused_quant_permute(x_new, t_new, E, M_sum, align, aq_out=pattern.clone().view(torch.float8_e4m3fn),
+                                          pdl=False))
+        for what in ("rows", "routing", "workspace"):
+            xb = torch.randn(M, K, device=dev, dtype=torch.bfloat16) if what == "rows" else x_new.clone()
+            tb = (torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(M)]).to(torch.int32)
+                  if what == "routing" else t_new.clone())
+            aq = pattern.clone()
+            seen = torch.empty_like(aq)
+            if what == "rows":
+                race(x_new, xb, SPIN_NS)
+            elif what == "routing":
+                race(t_new, tb, SPIN_NS)
+            else:
+                race(aq, seen, SPIN_NS)
+            got = outputs(fused_quant_permute(xb, tb, E, M_sum, align, aq_out=aq.view(torch.float8_e4m3fn), pdl=True))
+            torch.cuda.synchronize()
+            ok = all(torch.equal(a, b) for a, b in zip(ref, got))
+            if what == "workspace":
+                ok &= torch.equal(seen, pattern)
+            n_checks += 1
+            if not ok:
+                fails += 1
+                print(f"  PDL M={M}: {what} - the PDL launch differs from the plain one")
+        # inside a CUDA graph: predecessor + PDL kernel, replayed with new rows and routing
+        xs, ts, xb, tb = x_new.clone(), t_new.clone(), torch.empty_like(x_new), torch.empty_like(t_new)
+        aq = torch.empty(M_sum, K, device=dev, dtype=torch.float8_e4m3fn)
+        cap = torch.cuda.Stream()
+        cap.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(cap):
+            with torch.cuda.graph(graph, stream=cap):
+                race(xs, xb, SPIN_NS)
+                race(ts, tb, SPIN_NS)
+                res = fused_quant_permute(xb, tb, E, M_sum, align, aq_out=aq, pdl=True)
+        for rep in range(3):
+            xs.copy_(torch.randn(M, K, device=dev, dtype=torch.bfloat16))
+            ts.copy_(torch.stack([torch.randperm(E, device=dev)[:TOPK] for _ in range(M)]).to(torch.int32))
+            aq.view(torch.uint8).copy_(pattern)
+            graph.replay()
+            torch.cuda.synchronize()
+            ref_g = outputs(fused_quant_permute(xs, ts, E, M_sum, align, aq_out=pattern.clone().view(torch.float8_e4m3fn),
+                                                pdl=False))
+            got = outputs(res)
+            n_checks += 1
+            if not all(torch.equal(a, b) for a, b in zip(ref_g, got)):
+                fails += 1
+                print(f"  PDL M={M}: graph replay {rep} differs from the plain launch")
+    print(f"  PDL ordering: {n_checks} checks, {'all OK' if fails == 0 else f'{fails} FAILED'}")
+    return fails
 
 
 def ue8m0_bytes_from_fp32(s: torch.Tensor) -> torch.Tensor:
@@ -185,6 +293,9 @@ def check_chain(M, TOPK, E, K, I, dev, seed) -> int:
     return 0 if same else 1
 
 
+CHAIN_EXPERTS = 384
+
+
 def correctness(dev) -> int:
     fails = 0
     E, K, TOPK = 384, 5120, 6
@@ -271,7 +382,7 @@ def correctness(dev) -> int:
     print(f"  40 random served-shape cases: {n_pairs} pairs, {'all OK' if fails == 0 else 'FAILURES'}")
     # full chain (DeepGEMM FC1 / act / FC2 / gather) bit-identical
     for (M, seed) in ((6, 7), (48, 8), (64, 9), (1, 10)):
-        fails += check_chain(M, TOPK, E, K, 640, dev, seed)
+        fails += check_chain(M, TOPK, CHAIN_EXPERTS, K, 640, dev, seed)
     return fails
 
 
@@ -408,12 +519,19 @@ def main() -> int:
     ap.add_argument("--rot", type=int, default=6)
     ap.add_argument("--profile", action="store_true")
     ap.add_argument("--skip-correctness", action="store_true")
+    ap.add_argument("--chain-experts", type=int, default=384)
     args = ap.parse_args()
+    global CHAIN_EXPERTS
+    CHAIN_EXPERTS = args.chain_experts
     dev = torch.device("cuda")
-    print(f"device={torch.cuda.get_device_name(0)}  default mk alignment {get_mk_alignment_for_contiguous_layout()}")
+    import moe_quant_scatter_sm120 as QS
+
+    print(f"device={torch.cuda.get_device_name(0)}  default mk alignment {get_mk_alignment_for_contiguous_layout()}  "
+          f"launch {'PDL' if QS.PDL else 'plain'} (environment)")
     fails = 0
     if not args.skip_correctness:
         fails = correctness(dev)
+        fails += check_pdl(dev)
         print("ALL OK" if fails == 0 else f"{fails} FAILURES")
     if args.bench:
         bench(dev, [int(v) for v in args.tokens.split(",")], args.iters, args.rot, args.profile)

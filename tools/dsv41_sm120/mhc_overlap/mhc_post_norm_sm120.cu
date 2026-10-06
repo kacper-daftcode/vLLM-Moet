@@ -27,10 +27,12 @@
 // 64-wide butterfly), see mhc_pre_norm/mhc_pre_norm_sm120.cu.
 //
 // Launched with programmatic stream serialization (PDL, `pdl=`, default on): the CTAs come up
-// while the kernel that produces x drains; only the x load waits for it, and every store comes
-// after that wait. In the served graph the kernel is the only child of the sublayer's NCCL
-// all-reduce (the side stream joins onto the all-reduce node, see the patcher) and starts 0.2 us
-// after it, like the TileLang kernel it replaced; without PDL, or with a second parent, 2.2 us.
+// while the kernel that produces x drains. Before griddepcontrol.wait the kernel reads only the
+// norm weight; x, the streams and the coefficients (all written by earlier kernels - which, if the
+// predecessor releases its dependents early, may still be running) and every store come after it.
+// In the served graph the kernel is the only child of the sublayer's NCCL all-reduce (the side
+// stream joins onto the all-reduce node, see the patcher) and starts 0.2 us after it, like the
+// TileLang kernel it replaced; with a second parent, 2.2 us.
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -90,29 +92,39 @@ __global__ void __launch_bounds__(kMaxThreads) mhc_post_norm_kernel(
   const int h0 = ct * kVec;
   const unsigned full = 0xffffffffu;
 
-  // All loads in flight first. With PDL the kernel may start while the kernel before it on the
-  // stream (the one producing x) is still draining: everything but x comes from earlier work
-  // (the previous boundary's streams, the coefficients joined from the side stream, the weight),
-  // so only the x load waits for the grid dependency.
+  // All loads in flight first.
   const __nv_bfloat16* rrow = residual_in + static_cast<int64_t>(i) * kHC * H;
-  uint4 rv[kHC];
-#pragma unroll
-  for (int c = 0; c < kHC; ++c) rv[c] = *reinterpret_cast<const uint4*>(rrow + c * H + h0);
-  const uint4 wv = *reinterpret_cast<const uint4*>(norm_w + h0);
+  uint4 rv[kHC], wv, xv;
   float pm[kHC], pre[kHC], cm[kHC * kHC];
-#pragma unroll
-  for (int c = 0; c < kHC; ++c) {
-    pm[c] = __ldg(post_layer_mix + i * kHC + c);
-    pre[c] = __ldg(pre_mix_in + i * kHC + c);
-  }
-#pragma unroll
-  for (int e = 0; e < kHC * kHC; ++e) cm[e] = __ldg(comb_res_mix + i * kHC * kHC + e);
-  if (kPDL) {
+  if constexpr (kPDL) {
+    // the kernel may start while the one producing x still runs: only the weight before the wait
+    wv = *reinterpret_cast<const uint4*>(norm_w + h0);
     asm volatile("griddepcontrol.wait;" ::: "memory");
     // a PDL-launched successor may start its own prologue now; its wait covers this grid's completion
     asm volatile("griddepcontrol.launch_dependents;");
+#pragma unroll
+    for (int c = 0; c < kHC; ++c) rv[c] = *reinterpret_cast<const uint4*>(rrow + c * H + h0);
+#pragma unroll
+    for (int c = 0; c < kHC; ++c) {
+      pm[c] = __ldg(post_layer_mix + i * kHC + c);
+      pre[c] = __ldg(pre_mix_in + i * kHC + c);
+    }
+#pragma unroll
+    for (int e = 0; e < kHC * kHC; ++e) cm[e] = __ldg(comb_res_mix + i * kHC * kHC + e);
+    xv = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(i) * H + h0);
+  } else {
+#pragma unroll
+    for (int c = 0; c < kHC; ++c) rv[c] = *reinterpret_cast<const uint4*>(rrow + c * H + h0);
+    wv = *reinterpret_cast<const uint4*>(norm_w + h0);
+#pragma unroll
+    for (int c = 0; c < kHC; ++c) {
+      pm[c] = __ldg(post_layer_mix + i * kHC + c);
+      pre[c] = __ldg(pre_mix_in + i * kHC + c);
+    }
+#pragma unroll
+    for (int e = 0; e < kHC * kHC; ++e) cm[e] = __ldg(comb_res_mix + i * kHC * kHC + e);
+    xv = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(i) * H + h0);
   }
-  uint4 xv = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(i) * H + h0);
 
   // post-mix -> bf16 streams; collapse + aux from the rounded streams
   uint4 ov[kHC];

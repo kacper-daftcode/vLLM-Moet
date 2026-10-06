@@ -10,12 +10,20 @@
 // width cuBLAS picked for a shape and token count - calibrated against cuBLAS on this GPU at load time, see
 // bf16_replica_gemm_sm120.py - three kernels produce the same bits in one launch:
 //   chain   one slice (S == 1): one warp per 8 output columns streams the 8 weight rows through shared memory in
-//           commit groups and runs the single chain while the later groups are still in flight.
+//           commit groups and runs the single chain while the later groups are still in flight. chain_ring is the
+//           same chain with the activation rows in the shared-memory ring as well (56 instead of 104-188 registers).
 //   split   S >= 2: one CTA per 8 output columns, one warp per slice holding the slice's operand fragments in
 //           registers; the partials meet in shared memory and the CTA sums them in ascending slice order.
 //   spread  S >= 2 over all SMs: CTAs of up to 4 slice warps, partials to an fp32 workspace in L2; the CTA that
 //           arrives last at the tile's counter sums them in ascending order, writes the columns and resets it.
 // M <= 16 (one m16 row tile). Built without fast-math: the reduction adds must not flush denormals.
+//
+// Every kernel also exists launched with programmatic stream serialization (PDL, `pdl=`): it may then start while
+// the kernel before it on the stream still runs. Before griddepcontrol.wait it touches only the weights (split and
+// spread load their fragments into registers, chain issues its cp.async groups; chain_ring nothing); the
+// activations, the spread workspace and counters and the output only after it (two spread launches may overlap: the
+// second one's wait covers the first one's counter reset). Right after the wait it releases its own PDL dependents.
+// The arithmetic is the same in both launches.
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -50,6 +58,10 @@ __device__ __forceinline__ float ldcg(const float* p) {
   asm volatile("ld.global.cg.f32 %0, [%1];\n" : "=f"(v) : "l"(p));
   return v;
 }
+
+// PDL: wait for the kernels this grid depends on (complete, memory visible), then let this grid's dependents start
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch_dependents() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
 
 __device__ __forceinline__ void cp_async16(void* smem, const void* gmem) {
   const uint32_t s = static_cast<uint32_t>(__cvta_generic_to_shared(smem));
@@ -121,10 +133,43 @@ __device__ __forceinline__ void slice_chain(float (&c)[4], const __nv_bfloat16* 
   }
 }
 
+// slice_chain in two halves for the PDL launch: the weight fragments (before griddepcontrol.wait), then the
+// activation fragments and the same chain of mma's.
+template <int STEPS>
+__device__ __forceinline__ void slice_weights(uint2 (&b)[STEPS], const __nv_bfloat16* __restrict__ w, int K, int n0,
+                                              int kb, int nsteps, int g, int t) {
+  const __nv_bfloat16* wp = w + (size_t)(n0 + g) * K + kb + t * 4;
+#pragma unroll
+  for (int j = 0; j < STEPS; ++j) b[j] = ldg64_stream(wp + (j < nsteps ? j : nsteps - 1) * 16);
+}
+
+template <int STEPS, bool HI>
+__device__ __forceinline__ void slice_mma(float (&c)[4], const uint2 (&b)[STEPS], const __nv_bfloat16* __restrict__ x,
+                                          int ldx, int M, int kb, int nsteps, int g, int t) {
+  const bool v0 = g < M, v1 = g + 8 < M;
+  const __nv_bfloat16* x0 = x + (size_t)g * ldx + kb + t * 4;
+  const __nv_bfloat16* x1 = x + (size_t)(g + 8) * ldx + kb + t * 4;
+  uint2 a0[STEPS], a1[HI ? STEPS : 1];
+#pragma unroll
+  for (int j = 0; j < STEPS; ++j) {
+    const int jj = j < nsteps ? j : nsteps - 1;
+    a0[j] = v0 ? ldg64(x0 + jj * 16) : make_uint2(0u, 0u);
+    if constexpr (HI) a1[j] = v1 ? ldg64(x1 + jj * 16) : make_uint2(0u, 0u);
+  }
+  c[0] = c[1] = c[2] = c[3] = 0.f;
+#pragma unroll
+  for (int j = 0; j < STEPS; ++j) {
+    if (j < nsteps) {
+      const uint32_t hx = HI ? a1[j].x : 0u, hy = HI ? a1[j].y : 0u;
+      mma_16816(c, a0[j].x, hx, a0[j].y, hy, b[j].x, b[j].y);
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // split_kernel: grid N/8, block 32*S. Warp s computes slice s (k in [s*step, min(K, s*step+step))).
 // ---------------------------------------------------------------------------------------------------------------
-template <int STEPS, bool HI, bool OUT_F32, bool PBF16, int MAXT>
+template <int STEPS, bool HI, bool OUT_F32, bool PBF16, int MAXT, bool PDL>
 __global__ void __launch_bounds__(MAXT, 1)
 split_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ w, void* __restrict__ out,
              int M, int N, int K, int step) {
@@ -135,7 +180,15 @@ split_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* 
   const int n0 = blockIdx.x * 8;
   const int kb = s * step;
   float c[4];
-  slice_chain<STEPS, HI>(c, x, ldx, w, M, K, n0, kb, min(K - kb, step) >> 4, g, t);
+  if constexpr (PDL) {
+    uint2 b[STEPS];
+    slice_weights<STEPS>(b, w, K, n0, kb, min(K - kb, step) >> 4, g, t);
+    pdl_wait();
+    pdl_launch_dependents();
+    slice_mma<STEPS, HI>(c, b, x, ldx, M, kb, min(K - kb, step) >> 4, g, t);
+  } else {
+    slice_chain<STEPS, HI>(c, x, ldx, w, M, K, n0, kb, min(K - kb, step) >> 4, g, t);
+  }
   float* p = part + s * 128;
   *reinterpret_cast<float2*>(p + g * 8 + t * 2) = make_float2(c[0], c[1]);
   *reinterpret_cast<float2*>(p + (g + 8) * 8 + t * 2) = make_float2(c[2], c[3]);
@@ -154,7 +207,7 @@ split_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* 
 // spread_kernel: grid (ceil(S / W), N/8), block 32*W. Warp w of CTA (gy, tile) computes slice gy*W + w; partials go
 // to ws[tile][s][16][8]; the CTA that increments cnt[tile] last sums them and resets the counter.
 // ---------------------------------------------------------------------------------------------------------------
-template <int STEPS, bool HI, bool OUT_F32, bool PBF16>
+template <int STEPS, bool HI, bool OUT_F32, bool PBF16, bool PDL>
 __global__ void __launch_bounds__(128, 1)
 spread_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ w, void* __restrict__ out,
               float* __restrict__ ws, int* __restrict__ cnt, int M, int N, int K, int step, int S) {
@@ -165,13 +218,29 @@ spread_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16*
   const int tile = blockIdx.y;
   const int g = lane >> 2, t = lane & 3;
   const int n0 = tile * 8;
-  if (s < S) {
+  if constexpr (PDL) {
+    // every thread passes the wait before the workspace, the counter or the output is touched
     const int kb = s * step;
-    float c[4];
-    slice_chain<STEPS, HI>(c, x, ldx, w, M, K, n0, kb, min(K - kb, step) >> 4, g, t);
-    float* p = ws + ((size_t)tile * S + s) * 128;
-    *reinterpret_cast<float2*>(p + g * 8 + t * 2) = make_float2(c[0], c[1]);
-    *reinterpret_cast<float2*>(p + (g + 8) * 8 + t * 2) = make_float2(c[2], c[3]);
+    uint2 b[STEPS];
+    if (s < S) slice_weights<STEPS>(b, w, K, n0, kb, min(K - kb, step) >> 4, g, t);
+    pdl_wait();
+    pdl_launch_dependents();
+    if (s < S) {
+      float c[4];
+      slice_mma<STEPS, HI>(c, b, x, ldx, M, kb, min(K - kb, step) >> 4, g, t);
+      float* p = ws + ((size_t)tile * S + s) * 128;
+      *reinterpret_cast<float2*>(p + g * 8 + t * 2) = make_float2(c[0], c[1]);
+      *reinterpret_cast<float2*>(p + (g + 8) * 8 + t * 2) = make_float2(c[2], c[3]);
+    }
+  } else {
+    if (s < S) {
+      const int kb = s * step;
+      float c[4];
+      slice_chain<STEPS, HI>(c, x, ldx, w, M, K, n0, kb, min(K - kb, step) >> 4, g, t);
+      float* p = ws + ((size_t)tile * S + s) * 128;
+      *reinterpret_cast<float2*>(p + g * 8 + t * 2) = make_float2(c[0], c[1]);
+      *reinterpret_cast<float2*>(p + (g + 8) * 8 + t * 2) = make_float2(c[2], c[3]);
+    }
   }
   __threadfence();
   __syncthreads();
@@ -202,7 +271,7 @@ spread_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16*
 // chain_kernel: grid N/8, block 32. G commit groups of KG k each (G * KG == K) bring the 8 weight rows into shared
 // memory; the activation fragments of the next group are loaded into registers while the current group computes.
 // ---------------------------------------------------------------------------------------------------------------
-template <int G, int KG, bool HI, bool OUT_F32>
+template <int G, int KG, bool HI, bool OUT_F32, bool PDL>
 __global__ void __launch_bounds__(32, 1)
 chain_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ w, void* __restrict__ out,
              int M, int N) {
@@ -220,6 +289,10 @@ chain_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* 
       cp_async16(sw + r * PITCH + q * KG + sg * 8, w + (size_t)(n0 + r) * K + q * KG + sg * 8);
     }
     cp_async_commit();
+  }
+  if constexpr (PDL) {  // the weight rows stream in while the previous kernel finishes
+    pdl_wait();
+    pdl_launch_dependents();
   }
   const bool v0 = g < M, v1 = g + 8 < M;
   const __nv_bfloat16* x0 = x + (size_t)g * ldx + t * 4;
@@ -250,6 +323,91 @@ chain_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* 
       const uint2 aa = a0[q & 1][j];
       const uint32_t hx = HI ? a1[q & 1][j].x : 0u, hy = HI ? a1[q & 1][j].y : 0u;
       mma_16816(c, aa.x, hx, aa.y, hy, bb.x, bb.y);
+    }
+  }
+  const int col = n0 + t * 2;
+  if (v0) { store_out<OUT_F32>(out, (size_t)g * N + col, c[0]); store_out<OUT_F32>(out, (size_t)g * N + col + 1, c[1]); }
+  if (v1) { store_out<OUT_F32>(out, (size_t)(g + 8) * N + col, c[2]); store_out<OUT_F32>(out, (size_t)(g + 8) * N + col + 1, c[3]); }
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// chain_ring_kernel: grid N/8, block 32. The 8 weight rows and the activation rows stream through an NST-deep ring
+// of KC-wide chunks in shared memory (one cp.async group per chunk), so the chain's fragment reads wait on shared
+// memory only, not on L2 (served next to the main stream's GEMVs, the register prefetch one group ahead of
+// chain_kernel stretches its chain from 7.7 to 12.5-22.9 us). The same mma's in the same order as chain_kernel.
+// With PDL the kernel waits before its first load and then runs the same ring: holding the first chunks' weights
+// in shared memory before the wait makes chunk 0 wait for all of them, and an L2 prefetch of the rows costs ~0.4 us
+// (RTX 5090), both whenever the kernel does not start early - the weights_proj chain sits on its own graph branch.
+// ---------------------------------------------------------------------------------------------------------------
+template <int K, int KC, int NST, bool HI, bool OUT_F32, bool PDL>
+__global__ void __launch_bounds__(32, 1)
+chain_ring_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ w,
+                  void* __restrict__ out, int M, int N) {
+  constexpr int XR = HI ? 16 : 8;  // activation rows kept per chunk
+  constexpr int ROWS = 8 + XR;     // weight rows, then activation rows
+  constexpr int PITCH = KC + 16;   // row stride = 8 banks (mod 32): the 8-byte fragment reads are conflict-free
+  constexpr int SEG = KC / 8;      // 16-byte segments per row and chunk
+  constexpr int NCH = K / KC;
+  extern __shared__ __align__(16) __nv_bfloat16 ring[];  // [NST][ROWS][PITCH]
+  const int lane = threadIdx.x, g = lane >> 2, t = lane & 3;
+  const int n0 = blockIdx.x * 8;
+  const int xrows = M < XR ? M : XR;  // rows >= M are never read (zero fragments)
+  auto issue_w = [&](int ch) {
+    __nv_bfloat16* st = ring + (ch % NST) * ROWS * PITCH;
+    const int k0 = ch * KC;
+    for (int i = lane; i < 8 * SEG; i += 32) {
+      const int r = i / SEG, sg = i - r * SEG;
+      cp_async16(st + r * PITCH + sg * 8, w + (size_t)(n0 + r) * K + k0 + sg * 8);
+    }
+  };
+  auto issue_x = [&](int ch) {
+    __nv_bfloat16* st = ring + (ch % NST) * ROWS * PITCH;
+    const int k0 = ch * KC;
+    for (int i = lane; i < xrows * SEG; i += 32) {
+      const int r = i / SEG, sg = i - r * SEG;
+      cp_async16(st + (8 + r) * PITCH + sg * 8, x + (size_t)r * ldx + k0 + sg * 8);
+    }
+  };
+  if constexpr (PDL) {
+    pdl_wait();
+    pdl_launch_dependents();
+  }
+#pragma unroll
+  for (int ch = 0; ch < NST - 1; ++ch) {
+    if (ch < NCH) {
+      issue_w(ch);
+      issue_x(ch);
+    }
+    cp_async_commit();  // also when empty: one group per chunk index keeps the wait counts uniform
+  }
+  const bool v0 = g < M, v1 = g + 8 < M;
+  float c[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int ch = 0; ch < NCH; ++ch) {
+    cp_async_wait<NST - 2>();  // chunk ch has landed
+    __syncwarp();
+    if (ch + NST - 1 < NCH) {  // into the stage read at ch - 1 (those reads fed mma's that have issued)
+      issue_w(ch + NST - 1);
+      issue_x(ch + NST - 1);
+    }
+    cp_async_commit();
+    const __nv_bfloat16* st = ring + (ch % NST) * ROWS * PITCH;
+    const __nv_bfloat16* bw = st + g * PITCH + t * 4;
+    const __nv_bfloat16* bx0 = st + (8 + g) * PITCH + t * 4;
+    const __nv_bfloat16* bx1 = st + (16 + g) * PITCH + t * 4;
+    // the chunk's fragments first, then the mma's back to back: a shared-memory load in front of every dependent
+    // mma would add its latency to each of the 320 steps
+    constexpr int CS = KC / 16;
+    uint2 bb[CS], a0[CS], a1[HI ? CS : 1];
+#pragma unroll
+    for (int j = 0; j < CS; ++j) {
+      bb[j] = *reinterpret_cast<const uint2*>(bw + j * 16);
+      a0[j] = v0 ? *reinterpret_cast<const uint2*>(bx0 + j * 16) : make_uint2(0u, 0u);
+      if constexpr (HI) a1[j] = v1 ? *reinterpret_cast<const uint2*>(bx1 + j * 16) : make_uint2(0u, 0u);
+    }
+#pragma unroll
+    for (int j = 0; j < CS; ++j) {
+      const uint32_t hx = HI ? a1[j].x : 0u, hy = HI ? a1[j].y : 0u;
+      mma_16816(c, a0[j].x, hx, a0[j].y, hy, bb[j].x, bb[j].y);
     }
   }
   const int col = n0 + t * 2;
@@ -300,120 +458,194 @@ void check_operands(const at::Tensor& x, const at::Tensor& w, const at::Tensor& 
               "out [M, N] contiguous fp32 or bf16");
 }
 
-template <int STEPS, bool HI, bool OF, bool PB>
-void launch_split(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, int step, int S, cudaStream_t st) {
-  const int M = x.size(0), K = x.size(1), N = w.size(0);
-  auto kern = S <= 16 ? split_kernel<STEPS, HI, OF, PB, 512> : split_kernel<STEPS, HI, OF, PB, 1024>;
-  kern<<<N / 8, S * 32, 0, st>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x.stride(0),
-                                 reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), M, N, K, step);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+// The plain launch, or with programmatic stream serialization (graph-capture safe: becomes a programmatic edge).
+template <bool PDL, typename... KArgs, typename... Args>
+void launch(void (*kern)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t st, Args... args) {
+  if constexpr (PDL) {
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = grid;
+    cfg.blockDim = block;
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = st;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = 1;
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kern, args...));
+  } else {
+    kern<<<grid, block, smem, st>>>(args...);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
 }
 
-template <int STEPS, bool HI, bool OF, bool PB>
+template <int STEPS, bool HI, bool OF, bool PB, bool PDL>
+void launch_split(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, int step, int S, cudaStream_t st) {
+  const int M = x.size(0), K = x.size(1), N = w.size(0);
+  auto kern = S <= 16 ? split_kernel<STEPS, HI, OF, PB, 512, PDL> : split_kernel<STEPS, HI, OF, PB, 1024, PDL>;
+  launch<PDL>(kern, dim3(N / 8), dim3(S * 32), 0, st, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+              (int)x.stride(0), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), M, N, K, step);
+}
+
+template <int STEPS, bool HI, bool OF, bool PB, bool PDL>
 void launch_spread(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& ws, at::Tensor& cnt, int step,
                    int S, int W, cudaStream_t st) {
   const int M = x.size(0), K = x.size(1), N = w.size(0);
-  dim3 grid((S + W - 1) / W, N / 8);
-  spread_kernel<STEPS, HI, OF, PB><<<grid, W * 32, 0, st>>>(
-      reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x.stride(0),
-      reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), ws.data_ptr<float>(), cnt.data_ptr<int>(),
-      M, N, K, step, S);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  launch<PDL>(spread_kernel<STEPS, HI, OF, PB, PDL>, dim3((S + W - 1) / W, N / 8), dim3(W * 32), 0, st,
+              reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x.stride(0),
+              reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), ws.data_ptr<float>(),
+              cnt.data_ptr<int>(), M, N, K, step, S);
 }
 
-template <int G, int KG, bool HI, bool OF>
+template <int G, int KG, bool HI, bool OF, bool PDL>
 void launch_chain(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, cudaStream_t st) {
   const int M = x.size(0), N = w.size(0);
   const size_t smem = (size_t)8 * (G * KG + 16) * 2;
-  auto kern = chain_kernel<G, KG, HI, OF>;
+  auto kern = chain_kernel<G, KG, HI, OF, PDL>;
   C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
-  kern<<<N / 8, 32, smem, st>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x.stride(0),
-                                reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), M, N);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  launch<PDL>(kern, dim3(N / 8), dim3(32), smem, st, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+              (int)x.stride(0), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), M, N);
 }
 
-template <bool HI, bool OF, bool PB>
+template <int K, int KC, int NST, bool HI, bool OF, bool PDL>
+void launch_chain_ring(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, cudaStream_t st) {
+  static_assert(NST >= 2 && K % KC == 0, "ring");
+  const int M = x.size(0), N = w.size(0);
+  const size_t smem = (size_t)NST * (8 + (HI ? 16 : 8)) * (KC + 16) * 2;
+  auto kern = chain_ring_kernel<K, KC, NST, HI, OF, PDL>;
+  C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+  launch<PDL>(kern, dim3(N / 8), dim3(32), smem, st, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+              (int)x.stride(0), reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr(), M, N);
+}
+
+template <bool HI, bool OF, bool PB, bool PDL>
 void dispatch_split(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, int step, int S, cudaStream_t st) {
   switch (step / 16) {
-    case 8: launch_split<8, HI, OF, PB>(x, w, out, step, S, st); break;
-    case 12: launch_split<12, HI, OF, PB>(x, w, out, step, S, st); break;
-    case 16: launch_split<16, HI, OF, PB>(x, w, out, step, S, st); break;
+    case 8: launch_split<8, HI, OF, PB, PDL>(x, w, out, step, S, st); break;
+    case 12: launch_split<12, HI, OF, PB, PDL>(x, w, out, step, S, st); break;
+    case 16: launch_split<16, HI, OF, PB, PDL>(x, w, out, step, S, st); break;
     default: TORCH_CHECK(false, "split: unsupported slice width ", step);
   }
 }
 
-template <bool HI, bool OF, bool PB>
+template <bool HI, bool OF, bool PB, bool PDL>
 void dispatch_spread(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& ws, at::Tensor& cnt, int step,
                      int S, int W, cudaStream_t st) {
   if constexpr (!HI) {
-    if (step / 16 == 8) return launch_spread<8, false, OF, PB>(x, w, out, ws, cnt, step, S, W, st);
-    if (step / 16 == 12) return launch_spread<12, false, OF, PB>(x, w, out, ws, cnt, step, S, W, st);
+    if (step / 16 == 8) return launch_spread<8, false, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st);
+    if (step / 16 == 12) return launch_spread<12, false, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st);
   }
   switch (step / 16) {
-    case 16: launch_spread<16, HI, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
-    case 20: launch_spread<20, HI, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
-    case 24: launch_spread<24, HI, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
+    case 16: launch_spread<16, HI, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
+    case 20: launch_spread<20, HI, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
+    case 24: launch_spread<24, HI, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
     default: break;
   }
   if constexpr (!HI) {  // wider slices only for rows <= 8 (registers)
     switch (step / 16) {
-      case 28: launch_spread<28, false, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
-      case 32: launch_spread<32, false, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
-      case 36: launch_spread<36, false, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
-      case 40: launch_spread<40, false, OF, PB>(x, w, out, ws, cnt, step, S, W, st); return;
+      case 28: launch_spread<28, false, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
+      case 32: launch_spread<32, false, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
+      case 36: launch_spread<36, false, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
+      case 40: launch_spread<40, false, OF, PB, PDL>(x, w, out, ws, cnt, step, S, W, st); return;
       default: break;
     }
   }
   TORCH_CHECK(false, "spread: unsupported slice width ", step, " for ", x.size(0), " rows");
 }
 
-template <bool HI, bool OF>
+template <bool HI, bool OF, bool PDL>
 void dispatch_chain(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, cudaStream_t st) {
   switch (x.size(1)) {
-    case 5120: launch_chain<16, 320, HI, OF>(x, w, out, st); break;
-    case 512: launch_chain<2, 256, HI, OF>(x, w, out, st); break;
-    case 256: launch_chain<1, 256, HI, OF>(x, w, out, st); break;
+    case 5120: launch_chain<16, 320, HI, OF, PDL>(x, w, out, st); break;
+    case 512: launch_chain<2, 256, HI, OF, PDL>(x, w, out, st); break;
+    case 256: launch_chain<1, 256, HI, OF, PDL>(x, w, out, st); break;
     default: TORCH_CHECK(false, "chain: unsupported K ", x.size(1));
+  }
+}
+
+template <bool HI, bool OF, bool PDL>
+void dispatch_chain_ring(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, cudaStream_t st) {
+  // ring sizes: <= 99 KB of shared memory (rows <= 8: 5 x 16.9 KB; rows <= 16: 7 x 13 KB)
+  switch (x.size(1)) {
+    case 5120:
+      if constexpr (HI) launch_chain_ring<5120, 256, 7, true, OF, PDL>(x, w, out, st);
+      else launch_chain_ring<5120, 512, 5, false, OF, PDL>(x, w, out, st);
+      break;
+    case 512: launch_chain_ring<512, 256, 3, HI, OF, PDL>(x, w, out, st); break;
+    case 256: launch_chain_ring<256, 256, 2, HI, OF, PDL>(x, w, out, st); break;
+    default: TORCH_CHECK(false, "chain_ring: unsupported K ", x.size(1));
+  }
+}
+
+template <bool PDL>
+void chain_any(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, bool ring, cudaStream_t st) {
+  const bool hi = x.size(0) > 8, of = out.scalar_type() == at::kFloat;
+  if (ring) {
+    if (hi) { if (of) dispatch_chain_ring<true, true, PDL>(x, w, out, st); else dispatch_chain_ring<true, false, PDL>(x, w, out, st); }
+    else { if (of) dispatch_chain_ring<false, true, PDL>(x, w, out, st); else dispatch_chain_ring<false, false, PDL>(x, w, out, st); }
+  } else {
+    if (hi) { if (of) dispatch_chain<true, true, PDL>(x, w, out, st); else dispatch_chain<true, false, PDL>(x, w, out, st); }
+    else { if (of) dispatch_chain<false, true, PDL>(x, w, out, st); else dispatch_chain<false, false, PDL>(x, w, out, st); }
+  }
+}
+
+template <bool PDL>
+void split_any(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, int step, int S, bool pbf16, cudaStream_t st) {
+  const bool of = out.scalar_type() == at::kFloat;
+  if (x.size(0) > 8) {
+    if (of) dispatch_split<true, true, false, PDL>(x, w, out, step, S, st);
+    else if (pbf16) dispatch_split<true, false, true, PDL>(x, w, out, step, S, st);
+    else dispatch_split<true, false, false, PDL>(x, w, out, step, S, st);
+  } else {
+    if (of) dispatch_split<false, true, false, PDL>(x, w, out, step, S, st);
+    else if (pbf16) dispatch_split<false, false, true, PDL>(x, w, out, step, S, st);
+    else dispatch_split<false, false, false, PDL>(x, w, out, step, S, st);
+  }
+}
+
+template <bool PDL>
+void spread_any(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& ws, at::Tensor& cnt, int step,
+                int S, int W, bool pbf16, cudaStream_t st) {
+  const bool of = out.scalar_type() == at::kFloat;
+  if (x.size(0) > 8) {
+    if (of) dispatch_spread<true, true, false, PDL>(x, w, out, ws, cnt, step, S, W, st);
+    else if (pbf16) dispatch_spread<true, false, true, PDL>(x, w, out, ws, cnt, step, S, W, st);
+    else dispatch_spread<true, false, false, PDL>(x, w, out, ws, cnt, step, S, W, st);
+  } else {
+    if (of) dispatch_spread<false, true, false, PDL>(x, w, out, ws, cnt, step, S, W, st);
+    else if (pbf16) dispatch_spread<false, false, true, PDL>(x, w, out, ws, cnt, step, S, W, st);
+    else dispatch_spread<false, false, false, PDL>(x, w, out, ws, cnt, step, S, W, st);
   }
 }
 
 }  // namespace
 
-// One slice (cuBLAS without split-K).
-void chain_out(torch::Tensor x, torch::Tensor w, torch::Tensor out) {
+// One slice (cuBLAS without split-K); ring: chain_ring_kernel instead of chain_kernel.
+void chain_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool ring, bool pdl) {
   check_operands(x, w, out);
   TORCH_CHECK(chain_supported(x.size(0), w.size(0), x.size(1)), "chain: unsupported M=", x.size(0), " N=", w.size(0), " K=", x.size(1));
   const c10::cuda::CUDAGuard guard(x.device());
   cudaStream_t st = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
-  const bool hi = x.size(0) > 8, of = out.scalar_type() == at::kFloat;
-  if (hi) { if (of) dispatch_chain<true, true>(x, w, out, st); else dispatch_chain<true, false>(x, w, out, st); }
-  else { if (of) dispatch_chain<false, true>(x, w, out, st); else dispatch_chain<false, false>(x, w, out, st); }
+  if (pdl) chain_any<true>(x, w, out, ring, st);
+  else chain_any<false>(x, w, out, ring, st);
 }
 
 // S = ceil(K / step) slices, one CTA per 8 columns; pbf16: round the partials to bf16 before the reduction.
-void split_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t step, bool pbf16) {
+void split_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t step, bool pbf16, bool pdl) {
   check_operands(x, w, out);
   const int M = x.size(0), K = x.size(1), N = w.size(0);
   TORCH_CHECK(split_supported(M, N, K, step), "split: unsupported M=", M, " N=", N, " K=", K, " step=", step);
   const c10::cuda::CUDAGuard guard(x.device());
   cudaStream_t st = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
   const int S = num_slices(K, step);
-  const bool of = out.scalar_type() == at::kFloat;
-  if (M > 8) {
-    if (of) dispatch_split<true, true, false>(x, w, out, step, S, st);
-    else if (pbf16) dispatch_split<true, false, true>(x, w, out, step, S, st);
-    else dispatch_split<true, false, false>(x, w, out, step, S, st);
-  } else {
-    if (of) dispatch_split<false, true, false>(x, w, out, step, S, st);
-    else if (pbf16) dispatch_split<false, false, true>(x, w, out, step, S, st);
-    else dispatch_split<false, false, false>(x, w, out, step, S, st);
-  }
+  if (pdl) split_any<true>(x, w, out, step, S, pbf16, st);
+  else split_any<false>(x, w, out, step, S, pbf16, st);
 }
 
 // The same over all SMs: ws fp32 >= N/8 * S * 128 (any contents), cnt int32 >= N/8 (zero before the first call; the
 // kernel leaves it zero again); W slice warps per CTA (1..4).
 void spread_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t step, bool pbf16, torch::Tensor ws,
-                torch::Tensor cnt, int64_t W) {
+                torch::Tensor cnt, int64_t W, bool pdl) {
   check_operands(x, w, out);
   const int M = x.size(0), K = x.size(1), N = w.size(0);
   TORCH_CHECK(spread_supported(M, N, K, step), "spread: unsupported M=", M, " N=", N, " K=", K, " step=", step);
@@ -424,16 +656,8 @@ void spread_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t ste
   TORCH_CHECK(W >= 1 && W <= 4, "W in 1..4");
   const c10::cuda::CUDAGuard guard(x.device());
   cudaStream_t st = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
-  const bool of = out.scalar_type() == at::kFloat;
-  if (M > 8) {
-    if (of) dispatch_spread<true, true, false>(x, w, out, ws, cnt, step, S, W, st);
-    else if (pbf16) dispatch_spread<true, false, true>(x, w, out, ws, cnt, step, S, W, st);
-    else dispatch_spread<true, false, false>(x, w, out, ws, cnt, step, S, W, st);
-  } else {
-    if (of) dispatch_spread<false, true, false>(x, w, out, ws, cnt, step, S, W, st);
-    else if (pbf16) dispatch_spread<false, false, true>(x, w, out, ws, cnt, step, S, W, st);
-    else dispatch_spread<false, false, false>(x, w, out, ws, cnt, step, S, W, st);
-  }
+  if (pdl) spread_any<true>(x, w, out, ws, cnt, step, S, (int)W, pbf16, st);
+  else spread_any<false>(x, w, out, ws, cnt, step, S, (int)W, pbf16, st);
 }
 
 // The CUDA-graph capture sequence the current stream is part of (0 when it is not capturing).
@@ -446,11 +670,13 @@ int64_t capture_id() {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("capture_id", &capture_id);
-  m.def("chain_out", &chain_out, "one-slice chain", py::arg("x"), py::arg("w"), py::arg("out"));
+  m.def("chain_out", &chain_out, "one-slice chain", py::arg("x"), py::arg("w"), py::arg("out"), py::arg("ring") = false,
+        py::arg("pdl") = false);
   m.def("split_out", &split_out, "split-K slices, one CTA per 8 columns", py::arg("x"), py::arg("w"), py::arg("out"),
-        py::arg("step"), py::arg("pbf16"));
+        py::arg("step"), py::arg("pbf16"), py::arg("pdl") = false);
   m.def("spread_out", &spread_out, "split-K slices over all SMs, last CTA reduces", py::arg("x"), py::arg("w"),
-        py::arg("out"), py::arg("step"), py::arg("pbf16"), py::arg("ws"), py::arg("cnt"), py::arg("W"));
+        py::arg("out"), py::arg("step"), py::arg("pbf16"), py::arg("ws"), py::arg("cnt"), py::arg("W"),
+        py::arg("pdl") = false);
   m.def("chain_supported", &chain_supported);
   m.def("split_supported", &split_supported);
   m.def("spread_supported", &spread_supported);

@@ -1196,6 +1196,85 @@ GEMV 45 → 53 next to it) and the other FFN segments +0.9 µs each (run‑to‑
 steps/s (prose / code; `-bf16` 80.2–81.8 / 81.9–82.1), eight streams 33.3–33.9 / 36.2–39.7 (33.2–33.6 /
 37.3–37.8; the code runs at eight scatter by ±5 % in this window).
 
+Why the FFN right after each Engram layer got slower: it stopped being faster. In six replicated starts (run19–run24)
+that layer's FC1 ran 74.3–75.6 µs (layer 1) and 70.8–71.8 µs (layer 14) against ~81.5 µs for the other FFNs; with the
+split 83.6 / 76.4, with FC2 (the routing) unchanged, on all four ranks. DeepGEMM's FC2 writes whole 64‑row tiles, so
+2268 of its 2304 output rows (23.6 MB per MoE layer) are padding the gather never reads, and those dirty L2 lines are
+written back by whichever kernel next streams more than the L2 holds. The replicated wkv (157 MB) paid that inside its
+own 125 µs; the 39 MB slice does not, so the next FC1 pays it, as every other FC1 does. On 4× RTX PRO 6000 in one graph
+(`tools/dsv41_sm120/nccl_graph/engram_ffn_l2_tp4.py`): layer‑1 FC1 99.0 µs after the replicated and 111.3 after the
+split Engram, 98.9 / 102.7 when the previous FFN writes no padded output, both FC1s back at ~100 µs when FC2's padding
+rows are dropped from L2 — the fix for all 40 MoE layers in the next section.
+
+## The idle GPU between the decode kernels (2026‑10‑02..06)
+
+In the served decode graph (`run25_engram_c1`, rank 0, 6 tokens, 10,437 µs per step) no kernel runs on any stream for
+539 µs per step (`graph_idle.py`). The largest edges: ~2.8 µs in front of each of the 80 NCCL all‑reduces (231 µs),
+MXFP8 quantize → GEMV v3 (38), FC2 → gather (20), sparse MLA → merge (20), inverse RoPE + quant → grouped `wo_a` GEMV
+(19), FC1 → silu·mul·quant (19). The changes below target them, plus the L2 write‑back of the previous section; each
+is bit‑identical and has its own switch. Candidate image `-pdl` (Dockerfile steps 13 and 14, and the kernels of steps 3,
+8, 10 and 11); not served yet.
+
+**NCCL in the captured graph: one event record per collective.** With graph mixing on (NCCL's default; NCCL 2.30.7
+and 2.32.3 alike), NCCL serializes its device work across graphs and eager calls through one event per communicator:
+the first collective of a graph waits on it, and every captured collective records it afterwards — an event‑record
+node that the next NCCL kernel of the graph also depends on. The graph executor puts each NCCL kernel on its own stream
+and starts it 2.8 µs after its predecessor (99 % of the 80 all‑reduces behind a stream switch); without the record
+nodes the gap is the ordinary 0.3–0.5 µs and the all‑reduce kernel itself 1.8 µs shorter (4 ranks through vLLM's own
+path, side‑stream join as served: 28.4 → 22.5 µs per layer, `nccl_graph/nccl_gap_tp4.py`). Only the graph's last
+record matters to anyone waiting on the event, and the NCCL kernels stay chained by direct edges, so step 13
+(`patch_vllm_nccl_graph_records.py`) captures every graph with `keep_graph=True` (the GPU model runner's FULL graphs,
+the breakable PIECEWISE segments, `CUDAGraphWrapper`), keeps the last record per event, reconnects the dropped nodes'
+parents to their children and instantiates — NCCL's default mode and semantics. `test_nccl_graph_records_tp4.py` on
+4× RTX PRO 6000: 43 of 44 records dropped, bit‑identical, 28.4 → 23.8 µs per layer, 0 wrong results in 200 replays
+interleaved with eager collectives on the same communicator. `VLLM_MOET_NCCL_GRAPH_RECORDS=0` captures as before.
+`NCCL_GRAPH_MIXING_SUPPORT=0` removes the same nodes but NCCL does not support it for a communicator that also runs
+eager collectives while a graph is outstanding (vLLM's case), so it stays a measurement probe;
+`NCCL_GRAPH_STREAM_ORDERING=0` is slower; `NCCL_LAUNCH_MODE` changes nothing.
+
+**PDL for the dense GEMVs.** The v3 / v1 / grouped MXFP8 GEMVs launch with programmatic dependent launch
+(`VLLM_MOET_GEMV_PDL`, default 1). Each comes up while its predecessor — FlashInfer's MXFP8 quantize, the Triton
+norm+quant and inverse‑RoPE+quant kernels, all PDL‑aware — still runs, issues its first weight loads, executes
+`griddepcontrol.wait`, then reads the activations and writes C, and releases its own dependents right after the wait.
+v3 also streams its weights with `L1::no_allocate` + an L2 evict‑first policy (`VLLM_MOET_GEMV_EVICT_FIRST`, default 1;
+slower on the v1 layout). The activations stay weak L1‑cached loads (as `.cg` loads, every CTA's re‑read of the same few
+KB became 6× slower at 16 rows). Same bits in every mode (`sm120_gemv/test_gemv_pdl_sm120.py`: 118 checks on each GPU,
+eager and graph, back to back, after a cross‑stream join, a slow‑producer race with a negative control). One CUDA graph
+of the attention sublayer's chain (quantize → q_a+kv_a → norm+quant → q_b → … → inverse‑RoPE+quant → wo_a → quantize →
+wo_b), 6 rows, cold weights: RTX PRO 6000 48.4 → 38.6 µs per layer (GPU idle 5.8 → 0.5 µs), RTX 5090 38.8 → 33.3; the
+shared expert 18.9 → 15.2, the Engram slice 34.2 → 32.5. An L2 prefetch of the weights was 1–5 µs slower. Under PDL a
+kernel's trace duration includes its wait: compare spans, not per‑kernel sums.
+
+**PDL at the FFN boundary.** The MoE router's `spread` (`VLLM_MOET_BF16_GEMM_PDL`, a site list, default `router`) and
+`moe_quant_scatter` (`VLLM_MOET_MOE_QUANT_SCATTER_PDL`, default 1) launch with PDL; before the wait they touch only
+weights (the router's fragments), and `spread`'s L2 workspace and tile counters come after it. From the boundary's
+predecessor to the end of FC1: RTX PRO 6000 123.6 → 121.2 µs, RTX 5090 121.2 → 117.2; behind the real 4‑rank
+all‑reduce the router's top‑k ends 1.8–1.9 µs earlier — ~75–100 µs per step over 40 FFN boundaries. The indexer's
+chains gain nothing from PDL (`weights_proj` runs on its own branch, `wk`'s predecessor releases nothing early) and stay
+plain. `mhc_post_norm` keeps its PDL launch (worth 0.8 / 0.4 µs per attention / FFN boundary behind the all‑reduce; the
+router can start early only behind a PDL kernel); its PDL variant now reads only the norm weight before the wait — the
+served variant issued the residual‑stream and coefficient loads before it in source order, and only ptxas's scheduling
+kept them after the wait. The plain instantiations are SASS‑identical to the served build (bf16 84/84,
+moe_quant_scatter 4/4); every test passes with every switch combination on both GPUs, with race tests whose deliberately
+misplaced waits fail. Chain v2 (`VLLM_MOET_BF16_CHAIN=v2`, opt‑in) is the one‑slice chain with the activations in the
+shared‑memory ring too (56 instead of 104–186 registers), calibrated like the rest: 0.4 µs slower alone, but next to
+GEMV v3 on another stream it stays at 8.2–8.3 µs while v1 grows to 9.7 (about −15 µs per step in that stand‑in; the
+served chain stretches to 12.5–15.5 µs, so the window decides).
+
+**FC2's padding rows out of L2.** Step 14 (`patch_vllm_moe_fc2_discard_sm120.py` + `moe_l2/`): right after FC2, on the
+same stream, one small kernel invalidates the 128‑byte lines of FC2's padding rows (`discard.global.L2`; expert id −1
+inside a tile DeepGEMM wrote; the host refuses any layout where a discarded line could hold a byte of a real row). The
+gather reads only real rows, so the MoE output is the same bits (`test_moe_l2_discard_sm120.py`: eager and CUDA graphs,
+1..64 tokens and prefill sizes, guard buffers untouched, RTX 5090 and RTX PRO 6000). Through the patched experts class on
+4× RTX PRO 6000 (`bench_moe_l2_tp4.py`, paired interleaved rounds) the next FC1 runs 6–16 µs faster for a 2.4–10 µs
+discard: with the 20–26 distinct experts the served one‑stream step routes to, −3.8 to −7.0 µs per MoE layer at 6
+tokens, −4.2 µs at 48. It runs at 2..64 tokens (`VLLM_MOET_MOE_FC2_DISCARD_MIN_TOKENS` / `_MAX_TOKENS`): at 1 token it
+costs 1.6 µs, prefill is left as it was, and dropping FC1's padding rows as well gains nothing; on the RTX 5090 (96 MB
+of L2) it pays only up to ~18 tokens. `VLLM_MOET_MOE_FC2_DISCARD=0` turns it off.
+
+Expected per decode step at one stream, from the isolated measurements (the served graph decides): NCCL records −0.2 to
+−0.35 ms, GEMV PDL −0.15 to −0.35, FFN‑boundary PDL −0.075 to −0.1, FC2 discard −0.15 to −0.28.
+
 ## Apply / build / run
 
 ```bash

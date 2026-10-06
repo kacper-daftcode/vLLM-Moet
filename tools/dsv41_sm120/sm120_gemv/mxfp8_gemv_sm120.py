@@ -5,6 +5,11 @@
 
 The first import compiles the extension with torch.utils.cpp_extension.load
 (~40 s, cached under $TORCH_EXTENSIONS_DIR or ~/.cache/torch_extensions).
+
+Launch switches (read once per process, bit-identical either way; test_gemv_pdl_sm120.py):
+VLLM_MOET_GEMV_PDL=1 (default; 0 = plain launches, 2 / 3 = later launch_dependents) launches the
+v3 / v1 / grouped kernels with programmatic dependent launch; VLLM_MOET_GEMV_EVICT_FIRST=1
+(default) gives v3's weight loads an L2 evict-first policy under PDL.
 """
 
 from __future__ import annotations
@@ -40,17 +45,34 @@ def _ext():
 
 
 def mxfp8_gemv(
-    a: torch.Tensor, a_sf: torch.Tensor, w: torch.Tensor, w_sf: torch.Tensor
+    a: torch.Tensor,
+    a_sf: torch.Tensor,
+    w: torch.Tensor,
+    w_sf: torch.Tensor,
+    pdl: int | None = None,
+    evict: int | None = None,
 ) -> torch.Tensor:
-    """C[M, N] = A[M, K] (e4m3 + F8_128x4 ue8m0 scales) x W[N, K]^T (same format)."""
-    return _ext().mxfp8_gemv(a.contiguous(), a_sf.contiguous(), w.contiguous(), w_sf.contiguous())
+    """C[M, N] = A[M, K] (e4m3 + F8_128x4 ue8m0 scales) x W[N, K]^T (same format).
+
+    pdl / evict override VLLM_MOET_GEMV_PDL / VLLM_MOET_GEMV_EVICT_FIRST for this call
+    (None = the environment's choice); every combination returns the same bits.
+    """
+    return _ext().mxfp8_gemv(
+        a.contiguous(), a_sf.contiguous(), w.contiguous(), w_sf.contiguous(),
+        -1 if pdl is None else int(pdl), -1 if evict is None else int(evict),
+    )
 
 
 MAX_GROUPED_GEMV_T = 64
 
 
 def mxfp8_gemv_grouped(
-    a: torch.Tensor, a_sf: torch.Tensor, w: torch.Tensor, w_sf: torch.Tensor
+    a: torch.Tensor,
+    a_sf: torch.Tensor,
+    w: torch.Tensor,
+    w_sf: torch.Tensor,
+    pdl: int | None = None,
+    evict: int | None = None,
 ) -> torch.Tensor:
     """Grouped o-projection GEMV (DeepSeek-V4 `wo_a`), T <= 64 tokens.
 
@@ -58,7 +80,10 @@ def mxfp8_gemv_grouped(
     a_sf : int32 [G, T, ceil(K/128)] MN-major view (strides (S*T_al, 1, T_al)) — the
            packed ue8m0 scales fused_inv_rope_fp8_quant(tma_aligned_scales=True) writes
     w    : [G*Ng, K] e4m3 (layer.weight), w_sf: [G*Ng, K/32] uint8 (layer.weight_scale)
+    pdl / evict: as for mxfp8_gemv
     returns [T, G, Ng] bf16
     """
-    return _ext().mxfp8_gemv_grouped(a, a_sf, w, w_sf)
+    return _ext().mxfp8_gemv_grouped(
+        a, a_sf, w, w_sf, -1 if pdl is None else int(pdl), -1 if evict is None else int(evict)
+    )
 

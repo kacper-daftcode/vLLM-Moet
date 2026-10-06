@@ -16,6 +16,14 @@
 // ue8m0 scales, activations from fused_inv_rope_fp8_quant with DeepGEMM's packed
 // MN-major scales. On sm_120 vLLM otherwise falls back to BF16 weights + cuBLAS bmm.
 //
+// Since 2026-10-02 the v3 / v1 / grouped kernels are launched with programmatic dependent
+// launch (VLLM_MOET_GEMV_PDL, see griddep_wait / launch_mode): a GEMV comes up while the kernel
+// before it (FlashInfer's MXFP8 quantize, the Triton norm+quant / inverse-RoPE+quant kernels,
+// all PDL-aware) still runs, issues its first weight loads, waits, then reads the activations;
+// v3's weight loads skip L1 with an L2 evict-first policy (VLLM_MOET_GEMV_EVICT_FIRST). Same
+// arithmetic, same bits; with both switches at 0 the launches and kernels are the ones served
+// until then (SASS-identical).
+//
 // Mapping: one warp per output column n, 8 warps per block. The block stages A
 // (M x CHUNK e4m3) and its scales in shared memory once per K-chunk; every lane then
 // issues ALL of its 16-byte weight loads for the chunk up front (up to 10 in flight
@@ -24,6 +32,7 @@
 // streams ~2 GB). Each lane's 16 weights sit in exactly one 32-wide scale block, so
 // the block scale product 2^(ea + eb - 254) is applied per lane before the warp
 // reduction. Accumulation is fp32 like the CUTLASS kernel.
+#include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
@@ -35,6 +44,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 
 namespace vllm_moet_sm120 {
@@ -71,6 +81,81 @@ __device__ __forceinline__ void fp8x16_to_float(const uint4& v, float* out) {
 // 2^(e - 127) for a ue8m0 byte; e == 0 maps to 0 (only produced for all-zero blocks).
 __device__ __forceinline__ float ue8m0_to_float(uint32_t e) {
   return e == 0u ? 0.0f : __uint_as_float(e << 23);
+}
+
+// Programmatic dependent launch (PDL, 2026-10-02). A kernel launched with programmatic stream
+// serialization may start while the kernel before it still runs; until griddepcontrol.wait it may
+// read only immutable data (the weights and their scales), and every read of the activations and
+// every global write comes after it. Both kinds of loads of the PDL variants are asm volatile, so
+// the compiler keeps their order relative to the wait (an __ldg is an invariant load it may move
+// across it), and predicated inside the asm (a conditional asm load would become a branch per
+// load). The activations are weak L1-cached loads (griddepcontrol.wait makes the prerequisite
+// grids' writes visible to them), not the non-coherent path (the activations are not read-only
+// while the grid runs) and not ld.global.cg: every CTA re-reads the same few KB of activations,
+// and as L2-only (STRONG.GPU) loads they queue on the same L2 lines - 6x slower at 16 rows.
+// Predicated-off loads return 0.
+__device__ __forceinline__ void griddep_wait() { asm volatile("griddepcontrol.wait;" ::: "memory"); }
+__device__ __forceinline__ void griddep_launch_dependents() {
+  asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+}
+#define VLLM_MOET_PRED_LD(NAME, QUAL)                                                              \
+  __device__ __forceinline__ uint4 NAME##_v4(const void* ptr, bool pred) {                       \
+    uint4 v = make_uint4(0, 0, 0, 0);                                                            \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %5, 0;\n @p ld.global" QUAL                 \
+                 ".v4.u32 {%0, %1, %2, %3}, [%4];\n}"                                            \
+                 : "+r"(v.x), "+r"(v.y), "+r"(v.z), "+r"(v.w)                                    \
+                 : "l"(ptr), "r"((int)pred));                                                    \
+    return v;                                                                                    \
+  }                                                                                              \
+  __device__ __forceinline__ uint2 NAME##_v2(const void* ptr, bool pred) {                       \
+    uint2 v = make_uint2(0, 0);                                                                  \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %3, 0;\n @p ld.global" QUAL                 \
+                 ".v2.u32 {%0, %1}, [%2];\n}"                                                    \
+                 : "+r"(v.x), "+r"(v.y)                                                          \
+                 : "l"(ptr), "r"((int)pred));                                                    \
+    return v;                                                                                    \
+  }                                                                                              \
+  __device__ __forceinline__ uint32_t NAME##_u32(const void* ptr, bool pred) {                   \
+    uint32_t v = 0;                                                                              \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n @p ld.global" QUAL                 \
+                 ".u32 %0, [%1];\n}"                                                             \
+                 : "+r"(v)                                                                       \
+                 : "l"(ptr), "r"((int)pred));                                                    \
+    return v;                                                                                    \
+  }                                                                                              \
+  __device__ __forceinline__ uint32_t NAME##_u8(const void* ptr, bool pred) {                    \
+    uint32_t v = 0;                                                                              \
+    asm volatile("{\n .reg .pred p;\n setp.ne.b32 p, %2, 0;\n @p ld.global" QUAL                 \
+                 ".u8 %0, [%1];\n}"                                                              \
+                 : "+r"(v)                                                                       \
+                 : "l"(ptr), "r"((int)pred));                                                    \
+    return v;                                                                                    \
+  }
+VLLM_MOET_PRED_LD(ld_w, ".nc")  // weights / weight scales (immutable)
+VLLM_MOET_PRED_LD(ld_act, "")   // activations / activation scales (after griddepcontrol.wait)
+#undef VLLM_MOET_PRED_LD
+
+// EV = 1 (v3's PDL variants): the weight loads (not the scales) skip L1 and carry an L2
+// evict-first policy - every weight byte is read once per decode step. In CUDA graphs of the
+// served neighbour kernels the v3 calls get 0.3-0.6 us shorter and the gaps around them smaller;
+// the kernel alone under ncu (caches flushed) is unchanged (same L1 / L2 hit rates, same time).
+// Not for v1 / grouped: measured slower there (that layout shares each weight line between four
+// warps).
+__device__ __forceinline__ uint64_t evict_first_policy() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+template <int EV>
+__device__ __forceinline__ uint4 ld_weight_v4(const void* ptr, bool pred, uint64_t pol) {
+  if constexpr (EV == 0) return ld_w_v4(ptr, pred);
+  uint4 v = make_uint4(0, 0, 0, 0);
+  asm volatile(
+      "{\n .reg .pred p;\n setp.ne.b32 p, %5, 0;\n"
+      " @p ld.global.nc.L1::no_allocate.L2::cache_hint.v4.u32 {%0, %1, %2, %3}, [%4], %6;\n}"
+      : "+r"(v.x), "+r"(v.y), "+r"(v.z), "+r"(v.w)
+      : "l"(ptr), "r"((int)pred), "l"(pol));
+  return v;
 }
 
 // blockIdx.x -> group of kWarps output columns, blockIdx.y -> K-chunk (split-K).
@@ -230,14 +315,28 @@ struct GemvArgs {
 };
 
 template <int LAYOUT>
-__device__ __forceinline__ uint32_t load_sf(const uint8_t* __restrict__ sf, int row, int kb,
-                                            int num_k_tiles, int t_al, int ld) {
+__device__ __forceinline__ size_t sf_byte_offset(int row, int kb, int num_k_tiles, int t_al, int ld) {
   if constexpr (LAYOUT == SF_F8_128x4) {
-    return sf[sf_offset(row, kb, num_k_tiles)];
+    return sf_offset(row, kb, num_k_tiles);
   } else if constexpr (LAYOUT == SF_ROWMAJOR) {
-    return sf[(size_t)row * ld + kb];
+    return (size_t)row * ld + kb;
   } else {
-    return sf[((size_t)(kb >> 2) * t_al + row) * 4 + (kb & 3)];
+    return ((size_t)(kb >> 2) * t_al + row) * 4 + (kb & 3);
+  }
+}
+
+// LD: 0 = plain load, 1 = weight scale of a PDL variant, 2 = activation scale of a PDL variant
+// (predicated by `pred`, 0 when off).
+template <int LAYOUT, int LD = 0>
+__device__ __forceinline__ uint32_t load_sf(const uint8_t* __restrict__ sf, int row, int kb,
+                                            int num_k_tiles, int t_al, int ld, bool pred = true) {
+  const size_t off = sf_byte_offset<LAYOUT>(row, kb, num_k_tiles, t_al, ld);
+  if constexpr (LD == 1) {
+    return ld_w_u8(sf + off, pred);
+  } else if constexpr (LD == 2) {
+    return ld_act_u8(sf + off, pred);
+  } else {
+    return sf[off];
   }
 }
 
@@ -251,7 +350,12 @@ __device__ __forceinline__ void mma_m16n8k32_e4m3(float* d, const uint32_t* a, u
         "f"(0.0f), "f"(0.0f));
 }
 
-template <int MT, int A_SF, int B_SF>
+// PDL (see griddep_wait): 0 = plain launch; 1 = the first step's weight loads issued before
+// griddepcontrol.wait, the activation loads after it, launch_dependents right after the wait;
+// 2 = launch_dependents after the output stores instead; 3 = after the K loop. The arithmetic
+// is the same in every variant (same K split per warp, same per-lane fma order, same cross-warp
+// reduction): the same output bits.
+template <int MT, int A_SF, int B_SF, int PDL = 0>
 __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_kernel(const GemvArgs p) {
   __shared__ float s_red[kWarps][32][4 * MT];
 
@@ -287,48 +391,112 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_kernel(const GemvArgs
     for (int i = 0; i < 4; ++i) acc[t][i] = 0.0f;
 
   constexpr int UNROLL = 4;
-  for (int kb0 = warp; kb0 < KB; kb0 += kWarps * UNROLL) {
-    uint2 wa0[MT][UNROLL], wa1[MT][UNROLL], wb[UNROLL];
-    uint32_t sa0[MT][UNROLL], sa1[MT][UNROLL], sb0[UNROLL], sb1[UNROLL];
+  if constexpr (PDL == 0) {
+    for (int kb0 = warp; kb0 < KB; kb0 += kWarps * UNROLL) {
+      uint2 wa0[MT][UNROLL], wa1[MT][UNROLL], wb[UNROLL];
+      uint32_t sa0[MT][UNROLL], sa1[MT][UNROLL], sb0[UNROLL], sb1[UNROLL];
 #pragma unroll
-    for (int u = 0; u < UNROLL; ++u) {
-      const int kb = kb0 + u * kWarps;
-      const bool ok = kb < KB;
-      const size_t off = (size_t)kb * kBlockSize;
-      const int kbc = ok ? kb : 0;
-      wb[u] = (ok && col_ok) ? *reinterpret_cast<const uint2*>(brow + off) : make_uint2(0, 0);
-      sb0[u] = c0_ok ? load_sf<B_SF>(B_sf, c0, kbc, num_k_tiles, 0, p.b_sf_ld) : 0u;
-      sb1[u] = c1_ok ? load_sf<B_SF>(B_sf, c1, kbc, num_k_tiles, 0, p.b_sf_ld) : 0u;
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        const bool ok = kb < KB;
+        const size_t off = (size_t)kb * kBlockSize;
+        const int kbc = ok ? kb : 0;
+        wb[u] = (ok && col_ok) ? *reinterpret_cast<const uint2*>(brow + off) : make_uint2(0, 0);
+        sb0[u] = c0_ok ? load_sf<B_SF>(B_sf, c0, kbc, num_k_tiles, 0, p.b_sf_ld) : 0u;
+        sb1[u] = c1_ok ? load_sf<B_SF>(B_sf, c1, kbc, num_k_tiles, 0, p.b_sf_ld) : 0u;
 #pragma unroll
-      for (int t = 0; t < MT; ++t) {
-        const int r0 = g + 16 * t, r1 = r0 + 8;
-        const bool r0_ok = r0 < M, r1_ok = r1 < M;
-        wa0[t][u] = (ok && r0_ok) ? *reinterpret_cast<const uint2*>(acol + (size_t)r0 * K + off)
-                                  : make_uint2(0, 0);
-        wa1[t][u] = (ok && r1_ok) ? *reinterpret_cast<const uint2*>(acol + (size_t)r1 * K + off)
-                                  : make_uint2(0, 0);
-        sa0[t][u] = r0_ok ? load_sf<A_SF>(A_sf, r0, kbc, num_k_tiles, p.a_sf_t_al, 0) : 0u;
-        sa1[t][u] = r1_ok ? load_sf<A_SF>(A_sf, r1, kbc, num_k_tiles, p.a_sf_t_al, 0) : 0u;
+        for (int t = 0; t < MT; ++t) {
+          const int r0 = g + 16 * t, r1 = r0 + 8;
+          const bool r0_ok = r0 < M, r1_ok = r1 < M;
+          wa0[t][u] = (ok && r0_ok) ? *reinterpret_cast<const uint2*>(acol + (size_t)r0 * K + off)
+                                    : make_uint2(0, 0);
+          wa1[t][u] = (ok && r1_ok) ? *reinterpret_cast<const uint2*>(acol + (size_t)r1 * K + off)
+                                    : make_uint2(0, 0);
+          sa0[t][u] = r0_ok ? load_sf<A_SF>(A_sf, r0, kbc, num_k_tiles, p.a_sf_t_al, 0) : 0u;
+          sa1[t][u] = r1_ok ? load_sf<A_SF>(A_sf, r1, kbc, num_k_tiles, p.a_sf_t_al, 0) : 0u;
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        if (kb >= KB) break;
+        const float fb0 = ue8m0_to_float(sb0[u]), fb1 = ue8m0_to_float(sb1[u]);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const uint32_t afrag[4] = {wa0[t][u].x, wa1[t][u].x, wa0[t][u].y, wa1[t][u].y};
+          float d[4];
+          mma_m16n8k32_e4m3(d, afrag, wb[u].x, wb[u].y);
+          // d0,d1: row g, cols tig*2 + {0,1}; d2,d3: row g + 8, same cols.
+          const float fa0 = ue8m0_to_float(sa0[t][u]), fa1 = ue8m0_to_float(sa1[t][u]);
+          acc[t][0] = fmaf(d[0], fa0 * fb0, acc[t][0]);
+          acc[t][1] = fmaf(d[1], fa0 * fb1, acc[t][1]);
+          acc[t][2] = fmaf(d[2], fa1 * fb0, acc[t][2]);
+          acc[t][3] = fmaf(d[3], fa1 * fb1, acc[t][3]);
+        }
       }
     }
+  } else {
+    // The same K loop with the first step's weight half issued before griddepcontrol.wait (ptxas
+    // keeps only some of these loads in front of the wait in this kernel; v3 keeps all). The
+    // step is peeled rather than guarded inside the loop (a guard put every K block's loads into
+    // its own branch region).
+    uint2 wb[UNROLL];
+    uint32_t sb0[UNROLL], sb1[UNROLL];
+    auto load_b = [&](int kb0) {
 #pragma unroll
-    for (int u = 0; u < UNROLL; ++u) {
-      const int kb = kb0 + u * kWarps;
-      if (kb >= KB) break;
-      const float fb0 = ue8m0_to_float(sb0[u]), fb1 = ue8m0_to_float(sb1[u]);
-#pragma unroll
-      for (int t = 0; t < MT; ++t) {
-        const uint32_t afrag[4] = {wa0[t][u].x, wa1[t][u].x, wa0[t][u].y, wa1[t][u].y};
-        float d[4];
-        mma_m16n8k32_e4m3(d, afrag, wb[u].x, wb[u].y);
-        // d0,d1: row g, cols tig*2 + {0,1}; d2,d3: row g + 8, same cols.
-        const float fa0 = ue8m0_to_float(sa0[t][u]), fa1 = ue8m0_to_float(sa1[t][u]);
-        acc[t][0] = fmaf(d[0], fa0 * fb0, acc[t][0]);
-        acc[t][1] = fmaf(d[1], fa0 * fb1, acc[t][1]);
-        acc[t][2] = fmaf(d[2], fa1 * fb0, acc[t][2]);
-        acc[t][3] = fmaf(d[3], fa1 * fb1, acc[t][3]);
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        const bool ok = kb < KB;
+        const int kbc = ok ? kb : 0;
+        wb[u] = ld_w_v2(brow + (size_t)kbc * kBlockSize, ok && col_ok);
+        sb0[u] = load_sf<B_SF, 1>(B_sf, c0, kbc, num_k_tiles, 0, p.b_sf_ld, c0_ok);
+        sb1[u] = load_sf<B_SF, 1>(B_sf, c1, kbc, num_k_tiles, 0, p.b_sf_ld, c1_ok);
       }
-    }
+    };
+    auto k_step = [&](int kb0, auto with_b) {
+      uint2 wa0[MT][UNROLL], wa1[MT][UNROLL];
+      uint32_t sa0[MT][UNROLL], sa1[MT][UNROLL];
+      if constexpr (decltype(with_b)::value) load_b(kb0);
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        const bool ok = kb < KB;
+        const size_t off = (size_t)kb * kBlockSize;
+        const int kbc = ok ? kb : 0;
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const int r0 = g + 16 * t, r1 = r0 + 8;
+          const bool r0_ok = r0 < M, r1_ok = r1 < M;
+          wa0[t][u] = ld_act_v2(acol + (size_t)r0 * K + off, ok && r0_ok);
+          wa1[t][u] = ld_act_v2(acol + (size_t)r1 * K + off, ok && r1_ok);
+          sa0[t][u] = load_sf<A_SF, 2>(A_sf, r0, kbc, num_k_tiles, p.a_sf_t_al, 0, r0_ok);
+          sa1[t][u] = load_sf<A_SF, 2>(A_sf, r1, kbc, num_k_tiles, p.a_sf_t_al, 0, r1_ok);
+        }
+      }
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const int kb = kb0 + u * kWarps;
+        if (kb >= KB) break;
+        const float fb0 = ue8m0_to_float(sb0[u]), fb1 = ue8m0_to_float(sb1[u]);
+#pragma unroll
+        for (int t = 0; t < MT; ++t) {
+          const uint32_t afrag[4] = {wa0[t][u].x, wa1[t][u].x, wa0[t][u].y, wa1[t][u].y};
+          float d[4];
+          mma_m16n8k32_e4m3(d, afrag, wb[u].x, wb[u].y);
+          const float fa0 = ue8m0_to_float(sa0[t][u]), fa1 = ue8m0_to_float(sa1[t][u]);
+          acc[t][0] = fmaf(d[0], fa0 * fb0, acc[t][0]);
+          acc[t][1] = fmaf(d[1], fa0 * fb1, acc[t][1]);
+          acc[t][2] = fmaf(d[2], fa1 * fb0, acc[t][2]);
+          acc[t][3] = fmaf(d[3], fa1 * fb1, acc[t][3]);
+        }
+      }
+    };
+    load_b(warp);
+    griddep_wait();
+    if constexpr (PDL == 1) griddep_launch_dependents();
+    if (warp < KB) k_step(warp, std::false_type{});
+    for (int kb0 = warp + kWarps * UNROLL; kb0 < KB; kb0 += kWarps * UNROLL) k_step(kb0, std::true_type{});
+    if constexpr (PDL == 3) griddep_launch_dependents();
   }
 
   // Reduce the 8 K-split warps.
@@ -356,6 +524,7 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_kernel(const GemvArgs
       }
     }
   }
+  if constexpr (PDL == 2) griddep_launch_dependents();
 }
 
 // ---------------------------------------------------------------------------
@@ -687,6 +856,55 @@ static int env_int(const char* name, int def) {
   return v == nullptr ? def : std::atoi(v);
 }
 
+// How the v3 / v1 / grouped kernels are launched (2026-10-02, see griddep_wait):
+//   VLLM_MOET_GEMV_PDL          0 = plain launch (the kernels served until then), 1 = PDL with
+//                               launch_dependents right after griddepcontrol.wait, 2 = PDL with
+//                               launch_dependents after the output stores, 3 = PDL with
+//                               launch_dependents after the K loop (before the reduction)
+//   VLLM_MOET_GEMV_EVICT_FIRST  1 = v3's PDL variants load the weights with an L2 evict-first
+//                               policy (no L1 allocation), 0 = plain non-coherent loads
+// A call may override both (pdl= / evict= of the Python entry points; -1 = these defaults).
+struct LaunchMode {
+  int pdl;
+  int ev;
+};
+// Defaults since 2026-10-02 (test_gemv_pdl_sm120.py: every mode returns the committed kernels'
+// bits; cold-weight CUDA graphs of the served neighbour kernels, RTX PRO 6000, 6 rows: the
+// attention sublayer's quantize -> q_a+kv_a -> norm+quant -> q_b -> ... -> inv-RoPE+quant -> wo_a
+// -> quantize -> wo_b chain 48.7 -> 38.6 us per layer; the trigger after the K loop (3) ties
+// with 1 there and is slower for the grouped kernel at 48 tokens on the RTX 5090).
+constexpr int kPdlDefault = 1;
+constexpr int kEvictFirstDefault = 1;
+
+static LaunchMode launch_mode(int pdl, int ev) {
+  static const int env_pdl = env_int("VLLM_MOET_GEMV_PDL", kPdlDefault);
+  static const int env_ev = env_int("VLLM_MOET_GEMV_EVICT_FIRST", kEvictFirstDefault);
+  LaunchMode m{pdl < 0 ? env_pdl : pdl, ev < 0 ? env_ev : ev};
+  m.pdl = std::min(std::max(m.pdl, 0), 3);
+  m.ev = m.ev != 0 ? 1 : 0;
+  return m;
+}
+
+template <typename... KArgs, typename... Args>
+static void launch_kernel(void (*kernel)(KArgs...), dim3 grid, dim3 block, size_t smem, cudaStream_t stream,
+                          bool pdl, Args... args) {
+  if (!pdl) {
+    kernel<<<grid, block, smem, stream>>>(args...);
+    return;
+  }
+  cudaLaunchConfig_t cfg = {};
+  cfg.gridDim = grid;
+  cfg.blockDim = block;
+  cfg.dynamicSmemBytes = smem;
+  cfg.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  cfg.attrs = attr;
+  cfg.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&cfg, kernel, args...));
+}
+
 // VLLM_MOET_GEMV_IMPL: "v3" (default since 2026-09-19: the bandwidth rewrite of the dense
 // M <= 8 path below; grouped wo_a, M > 8 and K % 128 != 0 fall back to v1), "v1" (the kernel
 // served until then), "v2" (experiment: no gain, see tools/dsv41_sm120/README.md), "scalar".
@@ -822,17 +1040,39 @@ static void launch_mma_v2(const GemvArgs& p, int groups, int device, cudaStream_
   }
 }
 
+template <int MT, int A_SF, int B_SF, bool kModes>
+static void launch_mma_mt(const dim3& grid, const dim3& block, const GemvArgs& p, cudaStream_t stream,
+                          const LaunchMode& m) {
+  if constexpr (kModes) {
+    if (m.pdl == 1) {
+      launch_kernel(mxfp8_mma_gemv_kernel<MT, A_SF, B_SF, 1>, grid, block, 0, stream, true, p);
+      return;
+    }
+    if (m.pdl == 2) {
+      launch_kernel(mxfp8_mma_gemv_kernel<MT, A_SF, B_SF, 2>, grid, block, 0, stream, true, p);
+      return;
+    }
+    if (m.pdl == 3) {
+      launch_kernel(mxfp8_mma_gemv_kernel<MT, A_SF, B_SF, 3>, grid, block, 0, stream, true, p);
+      return;
+    }
+  }
+  mxfp8_mma_gemv_kernel<MT, A_SF, B_SF><<<grid, block, 0, stream>>>(p);
+}
+
+// Dense calls above 16 rows (not served: vLLM takes CUTLASS there) keep the plain launch.
 template <int A_SF, int B_SF>
-static void launch_mma(const GemvArgs& p, int groups, cudaStream_t stream) {
+static void launch_mma(const GemvArgs& p, int groups, cudaStream_t stream, const LaunchMode& m) {
+  constexpr bool kGrouped = A_SF == SF_MN_PACKED;
   const dim3 grid((p.N + kMmaCols - 1) / kMmaCols, groups), block(kThreads);
   if (p.M <= 16) {
-    mxfp8_mma_gemv_kernel<1, A_SF, B_SF><<<grid, block, 0, stream>>>(p);
+    launch_mma_mt<1, A_SF, B_SF, true>(grid, block, p, stream, m);
   } else if (p.M <= 32) {
-    mxfp8_mma_gemv_kernel<2, A_SF, B_SF><<<grid, block, 0, stream>>>(p);
+    launch_mma_mt<2, A_SF, B_SF, kGrouped>(grid, block, p, stream, m);
   } else if (p.M <= 48) {
-    mxfp8_mma_gemv_kernel<3, A_SF, B_SF><<<grid, block, 0, stream>>>(p);
+    launch_mma_mt<3, A_SF, B_SF, kGrouped>(grid, block, p, stream, m);
   } else {
-    mxfp8_mma_gemv_kernel<4, A_SF, B_SF><<<grid, block, 0, stream>>>(p);
+    launch_mma_mt<4, A_SF, B_SF, kGrouped>(grid, block, p, stream, m);
   }
 }
 
@@ -873,7 +1113,9 @@ struct V3Smem {
   static constexpr size_t kBytes = (size_t)kWarps * kPerWarp;
 };
 
-template <int R>
+// PDL / EV: as for mxfp8_mma_gemv_kernel; the PDL variants issue round 0's weight half before
+// griddepcontrol.wait (and ptxas keeps all of it there).
+template <int R, int PDL = 0, int EV = 0>
 __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvArgs p, const SplitKArgs sk) {
   using S = V3Smem<R>;
   extern __shared__ __align__(16) uint8_t v3_smem[];
@@ -936,8 +1178,44 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvA
     sbw = (ok && sl_b) ? __ldg(b_sf32 + sf_word_index(n0 + sl_row, kt, nkt)) : 0u;
     saw = (ok && sl_a) ? __ldg(a_sf32 + sf_word_index(sl_row, kt, nkt)) : 0u;
   };
+  // With PDL a round is split: the weight half may be issued before griddepcontrol.wait ...
+  const uint64_t pol = (PDL != 0 && EV != 0) ? evict_first_policy() : 0;
+  auto issue_round_w = [&](int r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      const int i = r * R + j;
+      const bool ok = i < nu;
+      const size_t k0 = (size_t)(u_begin + warp + kWarps * i) << 7;
+      wreg[j][0] = ld_weight_v4<EV>(b_row0 + k0, ok && r0_ok, pol);
+      wreg[j][1] = ld_weight_v4<EV>(b_row1 + k0, ok && r1_ok, pol);
+    }
+    const int i = r * R + sl_j;
+    const int kt = u_begin + warp + kWarps * i;
+    sbw = ld_w_u32(b_sf32 + sf_word_index(n0 + sl_row, kt, nkt), i < nu && sl_b);
+  };
+  // ... the activation half (written by the kernel before) only after it, through L2.
+  auto issue_round_a = [&](int r) {
+#pragma unroll
+    for (int j = 0; j < R; ++j) {
+      const int i = r * R + j;
+      const bool ok = i < nu;
+      const size_t k0 = (size_t)(u_begin + warp + kWarps * i) << 7;
+      areg[j][0] = ld_act_v4(a_row0 + k0, ok && a0_ok);
+      areg[j][1] = ld_act_v4(a_row1 + k0, ok && a1_ok);
+    }
+    const int i = r * R + sl_j;
+    const int kt = u_begin + warp + kWarps * i;
+    saw = ld_act_u32(a_sf32 + sf_word_index(sl_row, kt, nkt), i < nu && sl_a);
+  };
 
-  if (rounds > 0) issue_round(0);
+  if constexpr (PDL == 0) {
+    if (rounds > 0) issue_round(0);
+  } else {
+    if (rounds > 0) issue_round_w(0);
+    griddep_wait();
+    if constexpr (PDL == 1) griddep_launch_dependents();
+    if (rounds > 0) issue_round_a(0);
+  }
 
   float acc0 = 0.0f, acc1 = 0.0f;
   const int c0 = n0 + tig * 2, c1 = c0 + 1;
@@ -957,7 +1235,14 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvA
       s_asf[(buf * R + sl_j) * kMmaCols + sl_row] = saw;
     }
     __syncwarp();
-    if (r + 1 < rounds) issue_round(r + 1);
+    if (r + 1 < rounds) {
+      if constexpr (PDL == 0) {
+        issue_round(r + 1);
+      } else {
+        issue_round_w(r + 1);
+        issue_round_a(r + 1);
+      }
+    }
 
     uint32_t sb0w[R], sb1w[R], saw_g[R];
 #pragma unroll
@@ -985,6 +1270,7 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvA
     }
     __syncwarp();
   }
+  if constexpr (PDL == 3) griddep_launch_dependents();
 
   s_red[warp][lane][0] = acc0;
   s_red[warp][lane][1] = acc1;
@@ -1002,6 +1288,7 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvA
         if (c1 < N) p.C[(size_t)g * p.ldc + c1] = __float2bfloat16(r1);
       }
     }
+    if constexpr (PDL == 2) griddep_launch_dependents();
     return;
   }
   // Split-K: publish this block's [kV3MaxM][8] fp32 partial, the last-arriving block sums.
@@ -1030,6 +1317,7 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvA
     if (m < M && n0 + col < N) p.C[(size_t)m * p.ldc + n0 + col] = __float2bfloat16(sum);
   }
   if (threadIdx.x == 0) sk.counters[blockIdx.x] = 0;  // ready for the next launch / graph replay
+  if constexpr (PDL == 2) griddep_launch_dependents();
 }
 
 static int v3_units_per_round() { return env_int("VLLM_MOET_GEMV_V3_R", 1); }
@@ -1045,9 +1333,16 @@ static int device_sm_count(int device) {
   return sms[device] = (n > 0 ? n : 128);
 }
 
+template <int PDL>
+static void launch_v3_r1(int ev, const dim3& grid, const GemvArgs& p, const SplitKArgs& sk, cudaStream_t stream) {
+  auto* kfn = ev ? mxfp8_mma_gemv_v3_kernel<1, PDL, 1> : mxfp8_mma_gemv_v3_kernel<1, PDL, 0>;
+  set_dyn_smem(kfn, V3Smem<1>::kBytes);
+  launch_kernel(kfn, grid, dim3(kThreads), V3Smem<1>::kBytes, stream, true, p, sk);
+}
+
 // Split K across blocks until the grid holds ~2 blocks per SM (the small-N shapes run 72-224
 // blocks otherwise), keeping >= 8 units (one per warp) in every split.
-static void launch_mma_v3(const GemvArgs& p, int device, cudaStream_t stream) {
+static void launch_mma_v3(const GemvArgs& p, int device, cudaStream_t stream, const LaunchMode& m) {
   const int col_blocks = (p.N + kMmaCols - 1) / kMmaCols;
   const int units = p.K >> 7;
   static const int target = env_int("VLLM_MOET_GEMV_V3_BLOCKS_PER_SM", 2);
@@ -1082,6 +1377,12 @@ static void launch_mma_v3(const GemvArgs& p, int device, cudaStream_t stream) {
     auto* kfn = mxfp8_mma_gemv_v3_kernel<2>;
     set_dyn_smem(kfn, V3Smem<2>::kBytes);
     kfn<<<grid, dim3(kThreads), V3Smem<2>::kBytes, stream>>>(p, sk);
+  } else if (m.pdl == 1) {
+    launch_v3_r1<1>(m.ev, grid, p, sk, stream);
+  } else if (m.pdl == 2) {
+    launch_v3_r1<2>(m.ev, grid, p, sk, stream);
+  } else if (m.pdl == 3) {
+    launch_v3_r1<3>(m.ev, grid, p, sk, stream);
   } else {
     auto* kfn = mxfp8_mma_gemv_v3_kernel<1>;
     set_dyn_smem(kfn, V3Smem<1>::kBytes);
@@ -1113,7 +1414,7 @@ static void launch(const uint8_t* A, const uint8_t* Asf, const uint8_t* B, const
 }
 
 torch::Tensor mxfp8_gemv(torch::Tensor a, torch::Tensor a_sf, torch::Tensor b,
-                         torch::Tensor b_sf) {
+                         torch::Tensor b_sf, int64_t pdl, int64_t evict) {
   TORCH_CHECK(a.is_cuda() && b.is_cuda() && a_sf.is_cuda() && b_sf.is_cuda(), "cuda tensors");
   TORCH_CHECK(a.dim() == 2 && b.dim() == 2, "a [M,K], b [N,K]");
   TORCH_CHECK(a.is_contiguous() && b.is_contiguous() && a_sf.is_contiguous() && b_sf.is_contiguous(),
@@ -1140,12 +1441,13 @@ torch::Tensor mxfp8_gemv(torch::Tensor a, torch::Tensor a_sf, torch::Tensor b,
     GemvArgs p{};
     p.A = A; p.A_sf = Asf; p.B = B; p.B_sf = Bsf; p.C = Cp;
     p.M = M; p.N = N; p.K = K; p.num_k_tiles = num_k_tiles; p.ldc = N;
+    const LaunchMode mode = launch_mode((int)pdl, (int)evict);
     if (impl == 2) {
       launch_mma_v2<SF_F8_128x4, SF_F8_128x4>(p, 1, a.get_device(), stream);
     } else if (impl == 3 && v3_applicable(M, K)) {
-      launch_mma_v3(p, a.get_device(), stream);
+      launch_mma_v3(p, a.get_device(), stream, mode);
     } else {
-      launch_mma<SF_F8_128x4, SF_F8_128x4>(p, 1, stream);
+      launch_mma<SF_F8_128x4, SF_F8_128x4>(p, 1, stream, mode);
     }
   } else if (M <= 8) {
     launch<8, 5120>(A, Asf, B, Bsf, Cp, a, M, N, K, num_k_tiles, stream);   // 40 KB + 5 KB smem
@@ -1167,7 +1469,7 @@ torch::Tensor mxfp8_gemv(torch::Tensor a, torch::Tensor a_sf, torch::Tensor b,
 // w_sf   : [G*Ng, K/32] ue8m0 (the layer's weight_scale as loaded, row-major)
 // returns Z as [T, G, Ng] bf16.
 torch::Tensor mxfp8_gemv_grouped(torch::Tensor a, torch::Tensor a_sf, torch::Tensor w,
-                                 torch::Tensor w_sf) {
+                                 torch::Tensor w_sf, int64_t pdl, int64_t evict) {
   TORCH_CHECK(a.is_cuda() && w.is_cuda() && a_sf.is_cuda() && w_sf.is_cuda(), "cuda tensors");
   TORCH_CHECK(a.dim() == 3 && a.is_contiguous(), "a must be a contiguous [G, T, K] tensor");
   TORCH_CHECK(a.scalar_type() == torch::kFloat8_e4m3fn && w.scalar_type() == torch::kFloat8_e4m3fn,
@@ -1209,7 +1511,7 @@ torch::Tensor mxfp8_gemv_grouped(torch::Tensor a, torch::Tensor a_sf, torch::Ten
   if (gemv_impl_version() == 2) {
     launch_mma_v2<SF_MN_PACKED, SF_ROWMAJOR>(p, G, a.get_device(), stream);
   } else {
-    launch_mma<SF_MN_PACKED, SF_ROWMAJOR>(p, G, stream);
+    launch_mma<SF_MN_PACKED, SF_ROWMAJOR>(p, G, stream, launch_mode((int)pdl, (int)evict));
   }
   return z;
 }
@@ -1218,9 +1520,14 @@ torch::Tensor mxfp8_gemv_grouped(torch::Tensor a, torch::Tensor a_sf, torch::Ten
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("mxfp8_gemv", &vllm_moet_sm120::mxfp8_gemv,
-        "MXFP8 x MXFP8 -> BF16 GEMV for M <= 64 (F8_128x4 swizzled scales)");
+        "MXFP8 x MXFP8 -> BF16 GEMV for M <= 64 (F8_128x4 swizzled scales); pdl / evict: "
+        "launch mode (-1 = VLLM_MOET_GEMV_PDL / VLLM_MOET_GEMV_EVICT_FIRST)",
+        py::arg("a"), py::arg("a_sf"), py::arg("b"), py::arg("b_sf"), py::arg("pdl") = -1,
+        py::arg("evict") = -1);
   m.def("mxfp8_gemv_grouped", &vllm_moet_sm120::mxfp8_gemv_grouped,
         "Grouped MXFP8 GEMV for the DeepSeek-V4 o-projection (T <= 64): "
         "a [G,T,K] e4m3 + packed MN-major ue8m0 scales, w [G*Ng,K] e4m3 + row-major "
-        "ue8m0 scales -> [T, G, Ng] bf16");
+        "ue8m0 scales -> [T, G, Ng] bf16",
+        py::arg("a"), py::arg("a_sf"), py::arg("w"), py::arg("w_sf"), py::arg("pdl") = -1,
+        py::arg("evict") = -1);
 }

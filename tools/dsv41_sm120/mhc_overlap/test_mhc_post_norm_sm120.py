@@ -6,6 +6,10 @@ RMSNorm'd layer input and the draft aux against `mhc_pre_big_fuse_with_norm` fed
 Then the timing in a CUDA graph: ours alone (the new critical path) against the served pair and against
 upstream's overlap critical path (post + pre_norm[input]).
 
+The PDL launch (VLLM_MOET_MHC_PDL, the served default) is also checked behind a predecessor that releases its
+dependents at once and only ~20 us later writes one of the kernel's inputs (x, the streams, the three mixes) or reads
+its output buffers: the same bits as the plain launch on the final inputs, eagerly and inside a CUDA graph.
+
 Run inside the ds41 image on one sm_120 GPU:
     python3 test_mhc_post_norm_sm120.py [--bench] [--modes]
 """
@@ -60,6 +64,99 @@ def tl_pre_norm(mode, mixes, sqrsum, scale, base, residual_cur, norm_w, pre_mix,
         rms_numel=HC * H, split_mode=mode, write_aux=write_aux,
     )
     return post, comb, layer_input, next_pre, aux
+
+
+# A predecessor for the PDL checks: releases its programmatic dependents at once, spins, then copies src -> dst.
+RACER_SRC = r"""
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+__global__ void racer_kernel(const int* src, int* dst, int n, long long spin_ns) {
+  asm volatile("griddepcontrol.launch_dependents;");
+  long long t0, t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+  do { asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); } while (t - t0 < spin_ns);
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) dst[i] = src[i];
+}
+void racer(torch::Tensor src, torch::Tensor dst, int64_t spin_ns) {
+  TORCH_CHECK(src.is_contiguous() && dst.is_contiguous() && src.nbytes() == dst.nbytes() && src.nbytes() % 4 == 0);
+  racer_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream().stream()>>>(
+      (const int*)src.data_ptr(), (int*)dst.data_ptr(), (int)(src.nbytes() / 4), spin_ns);
+}
+"""
+SPIN_NS = 20_000
+
+
+def racer():
+    if not hasattr(racer, "ext"):
+        from torch.utils.cpp_extension import load_inline
+
+        racer.ext = load_inline("vllm_moet_test_pdl_racer", cpp_sources="void racer(torch::Tensor, torch::Tensor, int64_t);",
+                                cuda_sources=RACER_SRC, functions=["racer"], extra_cuda_cflags=["-O3"])
+    return racer.ext.racer
+
+
+def check_pdl(dev) -> int:
+    """The PDL launch against the plain one on the final inputs, behind a predecessor that releases its dependents at
+    once and writes one input ~20 us later (RAW) or reads the output buffers then (WAR); eagerly and in a graph."""
+    race = racer()
+    fails, n_checks = 0, 0
+    names = ("x", "residual", "post_layer_mix", "comb_res_mix", "pre_mix")
+    for T, capture_aux in ((1, False), (6, False), (6, True), (16, True), (64, False)):
+        new = inputs(T, dev)
+        x, residual, post_layer_mix, comb_res_mix, _, _, _, norm_w, pre_mix = new
+        args_new = (x, residual, post_layer_mix, comb_res_mix, pre_mix)
+        ref = mhc_post_norm(*args_new, norm_w, NORM_EPS, capture_aux=capture_aux, pdl=False)
+        for j, nm in enumerate(names):  # RAW on each input
+            stale = inputs(T, dev)
+            stale_args = (stale[0], stale[1], stale[2], stale[3], stale[8])
+            args = list(args_new)
+            buf = stale_args[j].clone()
+            race(args_new[j].contiguous(), buf, SPIN_NS)
+            args[j] = buf
+            got = mhc_post_norm(*args, norm_w, NORM_EPS, capture_aux=capture_aux, pdl=True)
+            torch.cuda.synchronize()
+            n_checks += 1
+            if not all(torch.equal(a, b) for a, b in zip(ref, got)):
+                fails += 1
+                print(f"  PDL T={T} aux={capture_aux}: the kernel did not see the {nm} its predecessor wrote")
+        # WAR on the output buffers
+        res_out = torch.randn_like(residual)
+        layer_in = torch.randn(T, H, device=dev).to(torch.bfloat16)
+        aux = torch.randn(T if capture_aux else 0, H, device=dev).to(torch.bfloat16)
+        old = (res_out.clone(), layer_in.clone())
+        seen = (torch.empty_like(res_out), torch.empty_like(layer_in))
+        race(res_out, seen[0], SPIN_NS)
+        race(layer_in, seen[1], SPIN_NS)
+        got = mhc_post_norm(*args_new, norm_w, NORM_EPS, capture_aux=capture_aux, pdl=True, out=(res_out, layer_in, aux))
+        torch.cuda.synchronize()
+        n_checks += 1
+        if not (torch.equal(seen[0], old[0]) and torch.equal(seen[1], old[1]) and all(torch.equal(a, b) for a, b in zip(ref, got))):
+            fails += 1
+            print(f"  PDL T={T} aux={capture_aux}: the kernel wrote its outputs before its predecessor read them")
+        # in a graph: every input written late by predecessors, replayed with new inputs
+        srcs = [t.clone() for t in args_new]
+        bufs = [torch.empty_like(t) for t in args_new]
+        cap = torch.cuda.Stream()
+        cap.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(cap):
+            with torch.cuda.graph(graph, stream=cap):
+                for s_, b_ in zip(srcs, bufs):
+                    race(s_.contiguous(), b_, SPIN_NS)
+                got = mhc_post_norm(*bufs, norm_w, NORM_EPS, capture_aux=capture_aux, pdl=True)
+        for rep in range(2):
+            fresh = inputs(T, dev)
+            for s_, f_ in zip(srcs, (fresh[0], fresh[1], fresh[2], fresh[3], fresh[8])):
+                s_.copy_(f_)
+            graph.replay()
+            torch.cuda.synchronize()
+            ref_g = mhc_post_norm(*srcs, norm_w, NORM_EPS, capture_aux=capture_aux, pdl=False)
+            n_checks += 1
+            if not all(torch.equal(a, b) for a, b in zip(ref_g, got)):
+                fails += 1
+                print(f"  PDL T={T} aux={capture_aux}: graph replay {rep} differs from the plain launch")
+    print(f"[{'ok ' if fails == 0 else 'BAD'}] PDL ordering: {n_checks} checks{'' if fails == 0 else f', {fails} failed'}")
+    return fails
 
 
 def ulp_stats(a: torch.Tensor, b: torch.Tensor) -> tuple[int, int]:
@@ -141,6 +238,7 @@ def main() -> int:
                 ds = (sqrsum.view(torch.int32) - sqrsum_o.view(torch.int32)).abs().max().item()
                 print(f"[{'ok ' if ok else 'BAD'}] T={T:2d} projection tok_block={tok_block}: mixes "
                       f"{'identical' if dm == 0 else f'<= {dm} ulp'}, sqrsum {'identical' if ds == 0 else f'<= {ds} ulp'}")
+    fails += check_pdl(dev)
     if args.bench:
         for T in (1, 6, 16, 32):
             x, residual, post_layer_mix, comb_res_mix, fn, scale, base, norm_w, pre_mix = inputs(T, dev)

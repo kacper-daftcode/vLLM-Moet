@@ -77,6 +77,10 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly --build-arg VLL
 # DeepSeek, served image since 2026-10-02: the same + Engram's wkv split over the TP ranks at decode token counts
 # ("The Engram wkv split at decode"; Dockerfile step 12); the line above is the -bf16 tag served before it
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-engram .
+# (the two lines above are the tags as built from their commits - -engram from f7cc6d9; this tree builds the candidate below)
+# DeepSeek, candidate (not served yet): + PDL in our decode kernels, NCCL's per-collective graph event records reduced to
+# one, FC2's padding rows out of L2 ("The idle GPU between the decode kernels"; Dockerfile steps 13, 14)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-pdl .
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -142,6 +146,7 @@ docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash vllm-moet-sm120
   'python3 /opt/vllm-moet/dsv41_sm120/test_engram_wkv_tp.py'
 docker run --rm --gpus '"device=0,1,2,3"' --ipc host -e NCCL_P2P_LEVEL=SYS --entrypoint bash \
   vllm-moet-sm120:dsv41-nightly-20260923-engram -c 'torchrun --nproc_per_node=4 /opt/vllm-moet/dsv41_sm120/test_engram_wkv_tp4.py'
+# the -pdl candidate in addition: tools/dsv41_sm120/README.md, "On the -pdl tag" (one GPU, then four)
 ```
 
 ## Serve
@@ -174,6 +179,11 @@ back in the linear layers), `VLLM_MOET_MHC_FUSE_ALLREDUCE=0` / `VLLM_MOET_MHC_PD
 picks the sites, served `indexer,wk,router`, `compressor` opt-in),
 `VLLM_MOET_ENGRAM_WKV_TP=0` (`-engram` image: Engram's wkv replicated at every token count again;
 `VLLM_MOET_ENGRAM_WKV_TP_MAX_TOKENS`, default 64, is the largest token count that splits),
+`VLLM_MOET_GEMV_PDL=0` / `VLLM_MOET_GEMV_EVICT_FIRST=0` (`-pdl` image: the MXFP8 GEMVs launched and loading as before),
+`VLLM_MOET_BF16_GEMM_PDL=0` / `VLLM_MOET_MOE_QUANT_SCATTER_PDL=0` (the router / MoE quant+scatter without PDL; the BF16
+switch also takes a site list, default `router`), `VLLM_MOET_BF16_CHAIN=v2` (opt-in: the indexer's one-slice chain with
+the activations in the shared-memory ring), `VLLM_MOET_NCCL_GRAPH_RECORDS=0` (graphs captured with all of NCCL's event
+records, as before), `VLLM_MOET_MOE_FC2_DISCARD=0` (FC2's padding rows stay in L2; `_MIN_TOKENS` / `_MAX_TOKENS`, 2 / 64),
 `VLLM_MOET_SM120_MOE_GEMV=0` (Qwen MoE GEMV → Triton), `VLLM_MOET_SM120_MOE_GEMV_FUSE_ACT=0`,
 `VLLM_MOET_SM120_LL_GEMM=0` (Qwen skinny GEMM → cuBLAS; changes the compiled graph, so use a fresh
 `CACHE_DIR`), `VLLM_PLE_CPU_OFFLOAD=1` (Qwen PLE table in a CPU worker; then `KV_CACHE_MEMORY=`).

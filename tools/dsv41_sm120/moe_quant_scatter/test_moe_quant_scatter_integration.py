@@ -7,7 +7,7 @@ with the deferred-quantization fallback (> 1024 pairs) and with the switch off
 intended path in each case.
 
 Run inside the ds41 image on one sm_120 GPU after the patch is applied:
-    python3 test_moe_quant_scatter_integration.py
+    python3 test_moe_quant_scatter_integration.py [--experts N]   (default the served 384; fewer = less memory)
 """
 
 from __future__ import annotations
@@ -71,10 +71,15 @@ def run(experts, prepare, x, topk_w, topk_ids, w13, w2, E, calls):
 
 
 def main() -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--experts", type=int, default=384)
+    args = ap.parse_args()
     assert hasattr(dgm, "_moet_quant_scatter"), "patch not applied"
     dev = torch.device("cuda")
     torch.manual_seed(3)
-    E, K, I, TOPK = 384, 5120, 640, 6
+    E, K, I, TOPK = args.experts, 5120, 640, 6
     N1 = 2 * I
     w13, w2, w13_s, w2_s = make_experts(E, N1, K, I, dev)
     quant_config = deepgemm_mxfp4_quant_config(w13_s, w2_s)

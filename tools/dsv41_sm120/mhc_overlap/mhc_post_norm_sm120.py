@@ -29,10 +29,11 @@ HC_MULT = 4
 # other two modes exist only so the test can show which one nvcc picked.
 POST_MIX_MODE = 1
 # Programmatic dependent launch for the critical-path kernel. In the served graph the kernel follows
-# the sublayer's NCCL all-reduce; as that node's only child and launched with PDL it starts 0.2 us
-# after it (with a second parent - the side stream's join - or without PDL: 2.2 us), at the price of
-# ~0.5 us of in-kernel wait. Micro-benchmarks behind a small kernel show the opposite (+0.5 us), so
-# it is a knob: VLLM_MOET_MHC_PDL=0 turns it off.
+# the sublayer's NCCL all-reduce as that node's only child and starts 0.2 us after it. Behind a real
+# 4-rank all-reduce (RTX PRO 6000, CUDA graph) it starts at the all-reduce's end with PDL and 0.4-0.5 us
+# after it without, equally long; its PDL successors (FlashInfer's MXFP8 quantization, the router) can
+# only start during it when it is PDL-launched (it releases them right after its wait): 0.8 us per
+# attention boundary, 0.4 per FFN boundary. VLLM_MOET_MHC_PDL=0 turns it off.
 PDL_DEFAULT = os.environ.get("VLLM_MOET_MHC_PDL", "1") == "1"
 
 

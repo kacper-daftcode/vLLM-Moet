@@ -25,6 +25,11 @@
 //
 // Compiled without --use_fast_math on purpose: vLLM's per_token_group_quant.cu is not, and the
 // scale math has to match it bit for bit (log2f/exp2f/IEEE division).
+//
+// Optionally launched with programmatic stream serialization (PDL, `pdl=`): the CTAs come up while
+// the router's top-k kernel drains. Everything the kernel reads (the rows, topk_ids) is produced by
+// earlier kernels, so griddepcontrol.wait comes first, before any load or store; right after it
+// the kernel releases its own dependents (DeepGEMM's FC1 is PDL-launched and waits for this grid).
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -65,7 +70,7 @@ __device__ __forceinline__ uint8_t to_e4m3(float q) {
   }
 }
 
-template <typename T, bool kHwCvt>
+template <typename T, bool kHwCvt, bool kPDL>
 __global__ void __launch_bounds__(kThreads) moe_quant_scatter_kernel(
     const T* __restrict__ x, const int64_t x_stride,   // [M, K], row stride in elements
     const int32_t* __restrict__ topk_ids,              // [M, TOPK] contiguous
@@ -87,6 +92,10 @@ __global__ void __launch_bounds__(kThreads) moe_quant_scatter_kernel(
   const int p = blockIdx.x;
   const int sf_k = K / kGroup;
   const int sf_k_pad = round_up_i(sf_k, 4);
+  if constexpr (kPDL) {
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+  }
 
   // 0. issue the row loads now; the routing work below overlaps their latency
   const int g = warp * kGroupsPerWarp + (lane >> 3);   // this lane's 128-group of the row
@@ -240,15 +249,34 @@ __global__ void __launch_bounds__(kThreads) moe_quant_scatter_kernel(
 template <typename T, bool kHwCvt>
 void launch(const at::Tensor& x, const at::Tensor& topk_ids, at::Tensor& out_q, at::Tensor& out_s,
             at::Tensor& m_indices, at::Tensor& inv_perm, int E, int align, float eps, float fp8_min,
-            float fp8_max, cudaStream_t stream) {
+            float fp8_max, bool pdl, cudaStream_t stream) {
   const int M = x.size(0), K = x.size(1), TOPK = topk_ids.size(1);
   const int M_sum = out_q.size(0);
   const int tma_mn = out_s.stride(1);
   const dim3 grid(M * TOPK), block(kThreads);
-  moe_quant_scatter_kernel<T, kHwCvt><<<grid, block, 0, stream>>>(
-      reinterpret_cast<const T*>(x.data_ptr()), x.stride(0), topk_ids.data_ptr<int32_t>(), M, TOPK, K, E,
-      align, M_sum, tma_mn, reinterpret_cast<uint8_t*>(out_q.data_ptr()), out_s.data_ptr<int32_t>(),
-      m_indices.data_ptr<int32_t>(), inv_perm.data_ptr<int32_t>(), eps, fp8_min, fp8_max);
+  if (!pdl) {
+    moe_quant_scatter_kernel<T, kHwCvt, false><<<grid, block, 0, stream>>>(
+        reinterpret_cast<const T*>(x.data_ptr()), x.stride(0), topk_ids.data_ptr<int32_t>(), M, TOPK, K, E,
+        align, M_sum, tma_mn, reinterpret_cast<uint8_t*>(out_q.data_ptr()), out_s.data_ptr<int32_t>(),
+        m_indices.data_ptr<int32_t>(), inv_perm.data_ptr<int32_t>(), eps, fp8_min, fp8_max);
+    return;
+  }
+  // programmatic stream serialization: a programmatic edge when captured into a CUDA graph
+  cudaLaunchConfig_t config = {};
+  config.gridDim = grid;
+  config.blockDim = block;
+  config.dynamicSmemBytes = 0;
+  config.stream = stream;
+  cudaLaunchAttribute attr[1];
+  attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+  attr[0].val.programmaticStreamSerializationAllowed = 1;
+  config.attrs = attr;
+  config.numAttrs = 1;
+  C10_CUDA_CHECK(cudaLaunchKernelEx(
+      &config, moe_quant_scatter_kernel<T, kHwCvt, true>, reinterpret_cast<const T*>(x.data_ptr()),
+      static_cast<int64_t>(x.stride(0)), topk_ids.data_ptr<int32_t>(), M, TOPK, K, E, align, M_sum, tma_mn,
+      reinterpret_cast<uint8_t*>(out_q.data_ptr()), out_s.data_ptr<int32_t>(), m_indices.data_ptr<int32_t>(),
+      inv_perm.data_ptr<int32_t>(), eps, fp8_min, fp8_max));
 }
 
 }  // namespace
@@ -256,10 +284,10 @@ void launch(const at::Tensor& x, const at::Tensor& topk_ids, at::Tensor& out_q, 
 // out_q [M_sum, K] e4m3 (contiguous), out_s int32 [M_sum, ceil(K/128/4)] with strides (1, M_sum),
 // m_indices int32 [M_sum], inv_perm int32 [M, TOPK]; E local experts, align = rows per expert
 // block (DeepGEMM BLOCK_M for this call); software_cvt = c10's e4m3 conversion instead of the
-// hardware one (test hook).
+// hardware one (test hook); pdl = programmatic dependent launch.
 void moe_quant_scatter(const at::Tensor& x, const at::Tensor& topk_ids, at::Tensor out_q, at::Tensor out_s,
                        at::Tensor m_indices, at::Tensor inv_perm, int64_t E, int64_t align, double eps,
-                       double fp8_min, double fp8_max, bool software_cvt) {
+                       double fp8_min, double fp8_max, bool software_cvt, bool pdl) {
   TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.stride(1) == 1, "x: 2-D CUDA tensor with unit inner stride");
   TORCH_CHECK(x.scalar_type() == at::kBFloat16 || x.scalar_type() == at::kHalf, "x: bf16 or fp16");
   TORCH_CHECK(topk_ids.is_cuda() && topk_ids.dim() == 2 && topk_ids.is_contiguous() &&
@@ -296,14 +324,14 @@ void moe_quant_scatter(const at::Tensor& x, const at::Tensor& topk_ids, at::Tens
   const float ep = static_cast<float>(eps), lo = static_cast<float>(fp8_min), hi = static_cast<float>(fp8_max);
   if (x.scalar_type() == at::kBFloat16) {
     if (software_cvt)
-      launch<c10::BFloat16, false>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, stream);
+      launch<c10::BFloat16, false>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, pdl, stream);
     else
-      launch<c10::BFloat16, true>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, stream);
+      launch<c10::BFloat16, true>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, pdl, stream);
   } else {
     if (software_cvt)
-      launch<c10::Half, false>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, stream);
+      launch<c10::Half, false>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, pdl, stream);
     else
-      launch<c10::Half, true>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, stream);
+      launch<c10::Half, true>(x, topk_ids, out_q, out_s, m_indices, inv_perm, e, a, ep, lo, hi, pdl, stream);
   }
   C10_CUDA_CHECK(cudaGetLastError());
 }
@@ -313,7 +341,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "fused per-token-group fp8/UE8M0 quantization + DeepGEMM grouped-layout permutation",
         py::arg("x"), py::arg("topk_ids"), py::arg("out_q"), py::arg("out_s"), py::arg("m_indices"),
         py::arg("inv_perm"), py::arg("E"), py::arg("align"), py::arg("eps"), py::arg("fp8_min"), py::arg("fp8_max"),
-        py::arg("software_cvt") = false);
+        py::arg("software_cvt") = false, py::arg("pdl") = false);
   m.attr("MAX_PAIRS") = kMaxPairs;
   m.attr("MAX_EXPERTS") = kMaxExperts;
   m.attr("MAX_K") = kMaxGroups * kGroup;
