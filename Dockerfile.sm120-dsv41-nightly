@@ -112,7 +112,7 @@
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .
-#   (candidate, not served yet). The images on vllm-openai:nightly 0961bbae with FlashInfer 0.7.0.dev20260922 came
+#   (served since 2026-10-13 16:27Z, window 8). The images on vllm-openai:nightly 0961bbae with FlashInfer 0.7.0.dev20260922 came
 #   from this file before the rebase: -pdl (steps 1-14) at commit c066be9, the served -engram (steps 1-12) at
 #   f7cc6d9, and with fewer steps -bf16, -mhc, -moeqs, -ced, -kvdedup and dsv41-nightly-20260923 (git log).
 #   FlashInfer fallback to the -pdl image's nightly: --build-arg FLASHINFER_INDEX=https://flashinfer.ai/whl/nightly

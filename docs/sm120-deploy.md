@@ -37,8 +37,8 @@ Everything below the model weights is produced by the two Dockerfiles from publi
 
 | input | where it comes from | pin |
 |---|---|---|
-| base image, DeepSeek (served) | Docker Hub `vllm/vllm-openai:nightly@sha256:42090442…` (vLLM main 0961bbae, torch 2.13+cu130) + FlashInfer nightly wheels `0.7.0.dev20260922` (`flashinfer.ai/whl/nightly`) + `vllm-project/DeepGEMM` e1f418c2 | digest / version pins in `Dockerfile.sm120-dsv41-nightly` at f7cc6d9 |
-| base image, DeepSeek (rebase candidate) | Docker Hub `vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` (vLLM main 21d93d0d = 0.30.1rc1.dev709, the same torch 2.13+cu130 build) + FlashInfer `0.7.1rc2` (python, cubin, jit-cache shim and the `sm120f` AOT provider from `flashinfer.ai/whl`, sha256-pinned) + `vllm-project/DeepGEMM` e1f418c2 | digest / version / hash pins in `Dockerfile.sm120-dsv41-nightly` |
+| base image, DeepSeek (served 2026-09-23 .. 10-13) | Docker Hub `vllm/vllm-openai:nightly@sha256:42090442…` (vLLM main 0961bbae, torch 2.13+cu130) + FlashInfer nightly wheels `0.7.0.dev20260922` (`flashinfer.ai/whl/nightly`) + `vllm-project/DeepGEMM` e1f418c2 | digest / version pins in `Dockerfile.sm120-dsv41-nightly` at f7cc6d9 |
+| base image, DeepSeek (served since 2026-10-13) | Docker Hub `vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` (vLLM main 21d93d0d = 0.30.1rc1.dev709, the same torch 2.13+cu130 build) + FlashInfer `0.7.1rc2` (python, cubin, jit-cache shim and the `sm120f` AOT provider from `flashinfer.ai/whl`, sha256-pinned) + `vllm-project/DeepGEMM` e1f418c2 | digest / version / hash pins in `Dockerfile.sm120-dsv41-nightly` |
 | base image, DeepSeek (0909, rollback) | Docker Hub `vllm/vllm-openai:deepseekv41-flash-0909` (vLLM 0.30, FlashInfer 0.6.18, vendored DeepGEMM, nvcc 13.0, torch 2.13) | the vLLM recipe's NVIDIA tag |
 | base image, Qwen | Docker Hub `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` (= the `qwen38-flash-next` nightly, v0.1.dev20073+g8e685d198) | digest |
 | DeepGEMM source (rebuilt inside the DeepSeek image with three host-side asserts relaxed) | `github.com/deepseek-ai/DeepGEMM` | commit `8b1392b978f5a03c828dd1711090d7fb50958b8a` |
@@ -75,15 +75,16 @@ git clone <this repo> && cd vllm-moet
 # pass -e VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router to those
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly --build-arg VLLM_MOET_ENGRAM_WKV_TP=0 \
   -t vllm-moet-sm120:dsv41-nightly-20260923-bf16 .   # ~12 min
-# DeepSeek, served image since 2026-10-02: the same + Engram's wkv split over the TP ranks at decode token counts
+# DeepSeek, served 2026-10-02 .. 10-13: the same + Engram's wkv split over the TP ranks at decode token counts
 # ("The Engram wkv split at decode"; Dockerfile step 12); the line above is the -bf16 tag served before it
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-engram .
 # (the two lines above are the tags as built from their commits - -engram from f7cc6d9)
-# DeepSeek, candidate on the same base (c066be9): + PDL in our decode kernels, NCCL's per-collective graph event records
-# reduced to one, FC2's padding rows out of L2 ("The idle GPU between the decode kernels"; Dockerfile steps 13, 14)
+# DeepSeek, built on the same base from c066be9, never served (the fallback of window 8): + PDL in our decode kernels,
+# NCCL's per-collective graph event records reduced to one, FC2's padding rows out of L2 ("The idle GPU between the
+# decode kernels"; Dockerfile steps 13, 14)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-pdl .
-# DeepSeek, candidate (not served yet; this tree): the same patches on vLLM nightly 21d93d0d + FlashInfer 0.7.1rc2 with
-# its sm120f AOT modules ("The rebase onto vLLM nightly 21d93d0d"); steps 7 and 9 are vLLM's own there
+# DeepSeek, served image since 2026-10-13 (window 8; this tree): the same patches on vLLM nightly 21d93d0d + FlashInfer
+# 0.7.1rc2 with its sm120f AOT modules ("The rebase onto vLLM nightly 21d93d0d"); steps 7 and 9 are vLLM's own there
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .   # ~15 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)

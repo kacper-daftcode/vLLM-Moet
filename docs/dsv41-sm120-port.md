@@ -1220,8 +1220,8 @@ In the served decode graph (`run25_engram_c1`, rank 0, 6 tokens, 10,437 µs per 
 539 µs per step (`graph_idle.py`). The largest edges: ~2.8 µs in front of each of the 80 NCCL all‑reduces (231 µs),
 MXFP8 quantize → GEMV v3 (38), FC2 → gather (20), sparse MLA → merge (20), inverse RoPE + quant → grouped `wo_a` GEMV
 (19), FC1 → silu·mul·quant (19). The changes below target them, plus the L2 write‑back of the previous section; each
-is bit‑identical and has its own switch. Candidate image `-pdl` (Dockerfile steps 13 and 14, and the kernels of steps 3,
-8, 10 and 11); not served yet.
+is bit‑identical and has its own switch. Image tag `-pdl` (Dockerfile steps 13 and 14, and the kernels of steps 3,
+8, 10 and 11); served since 2026‑10‑13 on the 21d93d0d base (next section: the decode graph 10,437 → 9,467 µs per step).
 
 **NCCL in the captured graph: one event record per collective.** With graph mixing on (NCCL's default; NCCL 2.30.7
 and 2.32.3 alike), NCCL serializes its device work across graphs and eager calls through one event per communicator:
@@ -1333,6 +1333,34 @@ boot JIT build, cutlass‑dsl 4.8.0, upstream's replay inside PIECEWISE graphs. 
 the new upstream code computes on sm_120 without them (op‑level, every patch, on an RTX PRO 6000 next to the serving
 job), so the serving gate for this image is a quality window rather than bit‑identity. The fused all‑reduce in a
 trimming prefill step (previous section) behaves the same on both bases.
+
+**Served (window 8, 2026‑10‑13, one window for the rebase and the `-pdl` features; 4× RTX PRO 6000; rank‑0 trace
+`run26_w8_rebase_c1` against the served `run25_engram_c1`).** The first start (`GPU_MEM_UTIL=0.92`: empty FlashInfer
+autotune cache, a scratch disk tier so nothing it wrote could reach production's) was up in 24.3 min (weights 861 s,
+then a cold `torch.compile`), with every `vllm-moet` line of the `-engram` image plus the new ones (NCCL records
+"first graph: 1 of 2 dropped", FC2 discard, the router's PDL launch). Against `-engram` the outputs turned out
+identical where the gate looks: greedy agreement 24/24, raw 128‑token completions 12/12, needle 6/6 with the same
+answers (fresh, 367K in 18.3–18.6 s), arithmetic / tools / JSON / vision PASS, coherence 0 degenerate, GSM8K‑200
+194 = 194 (1 + 1 flips, the C4 floor; McNemar p = 1); fresh prefill unchanged (19K 1.02–1.04 s, 163K 9.04–9.07,
+391K 24.48–24.49); 8 × 122K fresh stress 0 errors (51.3 s), offload probe 4/4. Per step, median of 10 graph replays
+(the four ranks within 1 µs of each other):
+
+| decode graph (6 tokens) | attention sublayers | FFN sublayers | GPU idle | span |
+|---|---:|---:|---:|---:|
+| `-engram` (0961bbae) | 4,207.4 µs | 5,942.4 | 539.2 | 10,437.2 |
+| **`21d93d0d-pdl` — served** | **3,846.0** | **5,367.6** | **299.3** | **9,467.4 (−9.3 %)** |
+
+−970 µs per step against the −0.6 to −1.1 ms the isolated measurements predicted: the idle edges in front of the
+all‑reduces (GEMV v3 → NCCL 116 → 30 µs per step, elementwise → NCCL 115 → 20) — 0.4 µs per all‑reduce instead of
+2.8 — the attention chain (−361 µs), every FFN (−15.5 µs each, −32 for the two after the Engram layers, where
+`discard_padding_rows_kernel` now sits between FC2 and the gather); the drafter's graph is unchanged (1,026 → 1,031).
+Decode: one stream 87.3–90.0 / 89.7–89.9 steps/s (prose / code; `-engram` 80.7–83.4 / 82.8–83.2, +9.1 / +8.5 %),
+eight streams 33.9–34.3 / 36.5–37.7 (33.3–33.9 / 36.2–39.7). Memory as before (weights + non‑torch 83.01 GiB,
+peak activation 2.0 GiB); at 0.92 the KV pool was 1,873,450 tokens, and the production start at 0.94 with the
+autotune cache filled (ready 16:27Z, 17.4 min) has 4.26 GiB = 3,380,873 tokens — −0.5 % against `-engram`'s 3,398,081:
+the peak activation the new base profiles is 0.07 GiB larger. The disk tier is shared with the old images: the same `FileMapper` namespace
+and `config.json`, and of 39 block files both images wrote for the same prompts 5 are byte‑identical and the median
+shares 63 % of its bytes (unrelated blocks: 3 %).
 
 ## Apply / build / run
 

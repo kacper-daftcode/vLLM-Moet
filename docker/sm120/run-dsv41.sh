@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, DSpark k=5, FP4 compressed KV + fp8 SWA KV, MXFP4
 # indexer cache, 512K context -- the validated deployment (docs/sm120-deploy.md, docs/dsv41-sm120-port.md).
-# Image: Dockerfile.sm120-dsv41-nightly (the vLLM main line, served since 2026-09-23: 3.41M-token KV, 77 steps/s);
+# Image: Dockerfile.sm120-dsv41-nightly (the vLLM main line, served since 2026-09-23; since 2026-10-13 on vLLM nightly
+# 21d93d0d + FlashInfer 0.7.1rc2: 3.4M-token KV, 88-90 steps/s single stream);
 # IMAGE=vllm-moet-sm120:dsv41-0909 (Dockerfile.sm120-dsv41, the recipe's 0909 image) is the rollback -- KV_MODE=auto
 # picks the right KV plumbing for either.
 #
 # Required:  MODEL_DIR   directory with the official DeepSeek-V4.1-Flash checkpoint
-# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-20260923-engram)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1: only local; "" = all interfaces)
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm
 #                        (FlashInfer autotune + JIT, DeepGEMM JIT; first start ~25 min, later ~17 min; the
@@ -86,7 +87,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-20260923-engram}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
