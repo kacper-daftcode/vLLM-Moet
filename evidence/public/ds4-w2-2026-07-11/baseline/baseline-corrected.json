@@ -1,0 +1,45 @@
+{
+  "combined": {
+    "n": 120,
+    "sink_rate": 0.13333333333333333,
+    "sinks": 16
+  },
+  "configuration": {
+    "base_cache_gb": 8,
+    "delta_gb": 6,
+    "delta_policy": "lru",
+    "gate_tau": 0.67,
+    "max_model_len": 32768,
+    "mode": "historical-warm-noncomparable"
+  },
+  "runs": [
+    {
+      "clean": 27,
+      "eval_seed": 42,
+      "file": "raw-rig-32k-base8-delta6-lru-s42.jsonl",
+      "n": 40,
+      "sha256": "04baf5e34635706839cb07cdefcde1952992c6478f4001200004f61778fa5815",
+      "sink_ids": ["r07", "c10", "r14", "r15", "c18"],
+      "sinks": 5
+    },
+    {
+      "clean": 22,
+      "eval_seed": 43,
+      "file": "raw-rig-32k-b8d6-lru-s43.jsonl",
+      "n": 40,
+      "sha256": "0b863f6440f099ba73197d52c65ef81e384b0e29553a08ea0fa2bfeb28bfc37d",
+      "sink_ids": ["r04", "r06", "r07", "r12", "r14", "r15", "r16"],
+      "sinks": 7
+    },
+    {
+      "clean": 27,
+      "eval_seed": 44,
+      "file": "raw-rig-32k-b8d6-lru-s44.jsonl",
+      "n": 40,
+      "sha256": "66f3b203e5578df3b12b10320fd712dd4645e2725e5024260079d9d281efb69e",
+      "sink_ids": ["r01", "c03", "r10", "c10"],
+      "sinks": 4
+    }
+  ],
+  "schema_version": "ds4-w2-baseline-rescore-v1"
+}

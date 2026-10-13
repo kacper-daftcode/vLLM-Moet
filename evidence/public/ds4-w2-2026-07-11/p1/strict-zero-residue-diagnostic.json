@@ -1,0 +1,37 @@
+{
+  "schema_version": "ds4-w2-pool-gate-diagnostic-v1",
+  "source_patch_sha256": "55d30bb9cf9bef45e7130fd5afe0090c5b540be22f6de3abfc51b782f738a6f7",
+  "runtime": {
+    "max_model_len": 32768,
+    "base_cache_gb": 8,
+    "delta_gb": 6,
+    "delta_policy": "lru",
+    "gate_tau": 0.75,
+    "speculative_tokens": 0,
+    "max_num_seqs": 1
+  },
+  "prewarm": {
+    "accepted": 10,
+    "total": 10
+  },
+  "policy_sha256": "941dd1a0c3301133c07f97a9765c830d187f39d085ab13be4e1e1ef6805eb786",
+  "policy": {
+    "max_base_fp_residue_steps": 0,
+    "max_base_unrestored_experts": 0,
+    "min_fp4_occupancy": 1.0,
+    "min_fp4_tick": 1,
+    "min_fp4_total_evicted": 1,
+    "min_fp4_total_evicted_delta": 16
+  },
+  "observed_latest_64_step_window": {
+    "base_replay_pct": 90.6,
+    "base_fp_residue_steps": 57,
+    "base_unrestored_experts": 0,
+    "fp4_cached": 481,
+    "fp4_slots": 481,
+    "fp4_total_evicted": 4084
+  },
+  "status": "failed-before-scoring",
+  "failed_metric": "base_fp_residue_steps",
+  "interpretation": "The zero-residue policy was over-strict for the default continuation threshold (FP_THRESH=0). Second-order experts are fetched for later steps but their current-step contributions remain zero. Final quality receipts retain this telemetry and empirically test the approximation; they do not claim miss-free or bit-deterministic output."
+}
