@@ -12,6 +12,18 @@ __pycache__/
 # Internal session logs / research harnesses (not for publication)
 internal/
 
+# Full evaluation receipts include host/container topology. Only explicitly
+# sanitized artifacts under evidence/public are publishable.
+evidence/*
+!evidence/public/
+!evidence/public/**
+
+# Deployment-specific guarded controllers/provenance contain private topology.
+tools/capture_w2_eval_provenance.sh
+tools/guarded_w2_eval_remote.sh
+tools/guarded_w2_restage_remote.sh
+tools/ds4_eval/tests/test_controller_guards.py
+
 # local artifacts (wheels kept out of git)
 patch/*.whl
 
