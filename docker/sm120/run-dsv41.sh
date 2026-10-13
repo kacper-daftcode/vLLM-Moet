@@ -9,7 +9,9 @@
 # Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-20260923-engram)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1: only local; "" = all interfaces)
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm
-#                        (FlashInfer autotune + JIT, DeepGEMM JIT; first start ~25 min, later ~17 min)
+#                        (FlashInfer autotune + JIT, DeepGEMM JIT; first start ~25 min, later ~17 min; the
+#                        dsv41-nightly-21d93d0d-* images load FlashInfer's sm_120 modules AOT, only the autotune
+#                        results and trtllm_utils land here)
 #            MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096)
 #            GPU_MEM_UTIL (0.94)     0.94 with a populated FlashInfer autotune cache; use 0.92 for
 #                        the very first start (the autotune sweep after KV allocation OOMs at 0.95)
@@ -63,14 +65,15 @@
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 # Runtime kill switches (env, no rebuild): VLLM_MOET_SM120_GEMV=0 (CUTLASS instead of the dense MXFP8
 # GEMV), VLLM_MOET_GEMV_IMPL=v1 (the pre-2026-09-20 GEMV kernel instead of v3), VLLM_MOET_SM120_GEMV_BMM=0
-# (BF16 emulation for wo_a), VLLM_MOET_DECODER_REPLAY=0 (the -ced image prefills layers 21-39 on every
-# prompt token again instead of the last 128), VLLM_MOET_MOE_QUANT_SCATTER=0 (the -moeqs image quantizes
+# (BF16 emulation for wo_a), VLLM_MOET_DECODER_REPLAY=0 (the -ced .. -pdl images on vLLM 0961bbae prefill layers 21-39
+# on every prompt token again instead of the last 128; on the dsv41-nightly-21d93d0d-* images the replay is vLLM's own and
+# EXTRA_ARGS="--no-swa-bounded-replay" turns off both of its sides), VLLM_MOET_MOE_QUANT_SCATTER=0 (the -moeqs image quantizes
 # the MoE input in prepare() and permutes it with vLLM's kernels again instead of one fused launch at
 # decode shapes), VLLM_MOET_MHC_OVERLAP=0 (the -mhc image runs the mHC boundary as the TileLang pair on
 # the model stream again, all-reduce back in the linear layers; sub-options VLLM_MOET_MHC_FUSE_ALLREDUCE=0,
 # VLLM_MOET_MHC_PDL=0, VLLM_MOET_MHC_PROJ=fused|tf32), VLLM_MOET_BF16_GEMM=0 (the -bf16 image runs the small-M
 # BF16 GEMMs on cuBLAS again; VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router[,compressor] picks the sites),
-# VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram image runs Engram's wkv replicated at decode again); on the -pdl candidate also
+# VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram image runs Engram's wkv replicated at decode again); on the -pdl images also
 # VLLM_MOET_GEMV_PDL=0, VLLM_MOET_GEMV_EVICT_FIRST=0, VLLM_MOET_BF16_GEMM_PDL=0, VLLM_MOET_MOE_QUANT_SCATTER_PDL=0 (plain
 # launches as before), VLLM_MOET_BF16_CHAIN=v2 (opt-in ring chain), VLLM_MOET_NCCL_GRAPH_RECORDS=0 (NCCL's graph event
 # records kept), VLLM_MOET_MOE_FC2_DISCARD=0 (FC2 padding rows left in L2).

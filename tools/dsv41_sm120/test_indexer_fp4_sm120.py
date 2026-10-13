@@ -178,6 +178,25 @@ def main() -> int:
     positions = torch.arange(T, device=dev, dtype=torch.int64)
     all_ok = True
 
+    # ---------------- config gate (patch_vllm_indexer_fp4_sm120.py) ----------------
+    from types import SimpleNamespace
+
+    from vllm.v1.attention.backends.mla.indexer import dsa_indexer_uses_fp4
+
+    def gate(kv_dtype: str):
+        cfg = SimpleNamespace(
+            attention_config=SimpleNamespace(resolve_indexer_kv_dtype=lambda default: kv_dtype), model_config=None
+        )
+        try:
+            return dsa_indexer_uses_fp4(cfg)
+        except ValueError as exc:
+            return f"ValueError: {exc}"
+
+    gate_fp4, gate_fp8 = gate("mxfp4"), gate("fp8")
+    gate_ok = gate_fp4 is True and gate_fp8 is False
+    print(f"  {'[ok ]' if gate_ok else '[BAD]'} dsa_indexer_uses_fp4: mxfp4 -> {gate_fp4!r}, fp8 -> {gate_fp8!r}")
+    all_ok &= gate_ok
+
     # ---------------- Q ----------------
     q = torch.randn(T, H, D, device=dev, dtype=torch.bfloat16) * 3
     weights = torch.randn(T, H, device=dev, dtype=torch.bfloat16)

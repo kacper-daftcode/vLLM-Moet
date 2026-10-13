@@ -3,16 +3,22 @@
 
 Run inside the image (the installed vLLM is the subject). Two levels:
 
-  1. Always: the reasoning-effort table vLLM renders must be the official one
-     (low 50 / high 75 / max 100, default high) and a thinking-mode request
-     without an explicit effort must render "Reasoning Effort: 75".
-  2. With --model-dir (checkpoint directory that carries encoding/): load the
-     reference encoder deepseek ships (encoding/encoding.py) and require
-     byte-identical prompts for (a) the encoding/tests goldens, encoded through
-     the same message normalisation the vLLM tokenizer wrapper applies, and
-     (b) a matrix of thinking-mode x reasoning_effort x tools x multi-turn
-     conversations. OpenAI aliases (minimal / medium / xhigh) are not DeepSeek
-     tiers, so they are only checked for the budget they render.
+  1. Always: the reasoning-effort table vLLM renders must be the served one -
+     the official tiers low 50 / high 75 / max 100 (default high) and the
+     aliases minimal 25 / medium 62 / xhigh 87, in that order - and a
+     thinking-mode request without an explicit effort must render
+     "Reasoning Effort: 75".
+  2. With --model-dir (checkpoint directory that carries encoding/ and the
+     tokenizer files): load the reference encoder deepseek ships
+     (encoding/encoding.py) and require byte-identical prompts for (a) the
+     encoding/tests goldens, encoded through the same message normalisation the
+     vLLM tokenizer wrapper applies, and (b) a matrix of thinking-mode x
+     reasoning_effort x tools x multi-turn conversations; then (c) the tokenizer
+     wrapper itself (the checkpoint's tokenizer): every name renders its budget,
+     no effort renders high's, "none" turns thinking off, and an unknown name is
+     rejected with a message listing the accepted ones. OpenAI aliases
+     (minimal / medium / xhigh) are not DeepSeek tiers, so they are only checked
+     for the budget they render.
 
 Exit status 1 on any mismatch. Usage:
     python3 test_reasoning_effort_encoding.py [--model-dir /model]
@@ -29,6 +35,7 @@ import sys
 from pathlib import Path
 
 OFFICIAL = {"low": 50, "high": 75, "max": 100}
+SERVED = {**OFFICIAL, "minimal": 25, "medium": 62, "xhigh": 87}
 BUDGET_PREFIX = "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: "
 
 TOOL = {
@@ -171,6 +178,10 @@ def main() -> int:
         all(table.get(k) == v for k, v in OFFICIAL.items()),
         f"official tiers low 50 / high 75 / max 100 (vLLM table: {table})",
     )
+    check(
+        list(table.items()) == list(SERVED.items()),
+        f"table is the served one {SERVED} (vLLM table: {table})",
+    )
     check(venc.DEFAULT_REASONING_EFFORT == "high", "default tier is high")
     default_prompt = venc.encode_messages(
         normalize_like_vllm(copy.deepcopy(CONVERSATIONS["system+user"])),
@@ -182,13 +193,17 @@ def main() -> int:
         f"thinking-mode default renders budget 75 (got {budget_of(default_prompt)})",
     )
     for alias in ("minimal", "medium", "xhigh"):
-        if alias in table:
-            prompt = venc.encode_messages(
-                normalize_like_vllm(copy.deepcopy(CONVERSATIONS["user-only"])),
-                thinking_mode="thinking",
-                reasoning_effort=alias,
+        try:
+            got = budget_of(
+                venc.encode_messages(
+                    normalize_like_vllm(copy.deepcopy(CONVERSATIONS["user-only"])),
+                    thinking_mode="thinking",
+                    reasoning_effort=alias,
+                )
             )
-            check(budget_of(prompt) == table[alias], f"alias {alias} renders {table[alias]}")
+        except (AssertionError, KeyError) as exc:
+            got = f"{type(exc).__name__}: {exc}"
+        check(got == SERVED[alias], f"alias {alias} renders {SERVED[alias]} (got {got})")
     chat_prompt = venc.encode_messages(
         normalize_like_vllm(copy.deepcopy(CONVERSATIONS["system+user"])),
         thinking_mode="chat",
@@ -254,6 +269,32 @@ def main() -> int:
     check(
         not any(f.startswith("matrix:") for f in failures),
         f"matrix: {n_cases} conversation x mode x effort cases identical to the reference",
+    )
+
+    # (c) the tokenizer wrapper: the chat endpoint's check (its ValueError is an HTTP 400)
+    from vllm.tokenizers.deepseek_v41 import DeepseekV41Tokenizer
+
+    tokenizer = DeepseekV41Tokenizer.from_pretrained(str(args.model_dir))
+
+    def wrapper_budget(**kwargs):
+        try:
+            prompt = tokenizer.apply_chat_template(
+                copy.deepcopy(CONVERSATIONS["system+user"]), tokenize=False, **kwargs
+            )
+        except ValueError as exc:
+            return exc
+        return budget_of(prompt)
+
+    for name, budget in SERVED.items():
+        got = wrapper_budget(reasoning_effort=name)
+        check(got == budget, f"wrapper: reasoning_effort={name!r} renders {budget} (got {got!r})")
+    for kwargs, budget in (({}, 75), ({"reasoning_effort": 37}, 37), ({"reasoning_effort": "none"}, None)):
+        got = wrapper_budget(**kwargs)
+        check(got == budget, f"wrapper: {kwargs or 'no reasoning_effort'} renders {budget} (got {got!r})")
+    got = wrapper_budget(reasoning_effort="ultra")
+    check(
+        isinstance(got, ValueError) and ", ".join(SERVED) in str(got),
+        f"wrapper: an unknown name is rejected, the message lists {', '.join(SERVED)} (got {got!r})",
     )
 
     if failures:

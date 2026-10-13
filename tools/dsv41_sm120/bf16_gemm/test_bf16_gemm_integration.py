@@ -68,7 +68,7 @@ def main() -> int:
     assert mod is not None and G._moet_bf16() is mod, "bf16_gemm module did not load"
     print(f"module {mod.__file__}, sites {sorted(mod.enabled_sites())}")
     layers, comp = build_layers()
-    assert layers["router"].allow_cublas_router_gemm, "GateLinear does not take tier 4 here"
+    assert layers["router"].allow_cublas_router_gemm, "GateLinear does not take its cuBLAS tier here"
     A._moet_bf16_register(128, 512, False, 512, "wk")  # as DeepseekV4Indexer.__init__ (owns_k)
 
     def patched(name, x):

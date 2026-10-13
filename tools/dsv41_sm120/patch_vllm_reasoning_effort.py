@@ -19,6 +19,13 @@ Patched files (installed vLLM package):
   vllm/tokenizers/deepseek_v41.py           error message lists the accepted names
       from the table instead of a hard-coded set.
 
+Since vllm#58316 (2026-09-26) vLLM's table is low 50 / high 75 / xhigh 75 / max 100
+with "high" the default: the official tiers are upstream. On such a vLLM the patch only
+adds the aliases - minimal 25 and medium 62, which the chat protocol accepts and the
+tokenizer wrapper answered with ValueError (HTTP 400), and xhigh 87 instead of 75 - so
+the table is the one above, as served on the old pin. vLLM's Rust frontend (opt-in,
+VLLM_USE_RUST_FRONTEND=1; not used by our launcher) has its own table and is not patched.
+
 No runtime knob: an integer `reasoning_effort` in chat_template_kwargs bypasses
 the table entirely, so callers who want a specific budget can always pin it.
 
@@ -64,6 +71,27 @@ MAPPING_NEW = (
     + "}\n"
 )
 
+# vllm#58316: the official tiers, plus xhigh at high's 75; the protocol's minimal / medium are missing.
+MAPPING_58316 = (
+    "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n"
+    '    "low": 50,\n'
+    '    "high": 75,\n'
+    '    "xhigh": 75,\n'
+    '    "max": 100,\n'
+    "}\n"
+)
+# The same table (keys, budgets, order) as MAPPING_NEW, so requests render as on the old pin.
+MAPPING_58316_NEW = (
+    f"{MARKER}: low 50 / high 75 / max 100 with\n"
+    "# \"high\" as the default are the checkpoint's tiers (vllm#58316). minimal / medium / xhigh\n"
+    "# are OpenAI-vocabulary aliases, not DeepSeek tiers: interpolated budgets, so minimal /\n"
+    "# medium do not fail (HTTP 400) and xhigh lies above high instead of equal to it.\n"
+    "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n"
+    + "".join(f'    "{k}": {v},\n' for k, v in OFFICIAL.items())
+    + "".join(f'    "{k}": {v},  # alias\n' for k, v in ALIASES.items())
+    + "}\n"
+)
+
 MESSAGE_OLD = (
     "                raise ValueError(\n"
     '                    "DeepSeek V4.1 reasoning_effort must be low, high, xhigh, max, "\n'
@@ -82,12 +110,13 @@ MESSAGE_NEW = (
 def patch_encoding(src: str) -> tuple[str, bool]:
     if MARKER in src:
         return src, False
-    if src.count(MAPPING_OLD) != 1:
-        raise SystemExit(
-            f"deepseek_v41_encoding.py: mapping anchor found {src.count(MAPPING_OLD)} "
-            "times (expected 1) -- vLLM changed the table, re-check against the checkpoint"
-        )
-    return src.replace(MAPPING_OLD, MAPPING_NEW, 1), True
+    for old, new in ((MAPPING_58316, MAPPING_58316_NEW), (MAPPING_OLD, MAPPING_NEW)):
+        if src.count(old) == 1:
+            return src.replace(old, new, 1), True
+    raise SystemExit(
+        "deepseek_v41_encoding.py: neither the pre-release nor the vllm#58316 table found "
+        "-- vLLM changed the table, re-check against the checkpoint"
+    )
 
 
 def patch_wrapper(src: str) -> tuple[str, bool]:
@@ -124,9 +153,14 @@ def main() -> int:
         path.write_text(out)
         changed += 1
         print(f"{path}: patched")
-    if changed or args.check:
-        tiers = ", ".join(f"{k}={v}" for k, v in {**OFFICIAL, **ALIASES}.items())
-        print(f"reasoning-effort tiers: {tiers}; default high=75")
+    if changed:
+        from importlib.util import module_from_spec, spec_from_file_location
+
+        spec = spec_from_file_location("_dsv41_encoding", targets[0][0])
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        tiers = ", ".join(f"{k}={v}" for k, v in module.REASONING_EFFORT_MAPPINGS.items())
+        print(f"reasoning-effort tiers: {tiers}; default {module.DEFAULT_REASONING_EFFORT}")
     return 0
 
 

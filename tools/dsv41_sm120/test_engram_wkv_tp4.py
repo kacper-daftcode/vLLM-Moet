@@ -6,11 +6,13 @@ tiny vocab; wkv synthetic or the checkpoint's, --checkpoint DIR, layer 1, loaded
 Every rank runs prepare_embeddings + forward - the full path: lookup, TP all-gather of the head rows, wkv, the
 post-wkv kernel - with the split off (the reference), forced at every size (1..4096 tokens: the slices + NCCL
 all-gather of the output) and at the default threshold, eagerly and replayed from CUDA graphs (NCCL inside the
-capture); the outputs must be identical bit for bit. Then timings on this host: the output all-gather alone and
-the forward with and without the split, in a CUDA graph at decode sizes and eagerly at prefill sizes.
+capture); the outputs must be identical bit for bit, also to the same Engram with upstream's wkv (vllm#58678:
+ColumnParallelLinear with gather_output, each rank loading its shard). Then timings on this host: the output
+all-gather alone and the forward with and without the split and with upstream's wkv, in a CUDA graph at decode sizes
+and eagerly at prefill sizes.
 
 usage (in the serving image with step 12, 4 GPUs):
-    torchrun --nproc_per_node=4 test_engram_wkv_tp4.py [--checkpoint DIR] [--no-bench]
+    torchrun --nproc_per_node=4 test_engram_wkv_tp4.py [--checkpoint DIR] [--no-bench] [--max-gpu-mem-gib G]
 """
 
 from __future__ import annotations
@@ -106,11 +108,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", default="")
     ap.add_argument("--no-bench", action="store_true")
+    ap.add_argument("--max-gpu-mem-gib", type=float, default=0.0,
+                    help="cap each rank's PyTorch allocations, e.g. next to a serving job (0: no cap)")
     args = ap.parse_args()
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     assert world == TP, "run with torchrun --nproc_per_node=4"
     torch.cuda.set_device(rank)
     dev = torch.device(f"cuda:{rank}")
+    if args.max_gpu_mem_gib:
+        total = torch.cuda.get_device_properties(dev).total_memory
+        torch.cuda.set_per_process_memory_fraction(args.max_gpu_mem_gib * 2**30 / total, dev)
 
     from vllm.config import VllmConfig, set_current_vllm_config
     from vllm.distributed import (
@@ -135,6 +142,11 @@ def main() -> int:
     ok = True
     vllm_config = VllmConfig()
     vllm_config.scheduler_config.max_num_batched_tokens = max(PREFILL_TS)  # Engram's staging rows, as served
+    if hasattr(vllm_config, "engram_config"):
+        from vllm.config.engram import EngramConfig
+
+        # resolved from the model config when serving; the tables stay on the GPU here
+        vllm_config.engram_config = EngramConfig(cpu_offload=False)
     with set_current_vllm_config(vllm_config), set_default_torch_dtype(torch.bfloat16), torch.device(dev):
         init_distributed_environment(world_size=world, rank=rank, distributed_init_method="env://",
                                      local_rank=rank, backend="nccl")
@@ -153,34 +165,55 @@ def main() -> int:
                                     * 0.05).to(torch.bfloat16))
         engram.k_weight.data.copy_((torch.randn(CFG.hc_mult, CFG.hidden_size, device=dev, generator=g_all)
                                     * 0.05).to(torch.bfloat16))
+        from vllm.model_executor.layers.linear import ColumnParallelLinear
+
+        # vllm#58678's wkv: this rank's 1/TP of the output columns, all-gathered at every token count
+        upstream_wkv = ColumnParallelLinear(K, N, bias=False, gather_output=True, quant_config=qc, return_bias=False,
+                                            prefix="model.layers.1.engram.wkv")
         w8, s8 = wkv_tensors(args, dev, g_all)
-        for param, tensor in ((engram.wkv.weight, w8), (engram.wkv.weight_scale, s8)):
-            param.weight_loader(param, tensor)
-        engram.wkv.quant_method.process_weights_after_loading(engram.wkv)
+        for layer in (engram.wkv, upstream_wkv):
+            for param, tensor in ((layer.weight, w8), (layer.weight_scale, s8)):
+                param.weight_loader(param, tensor)
+            layer.quant_method.process_weights_after_loading(layer)
         del w8, s8, table
         torch.cuda.empty_cache()
-        log(f"wkv {type(engram.wkv).__name__} {tuple(engram.wkv.weight.shape)}, "
-            f"{type(engram.wkv.quant_method.kernel).__name__}")
+        ours_wkv = engram.wkv
+        log(f"wkv {type(ours_wkv).__name__} {tuple(ours_wkv.weight.shape)}, "
+            f"{type(ours_wkv.quant_method.kernel).__name__}; upstream {type(upstream_wkv).__name__} "
+            f"{tuple(upstream_wkv.weight.shape)} per rank")
 
         def run(mode, hidden, ids):
+            engram.wkv = ours_wkv
             E._MOET_WKV_TP = mode
             engram.prepare_embeddings(ids)
             return engram(hidden, ids)
 
+        def run_upstream(hidden, ids):
+            engram.wkv = upstream_wkv
+            E._MOET_WKV_TP = OFF  # the patched forward calls wkv(x)
+            engram.prepare_embeddings(ids)
+            out = engram(hidden, ids)
+            engram.wkv = ours_wkv
+            return out
+
         with torch.inference_mode():
-            bad = []
+            bad, ubad = [], []
             for t in DECODE_TS + PREFILL_TS:
                 ids, hidden = inputs(layout, t, dev, g_all)
                 ref = run(OFF, hidden, ids).clone()
                 for mode in (FORCED, DEFAULT):
                     if not torch.equal(bits(run(mode, hidden, ids)), bits(ref)):
                         bad.append((t, mode))
-            n_bad = torch.tensor([len(bad)], device=dev)
+                if not torch.equal(bits(run_upstream(hidden, ids)), bits(ref)):
+                    ubad.append(t)
+            n_bad = torch.tensor([len(bad), len(ubad)], device=dev)
             dist.all_reduce(n_bad)
-            split = getattr(engram.wkv, "_moet_wkv_part", (None, None))[1]
+            split = getattr(ours_wkv, "_moet_wkv_part", (None, None))[1]
             log(f"eager, 1..4096 tokens, split forced and at the default threshold: split != replicated in "
-                f"{n_bad.item()} (rank 0: {bad[:6]}); rank slice {None if split is None else tuple(split.weight.shape)}")
-            ok &= n_bad.item() == 0 and split is not None
+                f"{n_bad[0].item()} (rank 0: {bad[:6]}); rank slice {None if split is None else tuple(split.weight.shape)}")
+            log(f"eager, 1..4096 tokens: upstream ColumnParallelLinear wkv != replicated in {n_bad[1].item()} "
+                f"(rank 0: {ubad[:6]})")
+            ok &= n_bad.sum().item() == 0 and split is not None
 
             gbad = []
             for t in (1, 6, 12, 16, 48, 64):
@@ -200,12 +233,14 @@ def main() -> int:
                     hidden.copy_(new_hidden)
                     graph.replay()
                     torch.cuda.synchronize()
-                    if not torch.equal(bits(out), bits(run(OFF, hidden, ids))):
+                    if not (torch.equal(bits(out), bits(run(OFF, hidden, ids)))
+                            and torch.equal(bits(out), bits(run_upstream(hidden, ids)))):
                         gbad.append(t)
                 del graph
             n_bad = torch.tensor([len(gbad)], device=dev)
             dist.all_reduce(n_bad)
-            log(f"CUDA graph replays (NCCL all-gather captured), 1..64 tokens: split != replicated in {n_bad.item()}")
+            log(f"CUDA graph replays (NCCL all-gather captured), 1..64 tokens: split != replicated or != upstream "
+                f"wkv in {n_bad.item()}")
             ok &= n_bad.item() == 0
 
             if not args.no_bench:
@@ -217,16 +252,20 @@ def main() -> int:
                     t_ag = graph_us(lambda: tensor_model_parallel_all_gather(part))
                     t_rep = graph_us(lambda: run(OFF, hidden, ids))
                     t_split = graph_us(lambda: run(DEFAULT, hidden, ids))
+                    t_up = graph_us(lambda: run_upstream(hidden, ids))
                     log(f"  graph tokens={t:4d}: all-gather [{t}, {N // TP}] {t_ag:6.1f}   Engram forward "
-                        f"replicated {t_rep:7.1f} -> split {t_split:7.1f} ({t_split - t_rep:+.1f})")
+                        f"replicated {t_rep:7.1f} -> split {t_split:7.1f} ({t_split - t_rep:+.1f}); "
+                        f"upstream wkv {t_up:7.1f}")
                 for t in (65, 96, 128, 256, 1024, 4096):
                     ids, hidden = inputs(layout, t, dev, g_all)
                     part = torch.randn(t, N // TP, device=dev, generator=g_all).to(torch.bfloat16)
                     t_ag = eager_us(lambda: tensor_model_parallel_all_gather(part))
                     t_rep = eager_us(lambda: run(OFF, hidden, ids))
                     t_forced = eager_us(lambda: run(FORCED, hidden, ids))
+                    t_up = eager_us(lambda: run_upstream(hidden, ids))
                     log(f"  eager tokens={t:4d}: all-gather [{t}, {N // TP}] {t_ag:8.1f}   Engram forward "
-                        f"replicated {t_rep:8.1f}, split forced {t_forced:8.1f} ({t_forced - t_rep:+.1f})")
+                        f"replicated {t_rep:8.1f}, split forced {t_forced:8.1f} ({t_forced - t_rep:+.1f}), "
+                        f"upstream wkv {t_up:8.1f} ({t_up - t_rep:+.1f})")
     ok_t = torch.tensor([0 if ok else 1], device=dev)
     dist.all_reduce(ok_t)
     log("ALL OK" if ok_t.item() == 0 else "FAILED")

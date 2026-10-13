@@ -13,10 +13,16 @@ a CircularBufferSpec of 8 rows) in a packed block-outermost layout.
 Only the compressed group is offloaded (`prefix_cacheable_group_ids`, vllm#57145: the
 bounded-replay SWA groups and the ring are scratch and never leave the GPU), and a packed
 block holds the pages of the one group that owns it. So the gate should look at what is
-copied: every layer of every offloaded group an MLA spec with one KV head. vllm#57652
-widens the gate to multi-group MLA but requires *all* groups to be MLA, which V4.0 passes
-(its compressor state is a SlidingWindowMLASpec) and V4.1 does not (CircularBufferSpec);
-if that PR is already in the file, its call is narrowed to the offloaded groups.
+copied: every layer of every offloaded group an MLA spec with one KV head.
+
+vllm#57652 (merged 2026-09-30, 5463fe4962) replaced the single-group gate with
+`kv_cache_config.kv_tp_replicas == tp`: the gcd over every layer of every group of
+`tp // spec.max_tp_shards` (1 for a spec that declares no `max_tp_shards`). It declared
+`max_tp_shards=1` for V3.2 / V4.0 (`deepseek_v4/attention.py`, `deepseek_v4/compressor.py`)
+and the shared sliding-window cache, but not for V4.1's own compressed MLA and indexer caches
+(`deepseek_v41/attention.py`) or its compressor ring (`deepseek_v41/compressor.py`), so V4.1
+still gets world_size copies. On such a vLLM the patch accepts either: the declared
+replication, or the offloaded-groups check above.
 
 Measured on DeepSeek-V4.1-Flash, TP4, nvfp4_ds_mla + MXFP4 indexer: 18,219 of 18,219
 fs-tier block files written by three server processes hold four byte-identical rank
@@ -91,27 +97,33 @@ NEW_GATE = (
     "        and worker_kv_bytes_per_block > 0\n"
 )
 
-# vllm#57652 (open 2026-09-23): every KV cache group MLA, scratch groups included.
-PR57652_GATE = "        and _all_groups_are_replicated(kv_cache_config.kv_cache_groups)\n"
-PR57652_NEW = (
+# vllm#57652 as merged (5463fe4962, 2026-09-30): the replication the layers declare, over all groups.
+MERGED_GATE = "        and kv_cache_config.kv_tp_replicas == parallel_config.tensor_parallel_size\n"
+MERGED_NEW = (
     f"        {MARKER}:\n"
-    "        # scratch groups (the V4.1 compressor ring) never leave the GPU.\n"
-    "        and _all_groups_are_replicated([group for _, group in selected_groups])\n"
+    "        # V4.1's compressed MLA / indexer caches and compressor ring declare no\n"
+    "        # max_tp_shards (kv_tp_replicas 1), yet only its MLA group is copied.\n"
+    "        and (\n"
+    "            kv_cache_config.kv_tp_replicas == parallel_config.tensor_parallel_size\n"
+    "            or _offloaded_groups_are_replicated_mla(selected_groups)\n"
+    "        )\n"
 )
 
 
 def patch_text(src: str) -> tuple[str, str]:
     if MARKER in src:
         return src, "already patched"
-    if src.count(PR57652_GATE) == 1:
-        return src.replace(PR57652_GATE, PR57652_NEW, 1), "vllm#57652 gate narrowed"
-    for anchor in (OLD_GATE, HELPER_ANCHOR):
+    if src.count(MERGED_GATE) == 1:
+        gate, what = (MERGED_GATE, MERGED_NEW), "vllm#57652 gate: declared replication or the offloaded groups"
+    else:
+        gate, what = (OLD_GATE, NEW_GATE), "gate on the offloaded groups"
+    for anchor in (gate[0], HELPER_ANCHOR):
         n = src.count(anchor)
         if n != 1:
             raise SystemExit(f"anchor found {n} times (expected 1):\n{anchor}")
-    src = src.replace(OLD_GATE, NEW_GATE, 1)
+    src = src.replace(gate[0], gate[1], 1)
     src = src.replace(HELPER_ANCHOR, HELPER, 1)
-    return src, "gate on the offloaded groups"
+    return src, what
 
 
 def main() -> int:

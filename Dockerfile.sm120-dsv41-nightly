@@ -1,19 +1,25 @@
 # vLLM-Moet: DeepSeek-V4.1-Flash on SM120 (RTX PRO 6000 Blackwell / RTX 5090) -- vLLM main line.
 #
 # The rebase of Dockerfile.sm120-dsv41 (vllm-openai:deepseekv41-flash-0909 + our patches) onto
-# vllm/vllm-openai:nightly (vLLM main; the recipe marks 0909 "superseded") with FlashInfer's nightly
-# wheels (main; the DSv4.1 dual-cache sparse MLA of flashinfer-ai/flashinfer#5197 reads the FP4
-# compressed record directly). Same idea as the 0909 image: the official image plus the sm_120 gaps
-# closed, nothing else.
+# vllm/vllm-openai:nightly (vLLM main; the recipe marks 0909 "superseded") with a FlashInfer release
+# candidate that carries the DSv4.1 dual-cache sparse MLA of flashinfer-ai/flashinfer#5197 (vLLM main
+# pins 0.7.0.post1, which does not: its kv_cache_format is 'fp8' / 'nvfp4' only). Same idea as the 0909
+# image: the official image plus the sm_120 gaps closed, nothing else.
 #
-#   1. FlashInfer nightly (flashinfer-python / -jit-cache / -cubin 0.7.0.devYYYYMMDD from
-#      flashinfer.ai/whl/nightly): runtime page-size / head / top-k dispatch for the SM120 sparse MLA
+#   1. FlashInfer 0.7.1rc2 (flashinfer-python / -cubin / -jit-cache + the sm120f jit-cache provider, cu130,
+#      flashinfer.ai/whl): runtime page-size / head / top-k dispatch for the SM120 sparse MLA
 #      (the 0909 image needed our own instantiations + dispatch hook: tools/dsv41_sm120/patch_flashinfer.py
 #      and sparse_mla_sm120_dsv41.cu -- NOT applied here) and the DSv4.1 dual cache that reads the
 #      288-B NVFP4 compressed record with the 528-B V4.1 fp8 sliding-window record
 #      (`kv_cache_format="fp8_dsv41_fp4_ca"`), so the fp8_ds_mla scratch/pool of the 0909 image
-#      (nvfp4_kv/patch_vllm_packed_kv_sm120.py) is NOT applied either. The AOT jit-cache wheel carries
-#      the sm_120 modules; nothing JIT-compiles at boot.
+#      (nvfp4_kv/patch_vllm_packed_kv_sm120.py) is NOT applied either. Its sm_120 sparse MLA and MXFP8 GEMM
+#      sources are byte-identical to the 0.7.0.dev20260922 nightly of the -engram / -pdl images. Since 0.7.0
+#      `flashinfer-jit-cache` is a shim and the AOT modules live in per-arch provider wheels; the sm120f
+#      provider (sparse_mla_sm120, mxfp8_gemm_cutlass_sm120, sampling, ...) is installed here, the base image's
+#      other providers are removed, so FlashInfer loads its sm_120 modules AOT (the -engram / -pdl images had the
+#      shim only and JIT-compiled into the launcher's /root/.cache at first start). One exception: FlashInfer
+#      builds its autotuner's delay kernel (trtllm_utils) AOT for sm90 / sm100 / sm103 only, so while it autotunes
+#      (an empty autotune cache = the first start of a FlashInfer version) it JIT-compiles that one module (4 s).
 #   2. DeepGEMM at the commit vLLM main vendors (vllm-project/DeepGEMM e1f418c2): SM120 FP8 and MXFP4 paged MQA logits accept
 #      the 128-row indexer pages of the compress_ratio=1 layers, and the SM120 per-group BLOCK_M of the
 #      contiguous grouped layout is restored (the fork's port of the SM120 kernels kept upstream's SM100-only
@@ -24,38 +30,46 @@
 #      o-projection wo_a in MXFP8 on the same kernel (patch_vllm_mxfp8_gemv.py, patch_vllm_wo_a_sm120.py;
 #      VLLM_MOET_SM120_GEMV=0 / VLLM_MOET_SM120_GEMV_BMM=0 revert); DeepGEMM MoE glue at decode token
 #      counts (patch_vllm_moe_glue_sm120.py).
-#   4. Reasoning-effort tiers of the released checkpoint (patch_vllm_reasoning_effort.py; the build
-#      fails if the default thinking request does not render budget 75).
+#   4. Reasoning effort: since vllm#58316 vLLM's table holds the released checkpoint's tiers (low 50 / high 75 /
+#      max 100, default high) plus xhigh at high's 75; patch_vllm_reasoning_effort.py adds the OpenAI-vocabulary
+#      aliases as served before the rebase - minimal 25 and medium 62 (the chat protocol accepts them, vLLM's
+#      tokenizer wrapper answered HTTP 400) and xhigh 87 - so the table is the -engram image's; the build fails
+#      unless test_reasoning_effort_encoding.py finds exactly that table and the default thinking request renders
+#      budget 75. (vLLM's opt-in Rust frontend, VLLM_USE_RUST_FRONTEND=1, keeps its own table.)
 #   5. `--kv-cache-dtype nvfp4_ds_mla` on sm_120 through FlashInfer (nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py
 #      = our vLLM PR, internal/upstream-dsv41-sm120-nvfp4-PR.md, until it is merged): the compressed
 #      cache in the checkpoint's FP4 record, the SWA cache in the V4.1 fp8 record; fp8_ds_mla keeps the
 #      V4 record and FlashInfer's DSV4 kernels (no keyword passed).
 #   6. KV offload keeps one host copy of the TP-replicated V4.1 KV instead of one per rank
-#      (patch_vllm_offload_replicated_mla.py: vLLM's replicated-MLA gate looks at the offloaded groups
-#      instead of requiring a single MLA group; the build fails unless test_offload_replicated_mla.py
-#      passes on the V4.1 cache layout).
-#   7. The decoder side of the report's SWA bounded replay - in prefill the layers after the last KV source
-#      run on each request's last 128 tokens only (vllm#58132 as a patch, patch_vllm_decoder_replay.py;
-#      ~1.7x fresh prefill of long prompts; VLLM_MOET_DECODER_REPLAY=0 turns it off at runtime). An
-#      approximation by design, served since 2026-09-23 after its quality gate; --build-arg VLLM_PR_58132=0
-#      leaves it out.
+#      (patch_vllm_offload_replicated_mla.py: vllm#57652's replicated-layout gate, kv_tp_replicas == tp, also
+#      admits the offloaded groups when they are all single-head MLA - V4.1's own compressed MLA / indexer
+#      caches and compressor ring declare no max_tp_shards, so upstream keeps one copy per rank; the build
+#      fails unless test_offload_replicated_mla.py passes on the V4.1 cache layout).
+#   7. (upstream) The decoder side of the report's SWA bounded replay is vLLM main's own since vllm#58132:
+#      CacheConfig.swa_bounded_replay / --swa-bounded-replay, default on (model runner V2); our
+#      patch_vllm_decoder_replay.py is no longer applied. --no-swa-bounded-replay turns it off (it also takes
+#      the SWA KV back into prefix caching: the upstream flag covers both sides of the replay); the decoder-only
+#      switch of the -ced .. -pdl images (VLLM_MOET_DECODER_REPLAY=0) has no equivalent here. Upstream trims in
+#      eager steps only, which with --max-cudagraph-capture-size 64 (below the 128-token window) are all the steps
+#      that can trim.
 #   8. The MoE input quantization fused with the permutation into DeepGEMM's grouped layout at decode
 #      token counts (patch_vllm_moe_quant_scatter_sm120.py + moe_quant_scatter/): one launch instead of
 #      the seven vLLM runs per MoE layer between the router and FC1, bit-identical fp8 rows / UE8M0
 #      scales written straight into DeepGEMM's packed layout; VLLM_MOET_MOE_QUANT_SCATTER=0 turns it off
 #      at runtime (quantization back in prepare()). Prefill keeps vLLM's kernels.
-#   9. (--build-arg VLLM_PR_57679=1, default since the -mhc tag) vllm#57679 as a patch
-#      (patch_vllm_query_quant_gate.py): restores vLLM's own fused q/kv RMSNorm + MXFP8 quantization of
-#      the query - its gate reads an attribute #53793 renamed, so every layer ran the BF16 norm and a
-#      standalone quantize; bit-identical (test_query_quant_gate.py), one launch less per layer.
+#   9. (upstream) vllm#57679, the fused q/kv RMSNorm + MXFP8 quantization of the query, is in vLLM main;
+#      patch_vllm_query_quant_gate.py is no longer applied.
 #  10. The mHC sublayer boundary off the decode critical path (patch_vllm_mhc_overlap_sm120.py + mhc_overlap/):
 #      upstream's side-stream design (`mhc_pre_delayed_overlap`, SM100-only) enabled on sm_120 with our
 #      kernels - post-mix + collapse + RMSNorm + draft aux in one launch on the model stream, the fn
 #      projection (one CTA per split x 4 tokens) and the Sinkhorn coefficients on the side stream behind
-#      the sublayer, the sublayer's all-reduce moved in front of the kernel (upstream's fuse_mhc_all_reduce,
-#      a plain all-reduce here); bit-identical to the TileLang pair (test_mhc_post_norm_sm120.py,
-#      test_mhc_overlap_integration.py); served since 2026-09-25. VLLM_MOET_MHC_OVERLAP=0 turns it off at
-#      runtime.
+#      the sublayer, the sublayer's all-reduce moved in front of the kernel (upstream's fuse_mhc_all_reduce;
+#      a plain all-reduce here - upstream's CuTe DSL AllReduceMHC and its deferred MoE finalize are SM100-only,
+#      init_mhc_all_reduce builds nothing on sm_120); bit-identical to the TileLang pair (test_mhc_post_norm_sm120.py,
+#      test_mhc_overlap_integration.py, also on 21d93d0d); served since 2026-09-25. One step kind differs from the
+#      unfused path, as served since then: an eager prefill step that trims (step 7) all-reduces the cut layer's FFN
+#      output on the replay rows only, and NCCL rounds ~30 % of their elements differently (1-2 ulp).
+#      VLLM_MOET_MHC_OVERLAP=0 turns it off at runtime, VLLM_MOET_MHC_FUSE_ALLREDUCE=0 only the all-reduce move.
 #  11. The small-M BF16 GEMMs of the decode step with cuBLAS's bits from one launch (patch_vllm_bf16_gemm_sm120.py
 #      + bf16_gemm/): the indexer's weights_proj (cuBLAS ran it on 2 CTAs; the main stream waited ~26 us for it in
 #      every index-source layer), the indexer's wk and the MoE router; the compressor projection optionally
@@ -64,8 +78,11 @@
 #      test_bf16_gemm_integration.py); served since 2026-10-01 (decode graph 10,707 -> 10,518 us per step).
 #      VLLM_MOET_BF16_GEMM=0 turns it off at runtime.
 #  12. Engram's wkv (MXFP8 6144 -> 25600, 157 MB, layers 1 and 14) split by output columns over the TP ranks at
-#      decode token counts (patch_vllm_engram_wkv_tp.py): vLLM replicates it, so every rank streamed the whole
-#      weight (123 us per layer in the served decode graph); up to 64 tokens a rank now runs the same kernel on its
+#      decode token counts (patch_vllm_engram_wkv_tp.py). vLLM main makes it a ColumnParallelLinear with
+#      gather_output (vllm#58678): the output all-gather at every token count costs prefill +1.8 ms per Engram
+#      layer per 4096-token chunk on this PCIe host, so the patch builds it as a ReplicatedLinear again (the
+#      layout the served images had, every rank streaming the whole weight: 123 us per layer in the served decode
+#      graph before the split); up to 64 tokens a rank now runs the same kernel on its
 #      6400 rows of the loaded weight and an all-gather rebuilds the output - bit-identical (test_engram_wkv_tp.py,
 #      test_engram_wkv_tp4.py). Above that the all-gather costs more than it saves, so prefill and the weights stay
 #      as they were; served since 2026-10-02 (decode graph 10,518 -> 10,437 us per step). VLLM_MOET_ENGRAM_WKV_TP=0
@@ -88,21 +105,26 @@
 #  boundary kernel's PDL variant (VLLM_MOET_MHC_PDL) reads only its norm weight before griddepcontrol.wait - and the
 #  indexer's one-slice chain has an opt-in ring variant (VLLM_MOET_BF16_CHAIN=v2). All bit-identical; =0 restores
 #  the plain launches.
+#  Every vLLM-file step has a build-arg (=0 leaves it out) so a step whose patcher does not fit a newer vLLM yet
+#  can be built around: VLLM_MOET_REASONING_EFFORT (4), VLLM_MOET_NVFP4_KV (2's indexer gate + 5),
+#  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10), VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12),
+#  VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14).
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-pdl .
-#   (candidate, not served yet; the served -engram image is this file's steps 1-12 at commit f7cc6d9 - on this tree
-#    the -pdl image with VLLM_MOET_GEMV_PDL=0 VLLM_MOET_BF16_GEMM_PDL=0 VLLM_MOET_MOE_QUANT_SCATTER_PDL=0
-#    VLLM_MOET_NCCL_GRAPH_RECORDS=0 VLLM_MOET_MOE_FC2_DISCARD=0 launches the same kernels; older tags: steps 1-11 =
-#    -bf16 (served 2026-10-01 .. 10-02); 1-10 = -mhc (served 2026-09-25 .. 10-01);
-#    --build-arg VLLM_PR_57679=0 --build-arg VLLM_MOET_MHC_OVERLAP=0 --build-arg VLLM_MOET_BF16_GEMM=0 -t ...-moeqs:
-#    steps 1-8; --build-arg VLLM_PR_58132=0: without step 7; the -ced tag: steps 1-7; -kvdedup: steps 1-6;
-#    dsv41-nightly-20260923: steps 1-5)
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-20260923-engram KV_MODE=upstream
-#   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla).
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .
+#   (candidate, not served yet). The images on vllm-openai:nightly 0961bbae with FlashInfer 0.7.0.dev20260922 came
+#   from this file before the rebase: -pdl (steps 1-14) at commit c066be9, the served -engram (steps 1-12) at
+#   f7cc6d9, and with fewer steps -bf16, -mhc, -moeqs, -ced, -kvdedup and dsv41-nightly-20260923 (git log).
+#   FlashInfer fallback to the -pdl image's nightly: --build-arg FLASHINFER_INDEX=https://flashinfer.ai/whl/nightly
+#   --build-arg FLASHINFER_VERSION=0.7.0.dev20260922 --build-arg FLASHINFER_SHA256= (same sm_120 sparse MLA / MXFP8
+#   sources, API-compatible with vLLM 21d93d0d).
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-21d93d0d-<tag> KV_MODE=upstream
+#   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla). A new FlashInfer
+#   version starts with an empty FlashInfer autotune cache (vLLM keys it by FlashInfer's version / arch dir): the
+#   first start autotunes again (GPU_MEM_UTIL 0.92 for that start, as for any empty autotune cache).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
-ARG BASE_IMAGE=vllm/vllm-openai:nightly@sha256:42090442d73c265ebef3f571b95b53d243b53aff35b06ad29aea090fad4496f4
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-21d93d0d8c0e9627900020382bfce4730e61cab7@sha256:bcee860ca68b70b3e7f666ab3dedb5932c89d901f56d1a29b302ec08f9569884
 
 # ---------------------------------------------------------------- deep_gemm
 FROM ${BASE_IMAGE} AS deepgemm-builder
@@ -131,21 +153,39 @@ RUN mkdir -p /tmp/linklibs \
 
 # ---------------------------------------------------------------- final image
 FROM ${BASE_IMAGE}
-ARG FLASHINFER_NIGHTLY=0.7.0.dev20260922
+ARG FLASHINFER_VERSION=0.7.1rc2
+ARG FLASHINFER_INDEX=https://flashinfer.ai/whl
+ARG FLASHINFER_CUDA=cu130
 
-# 1. DeepGEMM _C with the SM120 block_kv=128 paged MQA path (the vendored JIT device sources are
-#    the same commit, so they stay as shipped).
+# 1. DeepGEMM _C with the SM120 block_kv=128 paged MQA path and the SM120 per-group BLOCK_M (the vendored
+#    JIT device sources are the same commit, so they stay as shipped).
 COPY --from=deepgemm-builder /deepgemm/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so \
      /usr/local/lib/python3.12/dist-packages/vllm/third_party/deep_gemm/_C.cpython-312-x86_64-linux-gnu.so
 
-# 2. FlashInfer nightly (main) with its AOT jit-cache and cubins, replacing the pinned 0.6.18.post1.
-RUN pip install --no-cache-dir --break-system-packages --no-deps \
-        "flashinfer-python==${FLASHINFER_NIGHTLY}" \
-        "flashinfer-jit-cache==${FLASHINFER_NIGHTLY}+cu130" \
-        "flashinfer-cubin==${FLASHINFER_NIGHTLY}" \
-        --index-url https://flashinfer.ai/whl/nightly/cu130 \
-        --extra-index-url https://flashinfer.ai/whl/nightly \
-    && python3 -c "import flashinfer.mla as m; assert hasattr(m, 'dsv41_fp4_quantize_pack_sparse_mla_cache'); import importlib.metadata as md; print('flashinfer', md.version('flashinfer-python'), md.version('flashinfer-jit-cache'), md.version('flashinfer-cubin'))" \
+# 2. FlashInfer with flashinfer#5197 replacing the pinned 0.7.0.post1: python, cubin and the jit-cache shim at one
+#    version (FlashInfer refuses to import with a cubin or shim of another version) plus the sm120f AOT provider;
+#    the base image's other per-arch providers are removed (a provider of another version is ignored with a
+#    warning at every import). A release candidate can be re-uploaded under its version: the four wheels must
+#    have the sha256 of FLASHINFER_SHA256 (the 0.7.1rc2 x86_64 files tested in October 2026; empty = no check).
+ARG FLASHINFER_SHA256="1b77f989e6194e234a58d4faa1964a905ab8895afcd22df748ea4919fd85a2a4 7c8e7dc24ca8d97c00bc0709fc6b0882676c8a7fd65bf2dbc8021b88f4ec3c0f 45a104294a48652ce4db19a6c42b4a1d125da6d09f37aefe38507cb9b0270517 eaa4f5a1e98ad784c3bb963bc0b245d3eb1adb9c38eeed0d3358c66a5b441f1c"
+RUN pip uninstall -y --break-system-packages \
+        flashinfer-jit-cache-sm80 flashinfer-jit-cache-sm89 flashinfer-jit-cache-sm90a \
+        flashinfer-jit-cache-sm100a flashinfer-jit-cache-sm103a \
+    && pip download --no-cache-dir --no-deps -d /tmp/flashinfer-wheels \
+        "flashinfer-python==${FLASHINFER_VERSION}" \
+        "flashinfer-cubin==${FLASHINFER_VERSION}" \
+        "flashinfer-jit-cache==${FLASHINFER_VERSION}+${FLASHINFER_CUDA}" \
+        "flashinfer-jit-cache-sm120f==${FLASHINFER_VERSION}+${FLASHINFER_CUDA}" \
+        --index-url "${FLASHINFER_INDEX}/${FLASHINFER_CUDA}" \
+        --extra-index-url "${FLASHINFER_INDEX}" \
+    && if [ -n "$FLASHINFER_SHA256" ]; then \
+         got=$(sha256sum /tmp/flashinfer-wheels/*.whl | cut -d' ' -f1 | sort | tr '\n' ' '); \
+         want=$(printf '%s\n' $FLASHINFER_SHA256 | sort | tr '\n' ' '); \
+         [ "$got" = "$want" ] || { sha256sum /tmp/flashinfer-wheels/*.whl; echo "FlashInfer wheels: sha256 not FLASHINFER_SHA256"; exit 1; }; \
+         echo "FlashInfer wheels: sha256 match"; fi \
+    && pip install --no-cache-dir --break-system-packages --no-deps /tmp/flashinfer-wheels/*.whl \
+    && rm -rf /tmp/flashinfer-wheels \
+    && python3 -c "import importlib.metadata as md, inspect, flashinfer.mla as m; from flashinfer.jit import env; from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4 as f; assert hasattr(m, 'dsv41_fp4_quantize_pack_sparse_mla_cache'); assert 'fp8_dsv41_fp4_ca' in str(inspect.signature(f).parameters['kv_cache_format'].annotation); p = {x.provider_id: x for x in env.FLASHINFER_AOT_PROVIDERS}; assert sorted(p) == ['sm120f'] and {'sparse_mla_sm120', 'mxfp8_gemm_cutlass_sm120'} <= p['sm120f'].modules, p; print('flashinfer', *(md.version(d) for d in ('flashinfer-python', 'flashinfer-cubin', 'flashinfer-jit-cache', 'flashinfer-jit-cache-sm120f')), 'aot', sorted(p), len(p['sm120f'].modules), 'modules')" \
     && python3 -c "import vllm.third_party.deep_gemm as dg; print('deep_gemm', dg.__version__, dg._C.__file__)"
 
 # 3. The vLLM-side patches (see header). patch_vllm_indexer_sm120.py (varlen indexer / adaptive
@@ -155,18 +195,23 @@ ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
 RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_wo_a_sm120.py \
     && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_glue_sm120.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_offload_replicated_mla.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
-# 7. Decoder-side SWA bounded replay (header).
-ARG VLLM_PR_58132=1
-RUN if [ "$VLLM_PR_58132" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_decoder_replay.py; fi
+# 4. Reasoning-effort tiers (header).
+ARG VLLM_MOET_REASONING_EFFORT=1
+RUN if [ "$VLLM_MOET_REASONING_EFFORT" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py; fi
+
+# 5. nvfp4_ds_mla on sm_120 through FlashInfer's DSv4.1 dual cache + the MXFP4 indexer cache gate (header).
+ARG VLLM_MOET_NVFP4_KV=1
+RUN if [ "$VLLM_MOET_NVFP4_KV" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py; fi
+
+# 6. Single-copy KV offload of the TP-replicated V4.1 KV (header).
+ARG VLLM_MOET_OFFLOAD_DEDUP=1
+RUN if [ "$VLLM_MOET_OFFLOAD_DEDUP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_offload_replicated_mla.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py; fi
 
 # 8. MoE input quantization + DeepGEMM grouped-layout permutation in one kernel at decode shapes (header);
 #    the extension is compiled here so nothing JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
@@ -174,14 +219,11 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_quant_scatter'); import moe_quant_scatter_sm120 as q; e = q._ext(); assert hasattr(e, 'moe_quant_scatter'); print('sm120 moe quant+scatter extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_quant_scatter_sm120/*.so
 
-# 9. vllm#57679: the fused query RMSNorm + MXFP8 quantization gate (header).
-ARG VLLM_PR_57679=1
-RUN if [ "$VLLM_PR_57679" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_query_quant_gate.py; fi
-
 # 10. The mHC boundary off the decode critical path (header); the extension is compiled here so nothing
 #     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
 ARG VLLM_MOET_MHC_OVERLAP=1
 RUN if [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_overlap_sm120.py \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h; assert hasattr(h, '_moet_mhc_shifted_post_pre_overlap'); print('mhc overlap patched')" \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert hasattr(e, 'mhc_post_norm') and hasattr(e, 'mhc_proj'); print('sm120 mhc overlap extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mhc_post_norm_sm120/*.so; fi
 
@@ -212,10 +254,14 @@ RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly + FlashInfer nightly (DSv4.1 dual-cache sparse MLA, runtime dispatch) + DeepGEMM e1f418c2 with 128-row paged MQA logits on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly 21d93d0d + FlashInfer ${FLASHINFER_VERSION} (DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules) + DeepGEMM e1f418c2 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2" \
       com.vllm-moet.kv-mode="upstream" \
-      com.vllm-moet.decoder-replay="${VLLM_PR_58132}" \
-      com.vllm-moet.query-quant-gate="${VLLM_PR_57679}" \
+      com.vllm-moet.flashinfer="${FLASHINFER_VERSION}" \
+      com.vllm-moet.decoder-replay="upstream" \
+      com.vllm-moet.query-quant-gate="upstream" \
+      com.vllm-moet.reasoning-effort="${VLLM_MOET_REASONING_EFFORT}" \
+      com.vllm-moet.nvfp4-kv="${VLLM_MOET_NVFP4_KV}" \
+      com.vllm-moet.offload-dedup="${VLLM_MOET_OFFLOAD_DEDUP}" \
       com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}" \
       com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}" \
       com.vllm-moet.engram-wkv-tp="${VLLM_MOET_ENGRAM_WKV_TP}" \

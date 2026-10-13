@@ -25,7 +25,11 @@ def main() -> int:
     layer = torch.nn.Module()
     layer.weight = Parameter(w_q, requires_grad=False)
     layer.weight_scale = Parameter(w_sf.view(N, -1), requires_grad=False)
-    kernel = FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+    try:
+        config = Mxfp8LinearLayerConfig(weight_shape=(N, K))
+    except TypeError:  # vLLM before vllm#54223: the kernel is not chosen per weight shape
+        config = Mxfp8LinearLayerConfig()
+    kernel = FlashInferCutlassMxfp8LinearKernel(config)
     kernel.process_weights_after_loading(layer)
 
     fails = 0

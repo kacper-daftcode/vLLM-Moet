@@ -414,7 +414,11 @@ def check_vllm(kern: Kernels, dev) -> int:
         layer = torch.nn.Module()
         layer.weight = Parameter(wq, requires_grad=False)
         layer.weight_scale = Parameter(wsf.view(N, -1), requires_grad=False)
-        lk = FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+        try:
+            config = Mxfp8LinearLayerConfig(weight_shape=(N, K))
+        except TypeError:  # vLLM before vllm#54223: the kernel is not chosen per weight shape
+            config = Mxfp8LinearLayerConfig()
+        lk = FlashInferCutlassMxfp8LinearKernel(config)
         lk.process_weights_after_loading(layer)
         bad = []
         for M in (1, 6, 8, 12, 16):
@@ -436,7 +440,10 @@ def check_vllm(kern: Kernels, dev) -> int:
               f"{'' if ok else ' DIFF: ' + ', '.join(bad)}")
     from vllm.model_executor.kernels.linear import init_mxfp8_linear_kernel
 
-    gk = init_mxfp8_linear_kernel(bmm_batch_size=N_GROUPS)
+    try:
+        gk = init_mxfp8_linear_kernel(weight_shape=(N_GROUPS * O_LORA, WO_A_K), bmm_batch_size=N_GROUPS)
+    except TypeError:  # vLLM before vllm#54223
+        gk = init_mxfp8_linear_kernel(bmm_batch_size=N_GROUPS)
     if type(gk).__name__ != "Sm120GemvMxfp8BmmLinearKernel":
         print(f"[BAD] wo_a kernel not selected (patch_vllm_wo_a_sm120.py): {type(gk).__name__}")
         return fails + 1

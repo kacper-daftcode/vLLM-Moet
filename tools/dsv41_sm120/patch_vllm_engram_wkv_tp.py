@@ -19,7 +19,11 @@ and test_engram_wkv_tp4.py check it. Only that path splits (ModelOptLinearMethod
 FlashInferCutlassMxfp8LinearKernel); any other linear method, TP = 1 and sequence parallelism (each rank holds
 different tokens there) run the replicated layer.
 
-Patched file: vllm/models/deepseek_v41/common/engram.py (Engram.forward calls wkv through _moet_engram_wkv).
+Patched file: vllm/models/deepseek_v41/common/engram.py (Engram.forward calls wkv through _moet_engram_wkv). Since
+vllm#58678 (2026-09-26) upstream builds wkv as a ColumnParallelLinear(gather_output=True) - each rank loads 1/TP of
+the weight and the output is all-gathered at every token count, prefill included (+1.8 ms per Engram layer per
+4096-token chunk on this PCIe host) - so on such a vLLM the construction is put back to the replicated layer first;
+the split at decode gives the same bits as upstream's layer (same kernel on the same rows of the same bytes).
 Runtime switches: VLLM_MOET_ENGRAM_WKV_TP=0 (replicated at every token count), VLLM_MOET_ENGRAM_WKV_TP_MAX_TOKENS
 (64: the largest token count that splits).
 
@@ -127,6 +131,37 @@ def _moet_engram_wkv(wkv, x, use_sequence_parallel):
 
 '''
 
+REPLICATED_CONSTRUCTION = "        self.wkv = ReplicatedLinear(\n"
+# vllm#58678: wkv sharded by output columns, all-gathered at every token count.
+CPL_IMPORT_OLD = "from vllm.model_executor.layers.linear import ColumnParallelLinear\n"
+CPL_IMPORT_NEW = "from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLinear\n"
+CPL_CONSTRUCTION_OLD = (
+    "        # Without sequence parallelism every TP rank holds every token, so\n"
+    "        # shard the output columns instead of replicating the projection.\n"
+    "        self.wkv = ColumnParallelLinear(\n"
+    "            n_hash_cols * layout.head_dim,\n"
+    "            self.dim * (self.hc_mult + 1),\n"
+    "            bias=False,\n"
+    "            gather_output=True,\n"
+    "            quant_config=quant_config,\n"
+    "            return_bias=False,\n"
+    '            prefix=f"{prefix}.wkv",\n'
+    "            disable_tp=use_sequence_parallel,\n"
+    "        )\n"
+)
+CPL_CONSTRUCTION_NEW = (
+    "        # Replicated: an output all-gather at prefill sizes costs more than the\n"
+    "        # weight bytes it saves; _moet_engram_wkv splits at decode token counts.\n"
+    "        self.wkv = ReplicatedLinear(\n"
+    "            n_hash_cols * layout.head_dim,\n"
+    "            self.dim * (self.hc_mult + 1),\n"
+    "            bias=False,\n"
+    "            quant_config=quant_config,\n"
+    "            return_bias=False,\n"
+    '            prefix=f"{prefix}.wkv",\n'
+    "        )\n"
+)
+
 FORWARD_OLD = "        kv = self.wkv(self.embed(hash_ids).flatten(-2))\n"
 FORWARD_NEW = (
     "        kv = _moet_engram_wkv(\n"
@@ -149,8 +184,13 @@ def patch_text(src: str) -> str:
                  "tensor_model_parallel_all_gather"):
         if f"    {name},\n" not in src:
             raise SystemExit(f"engram.py: {name} is not imported (the helper uses it)")
-    if "        self.wkv = ReplicatedLinear(\n" not in src:
-        raise SystemExit("engram.py: wkv is not a ReplicatedLinear any more - re-validate the split")
+    if src.count(CPL_CONSTRUCTION_OLD) == 1:
+        src = _replace(src, CPL_IMPORT_OLD, CPL_IMPORT_NEW, "linear import")
+        src = _replace(src, CPL_CONSTRUCTION_OLD, CPL_CONSTRUCTION_NEW, "wkv construction")
+    elif REPLICATED_CONSTRUCTION not in src:
+        raise SystemExit(
+            "engram.py: wkv is neither a ReplicatedLinear nor vllm#58678's ColumnParallelLinear - re-validate the split"
+        )
     out = _replace(src, HELPER_ANCHOR, HELPER_ANCHOR + HELPER.replace("{marker}", MARKER), "helper")
     return _replace(out, FORWARD_OLD, FORWARD_NEW, "Engram.forward wkv call")
 

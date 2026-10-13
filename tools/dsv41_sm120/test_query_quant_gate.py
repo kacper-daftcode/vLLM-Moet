@@ -80,7 +80,11 @@ def main() -> int:
     layer = torch.nn.Module()
     layer.weight = Parameter(w_q, requires_grad=False)
     layer.weight_scale = Parameter(w_sf.view(N, -1), requires_grad=False)
-    lk = FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearLayerConfig())
+    import dataclasses
+
+    # vLLM since 2026-09 picks the MXFP8 kernel per weight shape: the config carries (N, K).
+    has_shape = "weight_shape" in {f.name for f in dataclasses.fields(Mxfp8LinearLayerConfig)}
+    lk = FlashInferCutlassMxfp8LinearKernel(Mxfp8LinearLayerConfig(**({"weight_shape": (N, Q)} if has_shape else {})))
     lk.process_weights_after_loading(layer)
     for T in (1, 6, 16, 17, 64):
         qr = torch.randn(T, Q, device=dev, dtype=torch.bfloat16)

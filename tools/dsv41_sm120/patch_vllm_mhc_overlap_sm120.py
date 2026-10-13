@@ -22,13 +22,20 @@ bit-identical to the served path (test_mhc_post_norm_sm120.py; the split modes r
 epilogue). The first layer's `mhc_pre` and the Engram layers' `mhc_post` + `mhc_pre` take upstream's
 overlap path unchanged (same kernels as today, coefficients on the side stream).
 
+Base: vLLM main 21d93d0d (nightly-21d93d0d8c0e...). Upstream's GB200 overlap path there all-reduces with
+a CuTe DSL kernel (`AllReduceMHC`, nvidia/ops/cute_dsl/all_reduce_mhc.py, built by the collective
+`init_mhc_all_reduce`; NVLink multicast only) and can finalize a deferred MoE output (`MoEOutput`) inside
+it. Neither runs on sm_120: `init_mhc_all_reduce` builds nothing here, and the deferred finalize needs
+TRTLLM-Gen MXFP4 experts (capability family 100), so the MoE always finalizes on sm_120.
+
 Patched file: vllm/models/deepseek_v41/nvidia/ops/mhc.py
   supports_mhc_overlap: also True on sm_120 (hidden 5120, hc_mult 4, DeepGEMM, no ubatching) when the
       kernel extension loads; MHC_OVERLAP_MAX_TOKENS 16 -> 64 there (VLLM_MOET_MHC_OVERLAP_MAX_TOKENS).
   supports_mhc_all_reduce: True there too (TP4) - upstream's fuse_mhc_all_reduce moves the sublayer's
       all-reduce out of wo_b / the MoE into mhc_shifted_post_pre, where the sm_120 path runs a plain
-      all-reduce right before the boundary kernel (no MNNVL kernel): the side stream's join then lands
-      on the all-reduce node and the boundary kernel has a single parent in the captured graph.
+      all-reduce right before the boundary kernel (no CuTe DSL / MNNVL kernel): the side stream's join
+      then lands on the all-reduce node and the boundary kernel has a single parent in the captured graph.
+  init_mhc_all_reduce: returns at once on that path (no AllReduceMHC, no cute_dsl import).
   mhc_shifted_post_pre: with a stream, the sm_120 path above.
 Runtime switches: VLLM_MOET_MHC_OVERLAP=0 (no side stream: the served two-kernel path),
   VLLM_MOET_MHC_FUSE_ALLREDUCE=0 (all-reduce stays in the linear layers), VLLM_MOET_MHC_PROJ,
@@ -286,24 +293,40 @@ SUPPORT_NEW = (
 )
 
 ALLREDUCE_ANCHOR = (
+    "    # The custom all-reduce's MNNVL buffers succeed exactly when NVLink\n"
+    "    # multicast does, which the fused kernel's own mailbox needs too.\n"
     "    comm = cast(\"CudaCommunicator\", get_tp_group().device_communicator).ca_comm\n"
     "    return comm is not None and bool(comm.mnnvl_lamport_ag_multicast_ptr)\n"
 )
 ALLREDUCE_NEW = (
     f"    {MARKER}: the sublayer's all-reduce moves into mhc_shifted_post_pre, in front of\n"
-    "    # the boundary kernel (a plain all-reduce, no MNNVL kernel; VLLM_MOET_MHC_FUSE_ALLREDUCE=0 keeps\n"
-    "    # it in the linear layers)\n"
+    "    # the boundary kernel (a plain all-reduce, not the CuTe DSL kernel: init_mhc_all_reduce builds\n"
+    "    # nothing here; VLLM_MOET_MHC_FUSE_ALLREDUCE=0 keeps it in the linear layers)\n"
     "    if _moet_mhc_overlap_supported(vllm_config):\n"
     "        import os\n"
     "\n"
     "        return os.environ.get(\"VLLM_MOET_MHC_FUSE_ALLREDUCE\", \"1\") == \"1\"\n"
 ) + ALLREDUCE_ANCHOR
 
+INIT_ANCHOR = (
+    "    global _all_reduce_mhc\n"
+    "    from .cute_dsl import AllReduceMHC\n"
+)
+INIT_NEW = (
+    "    global _all_reduce_mhc\n"
+    f"    {MARKER}: the fused path's all-reduce is a plain one in front of the boundary kernel\n"
+    "    if _moet_mhc_overlap_supported(vllm_config):\n"
+    "        _moet_logger.info_once(\n"
+    "            \"vllm-moet sm_120 mHC overlap: the sublayer all-reduce runs right before the boundary \"\n"
+    "            \"kernel (VLLM_MOET_MHC_FUSE_ALLREDUCE=0 keeps it in the linear layers)\"\n"
+    "        )\n"
+    "        return\n"
+    "    from .cute_dsl import AllReduceMHC\n"
+)
+
 DISPATCH_ANCHOR = (
     "    layer_input = None\n"
-    "    if reduce_results:\n"
-    "        tp = get_tp_group()\n"
-    "        if stream is not None and 0 < x.shape[0] <= MHC_OVERLAP_MAX_TOKENS:\n"
+    "    if isinstance(x, MoEOutput):\n"
 )
 DISPATCH_NEW = (
     f"    {MARKER}: one kernel on the critical path, the coefficients behind the sublayer.\n"
@@ -311,6 +334,8 @@ DISPATCH_NEW = (
     "    # the join of the side stream then lands on the all-reduce node, and the kernel has one\n"
     "    # parent (see _moet_mhc_shifted_post_pre_overlap).\n"
     "    if stream is not None and (_moet_kernels := _moet_mhc_post_norm()) is not None:\n"
+    "        # the deferred MoE finalize needs TRTLLM-Gen experts (SM100): sm_120 MoEs finalize\n"
+    "        assert isinstance(x, torch.Tensor), \"sm_120 mHC overlap: unexpected unfinalized MoE output\"\n"
     "        if not _moet_kernels.mhc_post_norm_applicable(x, residual, pre_mix, norm_weight):\n"
     "            stream = None  # not the kernel's shape: the served path, coefficients on this stream\n"
     "        else:\n"
@@ -339,18 +364,26 @@ DISPATCH_NEW = (
     "            )\n"
 ) + DISPATCH_ANCHOR
 
+HUNKS = (
+    ("supports_mhc_overlap", SUPPORT_ANCHOR, SUPPORT_NEW),
+    ("supports_mhc_all_reduce", ALLREDUCE_ANCHOR, ALLREDUCE_NEW),
+    ("init_mhc_all_reduce", INIT_ANCHOR, INIT_NEW),
+    ("dispatch", DISPATCH_ANCHOR, DISPATCH_NEW),
+)
+
 
 def patch_text(src: str, kernel_dir: str) -> str:
     if MARKER in src:
         return src
-    for name, anchor in (("constant", CONST_ANCHOR), ("supports_mhc_overlap", SUPPORT_ANCHOR),
-                         ("supports_mhc_all_reduce", ALLREDUCE_ANCHOR), ("dispatch", DISPATCH_ANCHOR)):
+    for name, anchor in (("constant", CONST_ANCHOR),) + tuple((n, a) for n, a, _ in HUNKS):
         if src.count(anchor) != 1:
-            raise SystemExit(f"{name} anchor found {src.count(anchor)} times (expected 1)")
+            raise SystemExit(
+                f"{name} anchor found {src.count(anchor)} times (expected 1); this patcher targets "
+                "vLLM main 21d93d0d's nvidia/ops/mhc.py"
+            )
     out = src.replace(CONST_ANCHOR, CONST_ANCHOR + HELPER_TEMPLATE.format(marker=MARKER, kernel_dir=kernel_dir), 1)
-    out = out.replace(SUPPORT_ANCHOR, SUPPORT_NEW, 1)
-    out = out.replace(ALLREDUCE_ANCHOR, ALLREDUCE_NEW, 1)
-    out = out.replace(DISPATCH_ANCHOR, DISPATCH_NEW, 1)
+    for _, anchor, new in HUNKS:
+        out = out.replace(anchor, new, 1)
     return out
 
 

@@ -36,7 +36,10 @@ def main() -> int:
     assert "sm120_gemv_bmm" in open(o_proj_mod.__file__).read(), "o_proj patch not applied"
     dev = torch.device("cuda")
     torch.manual_seed(1)
-    kernel = init_mxfp8_linear_kernel(bmm_batch_size=N_GROUPS)
+    try:
+        kernel = init_mxfp8_linear_kernel(weight_shape=(N, K), bmm_batch_size=N_GROUPS)
+    except TypeError:  # vLLM before vllm#54223
+        kernel = init_mxfp8_linear_kernel(bmm_batch_size=N_GROUPS)
     print("kernel class:", type(kernel).__name__)
     assert type(kernel).__name__ == "Sm120GemvMxfp8BmmLinearKernel", type(kernel)
 

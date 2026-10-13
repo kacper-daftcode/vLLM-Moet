@@ -7,6 +7,9 @@ of the kv-source layers 2/8/14/20 in one UniformTypeKVCacheSpecs, the compressor
 CircularBufferSpec; one packed block-outermost allocation of 114,688 B per block) and runs
 vLLM's own build_offloading_config, TieringOffloadingSpec sizing and fs-tier FileMapper on it:
 
+  upstream  (vLLM with vllm#57652's kv_tp_replicas) the TP replication the installed V4.1 layers
+            declare (max_tp_shards of the specs their own get_kv_cache_spec returns) and
+            whether upstream's gate alone keeps one copy - when it does, the patch can retire;
   gate      replicated_layout at TP 2/4/8 (only the compressed group is offloaded);
   closed    stays off for use_mla=False, TP1, a non-MLA or a HiddenStateCacheSpec layer in
             an offloaded group, a GQA group offloaded next to the MLA one, PP2 and the ray
@@ -21,7 +24,8 @@ Needs no GPU. Run inside the serving image:
 from __future__ import annotations
 
 import sys
-from dataclasses import replace
+from dataclasses import fields, replace
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
@@ -50,6 +54,54 @@ from vllm.v1.kv_offload.tiering.spec import TieringOffloadingSpec
 BLOCK_BYTES = 114_688  # per rank and 128-token block on the served image (fs-tier slot)
 KV_SOURCE_LAYERS = (2, 8, 14, 20)
 HOST_BYTES = 64 << 30
+# vllm#57652: specs declare how many TP shards their pages have (None = not declared, counted as sharded).
+HAS_TP_SHARDS = "max_tp_shards" in {f.name for f in fields(MLAAttentionSpec)}
+HAS_TP_REPLICAS = "kv_tp_replicas" in {f.name for f in fields(KVCacheConfig)}
+
+
+def installed_tp_shards() -> dict[str, int | None]:
+    """max_tp_shards of the specs the installed V4.1 layers' get_kv_cache_spec returns (attribute stand-ins)."""
+    if not HAS_TP_SHARDS:
+        return {}
+    from vllm.models.deepseek_v41.attention import DeepseekV4Attention, DeepseekV4IndexerCache
+    from vllm.models.deepseek_v41.compressor import CompressorStateCache
+    from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
+
+    # bf16 cache: the fp8_ds_mla page alignment would ask the platform; only max_tp_shards is read here.
+    cache = SimpleNamespace(block_size=128, cache_dtype="bfloat16")
+    cfg = SimpleNamespace(cache_config=cache)
+    specs = {
+        "compressed": DeepseekV4Attention.get_kv_cache_spec(
+            SimpleNamespace(is_kv_source=True, kv_cache_dtype="bfloat16", head_dim=512,
+                            kv_cache_torch_dtype=torch.bfloat16, compress_ratio=4, kv_page_alignment=512,
+                            compressed_bytes_per_token=None), cfg),
+        "indexer": DeepseekV4IndexerCache.get_kv_cache_spec(
+            SimpleNamespace(cache_config=cache, head_dim=132, dtype=torch.uint8, compress_ratio=4,
+                            sparse_logits=False, rocm_mxfp4=False), cfg),
+        "ring": CompressorStateCache.get_kv_cache_spec(
+            SimpleNamespace(block_size=8, state_dim=1024, dtype=torch.float32), cfg),
+        "swa": DeepseekV4SWACache.get_kv_cache_spec(
+            SimpleNamespace(cache_config=cache, bounded_replay=True, block_size=32, head_dim=512,
+                            dtype=torch.bfloat16, window_size=128, packed_bytes_per_token=None,
+                            packed_page_alignment=512), cfg),
+    }
+    return {name: spec.max_tp_shards for name, spec in specs.items()}
+
+
+TP_SHARDS: dict[str, int | None] = {}
+
+
+def tp_kwargs(kind: str) -> dict[str, Any]:
+    return {"max_tp_shards": TP_SHARDS.get(kind)} if HAS_TP_SHARDS else {}
+
+
+def with_replicas(kv: KVCacheConfig, tp: int) -> KVCacheConfig:
+    """kv_tp_replicas as get_kv_cache_configs sets it for this TP size."""
+    if not HAS_TP_REPLICAS:
+        return kv
+    from vllm.v1.core.kv_cache_utils import kv_cache_groups_tp_replicas
+
+    return replace(kv, kv_tp_replicas=kv_cache_groups_tp_replicas(kv.kv_cache_groups, tp))
 
 
 def vllm_config(
@@ -95,11 +147,11 @@ def compressed_specs(extra: dict[str, KVCacheSpec] | None = None) -> dict[str, K
         prefix = f"language_model.model.layers.{layer}.attn"
         specs[prefix] = MLAAttentionSpec(
             block_size=128, num_kv_heads=1, head_size=512, dtype=torch.uint8,
-            tokens_per_state=2,
+            tokens_per_state=2, **tp_kwargs("compressed"),
         )
         specs[f"{prefix}.indexer.k_cache"] = MLAAttentionSpec(
             block_size=128, num_kv_heads=1, head_size=68, dtype=torch.uint8,
-            tokens_per_state=2,
+            tokens_per_state=2, **tp_kwargs("indexer"),
         )
     specs.update(extra or {})
     return specs
@@ -117,7 +169,7 @@ def v41_kv_cache_config(
         layer += 5
         spec = SlidingWindowMLASpec(
             block_size=32, num_kv_heads=1, head_size=528, dtype=torch.uint8,
-            sliding_window=128, bounded_replay=True,
+            sliding_window=128, bounded_replay=True, **tp_kwargs("swa"),
         )
         groups.append(KVCacheGroupSpec(names, spec))
     compressed = compressed if compressed is not None else compressed_specs()
@@ -129,7 +181,8 @@ def v41_kv_cache_config(
     groups += extra_groups or []
     ring = {
         f"language_model.model.layers.{i}.attn.compressor.state_cache": CircularBufferSpec(
-            block_size=8, num_kv_heads=1, head_size=1024, head_size_v=0, dtype=torch.float32
+            block_size=8, num_kv_heads=1, head_size=1024, head_size_v=0, dtype=torch.float32,
+            **tp_kwargs("ring"),
         )
         for i in KV_SOURCE_LAYERS
     }
@@ -158,15 +211,32 @@ def main() -> int:
         results.append((ok, what))
         print(f"  {'[ok ]' if ok else '[BAD]'} {what}")
 
+    TP_SHARDS.update(installed_tp_shards())
     kv = v41_kv_cache_config()
     print(f"groups {[g.kv_cache_spec.block_size for g in kv.kv_cache_groups]}, "
           f"offloaded {list(kv.prefix_cacheable_group_ids)}")
 
+    if HAS_TP_REPLICAS:
+        print("upstream (vllm#57652: replicated_layout needs kv_tp_replicas == TP)")
+        print(f"  max_tp_shards declared by the installed V4.1 specs: {TP_SHARDS}")
+        upstream_alone = all(with_replicas(kv, tp).kv_tp_replicas == tp for tp in (2, 4, 8))
+        print(f"  kv_tp_replicas at TP4: {with_replicas(kv, 4).kv_tp_replicas} -> upstream's gate alone: "
+              + ("one copy (patch_vllm_offload_replicated_mla.py can retire)" if upstream_alone
+                 else "per-rank copies (the patch is needed)"))
+        installed = dict(TP_SHARDS)
+        TP_SHARDS.update(dict.fromkeys(("compressed", "indexer", "ring", "swa"), 1))
+        declared = v41_kv_cache_config()
+        TP_SHARDS.clear()
+        TP_SHARDS.update(installed)
+        check(with_replicas(declared, 4).kv_tp_replicas == 4
+              and build_offloading_config(vllm_config(), with_replicas(declared, 4)).replicated_layout,
+              "every spec declaring max_tp_shards=1: kv_tp_replicas 4, replicated_layout")
+
     print("gate")
     for tp in (2, 4, 8):
-        cfg = build_offloading_config(vllm_config(tp=tp), kv)
+        cfg = build_offloading_config(vllm_config(tp=tp), with_replicas(kv, tp))
         check(cfg.replicated_layout, f"TP{tp}: replicated_layout")
-    cfg = build_offloading_config(vllm_config(), kv)
+    cfg = build_offloading_config(vllm_config(), with_replicas(kv, 4))
     check([g.group_id for g in cfg.groups] == [8], "only the compressed group is offloaded")
     check(cfg.worker_kv_bytes_per_block == BLOCK_BYTES, f"{BLOCK_BYTES} B per block and rank")
 
@@ -177,20 +247,20 @@ def main() -> int:
     hidden = HiddenStateCacheSpec(block_size=128, num_kv_heads=1, head_size=512, dtype=torch.bfloat16)
     non_mla = FullAttentionSpec(block_size=128, num_kv_heads=1, head_size=512, dtype=torch.uint8)
     for label, config, kv_config in (
-        ("use_mla=False", vllm_config(use_mla=False), kv),
-        ("TP1", vllm_config(tp=1), kv),
-        ("PP2", vllm_config(tp=2, pp=2), kv),
-        ("ray executor", vllm_config(backend="ray"), kv),
-        ("GQA group offloaded too", vllm_config(), v41_kv_cache_config(extra_groups=[gqa])),
+        ("use_mla=False", vllm_config(use_mla=False), with_replicas(kv, 4)),
+        ("TP1", vllm_config(tp=1), with_replicas(kv, 1)),
+        ("PP2", vllm_config(tp=2, pp=2), with_replicas(kv, 2)),
+        ("ray executor", vllm_config(backend="ray"), with_replicas(kv, 4)),
+        ("GQA group offloaded too", vllm_config(), with_replicas(v41_kv_cache_config(extra_groups=[gqa]), 4)),
         ("non-MLA layer in the compressed group",
-         vllm_config(), v41_kv_cache_config(compressed_specs({"x.attn": non_mla}))),
+         vllm_config(), with_replicas(v41_kv_cache_config(compressed_specs({"x.attn": non_mla})), 4)),
         ("HiddenStateCacheSpec layer in the compressed group",
-         vllm_config(), v41_kv_cache_config(compressed_specs({"x.hidden": hidden}))),
+         vllm_config(), with_replicas(v41_kv_cache_config(compressed_specs({"x.hidden": hidden})), 4)),
     ):
         check(not build_offloading_config(config, kv_config).replicated_layout, f"{label}: per-rank layout")
 
     print("sizing")
-    offloading_config = build_offloading_config(vllm_config(), kv)
+    offloading_config = build_offloading_config(vllm_config(), with_replicas(kv, 4))
     single = TieringOffloadingSpec(offloading_config)
     per_rank = TieringOffloadingSpec(replace(offloading_config, replicated_layout=False))
     check(per_rank.num_chunks == 149_796, f"per-rank layout: {per_rank.num_chunks} chunks (served log: 149796)")

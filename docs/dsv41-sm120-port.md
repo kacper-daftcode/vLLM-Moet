@@ -981,7 +981,15 @@ What the rank‑0 traces (`run19..22_*` in the profiles directory) showed, bound
   `all_reduce`, not the MNNVL kernel the GB200 path uses): the kernel's gap drops to 0.19 µs, the
   all‑reduce's own gap stays at its 2.8 µs (unchanged from `-moeqs`), the attention sublayer goes
   from 91.4 to 83.6 µs and the step from 11,152 to 10,681 µs (−4.2 %). The same all‑reduce kernel
-  on the same operands, so the bits are the same (agreement 24/24, raw 12/12).
+  on the same operands, so the bits are the same (agreement 24/24, raw 12/12) — in every step but one
+  kind. An eager prefill step that trims (the decoder replay) selects the replay rows of layer 20's still
+  unreduced FFN output, and layer 21's boundary all‑reduces only those rows, where the unfused path reduces
+  every row inside the MoE. NCCL's rounding depends on the message, so ~30 % of those rows' elements come
+  out 1–2 ulp apart (measured 2026‑10‑06 on 4× RTX PRO 6000 with `mhc_overlap/nccl_replay_subset_tp4.py`,
+  identically in the `-engram` image and on vLLM 21d93d0d; for scale, the unfused path itself moves 3–8 %
+  of a chunk's elements whenever the step holds another request's rows). The needle answers to 367K were
+  the same. `VLLM_MOET_MHC_FUSE_ALLREDUCE=0` gives the unfused bits there, at the cost of variant d's
+  ~120 µs per decode step.
 - `record_stream` under graph capture keeps every recorded block allocated until the capture ends:
   +0.15 GiB of graph memory and +0.14 GiB of "peak activation" per rank, −3.2 % KV tokens
   (3,303,226). Holding Python references on the stream object until the next boundary — by which
@@ -1274,6 +1282,57 @@ of L2) it pays only up to ~18 tokens. `VLLM_MOET_MOE_FC2_DISCARD=0` turns it off
 
 Expected per decode step at one stream, from the isolated measurements (the served graph decides): NCCL records −0.2 to
 −0.35 ms, GEMV PDL −0.15 to −0.35, FFN‑boundary PDL −0.075 to −0.1, FC2 discard −0.15 to −0.28.
+
+## The rebase onto vLLM nightly 21d93d0d (2026‑10‑06..13)
+
+`Dockerfile.sm120-dsv41-nightly` moved from `vllm/vllm-openai:nightly` 0961bbae (vLLM 0.29.1rc1.dev513) to
+`nightly-21d93d0d` (0.30.1rc1.dev709, 2026‑10‑05; image digest `bcee860c…`), a nightly with vllm#57679, #58132,
+#57652 and #58316 merged (the v0.31.0 release was cut without #58132). The torch build is the same (2.13.0+cu130, identical
+`libtorch_cuda.so`), and so are CUDA 13.0, NCCL 2.30.7, Triton 3.7.1, TileLang 0.1.12 and the DeepGEMM pin e1f418c2, so
+every extension compiles unchanged. Image tag `dsv41-nightly-21d93d0d-pdl` = the `-pdl` patch set on the new base.
+
+What upstream has now, so the patch is gone: the decoder side of the SWA bounded replay (vllm#58132; step 7 —
+`--swa-bounded-replay`, default on, trims in eager steps only, which with `--max-cudagraph-capture-size 64` are all the
+steps that can trim; our head also trimmed the untrimmed replay layers of PIECEWISE steps eagerly, upstream runs them
+inside the graph) and the fused query norm + MXFP8 quantization gate (vllm#57679; step 9, our patch and the merge are
+the same file). `VLLM_MOET_DECODER_REPLAY=0` has no equivalent: `--no-swa-bounded-replay` turns off both sides of the
+replay.
+
+What upstream has and we keep patching: the reasoning‑effort table (vllm#58316 brings the checkpoint's low 50 / high 75 /
+max 100 and xhigh at 75; the patch adds only the aliases minimal 25 / medium 62 — HTTP 400 otherwise — and xhigh 87, so
+the served table does not change); the KV offload's replicated layout (vllm#57652 gates it on `kv_tp_replicas == TP`,
+which V4.1's own caches never reach because they declare no `max_tp_shards`; without the patch every rank stores its
+own copy again); Engram's `wkv` (vllm#58678 makes it a `ColumnParallelLinear` with `gather_output` — the same bits and
+the same time at decode as our split, 55.8 vs 55.4 µs at 6 tokens, but the output all‑gather costs every prefill chunk
++1.8 ms per Engram layer at 4096 tokens on this PCIe host, so the patch builds a `ReplicatedLinear` again and keeps
+the decode split); the mHC overlap (the patcher re‑anchors on upstream's new `init_mhc_all_reduce` — CuTe DSL
+`AllReduceMHC`, SM100 only, builds nothing on sm_120 — and its deferred‑MoE branch, which cannot engage on sm_120);
+the `fp8_dsv41_fp4_ca` capability probe of the nvfp4 patch (not upstream; now all‑or‑nothing over its three files);
+the DeepGEMM `_C` (pristine e1f418c2 still pads every routed expert to 128 rows on sm_120 and refuses the 128‑row
+indexer pages). No new upstream path engages on sm_120 in the served configuration: the fused WO‑A, CuTe‑DSL MXFP8,
+AllReduceMHC, Mega mHC, TRTLLM MXFP4 experts and the deferred MoE finalize are capability‑family‑100 only, the
+FlashInfer all‑reduce has no sm_120 size table (NCCL as before), and every hook of the GEMV, wo_a, MoE glue,
+quant+scatter, NCCL‑records and FC2‑discard patchers is still on the path the new code takes.
+
+FlashInfer: vLLM main pins 0.7.0.post1, which lacks flashinfer#5197 (the DSv4.1 dual cache that reads our FP4 record),
+so the image installs 0.7.1rc2 (2026‑10‑02, a strict superset of the served 0.7.0.dev20260922 on `main`; its sm_120
+sparse MLA and MXFP8 GEMM sources are byte‑identical to it; API‑compatible with every FlashInfer call of vLLM
+21d93d0d) — python, cubin, the jit‑cache shim and the `sm120f` provider, sha256‑pinned, the base image's other providers
+removed. Found on the way: since 0.7.0 the jit‑cache wheel is a shim and the AOT modules live in per‑arch providers,
+so the 0961bbae images, which installed the shim with `--no-deps`, carried no FlashInfer AOT module at all and compiled
+them at their first start into `CACHE_DIR` (the ~25 min first start). The new image loads all 562 provider modules AOT
+(`FLASHINFER_DISABLE_JIT=1` on an RTX PRO 6000: DSv4.1 sparse MLA 48/48 geometry cases and byte‑identical records,
+sampling, the CUTLASS MXFP8 GEMM); only FlashInfer's autotuner delay kernel `trtllm_utils` still JIT‑compiles (4 s,
+when it autotunes). Other changes the tests met: vllm#54223 makes `Mxfp8LinearLayerConfig` carry the weight shape
+(three GEMV test files and `test_query_quant_gate.py` pass it now; the served path passes it itself); vLLM's ops
+library is `_C_stable_libtorch.abi3.so`, so every import logs a harmless `Failed to import from vllm._C`;
+cutlass‑dsl 4.7.1 → 4.8.0 (FlashInfer's CuTe‑DSL MXFP8 activation quantizer, compiled in‑process at boot).
+
+Not bit‑identical to the `-engram` / `-pdl` images by construction: FlashInfer CI's AOT binaries instead of our first‑
+boot JIT build, cutlass‑dsl 4.8.0, upstream's replay inside PIECEWISE graphs. Our kernels are bit‑identical to what
+the new upstream code computes on sm_120 without them (op‑level, every patch, on an RTX PRO 6000 next to the serving
+job), so the serving gate for this image is a quality window rather than bit‑identity. The fused all‑reduce in a
+trimming prefill step (previous section) behaves the same on both bases.
 
 ## Apply / build / run
 

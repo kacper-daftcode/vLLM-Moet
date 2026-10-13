@@ -126,23 +126,16 @@ ATTENTION: list[tuple[str, str]] = [
 
 FLASHINFER_SPARSE: list[tuple[str, str]] = [
     (
+        # supported_kv_cache_dtypes of DeepseekV4FlashInferMLASparseBackend (the only such list in the file)
         '        "fp8_e4m3",\n'
         '        "fp8_ds_mla",\n'
-        "    ]\n"
-        "\n"
-        "    @staticmethod\n"
-        "    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:\n"
-        "        return [128]\n",
+        "    ]\n",
         '        "fp8_e4m3",\n'
         '        "fp8_ds_mla",\n'
         "        # SM120 with flashinfer-ai/flashinfer#5197: V4.1 fp8 SWA record +\n"
         "        # NVFP4 compressed record, read by FlashInfer's DSv4.1 dual cache.\n"
         '        "nvfp4_ds_mla",\n'
-        "    ]\n"
-        "\n"
-        "    @staticmethod\n"
-        "    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:\n"
-        "        return [128]\n",
+        "    ]\n",
     ),
     (
         "        if device_capability.major == 12:\n"
@@ -253,26 +246,19 @@ FILES = {
 }
 
 
-def apply(path: Path, edits: list[tuple[str, str]], check: bool) -> bool:
+def patched_text(path: Path, edits: list[tuple[str, str]]) -> str | None:
+    """The patched source (== the file's when already patched), or None if an anchor does not match."""
     s = path.read_text()
-    if all(new in s for _, new in edits):
-        print(f"{path}: already patched")
-        return True
     for old, new in edits:
         if new in s:
             continue
         n = s.count(old)
         if n != 1:
             print(f"{path}: anchor x{n} != 1:\n{old[:160]}", file=sys.stderr)
-            return False
+            return None
         s = s.replace(old, new)
-    if check:
-        print(f"{path}: patch applies cleanly (not written)")
-        return True
     compile(s, str(path), "exec")
-    path.write_text(s)
-    print(f"{path}: patched ({len(edits)} sites)")
-    return True
+    return s
 
 
 def main() -> int:
@@ -280,15 +266,26 @@ def main() -> int:
     ap.add_argument("--vllm-dir", type=Path, default=DEFAULT_VLLM)
     ap.add_argument("--check", action="store_true", help="verify anchors, write nothing")
     args = ap.parse_args()
-    ok = True
+    # All three files or none: a half-applied patch would leave e.g. the capability probe without its users.
+    out = {}
     for rel, edits in FILES.items():
         path = args.vllm_dir / rel
         if not path.exists():
             print(f"{path}: missing (vLLM main layout expected)", file=sys.stderr)
-            ok = False
-            continue
-        ok = apply(path, edits, args.check) and ok
-    return 0 if ok else 1
+            return 1
+        out[path] = patched_text(path, edits)
+    if any(s is None for s in out.values()):
+        print("nothing written", file=sys.stderr)
+        return 1
+    for (path, s), edits in zip(out.items(), FILES.values()):
+        if s == path.read_text():
+            print(f"{path}: already patched")
+        elif args.check:
+            print(f"{path}: patch applies cleanly (not written)")
+        else:
+            path.write_text(s)
+            print(f"{path}: patched ({len(edits)} sites)")
+    return 0
 
 
 if __name__ == "__main__":

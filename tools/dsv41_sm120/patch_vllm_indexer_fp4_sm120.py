@@ -35,8 +35,8 @@ DEFAULT_PATH = Path(
 )
 MARKER = "# [vllm-moet] sm_120 runs the MXFP4 indexer cache on DeepGEMM's sm120_fp4 kernels"
 
+# The CUDA gate at the end of dsa_indexer_uses_fp4 (since vllm#58671 a ROCm branch returns before it).
 OLD = (
-    "    use_fp4 = kv_dtype == \"mxfp4\"\n"
     "    if use_fp4 and not current_platform.is_device_capability_family(100):\n"
     "        raise ValueError(\n"
     "            \"indexer_kv_dtype='mxfp4' requires Blackwell datacenter GPUs \"\n"
@@ -46,7 +46,6 @@ OLD = (
     "    return use_fp4\n"
 )
 NEW = (
-    "    use_fp4 = kv_dtype == \"mxfp4\"\n"
     f"    {MARKER}\n"
     "    # (patch_deepgemm.py admits the 128-key pages; Q/K quantizers and the gather\n"
     "    # op are arch-generic). Validated by test_indexer_fp4_sm120.py.\n"

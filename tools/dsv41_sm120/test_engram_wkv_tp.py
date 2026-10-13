@@ -15,14 +15,17 @@ integration part (patched engram.py): the real ReplicatedLinear with DeepseekV4F
 loaded through its parameter loaders from the same checkpoint tensors; _moet_engram_wkv for each of 4 simulated TP
 ranks (the all-gather is the identity in this one-rank process, so the rank outputs are concatenated here) must
 equal wkv(x) bit for bit, eagerly for 1..4096 tokens (threshold lifted) and replayed from CUDA graphs, with the rank
-slices views into the layer's weight and scales. Then the dispatch: the split above VLLM_MOET_ENGRAM_WKV_TP_MAX_TOKENS,
-for TP = 1, sequence parallelism, an unquantized layer and VLLM_MOET_ENGRAM_WKV_TP=0 is the replicated layer, and
-the two switches as read from the environment.
+slices views into the layer's weight and scales. Then upstream's layer (vllm#58678: ColumnParallelLinear with
+gather_output, each simulated rank loading its shard through its own loaders): every rank's weight and swizzled
+scales are byte-identical to the split's views, and its gathered output equals the replicated layer's and the split's
+for 1..4096 tokens. Then the dispatch: the split above VLLM_MOET_ENGRAM_WKV_TP_MAX_TOKENS, for TP = 1, sequence
+parallelism, an unquantized layer and VLLM_MOET_ENGRAM_WKV_TP=0 is the replicated layer, and the two switches as
+read from the environment.
 
 --bench: GPU time per call in a CUDA graph with cold weights (the full weight vs the 4 slices in rotation).
 
 usage (in the serving image, engram.py patched for the integration part):
-    python3 test_engram_wkv_tp.py [--part op|integration|all] [--checkpoint DIR] [--bench]
+    python3 test_engram_wkv_tp.py [--part op|integration|all] [--checkpoint DIR] [--bench] [--max-gpu-mem-gib G]
 """
 
 from __future__ import annotations
@@ -117,17 +120,17 @@ def op_part(args, w8: torch.Tensor, s8: torch.Tensor, g: torch.Generator, tag: s
             paths["mm_mxfp8"] = lambda w, sf: served_cutlass(a, a_sf, w, sf)
             if m <= GEMV_MAX_M:
                 paths["gemv"] = lambda w, sf: mxfp8_gemv(a, a_sf, w, sf)
-            fulls = {}
+            ref = None  # cutlass0's output, the first path: every other CUTLASS path must match it
             for name, fn in paths.items():
                 full = fn(w8, w_sf)
                 split = torch.cat([fn(w, sf) for w, sf in sl], dim=1)
                 n_cmp += 1
                 if not torch.equal(bits(full), bits(split)):
                     bad_split.append((m, name, (bits(full) != bits(split)).sum().item()))
-                fulls[name] = full
-            ref = fulls["cutlass0"]
-            for name, full in fulls.items():
-                if name != "gemv" and not torch.equal(bits(full), bits(ref)):
+                del split
+                if ref is None:
+                    ref = full
+                elif name != "gemv" and not torch.equal(bits(full), bits(ref)):
                     bad_tactic.append((m, name))
     print(f"[{tag}] {n_cmp} (tokens, kernel) cases, {n_tac} CUTLASS tactics, GEMV for 1..{GEMV_MAX_M} tokens: "
           f"split != full in {len(bad_split)}, CUTLASS tactics disagree in {len(bad_tactic)}")
@@ -214,14 +217,19 @@ def split_wkv(E, wkv, x, size: int = TP, sp: bool = False) -> list[torch.Tensor]
     return outs
 
 
+def loaded(layer, w8: torch.Tensor, s8: torch.Tensor):
+    for param, tensor in ((layer.weight, w8), (layer.weight_scale, s8)):
+        param.weight_loader(param, tensor)  # as DeepseekV4Model.load_weights (".scale" -> ".weight_scale")
+    layer.quant_method.process_weights_after_loading(layer)
+    return layer
+
+
 def integration_part(args, w8: torch.Tensor, s8: torch.Tensor, g: torch.Generator, tag: str, qc) -> bool:
     import vllm.models.deepseek_v41.common.engram as E
     from vllm.model_executor.layers.linear import ReplicatedLinear
 
-    rep = ReplicatedLinear(K, N, bias=False, quant_config=qc, return_bias=False, prefix="model.layers.1.engram.wkv")
-    for param, tensor in ((rep.weight, w8), (rep.weight_scale, s8)):
-        param.weight_loader(param, tensor)  # as DeepseekV4Model.load_weights (".scale" -> ".weight_scale")
-    rep.quant_method.process_weights_after_loading(rep)
+    rep = loaded(ReplicatedLinear(K, N, bias=False, quant_config=qc, return_bias=False,
+                                  prefix="model.layers.1.engram.wkv"), w8, s8)
     qm = rep.quant_method
     print(f"[{tag}] {type(qm).__name__} / {type(qm.fmt).__name__} / {type(qm.kernel).__name__}")
     ok = True
@@ -267,9 +275,42 @@ def integration_part(args, w8: torch.Tensor, s8: torch.Tensor, g: torch.Generato
                     gbad.append(m)
         print(f"[{tag}] CUDA graph replays (1..64 tokens): split != replicated in {len(gbad)} {gbad[:10]}")
         ok &= not gbad
+    ok &= upstream_part(w8, s8, g, tag, qc, rep)
     del rep
     torch.cuda.empty_cache()
     return ok
+
+
+def upstream_part(w8: torch.Tensor, s8: torch.Tensor, g: torch.Generator, tag: str, qc, rep) -> bool:
+    """vllm#58678's wkv: ColumnParallelLinear(gather_output=True), one shard per simulated rank."""
+    import vllm.models.deepseek_v41.common.engram as E
+    from vllm.model_executor.layers.linear import ColumnParallelLinear
+
+    shards, same_bytes = [], True
+    for r in range(TP):
+        with simulated_rank(r, TP):
+            shard = loaded(ColumnParallelLinear(K, N, bias=False, gather_output=True, quant_config=qc,
+                                                return_bias=False, prefix="model.layers.1.engram.wkv"), w8, s8)
+            part = E._moet_wkv_part(rep, TP)
+        same_bytes &= (part is not None and tuple(shard.weight.shape) == (NS, K)
+                       and torch.equal(shard.weight.view(torch.uint8), part.weight.view(torch.uint8))
+                       and torch.equal(shard.weight_scale.view(torch.uint8), part.weight_scale.view(torch.uint8)))
+        shards.append(shard)
+    print(f"[{tag}] upstream ColumnParallelLinear shards (own loaders, 4 simulated ranks): weight + swizzled scales "
+          f"byte-identical to the split's views: {same_bytes}")
+    E._MOET_WKV_TP = (True, 64)
+    bad = []
+    with torch.inference_mode():
+        for m in DECODE_MS + PREFILL_MS:
+            x = activations(m, g)
+            upstream = torch.cat([shard(x) for shard in shards], dim=1)  # the all-gather, rank order
+            ours = torch.cat(split_wkv(E, rep, x), dim=1) if m <= 64 else rep(x)
+            if not (torch.equal(bits(upstream), bits(ours)) and torch.equal(bits(upstream), bits(rep(x)))):
+                bad.append(m)
+    print(f"[{tag}] upstream layer vs ours (split up to 64 tokens, replicated above) and vs replicated, "
+          f"1..4096 tokens: differ in {len(bad)} {bad[:10]}")
+    del shards
+    return same_bytes and not bad
 
 
 def dispatch_part(qc) -> bool:
@@ -329,7 +370,12 @@ def main() -> int:
     ap.add_argument("--checkpoint", default="", help="checkpoint directory: test layers 1 and 14's own wkv")
     ap.add_argument("--layers", default="1,14")
     ap.add_argument("--bench", action="store_true")
+    ap.add_argument("--max-gpu-mem-gib", type=float, default=0.0,
+                    help="cap the PyTorch allocations, e.g. next to a serving job (0: no cap)")
     args = ap.parse_args()
+    if args.max_gpu_mem_gib:
+        total = torch.cuda.get_device_properties(dev).total_memory
+        torch.cuda.set_per_process_memory_fraction(args.max_gpu_mem_gib * 2**30 / total)
     print(f"device={torch.cuda.get_device_name(0)} VLLM_MOET_GEMV_IMPL={os.environ.get('VLLM_MOET_GEMV_IMPL', 'v3')}")
     g = torch.Generator(device=dev).manual_seed(41)
     sources = [(f"layer {i}", int(i)) for i in args.layers.split(",")] if args.checkpoint else [("synthetic", 0)]

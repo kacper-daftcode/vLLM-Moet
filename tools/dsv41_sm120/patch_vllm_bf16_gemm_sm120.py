@@ -7,7 +7,8 @@ In the served decode graph (RTX PRO 6000, one stream) four BF16 projections run 
     ~26 us for it before the q/kv norm of every one of those layers (~210 us per step);
   - the indexer's wk (512 -> 128, bf16 out) in the 4 kv-source layers, on the main stream;
   - the compressor's fused_wkv_wgate (5120 -> 1024 / 512, fp32 out) on the first aux stream;
-  - the MoE router (GateLinear tier 4, 5120 -> 384, the drafter's 5120 -> 128, fp32 out): GEMM + splitKreduce.
+  - the MoE router (GateLinear's cuBLAS tier, 5120 -> 384, the drafter's 5120 -> 128, fp32 out): GEMM +
+    splitKreduce.
 bf16_gemm/ reproduces cuBLAS's result for each of them bit for bit in one launch (per-shape calibration against
 cuBLAS at load time, see bf16_replica_gemm_sm120.py), so outputs are unchanged.
 
@@ -15,7 +16,8 @@ Patched files:
   vllm/models/deepseek_v41/attention.py: the compressor_kv_score and indexer_weights_proj closures of the attention
       input GEMMs, the indexer's wk call in _produce_k, and the wk shape registered at indexer construction (wk is
       first called inside graph capture: the profile run skips it).
-  vllm/model_executor/layers/fused_moe/router/gate_linear.py: tier 4 (cuBLAS bf16 -> fp32).
+  vllm/model_executor/layers/fused_moe/router/gate_linear.py: the cuBLAS bf16 -> fp32 tier (tier 4 at 0961bbae,
+      tier 5 since the ROCm bf16x3 tier went in front of it; the only specialized tier sm_120 reaches).
 The indexer / wk layers take the kernels only when they would run F.linear (no bias, default unquantized GEMM, no
 VLLM_BATCH_INVARIANT); otherwise, and whenever the module is off or a token count is not calibrated, the original
 op runs.
@@ -152,15 +154,15 @@ ATTN_WK_CALL_OLD = "        k_pre, _ = self.wk(latent)\n"
 ATTN_WK_CALL_NEW = '        k_pre = _moet_bf16_linear(self.wk, latent, "wk")\n'
 
 GATE_ANCHOR_HELPER = "from vllm.utils.torch_utils import direct_register_custom_op\n"
-GATE_TIER4_OLD = (
+# The return line differs by pin (`return output, None`; `return self._return(output)` since return_bias), so it
+# is not part of the anchor.
+GATE_CUBLAS_OLD = (
     "        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:\n"
     "            output = torch.mm(x, self.weight.T, out_dtype=torch.float32)\n"
-    "            return output, None\n"
 )
-GATE_TIER4_NEW = (
+GATE_CUBLAS_NEW = (
     "        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:\n"
     '            output = _moet_bf16_mm(x, self.weight, True, "router")\n'
-    "            return output, None\n"
 )
 
 
@@ -190,7 +192,7 @@ def patch_gate(src: str, kernel_dir: str) -> str:
         return src
     helper = HELPER.replace("{marker}", MARKER).replace("{kernel_dir}", kernel_dir)
     out = _replace(src, GATE_ANCHOR_HELPER, GATE_ANCHOR_HELPER + helper, "gate_linear helper")
-    return _replace(out, GATE_TIER4_OLD, GATE_TIER4_NEW, "GateLinear tier 4")
+    return _replace(out, GATE_CUBLAS_OLD, GATE_CUBLAS_NEW, "GateLinear cuBLAS tier")
 
 
 def main() -> int:
