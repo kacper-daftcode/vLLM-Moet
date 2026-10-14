@@ -67,7 +67,10 @@ PDL-aware: FlashInfer's MXFP8 quantize, the Triton q/kv norm+quant (wait, then t
 
 - A GEMV comes up while its predecessor runs and issues its first weight loads (v3: round 0, all kept in front of the
   wait by ptxas; v1: the first K step, of which ptxas keeps 0–3 loads in front). It then executes `griddepcontrol.wait`,
-  reads the activations, writes C, and triggers its own dependents right after the wait.
+  reads the activations, writes C, and triggers its own dependents right after the wait. Forcing v1's 12 loads in
+  front of the wait (2026-10-14: the wait in a `__noinline__` call, or predicated both ways on an OR of the loaded
+  words) keeps them there in the SASS and returns the same bits, but is slower (call) or noise (predicate) on the
+  RTX PRO 6000 — not applied (`docs/dsv41-sm120-port.md`, "PDL for the dense GEMVs").
 - The PDL loads are `asm volatile`, so the compiler keeps their order relative to the wait, and they are predicated
   inside the asm (a conditional inline-asm load would become a branch per load).
 - The activations are weak L1-cached loads. As `ld.global.cg`, every CTA's re-read of the same few KB of activations

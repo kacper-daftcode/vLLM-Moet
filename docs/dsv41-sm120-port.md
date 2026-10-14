@@ -1277,6 +1277,19 @@ wo_b), 6 rows, cold weights: RTX PRO 6000 48.4 → 38.6 µs per layer (GPU idle 
 shared expert 18.9 → 15.2, the Engram slice 34.2 → 32.5. An L2 prefetch of the weights was 1–5 µs slower. Under PDL a
 kernel's trace duration includes its wait: compare spans, not per‑kernel sums.
 
+*v1 / grouped weights in front of the wait (2026‑10‑14, measured, not applied).* In the v1 / grouped PDL variants
+`ptxas` sinks 9–12 of the first K step's 12 weight loads below `ACQBULK` (the wait), and the open question was whether
+keeping them in front is worth ~1 µs per wo_a call. Two constructs keep all 12 in front in the SASS (checked on the
+cubin, no GPU needed): the wait inside a `__noinline__` function (a `CALL`, the loads stay in flight across it; the
+dense `<1,0,0,1>` instantiation then takes the ABI's 8‑byte stack and two spills) and the wait predicated both ways on
+an OR of the loaded words (`@p griddepcontrol.wait; @!p griddepcontrol.wait;` — the loads must complete first). Both
+return the served bits (`test_gemv_pdl_sm120.py` with the committed source as `--ref-cu`, ALL OK), neither pays on the
+RTX PRO 6000: the call variant is slower everywhere it matters (wo_a behind inverse‑RoPE+quant at 6 tokens 9.24 → 10.17
+µs, v1 dense at 16 rows +1…+8 µs, the attention chain +0.5…0.7 µs per layer; only `shared w2`, K = 576, gained 0.8), the
+predicated one is noise in the chains (attention 38.65 → 38.69, shared / Engram / indexer within ±0.6) and mixed per
+shape (wo_a at 6 tokens +0.3…0.6, at 48 −0.5…−1.0; v1 dense at 16 rows −0.3…+1.3). The kernels stay as served; the
+hidden launch latency was the whole gain of their PDL launch.
+
 **PDL at the FFN boundary.** The MoE router's `spread` (`VLLM_MOET_BF16_GEMM_PDL`, a site list, default `router`) and
 `moe_quant_scatter` (`VLLM_MOET_MOE_QUANT_SCATTER_PDL`, default 1) launch with PDL; before the wait they touch only
 weights (the router's fragments), and `spread`'s L2 workspace and tile counters come after it. From the boundary's
