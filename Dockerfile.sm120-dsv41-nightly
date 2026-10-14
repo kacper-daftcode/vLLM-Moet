@@ -70,6 +70,11 @@
 #      unfused path, as served since then: an eager prefill step that trims (step 7) all-reduces the cut layer's FFN
 #      output on the replay rows only, and NCCL rounds ~30 % of their elements differently (1-2 ulp).
 #      VLLM_MOET_MHC_OVERLAP=0 turns it off at runtime, VLLM_MOET_MHC_FUSE_ALLREDUCE=0 only the all-reduce move.
+#      The DSpark drafter's three layers are the same decoder layer but were built without the stream, so its
+#      graph kept the TileLang pair (~10 us x 6 boundaries, plus the first layer's TF32 prenorm GEMM).
+#      patch_vllm_dspark_mhc_stream_sm120.py passes the drafter its own stream under the same switches, and
+#      all-reduces the last layer's FFN output in front of the drafter's final post-mix (with fuse_mhc_all_reduce
+#      the layers leave it unreduced; the target's _collapse does the same) - test_dspark_mhc_stream.py.
 #  11. The small-M BF16 GEMMs of the decode step with cuBLAS's bits from one launch (patch_vllm_bf16_gemm_sm120.py
 #      + bf16_gemm/): the indexer's weights_proj (cuBLAS ran it on 2 CTAs; the main stream waited ~26 us for it in
 #      every index-source layer), the indexer's wk and the MoE router; the compressor projection optionally
@@ -99,6 +104,9 @@
 #      (23 MB per MoE layer) are padding nobody reads, and the next FC1 paid for their write-back. Right after FC2
 #      their lines are invalidated (discard.global.L2) - bit-identical (test_moe_l2_discard_sm120.py); 2..64 tokens
 #      (VLLM_MOET_MOE_FC2_DISCARD_MIN_TOKENS / _MAX_TOKENS). VLLM_MOET_MOE_FC2_DISCARD=0 turns it off at runtime.
+#      Since 2026-10-14 the discard runs on a side stream forked after FC2 and joined after the gather (disjoint
+#      lines: the gather reads only real rows), another -3.7 us per MoE layer at 6 tokens on 4x RTX PRO 6000;
+#      VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 launches it inline on the model stream as served since 2026-10-13.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -223,7 +231,9 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
 #     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
 ARG VLLM_MOET_MHC_OVERLAP=1
 RUN if [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_overlap_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_mhc_stream_sm120.py \
     && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h; assert hasattr(h, '_moet_mhc_shifted_post_pre_overlap'); print('mhc overlap patched')" \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.dspark as d; import inspect; s = inspect.getsource(d.DSparkDeepseekV4Model); assert 'mhc_stream=mhc_stream' in s and 'tensor_model_parallel_all_reduce(hidden_states)' in s; print('drafter mhc stream patched')" \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert hasattr(e, 'mhc_post_norm') and hasattr(e, 'mhc_proj'); print('sm120 mhc overlap extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mhc_post_norm_sm120/*.so; fi
 
@@ -249,7 +259,7 @@ RUN if [ "$VLLM_MOET_NCCL_GRAPH_RECORDS" = "1" ]; then python3 /opt/vllm-moet/ds
 ARG VLLM_MOET_MOE_FC2_DISCARD=1
 RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_fc2_discard_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_l2'); import moe_l2_discard_sm120 as l; e = l._ext(); assert hasattr(e, 'discard_padding_rows'); print('sm120 moe l2 discard extension built')" \
-    && python3 -c "import vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe as d; assert hasattr(d, '_moet_drop_padding_rows'); print('moe fc2 discard patched')" \
+    && python3 -c "import vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe as d; import inspect; assert hasattr(d, '_moet_drop_padding_rows') and hasattr(d, '_moet_l2_side_stream') and 'wait_stream(_moet_l2_side)' in inspect.getsource(d.DeepGemmFP4Experts.apply); print('moe fc2 discard patched')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_l2_discard_sm120/*.so; fi
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.

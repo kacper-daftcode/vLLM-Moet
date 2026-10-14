@@ -7,9 +7,10 @@ DeepGemmFP4Experts prepare -> apply (fused quant+scatter, FC1, silu*mul+quant, F
 stream next to the shared expert on an aux stream (GEMV v3 w13 [1152 <- 5120], silu*mul, quant, GEMV v1 w2
 [5120 <- 576]), the add and vLLM's all-reduce. Every layer routes to fresh random experts (top-6 of --experts), so
 weights are cold as in the served graph. Variants: the discard off (VLLM_MOET_MOE_FC2_DISCARD=0 equivalent), FC2's
-padding rows discarded (fc2, the patch), and two experiments: fc2+fc1 (FC1's padding rows too, right after the FC1
-call, before silu*mul reads the real rows; FC2 later writes over the same workspace) and fc2side (the discard forked
-onto a side stream after FC2 and joined after the gather).
+padding rows discarded inline on the model stream (fc2; VLLM_MOET_MOE_FC2_DISCARD_SIDE=0, as served since
+2026-10-13), the same discard forked onto the patch's side stream after FC2 and joined after the gather (fc2side;
+the patch's default), and one experiment: fc2+fc1 (FC1's padding rows too, right after the FC1 call, before
+silu*mul reads the real rows; FC2 later writes over the same workspace).
 
 Every variant's graph is captured first, then the graphs are replayed round-robin. Printed per variant (rank-0
 medians over the layers after the first and --replays profiled replays; torch profiler): FC1, FC2, the discard
@@ -17,7 +18,7 @@ kernels, the gather, the layer span (FC1 to FC1), and the replay time per layer 
 "paired" is the median over rounds of the difference to the same round's "off" replay.
 
 usage (serving image, the patch applied):
-    torchrun --nproc_per_node=4 bench_moe_l2_tp4.py --tokens 6 [--experts 288] [--topk 6] [--variants off,fc2]
+    torchrun --nproc_per_node=4 bench_moe_l2_tp4.py --tokens 6 [--experts 288] [--topk 6] [--variants off,fc2,fc2side]
 (--experts 256 keeps a 4-rank run under 3 GB per GPU; the DSpark drafter's MoE: --tokens 5 --experts 128 --topk 3.)
 """
 
@@ -60,7 +61,7 @@ def main() -> int:
     ap.add_argument("--layers", type=int, default=8)
     ap.add_argument("--replays", type=int, default=8, help="profiled replays per variant")
     ap.add_argument("--rounds", type=int, default=40, help="timed replays per variant (CUDA events)")
-    ap.add_argument("--variants", default="off,fc2,fc2+fc1")
+    ap.add_argument("--variants", default="off,fc2,fc2side")
     args = ap.parse_args()
     for key, value in (("MASTER_ADDR", "127.0.0.1"), ("MASTER_PORT", "29551"), ("RANK", "0"), ("WORLD_SIZE", "1"),
                        ("LOCAL_RANK", "0")):
@@ -91,7 +92,8 @@ def main() -> int:
     from mxfp8_gemv_sm120 import mxfp8_gemv
     from nccl_gap_tp4 import mx_weight
 
-    assert hasattr(dgm, "_moet_drop_padding_rows"), "deep_gemm_moe.py is not patched"
+    assert hasattr(dgm, "_moet_drop_padding_rows") and hasattr(dgm, "_moet_l2_side_stream"), \
+        "deep_gemm_moe.py is not patched with the side-stream discard"
     T, E, L, TOPK = args.tokens, args.experts, args.layers, args.topk
     with set_current_vllm_config(VllmConfig()), set_default_torch_dtype(torch.bfloat16), torch.device(dev):
         init_distributed_environment(world_size=world, rank=rank, distributed_init_method="env://",
@@ -151,28 +153,6 @@ def main() -> int:
 
         dgm.m_grouped_fp8_fp4_gemm_nt_contiguous = gemm_with_fc1_discard
 
-        # experiment "fc2side": the same discard forked onto a side stream after FC2 and joined after the gather,
-        # so it runs next to the gather (disjoint rows) instead of in front of it
-        side_l2 = {"on": False, "stream": torch.cuda.Stream(), "pending": False}
-        real_drop, real_gather = dgm._moet_drop_padding_rows, dgm.deepgemm_unpermute_and_reduce
-
-        def drop_on_side(out, m_indices, block_m, num_tokens):
-            if not side_l2["on"]:
-                return real_drop(out, m_indices, block_m, num_tokens)
-            side_l2["stream"].wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side_l2["stream"]):
-                real_drop(out, m_indices, block_m, num_tokens)
-            side_l2["pending"] = True
-
-        def gather_then_join(*a, **k):
-            r = real_gather(*a, **k)
-            if side_l2["pending"]:
-                torch.cuda.current_stream().wait_stream(side_l2["stream"])
-                side_l2["pending"] = False
-            return r
-
-        dgm._moet_drop_padding_rows, dgm.deepgemm_unpermute_and_reduce = drop_on_side, gather_then_join
-
         def shared(j: int) -> torch.Tensor:
             h = mxfp8_gemv(hq, hq_sf, *sh_w13[j % 2])
             h = torch.nn.functional.silu(h[:, :576]) * h[:, 576:]
@@ -205,13 +185,17 @@ def main() -> int:
         graphs = {}
         for variant in variants:
             dgm._MOET_L2 = None
+            dgm._MOET_L2_SIDE = None
             if variant == "off":
                 dgm._MOET_L2 = False
             else:
                 assert dgm._moet_moe_l2() is not None
                 dgm._MOET_L2 = (dgm._MOET_L2[0], 1, 64)
+                if "side" in variant:
+                    assert dgm._moet_l2_side_stream() is not None, "VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 in this environment"
+                else:
+                    dgm._MOET_L2_SIDE = False  # inline, as served
             fc1_discard["on"] = "fc1" in variant
-            side_l2["on"] = "side" in variant
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
@@ -228,7 +212,6 @@ def main() -> int:
             torch.cuda.synchronize()
             graphs[variant] = graph
         dgm.m_grouped_fp8_fp4_gemm_nt_contiguous = real_gemm
-        dgm._moet_drop_padding_rows, dgm.deepgemm_unpermute_and_reduce = real_drop, real_gather
         for _ in range(3):
             for variant in variants:
                 barrier()

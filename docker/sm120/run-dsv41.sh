@@ -77,7 +77,8 @@
 # VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram image runs Engram's wkv replicated at decode again); on the -pdl images also
 # VLLM_MOET_GEMV_PDL=0, VLLM_MOET_GEMV_EVICT_FIRST=0, VLLM_MOET_BF16_GEMM_PDL=0, VLLM_MOET_MOE_QUANT_SCATTER_PDL=0 (plain
 # launches as before), VLLM_MOET_BF16_CHAIN=v2 (opt-in ring chain), VLLM_MOET_NCCL_GRAPH_RECORDS=0 (NCCL's graph event
-# records kept), VLLM_MOET_MOE_FC2_DISCARD=0 (FC2 padding rows left in L2).
+# records kept), VLLM_MOET_MOE_FC2_DISCARD=0 (FC2 padding rows left in L2), VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 (images
+# built after 2026-10-14: the discard inline on the model stream instead of a side stream joined after the gather).
 # Pass them with EXTRA_DOCKER_ARGS="-e VAR=0". enable_adaptive_verification must stay
 # false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,

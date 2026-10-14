@@ -998,10 +998,34 @@ What the rank‑0 traces (`run19..22_*` in the profiles directory) showed, bound
 
 Served since 2026‑09‑25 20:50Z (`vllm-moet-sm120:dsv41-nightly-20260923-mhc`, also carrying
 vllm#57679 — step 9 — whose `_q_kv_norm_quant_kernel` replaces the norm + quantize pair in every
-attention sublayer). Left on the table: the drafter's six boundaries (its layers have no
+attention sublayer). Left on the table then: the drafter's six boundaries (its layers had no
 `mhc_stream`), an A/B of the PDL launch inside variant d (`VLLM_MOET_MHC_PDL=0`: the kernel would
 be 0.5 µs shorter if its gap stayed at 0.2 µs), and the projection's bandwidth behind the GEMVs
 (fn in fp32 is 157 MB per step; the checkpoint's fn is fp32, so bf16 storage would change bits).
+
+**The drafter's boundaries (2026‑10‑14).** In the window‑8 graph the drafter is its own 157‑kernel
+graph, 1,031 µs, and almost serial (kernel sum 1,092 µs). The LM head (227 µs, 331 MB of BF16) and
+the five Markov GEMMs (122 µs) sit on the bandwidth floor. What is not on the floor is the mHC:
+the first layer's TF32 prenorm GEMM plus the TileLang epilogue (18 µs) and five TileLang pairs
+(~10 µs each) run on the model stream, because `dspark.py` built its three `DeepseekV4DecoderLayer`s
+without `mhc_stream`. `patch_vllm_dspark_mhc_stream_sm120.py` (step 10, same switches) gives the
+drafter its own stream and `fuse_mhc_all_reduce`, the wiring the target already uses. The first
+boundary becomes upstream's `mhc_pre_delayed_overlap` (pre‑mix is None: the embedding is already
+expanded to `[T, hc, H]`), and the other five become `mhc_shifted_post_pre` joined after the
+sublayer. One line the drafter needs that its layers do not supply: with `fuse_mhc_all_reduce` the
+layers are built with `reduce_results=False` on `wo_b` and the MoE and every boundary all‑reduces
+the sublayer output it consumes, so the last layer's FFN output leaves the layer stack as this
+rank's partial sum — the target's `_collapse` all‑reduces it in front of its final
+`mhc_post_tilelang`, the drafter's `forward` called `mhc_post_tilelang` directly, and the patch puts
+the same all‑reduce in front of it (a first version without it would have drafted from an
+unreduced hidden state at TP 4). On an RTX PRO 6000 (GPU 0, next to an idle Qwen3.8), the chain of
+six boundaries with one 80 MB GEMM between them — about one drafter sublayer — is 291 → 252 µs
+(−39 µs; later runs 290 → 250, 290 → 253), and every output matches the TileLang path on fresh
+inputs, eagerly and from a CUDA graph; the 3‑layer drafter driven with a counted stand‑in
+all‑reduce gives the same bits in all four wirings (reduce inside the sublayer vs. at the boundary,
+TileLang vs. the side stream, the fused side‑stream drafter also from a graph), six all‑reduces
+each (`mhc_overlap/test_dspark_mhc_stream.py`). The served drafter graph has to wait for the next
+window.
 
 ## The small-M BF16 GEMMs with cuBLAS's bits (2026‑10‑01)
 
@@ -1282,6 +1306,26 @@ of L2) it pays only up to ~18 tokens. `VLLM_MOET_MOE_FC2_DISCARD=0` turns it off
 
 Expected per decode step at one stream, from the isolated measurements (the served graph decides): NCCL records −0.2 to
 −0.35 ms, GEMV PDL −0.15 to −0.35, FFN‑boundary PDL −0.075 to −0.1, FC2 discard −0.15 to −0.28.
+
+**The discard next to the gather (2026‑10‑14, not served).** Inline, the discard sits between FC2 and the gather on the
+model stream: ~3 µs of the critical path per MoE layer at 6 tokens, ~9 at 48. The gather reads only real rows and the
+discard touches only padding rows — disjoint 128‑byte lines — so the patch now forks the discard onto a side stream
+right after FC2 and joins it after the gather, inside the same `apply()` (`VLLM_MOET_MOE_FC2_DISCARD_SIDE`, default 1;
+`=0` is the inline launch served since 2026‑10‑13). The join is what keeps the old ordering guarantee: everything the
+model stream, or a stream forked from it later, writes into the workspace afterwards — the next layer's FC1, the
+indexer's scratch (vLLM's workspace manager hands every consumer views of one buffer) — is ordered after the discard,
+and the discard still starts after FC2 completed. Nothing changes for eager steps outside the token range. On 4× RTX
+PRO 6000 in a graph (`bench_moe_l2_tp4.py`, paired interleaved rounds against `off`, 8 layers, the 21d93d0d image): at
+6 tokens / 256 experts inline −10.1 µs per MoE layer and the side stream −13.7 (ranks 1–3 −9.6…−10.3 / −13.2…−14.2; a
+second run −10.1 / −13.7), at 48 tokens / 150 experts per layer −5.1 / −10.5 (−4.5…−4.9 / −9.9…−10.4) — another
+−3.7 / −5.4 µs per layer, the gather itself 3.6 → 4.7 µs (5.0 → 9.1 at 48) because it now shares the GPU with the
+discard. The drafter's MoE (5 tokens, 128 experts, top‑3, 960 rows) is the one shape where the discard does not pay on
+this GPU: +0.9 µs per layer inline, +0.7 on the side stream (−0.7 on the RTX 5090 earlier) — three layers, noise
+either way, so the range stays 2..64. Bit‑identity: `test_moe_l2_discard_sm120.py` runs every case in both modes
+(1..64 tokens and prefill sizes eagerly, graphs captured at 1/6/16/48/64 tokens with the fork and join inside the
+capture, the launch checked to be on the mode's stream), plus two MoE layers back to back on one workspace eagerly
+and over 20 graph replays, and checks the patched `apply()` for the fork after FC2 and the join after the gather.
+Expected in the served graph: 40 MoE layers × 3.7 µs ≈ −0.15 ms per step at one stream.
 
 ## The rebase onto vLLM nightly 21d93d0d (2026‑10‑06..13)
 

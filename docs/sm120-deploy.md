@@ -173,6 +173,8 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc host -e NCCL_P2P_LEVEL=SYS --ent
 #   (FlashInfer's AOT sparse MLA; FLASHINFER_DISABLE_JIT=1 proves nothing compiles), then on four GPUs
 #   torchrun --nproc_per_node=4 nccl_graph/test_nccl_graph_records_tp4.py, nccl_graph/test_nccl_graph_mixing_tp4.py,
 #   test_engram_wkv_tp4.py --checkpoint /model (each with /model mounted for the checkpoint tests).
+# images built after 2026-10-14 (drafter mHC stream, side-stream FC2 discard) in addition, one GPU:
+#   mhc_overlap/test_dspark_mhc_stream.py --bench (moe_l2/test_moe_l2_discard_sm120.py covers both discard modes).
 #   Next to a serving job: --max-gpu-mem-gib 2.2 for the Engram tests, --chain-experts 64 / --experts 64 for MoE
 #   quant+scatter, --experts 256 for the FC2 discard test, and no test_deepgemm_sm120_paged_mqa.py (~9 GB).
 ```
@@ -212,7 +214,9 @@ picks the sites, served `indexer,wk,router`, `compressor` opt-in),
 `VLLM_MOET_BF16_GEMM_PDL=0` / `VLLM_MOET_MOE_QUANT_SCATTER_PDL=0` (the router / MoE quant+scatter without PDL; the BF16
 switch also takes a site list, default `router`), `VLLM_MOET_BF16_CHAIN=v2` (opt-in: the indexer's one-slice chain with
 the activations in the shared-memory ring), `VLLM_MOET_NCCL_GRAPH_RECORDS=0` (graphs captured with all of NCCL's event
-records, as before), `VLLM_MOET_MOE_FC2_DISCARD=0` (FC2's padding rows stay in L2; `_MIN_TOKENS` / `_MAX_TOKENS`, 2 / 64),
+records, as before), `VLLM_MOET_MOE_FC2_DISCARD=0` (FC2's padding rows stay in L2; `_MIN_TOKENS` / `_MAX_TOKENS`, 2 / 64;
+`VLLM_MOET_MOE_FC2_DISCARD_SIDE=0` launches the discard inline on the model stream instead of a side stream joined after
+the gather — the inline launch is what the served image has, the side stream is in images built after 2026-10-14),
 `VLLM_MOET_SM120_MOE_GEMV=0` (Qwen MoE GEMV → Triton), `VLLM_MOET_SM120_MOE_GEMV_FUSE_ACT=0`,
 `VLLM_MOET_SM120_LL_GEMM=0` (Qwen skinny GEMM → cuBLAS; changes the compiled graph, so use a fresh
 `CACHE_DIR`), `VLLM_PLE_CPU_OFFLOAD=1` (Qwen PLE table in a CPU worker; then `KV_CACHE_MEMORY=`).

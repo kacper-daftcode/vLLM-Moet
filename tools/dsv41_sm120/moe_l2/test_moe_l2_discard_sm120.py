@@ -10,10 +10,13 @@ L2 without a write-back). Layouts the kernel must refuse (rows not whole 128-byt
 non-contiguous view, int64 ids) return False without launching.
 
 integration part (patched deep_gemm_moe.py): DeepGemmFP4Experts driven the way FusedMoEModularKernel drives it
-(MoEPrepareAndFinalizeNoDPEPModular.prepare -> apply, vLLM's own workspaces) with the switch on and off: the MoE
-output must be bit-identical for 1..64 tokens and prefill sizes (65..2048 tokens), with the default token range
-(2..64) and with it widened so the discard also runs at 1 token and at the prefill sizes, eagerly and replayed from
-CUDA graphs (discard captured at 1/6/16/48/64 tokens); the discard must run exactly inside the range.
+(MoEPrepareAndFinalizeNoDPEPModular.prepare -> apply, vLLM's own workspaces) with the switch on and off, inline and
+on the side stream (VLLM_MOET_MOE_FC2_DISCARD_SIDE): the MoE output must be bit-identical for 1..64 tokens and
+prefill sizes (65..2048 tokens), with the default token range (2..64) and with it widened so the discard also runs
+at 1 token and at the prefill sizes, eagerly and replayed from CUDA graphs (discard captured at 1/6/16/48/64 tokens
+in both modes); the discard must run exactly inside the range, and on the stream its mode says. Two MoE layers
+back to back on the same workspaces (the next FC1 overwrites what the discard dropped: the join has to order them),
+eagerly and from a graph. The patched apply() must join the side stream after the gather.
 
 usage (serving image, the patch applied):
     python3 test_moe_l2_discard_sm120.py [--experts 384] [--prefill 65,128,512,2048] [--part kernel|integration|all]
@@ -108,9 +111,17 @@ def integration_part(n_experts: int, prefill: list[int]) -> bool:
     from vllm.model_executor.layers.quantization.utils.quant_utils import GroupShape
     from vllm.platforms import current_platform
 
-    if not hasattr(dgm, "_moet_drop_padding_rows"):
-        print("[integration] deep_gemm_moe.py is not patched (patch_vllm_moe_fc2_discard_sm120.py)")
+    if not hasattr(dgm, "_moet_drop_padding_rows") or not hasattr(dgm, "_moet_l2_side_stream"):
+        print("[integration] deep_gemm_moe.py is not patched with the side-stream discard "
+              "(patch_vllm_moe_fc2_discard_sm120.py)")
         return False
+    import inspect
+
+    apply_src = inspect.getsource(DeepGemmFP4Experts.apply)
+    fork, gather = apply_src.find("_moet_l2_side = _moet_drop_padding_rows("), apply_src.find("deepgemm_unpermute_and_reduce(")
+    join = apply_src.find("torch.cuda.current_stream().wait_stream(_moet_l2_side)")
+    src_ok = 0 <= fork < gather < join and apply_src.count("_moet_l2_side") == 3
+    print(f"[integration] patched apply(): fork after FC2, gather, then the join of the side stream: {src_ok}")
     E, K, I, TOPK = n_experts, 5120, 640, 6
     N1 = 2 * I
     g = torch.Generator(device=dev).manual_seed(3)
@@ -130,14 +141,19 @@ def integration_part(n_experts: int, prefill: list[int]) -> bool:
     experts.moe_config = SimpleNamespace(in_dtype=torch.bfloat16)
     experts.gemm1_clamp_limit = None
     prepare = MoEPrepareAndFinalizeNoDPEPModular()
-    launches = []
+    launches = []  # the stream each discard launch went to
     real_discard = l2.discard_padding_rows
 
     def counting(*a, **k):
-        launches.append(1)
+        launches.append(torch.cuda.current_stream().cuda_stream)
         return real_discard(*a, **k)
 
     l2.discard_padding_rows = counting
+
+    def launched_on(side: bool) -> bool:
+        """Every recorded launch went to the mode's stream: the side stream, or the stream apply() ran on."""
+        want = dgm._MOET_L2_SIDE.cuda_stream if side else torch.cuda.current_stream().cuda_stream
+        return all(s == want for s in launches)
 
     def inputs(m: int):
         x = (torch.randn(m, K, device=dev, generator=g) * 0.7).to(torch.bfloat16)
@@ -158,17 +174,24 @@ def integration_part(n_experts: int, prefill: list[int]) -> bool:
         s13, s2, _ = experts.workspace_shapes(m, N1, K, TOPK, E, E, None, MoEActivation.SILU)
         return torch.empty(s13, device=dev, dtype=torch.bfloat16), torch.empty(s2, device=dev, dtype=torch.bfloat16)
 
-    def switch(on: bool, limits: tuple[int, int] | None = None) -> None:
-        """off, on with the environment's token range (default 2..64), or on with limits = (min, max)."""
+    def switch(on: bool, limits: tuple[int, int] | None = None, side: bool = True) -> None:
+        """off, on with the environment's token range (default 2..64), or on with limits = (min, max); side = the
+        discard forked onto the side stream (the default), else inline on the model stream."""
         dgm._MOET_L2 = None
+        dgm._MOET_L2_SIDE = None  # resolved again from the environment (default: a side stream)
         if on:
             assert dgm._moet_moe_l2() is not None, "the discard did not load"
             if limits is not None:
                 dgm._MOET_L2 = (dgm._MOET_L2[0], *limits)
+            if side:
+                assert dgm._moet_l2_side_stream() is not None, "the side stream is off in this environment"
+            else:
+                dgm._MOET_L2_SIDE = False
         else:
             dgm._MOET_L2 = False
 
-    ok = True
+    ok = src_ok
+    modes = ((False, "inline"), (True, "side stream"))
     with set_current_vllm_config(VllmConfig()):
         bad = []
         default_range = None
@@ -178,60 +201,104 @@ def integration_part(n_experts: int, prefill: list[int]) -> bool:
             switch(False)
             ref = moe(x, w, ids, ws)
             for limits in (None, (1, 64) if m <= 64 else (1, 4096)):
-                switch(True, limits)
-                lo, hi = dgm._MOET_L2[1], dgm._MOET_L2[2]
-                default_range = default_range or (lo, hi)
-                launches.clear()
-                ws[1].fill_(7)  # stale workspace content: the discarded rows read back whatever was there
-                got = moe(x, w, ids, ws)
-                torch.cuda.synchronize()
-                expected = 1 if lo <= m <= hi else 0
-                if not torch.equal(got.view(torch.int16), ref.view(torch.int16)) or len(launches) != expected:
-                    bad.append((m, (lo, hi), len(launches)))
+                for side, _name in modes:
+                    switch(True, limits, side)
+                    lo, hi = dgm._MOET_L2[1], dgm._MOET_L2[2]
+                    default_range = default_range or (lo, hi)
+                    launches.clear()
+                    ws[1].fill_(7)  # stale workspace content: the discarded rows read back whatever was there
+                    got = moe(x, w, ids, ws)
+                    torch.cuda.synchronize()
+                    expected = 1 if lo <= m <= hi else 0
+                    if (not torch.equal(got.view(torch.int16), ref.view(torch.int16)) or len(launches) != expected
+                            or not launched_on(side)):
+                        bad.append((m, (lo, hi), _name, len(launches)))
             del x, w, ids, ws, ref, got
             torch.cuda.empty_cache()  # one token count's workspaces at a time (the PRO 6000 test budget is 3 GB)
         sizes = "/".join(map(str, prefill))
         print(f"[integration] eager, {n_experts} experts, 1..64 tokens + {sizes}, token range "
-              f"{default_range[0]}..{default_range[1]} (default) and widened to 1..64 / 1..4096: switch on != off in "
-              f"{len(bad)} cases {bad[:6]}; discard launched exactly inside the range")
+              f"{default_range[0]}..{default_range[1]} (default) and widened to 1..64 / 1..4096, inline and side "
+              f"stream: switch on != off in {len(bad)} cases {bad[:6]}; discard launched exactly inside the range, "
+              f"on the mode's stream")
         ok &= not bad
         gbad = []
-        for m in (1, 6, 16, 48, 64):
-            x, w, ids = inputs(m)
+        for side_mode, name in modes:
+            for m in (1, 6, 16, 48, 64):
+                x, w, ids = inputs(m)
+                ws = workspaces(m)
+                switch(True, (1, 64), side_mode)
+                launches.clear()
+                cap = torch.cuda.Stream()
+                cap.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(cap):
+                    moe(x, w, ids, ws)
+                    cap.synchronize()
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=cap):
+                        out = moe(x, w, ids, ws)
+                torch.cuda.synchronize()
+                if len(launches) != 2:  # the warm-up call and the captured one
+                    gbad.append((name, m, "not captured"))
+                for _ in range(3):
+                    nx, nw, nids = inputs(m)
+                    x.copy_(nx)
+                    w.copy_(nw)
+                    ids.copy_(nids)
+                    graph.replay()
+                    torch.cuda.synchronize()
+                    got = out.clone()
+                    switch(False)
+                    ref = moe(x, w, ids, workspaces(m))
+                    switch(True, (1, 64), side_mode)
+                    torch.cuda.synchronize()
+                    if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
+                        gbad.append((name, m))
+                del graph
+        print(f"[integration] CUDA graph replays with the discard (1/6/16/48/64 tokens, inline and side stream) vs "
+              f"eager switch off: differ in {len(gbad)} {gbad}")
+        ok &= not gbad
+
+        # two MoE layers back to back on the same workspaces, as in the decoder: the second layer's FC1 overwrites
+        # the rows the first layer's discard dropped, so the join after the gather has to order them
+        def two_layers(a, b, ws):
+            return moe(*a, ws), moe(*b, ws)
+
+        cbad = []
+        for m in (6, 48):
+            a, b = inputs(m), inputs(m)
             ws = workspaces(m)
-            switch(True, (1, 64))
-            launches.clear()
-            side = torch.cuda.Stream()
-            side.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(side):
-                moe(x, w, ids, ws)
-                side.synchronize()
+            switch(False)
+            ref = [t.clone() for t in two_layers(a, b, ws)]
+            switch(True, (1, 64), True)
+            for _ in range(5):
+                ws[1].fill_(7)
+                got = two_layers(a, b, ws)
+                torch.cuda.synchronize()
+                if not all(torch.equal(r.view(torch.int16), g.view(torch.int16)) for r, g in zip(ref, got)):
+                    cbad.append((m, "eager"))
+                    break
+            cap = torch.cuda.Stream()
+            cap.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(cap):
+                two_layers(a, b, ws)
+                cap.synchronize()
                 graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(graph, stream=side):
-                    out = moe(x, w, ids, ws)
+                with torch.cuda.graph(graph, stream=cap):
+                    outs = two_layers(a, b, ws)
             torch.cuda.synchronize()
-            if len(launches) != 2:  # the warm-up call and the captured one
-                gbad.append((m, "not captured"))
-            for _ in range(3):
-                nx, nw, nids = inputs(m)
-                x.copy_(nx)
-                w.copy_(nw)
-                ids.copy_(nids)
+            for _ in range(20):
                 graph.replay()
                 torch.cuda.synchronize()
-                got = out.clone()
-                switch(False)
-                ref = moe(x, w, ids, workspaces(m))
-                switch(True, (1, 64))
-                torch.cuda.synchronize()
-                if not torch.equal(got.view(torch.int16), ref.view(torch.int16)):
-                    gbad.append(m)
+                if not all(torch.equal(r.view(torch.int16), g.view(torch.int16)) for r, g in zip(ref, outs)):
+                    cbad.append((m, "graph"))
+                    break
             del graph
-        print(f"[integration] CUDA graph replays with the discard (1/6/16/48/64 tokens) vs eager switch off: "
-              f"differ in {len(gbad)} {gbad}")
-        ok &= not gbad
+        print(f"[integration] two layers back to back on one workspace, side stream (6 / 48 tokens), eager x5 and "
+              f"20 graph replays vs switch off: differ in {len(cbad)} {cbad}")
+        ok &= not cbad
     l2.discard_padding_rows = real_discard
     dgm._MOET_L2 = None
+    dgm._MOET_L2_SIDE = None
     return ok
 
 
