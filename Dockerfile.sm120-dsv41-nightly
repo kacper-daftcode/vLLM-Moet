@@ -74,7 +74,10 @@
 #      graph kept the TileLang pair (~10 us x 6 boundaries, plus the first layer's TF32 prenorm GEMM).
 #      patch_vllm_dspark_mhc_stream_sm120.py passes the drafter its own stream under the same switches, and
 #      all-reduces the last layer's FFN output in front of the drafter's final post-mix (with fuse_mhc_all_reduce
-#      the layers leave it unreduced; the target's _collapse does the same) - test_dspark_mhc_stream.py.
+#      the layers leave it unreduced; the target's _collapse does the same) - test_dspark_mhc_stream.py. Window 9
+#      (2026-10-14, image -side, not kept): the drafter graph 1,031 -> 988 us per step as predicted, but the start
+#      profiled 0.06 GiB more peak activation and 0.06 GiB more graph memory (KV 3,380,873 -> 3,331,199 tokens,
+#      -1.5 %; which of the two -side changes is unknown, the build-arg below is for that A/B).
 #  11. The small-M BF16 GEMMs of the decode step with cuBLAS's bits from one launch (patch_vllm_bf16_gemm_sm120.py
 #      + bf16_gemm/): the indexer's weights_proj (cuBLAS ran it on 2 CTAs; the main stream waited ~26 us for it in
 #      every index-source layer), the indexer's wk and the MoE router; the compressor projection optionally
@@ -104,9 +107,10 @@
 #      (23 MB per MoE layer) are padding nobody reads, and the next FC1 paid for their write-back. Right after FC2
 #      their lines are invalidated (discard.global.L2) - bit-identical (test_moe_l2_discard_sm120.py); 2..64 tokens
 #      (VLLM_MOET_MOE_FC2_DISCARD_MIN_TOKENS / _MAX_TOKENS). VLLM_MOET_MOE_FC2_DISCARD=0 turns it off at runtime.
-#      Since 2026-10-14 the discard runs on a side stream forked after FC2 and joined after the gather (disjoint
-#      lines: the gather reads only real rows), another -3.7 us per MoE layer at 6 tokens on 4x RTX PRO 6000;
-#      VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 launches it inline on the model stream as served since 2026-10-13.
+#      Opt-in since 2026-10-14 (VLLM_MOET_MOE_FC2_DISCARD_SIDE=1): the discard on a side stream forked after FC2 and
+#      joined after the gather (disjoint lines: the gather reads only real rows) - another -3.7 us per MoE layer at
+#      6 tokens in the bench graph on 4x RTX PRO 6000, but in the served decode graph (window 9) the gather next to
+#      the discard took 6.5 us instead of 3.3 and every FFN segment +1.7 us; the default stays the inline launch.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -115,12 +119,14 @@
 #  the plain launches.
 #  Every vLLM-file step has a build-arg (=0 leaves it out) so a step whose patcher does not fit a newer vLLM yet
 #  can be built around: VLLM_MOET_REASONING_EFFORT (4), VLLM_MOET_NVFP4_KV (2's indexer gate + 5),
-#  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10), VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12),
-#  VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14).
+#  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10; VLLM_MOET_DSPARK_MHC_STREAM for the drafter's stream alone),
+#  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14).
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .
-#   (served since 2026-10-13 16:27Z, window 8). The images on vllm-openai:nightly 0961bbae with FlashInfer 0.7.0.dev20260922 came
+#   (served since 2026-10-13 16:27Z, window 8; the tag built from 6aafbb6 as dsv41-nightly-21d93d0d-side - drafter mHC stream +
+#   side-stream FC2 discard - ran window 9 on 2026-10-14 and was not kept, see the port doc). The images on
+#   vllm-openai:nightly 0961bbae with FlashInfer 0.7.0.dev20260922 came
 #   from this file before the rebase: -pdl (steps 1-14) at commit c066be9, the served -engram (steps 1-12) at
 #   f7cc6d9, and with fewer steps -bf16, -mhc, -moeqs, -ced, -kvdedup and dsv41-nightly-20260923 (git log).
 #   FlashInfer fallback to the -pdl image's nightly: --build-arg FLASHINFER_INDEX=https://flashinfer.ai/whl/nightly
@@ -228,12 +234,14 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_quant_scatter_sm120/*.so
 
 # 10. The mHC boundary off the decode critical path (header); the extension is compiled here so nothing
-#     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
+#     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md. VLLM_MOET_DSPARK_MHC_STREAM=0 leaves the
+#     drafter's layers without the stream (the served wiring; an image for the KV-capacity A/B of window 9).
 ARG VLLM_MOET_MHC_OVERLAP=1
+ARG VLLM_MOET_DSPARK_MHC_STREAM=1
 RUN if [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_overlap_sm120.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_mhc_stream_sm120.py \
     && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h; assert hasattr(h, '_moet_mhc_shifted_post_pre_overlap'); print('mhc overlap patched')" \
-    && python3 -c "import vllm.models.deepseek_v41.nvidia.dspark as d; import inspect; s = inspect.getsource(d.DSparkDeepseekV4Model); assert 'mhc_stream=mhc_stream' in s and 'tensor_model_parallel_all_reduce(hidden_states)' in s; print('drafter mhc stream patched')" \
+    && if [ "$VLLM_MOET_DSPARK_MHC_STREAM" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_mhc_stream_sm120.py \
+       && python3 -c "import vllm.models.deepseek_v41.nvidia.dspark as d; import inspect; s = inspect.getsource(d.DSparkDeepseekV4Model); assert 'mhc_stream=mhc_stream' in s and 'tensor_model_parallel_all_reduce(hidden_states)' in s; print('drafter mhc stream patched')"; fi \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert hasattr(e, 'mhc_post_norm') and hasattr(e, 'mhc_proj'); print('sm120 mhc overlap extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mhc_post_norm_sm120/*.so; fi
 
@@ -273,6 +281,7 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.nvfp4-kv="${VLLM_MOET_NVFP4_KV}" \
       com.vllm-moet.offload-dedup="${VLLM_MOET_OFFLOAD_DEDUP}" \
       com.vllm-moet.mhc-overlap="${VLLM_MOET_MHC_OVERLAP}" \
+      com.vllm-moet.dspark-mhc-stream="${VLLM_MOET_DSPARK_MHC_STREAM}" \
       com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}" \
       com.vllm-moet.engram-wkv-tp="${VLLM_MOET_ENGRAM_WKV_TP}" \
       com.vllm-moet.nccl-graph-records="${VLLM_MOET_NCCL_GRAPH_RECORDS}" \

@@ -11,10 +11,11 @@ non-contiguous view, int64 ids) return False without launching.
 
 integration part (patched deep_gemm_moe.py): DeepGemmFP4Experts driven the way FusedMoEModularKernel drives it
 (MoEPrepareAndFinalizeNoDPEPModular.prepare -> apply, vLLM's own workspaces) with the switch on and off, inline and
-on the side stream (VLLM_MOET_MOE_FC2_DISCARD_SIDE): the MoE output must be bit-identical for 1..64 tokens and
+on a side stream (VLLM_MOET_MOE_FC2_DISCARD_SIDE=1, opt-in): the MoE output must be bit-identical for 1..64 tokens and
 prefill sizes (65..2048 tokens), with the default token range (2..64) and with it widened so the discard also runs
 at 1 token and at the prefill sizes, eagerly and replayed from CUDA graphs (discard captured at 1/6/16/48/64 tokens
-in both modes); the discard must run exactly inside the range, and on the stream its mode says. Two MoE layers
+in both modes - inline is the default, the side stream VLLM_MOET_MOE_FC2_DISCARD_SIDE=1); the discard must run
+exactly inside the range, and on the stream its mode says. Two MoE layers
 back to back on the same workspaces (the next FC1 overwrites what the discard dropped: the join has to order them),
 eagerly and from a graph. The patched apply() must join the side stream after the gather.
 
@@ -174,19 +175,19 @@ def integration_part(n_experts: int, prefill: list[int]) -> bool:
         s13, s2, _ = experts.workspace_shapes(m, N1, K, TOPK, E, E, None, MoEActivation.SILU)
         return torch.empty(s13, device=dev, dtype=torch.bfloat16), torch.empty(s2, device=dev, dtype=torch.bfloat16)
 
+    side_stream = torch.cuda.Stream()
+
     def switch(on: bool, limits: tuple[int, int] | None = None, side: bool = True) -> None:
         """off, on with the environment's token range (default 2..64), or on with limits = (min, max); side = the
-        discard forked onto the side stream (the default), else inline on the model stream."""
+        discard forked onto a side stream (VLLM_MOET_MOE_FC2_DISCARD_SIDE=1, set here directly), else inline on the
+        model stream (the default)."""
         dgm._MOET_L2 = None
-        dgm._MOET_L2_SIDE = None  # resolved again from the environment (default: a side stream)
+        dgm._MOET_L2_SIDE = None  # resolved again from the environment first (the default: inline) ...
         if on:
             assert dgm._moet_moe_l2() is not None, "the discard did not load"
             if limits is not None:
                 dgm._MOET_L2 = (dgm._MOET_L2[0], *limits)
-            if side:
-                assert dgm._moet_l2_side_stream() is not None, "the side stream is off in this environment"
-            else:
-                dgm._MOET_L2_SIDE = False
+            dgm._MOET_L2_SIDE = side_stream if side else False  # ... then the mode this case wants
         else:
             dgm._MOET_L2 = False
 

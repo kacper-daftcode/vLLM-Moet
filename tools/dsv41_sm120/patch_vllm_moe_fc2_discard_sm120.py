@@ -9,13 +9,14 @@ Right after FC2, while the workspace is still FC2's output, tools/dsv41_sm120/mo
 exactly those rows (`discard.global.L2`; expert id -1 inside a used tile, rows checked to be whole 128-byte lines).
 The gather reads only real rows, so the MoE output is the same bits.
 
-The discard runs on a side stream forked after FC2 and joined after the gather (VLLM_MOET_MOE_FC2_DISCARD_SIDE,
-default 1): the gather reads only real rows - disjoint 128-byte lines - so the two run next to each other instead
-of the discard in front of the gather; 4x RTX PRO 6000, in a graph: another -2.3 us per MoE layer at 6 tokens and
--3.5 at 48 against the inline launch (bench_moe_l2_tp4.py). The join sits in the same apply() call, so everything
-the model stream - or a stream forked from it later - writes into the workspace afterwards (the next FC1, the
-indexer's scratch: vLLM's workspace manager hands every consumer views of one buffer) is ordered after the
-discard, as with the inline launch. =0 launches it inline on the model stream, as served since 2026-10-13.
+Opt-in (VLLM_MOET_MOE_FC2_DISCARD_SIDE=1): the discard on a side stream forked after FC2 and joined after the
+gather - the gather reads only real rows, disjoint 128-byte lines, so the two run next to each other instead of the
+discard in front of the gather. In bench_moe_l2_tp4.py's graph on 4x RTX PRO 6000 that was another -3.7 us per MoE
+layer at 6 tokens (-5.4 at 48), but in the served decode graph (window 9, 2026-10-14) the gather next to the discard
+took 6.5 us instead of 3.3 and every FFN segment got +1.7 us (+54 us per step): the default stays the inline launch
+served since 2026-10-13. The join sits in the same apply() call, so everything the model stream - or a stream forked
+from it later - writes into the workspace afterwards (the next FC1, the indexer's scratch: vLLM's workspace manager
+hands every consumer views of one buffer) is ordered after the discard, as with the inline launch.
 
 Patched file: vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py (DeepGemmFP4Experts.apply: the fork
 after the FC2 call, the join after the gather that ends the method; the helpers go in front of the class). The
@@ -24,7 +25,7 @@ applies on the image's already patched file (Dockerfile steps 3-12) as well as o
 Runtime switches (read once, at the first MoE forward): VLLM_MOET_MOE_FC2_DISCARD=0 turns it off;
 VLLM_MOET_MOE_FC2_DISCARD_MIN_TOKENS / _MAX_TOKENS (2 / 64): the token counts it runs at - every decode and drafter
 graph of this deployment; at 1 token FC1 streams too little to pay for the launch, prefill chunks are left as they are;
-VLLM_MOET_MOE_FC2_DISCARD_SIDE=0: inline instead of the side stream.
+VLLM_MOET_MOE_FC2_DISCARD_SIDE=1: the side stream instead of the inline launch (opt-in).
 
 Idempotent, anchor-based. Usage:
     python3 patch_vllm_moe_fc2_discard_sm120.py [--file PATH] [--l2-dir DIR] [--check]
@@ -71,7 +72,7 @@ def _moet_moe_l2():
                 side = _moet_l2_side_stream()  # resolved here, at the first (eager) MoE forward
                 logger.info_once(
                     "vllm-moet sm_120 MoE: FC2's padding rows leave L2 without a write-back at %d..%d tokens, %s "
-                    "(VLLM_MOET_MOE_FC2_DISCARD=0 turns it off, VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 launches inline)",
+                    "(VLLM_MOET_MOE_FC2_DISCARD=0 turns it off, VLLM_MOET_MOE_FC2_DISCARD_SIDE=1 forks a side stream)",
                     min_tokens,
                     max_tokens,
                     "on a side stream joined after the gather" if side is not None else "inline after FC2",
@@ -81,17 +82,17 @@ def _moet_moe_l2():
     return _MOET_L2 or None
 
 
-_MOET_L2_SIDE = None  # None = not resolved yet, False = inline (VLLM_MOET_MOE_FC2_DISCARD_SIDE=0), else the stream
+_MOET_L2_SIDE = None  # None = not resolved yet, False = inline (the default), else the stream (VLLM_MOET_MOE_FC2_DISCARD_SIDE=1)
 
 
 def _moet_l2_side_stream() -> "torch.cuda.Stream | None":
-    """The stream the discard forks onto (one per process, every MoE layer forks and joins it), or None."""
+    """The stream the discard forks onto (opt-in; one per process, every MoE layer forks and joins it), or None."""
     global _MOET_L2_SIDE
     if _MOET_L2_SIDE is None:
         import os
 
         _MOET_L2_SIDE = (
-            torch.cuda.Stream() if os.environ.get("VLLM_MOET_MOE_FC2_DISCARD_SIDE", "1") == "1" else False
+            torch.cuda.Stream() if os.environ.get("VLLM_MOET_MOE_FC2_DISCARD_SIDE", "0") == "1" else False
         )
     return _MOET_L2_SIDE or None
 
@@ -188,7 +189,7 @@ def main() -> int:
         print(f"{args.file}: patch applies cleanly (not written)")
         return 0
     args.file.write_text(patched)
-    print(f"{args.file}: patched (FC2 padding rows out of L2 after FC2, on a side stream joined after the gather)")
+    print(f"{args.file}: patched (FC2 padding rows out of L2 after FC2; VLLM_MOET_MOE_FC2_DISCARD_SIDE=1 = a side stream joined after the gather)")
     return 0
 
 

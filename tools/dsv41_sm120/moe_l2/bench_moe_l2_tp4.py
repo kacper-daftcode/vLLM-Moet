@@ -7,10 +7,11 @@ DeepGemmFP4Experts prepare -> apply (fused quant+scatter, FC1, silu*mul+quant, F
 stream next to the shared expert on an aux stream (GEMV v3 w13 [1152 <- 5120], silu*mul, quant, GEMV v1 w2
 [5120 <- 576]), the add and vLLM's all-reduce. Every layer routes to fresh random experts (top-6 of --experts), so
 weights are cold as in the served graph. Variants: the discard off (VLLM_MOET_MOE_FC2_DISCARD=0 equivalent), FC2's
-padding rows discarded inline on the model stream (fc2; VLLM_MOET_MOE_FC2_DISCARD_SIDE=0, as served since
-2026-10-13), the same discard forked onto the patch's side stream after FC2 and joined after the gather (fc2side;
-the patch's default), and one experiment: fc2+fc1 (FC1's padding rows too, right after the FC1 call, before
-silu*mul reads the real rows; FC2 later writes over the same workspace).
+padding rows discarded inline on the model stream (fc2; the patch's default, served since 2026-10-13), the same
+discard forked onto the patch's side stream after FC2 and joined after the gather (fc2side; VLLM_MOET_MOE_FC2_DISCARD_SIDE=1,
+opt-in: -3.7 us per layer here at 6 tokens, but +1.7 us per FFN segment in the served decode graph of window 9),
+and one experiment: fc2+fc1 (FC1's padding rows too, right after the FC1 call, before silu*mul reads the real
+rows; FC2 later writes over the same workspace).
 
 Every variant's graph is captured first, then the graphs are replayed round-robin. Printed per variant (rank-0
 medians over the layers after the first and --replays profiled replays; torch profiler): FC1, FC2, the discard
@@ -191,10 +192,7 @@ def main() -> int:
             else:
                 assert dgm._moet_moe_l2() is not None
                 dgm._MOET_L2 = (dgm._MOET_L2[0], 1, 64)
-                if "side" in variant:
-                    assert dgm._moet_l2_side_stream() is not None, "VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 in this environment"
-                else:
-                    dgm._MOET_L2_SIDE = False  # inline, as served
+                dgm._MOET_L2_SIDE = torch.cuda.Stream() if "side" in variant else False  # side stream / inline (served)
             fc1_discard["on"] = "fc1" in variant
             stream = torch.cuda.Stream()
             stream.wait_stream(torch.cuda.current_stream())

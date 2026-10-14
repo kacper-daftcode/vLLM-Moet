@@ -1024,8 +1024,18 @@ six boundaries with one 80 MB GEMM between them — about one drafter sublayer �
 inputs, eagerly and from a CUDA graph; the 3‑layer drafter driven with a counted stand‑in
 all‑reduce gives the same bits in all four wirings (reduce inside the sublayer vs. at the boundary,
 TileLang vs. the side stream, the fused side‑stream drafter also from a graph), six all‑reduces
-each (`mhc_overlap/test_dspark_mhc_stream.py`). The served drafter graph has to wait for the next
-window.
+each (`mhc_overlap/test_dspark_mhc_stream.py`). **Window 9 (2026‑10‑14 21:28–22:2xZ, image
+`dsv41-nightly-21d93d0d-side` from 6aafbb6 = this patch + the side‑stream FC2 discard below, 4× RTX PRO 6000):** the
+drafter graph went 1,030.6 → 987.7 µs per step on rank 0 (ranks 1–3 −44, −67, −45), as predicted, with every
+quality gate green against the served window‑8 start (agreement 24/24, raw 12/12, needle 6/6 same answers, GSM8K‑200
+195 vs 194 = 0 + 1 flips, p = 1, health PASS, prefill 163K 9.06–9.10 s / 391K 24.53–24.57, stress 0 errors, offload
+4/4). The image was not kept: the decode graph lost 70 µs per step to the side‑stream discard (next paragraph), and
+the start profiled 2.06 GiB of peak activation instead of 2.00 and 0.73 GiB of graph memory instead of 0.67 — GPU
+KV 3,380,873 → 3,331,199 tokens (−1.5 %, the runbook's capacity gate allows −0.5 %). Which of the two changes
+costs the memory is open (the drafter's second side stream keeps its boundary tensors alive across captures, the
+fused all‑reduce adds an out‑of‑place reduction at the drafter's end; the discard's stream allocates nothing);
+`--build-arg VLLM_MOET_DSPARK_MHC_STREAM=0` builds the image for that A/B. Production went back to the window‑8
+image at 21:59Z (`./run.sh`, up 22:1xZ).
 
 ## The small-M BF16 GEMMs with cuBLAS's bits (2026‑10‑01)
 
@@ -1320,25 +1330,30 @@ of L2) it pays only up to ~18 tokens. `VLLM_MOET_MOE_FC2_DISCARD=0` turns it off
 Expected per decode step at one stream, from the isolated measurements (the served graph decides): NCCL records −0.2 to
 −0.35 ms, GEMV PDL −0.15 to −0.35, FFN‑boundary PDL −0.075 to −0.1, FC2 discard −0.15 to −0.28.
 
-**The discard next to the gather (2026‑10‑14, not served).** Inline, the discard sits between FC2 and the gather on the
-model stream: ~3 µs of the critical path per MoE layer at 6 tokens, ~9 at 48. The gather reads only real rows and the
-discard touches only padding rows — disjoint 128‑byte lines — so the patch now forks the discard onto a side stream
-right after FC2 and joins it after the gather, inside the same `apply()` (`VLLM_MOET_MOE_FC2_DISCARD_SIDE`, default 1;
-`=0` is the inline launch served since 2026‑10‑13). The join is what keeps the old ordering guarantee: everything the
-model stream, or a stream forked from it later, writes into the workspace afterwards — the next layer's FC1, the
-indexer's scratch (vLLM's workspace manager hands every consumer views of one buffer) — is ordered after the discard,
-and the discard still starts after FC2 completed. Nothing changes for eager steps outside the token range. On 4× RTX
-PRO 6000 in a graph (`bench_moe_l2_tp4.py`, paired interleaved rounds against `off`, 8 layers, the 21d93d0d image): at
-6 tokens / 256 experts inline −10.1 µs per MoE layer and the side stream −13.7 (ranks 1–3 −9.6…−10.3 / −13.2…−14.2; a
-second run −10.1 / −13.7), at 48 tokens / 150 experts per layer −5.1 / −10.5 (−4.5…−4.9 / −9.9…−10.4) — another
-−3.7 / −5.4 µs per layer, the gather itself 3.6 → 4.7 µs (5.0 → 9.1 at 48) because it now shares the GPU with the
-discard. The drafter's MoE (5 tokens, 128 experts, top‑3, 960 rows) is the one shape where the discard does not pay on
+**The discard next to the gather (2026‑10‑14, measured in window 9, opt‑in).** Inline, the discard sits between
+FC2 and the gather on the model stream: ~3 µs of the critical path per MoE layer at 6 tokens, ~9 at 48. The gather
+reads only real rows and the discard touches only padding rows — disjoint 128‑byte lines — so the patch can fork the
+discard onto a side stream right after FC2 and join it after the gather, inside the same `apply()`
+(`VLLM_MOET_MOE_FC2_DISCARD_SIDE=1`; the default is the inline launch served since 2026‑10‑13). The join keeps the
+old ordering guarantee: everything the model stream, or a stream forked from it later, writes into the workspace
+afterwards — the next layer's FC1, the indexer's scratch (vLLM's workspace manager hands every consumer views of one
+buffer) — is ordered after the discard, and the discard still starts after FC2 completed. Nothing changes for eager
+steps outside the token range. On 4× RTX PRO 6000 in `bench_moe_l2_tp4.py`'s graph (paired interleaved rounds against
+`off`, 8 layers, the 21d93d0d image): at 6 tokens / 256 experts inline −10.1 µs per MoE layer and the side stream
+−13.7 (ranks 1–3 −9.6…−10.3 / −13.2…−14.2; a second run −10.1 / −13.7), at 48 tokens / 150 experts per layer
+−5.1 / −10.5 — another −3.7 / −5.4 µs per layer, the gather itself 3.6 → 4.7 µs (5.0 → 9.1 at 48) next to the
+discard. **The served graph said otherwise (window 9, rank‑0 trace `run26_w8_side_c1` against `run26_w8_rebase_c1`,
+medians of 10 replays, ranks 1–3 within 5 µs):** next to the shared expert's and the mHC side streams the gather
+took 6.5 µs instead of 3.3 (6.2 instead of 3.4 in the second Engram layer), every one of the 37 FFN segments got
++1.6…1.7 µs (segdiff median +1.69), the FFN sublayers +54 µs per step, the attention sublayers +9, GPU idle −18 — the
+decode graph 9,467.4 → 9,537.8 µs (+70.4, +0.74 %). The bench graph, with one all‑reduce after each MoE, hid an L2 /
+SM contention the served graph has, so the side stream is opt‑in and the inline launch stays the default. The
+drafter's MoE (5 tokens, 128 experts, top‑3, 960 rows) is the one shape where the discard itself does not pay on
 this GPU: +0.9 µs per layer inline, +0.7 on the side stream (−0.7 on the RTX 5090 earlier) — three layers, noise
 either way, so the range stays 2..64. Bit‑identity: `test_moe_l2_discard_sm120.py` runs every case in both modes
 (1..64 tokens and prefill sizes eagerly, graphs captured at 1/6/16/48/64 tokens with the fork and join inside the
 capture, the launch checked to be on the mode's stream), plus two MoE layers back to back on one workspace eagerly
 and over 20 graph replays, and checks the patched `apply()` for the fork after FC2 and the join after the gather.
-Expected in the served graph: 40 MoE layers × 3.7 µs ≈ −0.15 ms per step at one stream.
 
 ## The rebase onto vLLM nightly 21d93d0d (2026‑10‑06..13)
 
