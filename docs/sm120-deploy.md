@@ -120,6 +120,18 @@ also hits the previous answer. The served deployment runs all three (64 GiB, a d
 keeps disk files for 7 days (`TTL_HOURS=168` in the cron line: with 72 h a weekend without requests emptied the tier);
 `docs/dsv41-sm120-port.md`, "KV outside HBM".
 
+The containers run with `--restart no` (maintenance windows stop and replace them), so a crash stays down until
+someone looks: on 2026-10-14 the host's OOM killer took the production worker while a second DeepSeek server was
+starting on the other GPUs (each holds ~330 GB of host shared memory — the loader's `psm_*` segments plus the offload
+region; one DeepSeek-V4.1 server per host), and the service was down for 14 hours. Since 2026-10-15
+`docker/sm120/ds41-watchdog.sh` runs from cron every minute: a container that is not running is logged, its log and
+`docker inspect` saved as `<name>-crash-<UTC>.*`, renamed `<name>-crash-<UTC>` and started again (`ds41-flash` with the
+wrapper, `qwen38` with `docker start`); a running one that fails `GET /health` three minutes in a row after its
+35-minute startup grace is stopped and replaced the same way; at most one restart per 30 minutes and three per six
+hours per container, then it only logs "NEEDS A HUMAN". `touch /mnt/k3x/ds41flash/MAINTENANCE` before stopping anything
+by hand (`w8_stop.sh ds41-flash` does), `rm` it after the window; while it exists the watchdog does nothing but remind.
+Log: `/mnt/k3x/logs/watchdog.log` (a healthy minute writes nothing).
+
 The image also runs the report's CED prefill: the layers after the last KV-source layer run on each
 prompt's last 128 tokens only (vllm#58132, not merged yet, applied as a patch). Fresh prefill of long
 prompts is ~1.7× faster (19K / 163K / 391K tokens: 1.63 / 1.68 / 1.75×), decode unchanged, GPU KV
