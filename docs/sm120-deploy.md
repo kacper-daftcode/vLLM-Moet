@@ -88,7 +88,8 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .   # ~15 min
 # DeepSeek, this tree: + the DSpark drafter's mHC side stream (step 10; --build-arg VLLM_MOET_DSPARK_MHC_STREAM=0 leaves it
 # out) and the opt-in side-stream FC2 discard (step 14). Built from 6aafbb6 as -side for window 9 (2026-10-14), not kept:
-# drafter graph -43 us per step, but the side-stream discard +70 us and GPU KV -1.5 % ("The drafter's boundaries")
+# drafter graph -43 us per step, but the side-stream discard +70 us and GPU KV -1.5 % ("The drafter's boundaries"); the
+# drafter's stream alone (= this tree's defaults) profiles GPU KV 3,374,600 (-0.19 %), a candidate for the next window
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-side .   # ~8 min with the cached base
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)

@@ -1031,11 +1031,17 @@ quality gate green against the served window‑8 start (agreement 24/24, raw 12/
 195 vs 194 = 0 + 1 flips, p = 1, health PASS, prefill 163K 9.06–9.10 s / 391K 24.53–24.57, stress 0 errors, offload
 4/4). The image was not kept: the decode graph lost 70 µs per step to the side‑stream discard (next paragraph), and
 the start profiled 2.06 GiB of peak activation instead of 2.00 and 0.73 GiB of graph memory instead of 0.67 — GPU
-KV 3,380,873 → 3,331,199 tokens (−1.5 %, the runbook's capacity gate allows −0.5 %). Which of the two changes
-costs the memory is open (the drafter's second side stream keeps its boundary tensors alive across captures, the
-fused all‑reduce adds an out‑of‑place reduction at the drafter's end; the discard's stream allocates nothing);
-`--build-arg VLLM_MOET_DSPARK_MHC_STREAM=0` builds the image for that A/B. Production went back to the window‑8
-image at 21:59Z (`./run.sh`, up 22:1xZ).
+KV 3,380,873 → 3,331,199 tokens (−1.5 %, the runbook's capacity gate allows −0.5 %). Production went back to
+the window‑8 image at 21:59Z (`./run.sh`, up 22:18Z). **The A/B (2026‑10‑14 22:38Z, the same image with
+`VLLM_MOET_MOE_FC2_DISCARD_SIDE=0`, i.e. the drafter's stream alone, a second server on GPUs 0–3):** peak activation
+2.01 GiB, graph memory 0.68 GiB, GPU KV **3,374,600** tokens (−0.19 %) — the drafter's stream costs ~6K tokens
+(its second side stream's boundary tensors across the drafter graphs' captures), the side‑stream discard the other
+−1.3 % (its fork / join in 43 MoE layers of every captured graph size). So a drafter‑only image (this tree's
+defaults; `--build-arg VLLM_MOET_DSPARK_MHC_STREAM=0` leaves even that out) passes the capacity gate. That second
+server was a mistake of its own: a DeepSeek‑V4.1 server on this host holds ~330 GB of shared memory (the loader's
+`psm_*` segments plus the 64 GiB offload region), two of them do not fit into 708 GB, and the kernel's global OOM
+killer took production's worker 0 at 23:02Z (`shmem-rss` 130 GiB) while the A/B server finished its start —
+production was down until 13:25Z the next day. One DeepSeek‑V4.1 server per host, as every window before had it.
 
 ## The small-M BF16 GEMMs with cuBLAS's bits (2026‑10‑01)
 
