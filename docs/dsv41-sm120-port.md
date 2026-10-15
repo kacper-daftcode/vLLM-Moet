@@ -1440,6 +1440,53 @@ the peak activation the new base profiles is 0.07 GiB larger. The disk tier is s
 and `config.json`, and of 39 block files both images wrote for the same prompts 5 are byte‑identical and the median
 shares 63 % of its bytes (unrelated blocks: 3 %).
 
+## Where a 163K‑token prefill spends its 9 s (2026‑10‑15)
+
+The served requests average ~219K prompt tokens (157M prompt tokens over 718 requests in the first day after window 8),
+so a request's wall time is prefill: ~12 s against 1–2 s of decode. The first prefill profile — production on 4× RTX
+PRO 6000, idle, `/start_profile` → one fresh 4600‑line prompt (163,082 tokens, `max_tokens=1`, 9.22 s = 17.7K tok/s)
+→ `/stop_profile`; 40 chunks of `--max-num-batched-tokens 4096`; rank‑0 trace `run27_prefill163k`, ranks 1–3 within
+0.5 % — GPU busy 100 % of the 9.04 s window, 93K kernel launches:
+
+| share | time | launches | what |
+|---:|---:|---:|---|
+| 32.6 % | 2,943 ms | 3,866 | **NCCL all‑reduce** (3,696; the Engram all‑gathers 170): 1,741 full‑chunk all‑reduces of [4096, 5120] bf16 (42 MB) at 1.5–1.7 ms each — 44 per chunk, two per non‑trimmed layer — and 1,955 small ones (< 100 µs: the CED‑trimmed layers' 128 rows) |
+| 18.6 % | 1,679 ms | 3,612 | MoE FP8×FP4 grouped GEMM (DeepGEMM): FC1 626 µs, FC2 370 µs per layer‑chunk — ~500 TFLOPS, compute‑bound |
+| 10.6 % | 961 ms | 3,652 | sparse MLA prefill (FlashInfer SM120, 592 µs) |
+| 9.2 % | 833 ms | 10,629 | mHC at prefill: `mhc_post_tilelang` 120 µs × 3,325, the TF32 prenorm GEMM 124 µs × 1,681, `mhc_pre_big_fuse_with_norm` 53 µs × 3,615 |
+| 9.0 % | 813 ms | 17,506 | MXFP8 dense GEMMs (FlashInfer CUTLASS) |
+| 8.3 % | 750 ms | 31,592 | norm / quantize / activation elementwise |
+| 5.2 % | 471 ms | 5,187 | indexer: `fp4_mqa_logits` 827 µs × 519, `topKPerRowPrefill` 329 µs × 519 |
+| 3.3 % | 296 ms | 5,345 | BF16 GEMMs (cuBLAS) |
+| 2.9 % | 274 ms | 11,996 | everything else (Engram lookup 66 ms, copies, sampler) |
+
+**The all‑reduce is at the PCIe floor.** The GPUs are PCIe Gen5 x16 behind one host bridge (`PHB` for every pair, P2P
+with `NCCL_P2P_LEVEL=SYS`), no NVLink, and vLLM's custom all‑reduce is off (PCIe‑only, more than two GPUs). A 42 MB
+ring all‑reduce moves 63 MB per GPU and direction in 1.6 ms = 39 GB/s per link, 26 GB/s of payload. A sweep on GPUs
+0–3 in the serving image (`nccl_graph/nccl_proto_bench.py`, `torchrun` × 4, 20 iterations per size): the default protocol choice
+already equals `NCCL_PROTO=Simple` (1,601 µs for 42 MB; the trace names every all‑reduce `RING_LL`, but forcing LL
+doubles the time to 3,293 µs, so the default is not running LL at this size), LL128 is 7 % slower, Tree 17× slower on PCIe, and
+`NCCL_BUFFSIZE` 8–32 MB, `NCCL_NTHREADS=512`, 2–16 channels and `NCCL_CUMEM_ENABLE=0` all land within 1 % of 1,600 µs
+(`NCCL_P2P_USE_CUDA_MEMCPY=1` gains 3.5 % at 42 MB and loses 4.6× at 1.3 MB). The decode‑sized all‑reduce (6 × 5120)
+takes 24 µs in every configuration but LL128 / Simple (41 / 50 µs). No environment variable moves this third of the
+prefill.
+
+**What could.** (1) Overlap instead of bandwidth: the ring kernel occupies a handful of SMs while 180 idle, so a chunk
+split into two micro‑batches could hide one half's all‑reduces behind the other's GEMMs — vLLM's dual‑batch overlap
+(`--enable-dbo`, `use_ubatching`, prefill threshold 512 tokens) exists in 21d93d0d and the DSv4.1 model indexes its
+attention metadata per micro‑batch, but its yield points sit only in the MoE all‑to‑all (DeepEP / NIXL) prepare /
+finalize, and `use_ubatching` switches the mHC overlap off (upstream's gate and ours: the coefficient stream would be
+shared between the two threads). Hiding the TP all‑reduce would need yield points around it in the model code, a
+per‑ubatch mHC stream, and a memory check (two micro‑batches of activations against the KV budget). Potential: up to
+−2 s of the 9 s. (2) Sequence parallelism would cut the mHC and the elementwise work to a quarter per rank (−10 % of
+the prefill) but `_use_sequence_parallel` requires expert parallelism in this model (and the fused GEMM + reduce‑scatter
+needs NVLink multicast), so it is not available on this host without changing the MoE to EP over PCIe. (3) A smaller
+payload — the all‑reduce in FP8 with per‑row scales — would halve the 2.9 s but is not bit‑identical and changes
+prefill numerics: an owner decision, not an optimization. (4) Kernel work with a known ceiling: the three mHC kernels
+per boundary at prefill (9.2 %) read the [4096, 4, 5120] residual three times; the decode‑shaped fused post + collapse
++ norm of `mhc_overlap/` extended to prefill token counts would save one pass (~3 %). Larger chunks only trim the
+per‑call latencies (~1 %) and raise the activation peak.
+
 ## Apply / build / run
 
 ```bash
