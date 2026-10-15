@@ -1525,3 +1525,43 @@ JIT when the AOT artifact fails to load) and the rebuilt `_C.so` over
   CUTLASS + GEMV, `wo_a` → grouped GEMV); the remaining BF16 GEMMs are BF16 checkpoint weights.
 - Bench recipe (`bench/recipes/`) for `deepseek-v4.1-flash/pro6000x8-tp8-dspark` not yet
   registered; the numbers above are single‑shot smoke measurements, not a release row.
+- **vLLM main after 21d93d0d (reviewed 2026‑10‑15, 649 commits):** what the next rebase brings and costs.
+  - Prefill, for free: [vllm#59894](https://github.com/vllm-project/vllm/pull/59894) — the last KV‑source layer
+    writes every token's KV and runs the rest of itself on the replay rows only (one full layer of ~22 per chunk,
+    ≈ −4 % of the 163K prefill above); [vllm#54951](https://github.com/vllm-project/vllm/pull/54951) +
+    [vllm#61647](https://github.com/vllm-project/vllm/pull/61647) — the indexer's replicated prefill rows sharded
+    across the TP ranks (`SparseAttnIndexer`, the class behind `DeepseekV4Indexer`; the gate admits CUDA, TP > 1,
+    no DCP/PCP, a mixed cudagraph mode other than FULL — FULL_AND_PIECEWISE passes), so the indexer's 5.2 % + top‑k
+    on long prompts divide by four; [vllm#59532](https://github.com/vllm-project/vllm/pull/59532) runs the replay
+    layers in CUDA graphs and trims in PIECEWISE graphs; [vllm#61039](https://github.com/vllm-project/vllm/pull/61039)
+    length‑aware candidate blocks in the decode indexer.
+  - The pattern for the all‑reduce overlap this document asks for:
+    [vllm#57773](https://github.com/vllm-project/vllm/pull/57773) (ROCm, DeepSeek‑V4) wraps a collective in a
+    `_comm_region()` — `dbo_yield_and_switch_from_compute_to_comm()`, the collective, `dbo_switch_to_compute_sync()`,
+    skipped under graph capture — so the peer micro‑batch computes while it is in flight. On our TP4 the same wrapper
+    around the two all‑reduces per layer (and the Engram all‑gathers) is the candidate; `--enable-dbo` on CUDA needs
+    `--all2all-backend=deepep_low_latency` only to pass the config assertion (no EP, no backend built), the decode
+    threshold set above the decode batch, and the mHC overlap's `use_ubatching` gate relaxed on sm_120 (the side
+    stream is only used inside FULL graphs ≤ 64 tokens, never in prefill).
+  - FlashInfer 0.7.1 final ([vllm#60948](https://github.com/vllm-project/vllm/pull/60948)): wheel against wheel
+    with rc2, the sm_120 sparse‑MLA and SM120 MXFP8 GEMM sources are unchanged (the 43 changed files are the
+    SM100 PrimsTS MLA decode, the `blackwell_sm12x` CuTe DSL MoE, the autotune cache's entry format — read
+    compatibly —, the SM100 FP4 dense GEMM dispatch, `prefill.py`'s host‑sync‑free plan); the four wheels, the
+    `sm120f` provider included, are on the index. vLLM's own Dockerfile now installs the kernels with
+    `flashinfer download-kernels` ([vllm#58765](https://github.com/vllm-project/vllm/pull/58765)), so the
+    `flashinfer-jit-cache` step of `Dockerfile.sm120-dsv41-nightly` will be rewritten.
+  - The cost: torch 2.14.0 / triton 3.8.0 ([vllm#52183](https://github.com/vllm-project/vllm/pull/52183)) —
+    every extension, TileLang and DeepGEMM recompile and re‑test; DeepGEMM pinned to the fork's `6ce1c5ec`
+    "with the SM120 and SM90 paged‑MQA ports" ([vllm#61149](https://github.com/vllm-project/vllm/pull/61149)) —
+    check whether `patch_deepgemm.py` is still needed; `DeepseekV4Config` from Transformers
+    ([vllm#61392](https://github.com/vllm-project/vllm/pull/61392)), the mega‑attention load‑time permutes
+    ([vllm#60064](https://github.com/vllm-project/vllm/pull/60064)), MegaMoE experts loaded into the DeepGEMM
+    layout ([vllm#60096](https://github.com/vllm-project/vllm/pull/60096)) and the packed FP8 Engram rows across
+    DP ([vllm#59923](https://github.com/vllm-project/vllm/pull/59923)) move the anchors of the drafter, mHC,
+    reasoning‑effort and Engram patchers.
+  - Not ours: [vllm#61643](https://github.com/vllm-project/vllm/pull/61643) (replay rows only with
+    `enable_return_routed_experts`), [vllm#61274](https://github.com/vllm-project/vllm/pull/61274) (DeepGEMM
+    auto‑disabled on SM12x for Kolibri only), [vllm#46963](https://github.com/vllm-project/vllm/pull/46963) /
+    [vllm#60452](https://github.com/vllm-project/vllm/pull/60452) (NVFP4 KV on SM12x in the dense FlashInfer / XQA
+    backends, not the sparse MLA), [vllm#58877](https://github.com/vllm-project/vllm/pull/58877) (OAI Triton MXFP4
+    MoE on SM12x — bf16 activations, not the FP8 × FP4 UE8M0 experts).
