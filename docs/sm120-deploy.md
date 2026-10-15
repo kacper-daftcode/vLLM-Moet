@@ -132,6 +132,11 @@ hours per container, then it only logs "NEEDS A HUMAN". `touch /mnt/k3x/ds41flas
 by hand (`w8_stop.sh ds41-flash` does), `rm` it after the window; while it exists the watchdog does nothing but remind.
 Log: `/mnt/k3x/logs/watchdog.log` (a healthy minute writes nothing).
 
+Images built after 2026-10-15 carry an experiment switch, `PREFILL_DBO=1` (`--enable-dbo`): a prefill step of ≥ 1024
+tokens runs as two microbatches whose TP all-reduces overlap each other's compute. Leave it off: on this host the
+step is paced by the Python that launches each microbatch (measured 2.4× slower on a 1/5-scale dummy-weight model;
+`docs/dsv41-sm120-port.md`, "Dual-batch overlap of the prefill all-reduces").
+
 The image also runs the report's CED prefill: the layers after the last KV-source layer run on each
 prompt's last 128 tokens only (vllm#58132, not merged yet, applied as a patch). Fresh prefill of long
 prompts is ~1.7× faster (19K / 163K / 391K tokens: 1.63 / 1.68 / 1.75×), decode unchanged, GPU KV

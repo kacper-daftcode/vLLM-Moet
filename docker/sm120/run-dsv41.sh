@@ -61,6 +61,14 @@
 #                        tool calls in the history when the request has tools (agents) and drops the reasoning
 #                        otherwise; the dropped blocks only take room in the tiers.
 #            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
+#            PREFILL_DBO (0)         1 = --enable-dbo: an eager step of >= DBO_PREFILL_THRESHOLD (1024) tokens runs as
+#                        two microbatches whose TP all-reduces overlap each other's compute (Dockerfile step 15,
+#                        images built after 2026-10-15; the prefill's all-reduces are a third of its time on this
+#                        PCIe host). DBO_DECODE_THRESHOLD (4096) keeps every decode step (<= 64 tokens, FULL graphs)
+#                        one batch. Not bit-identical to the single-batch prefill (half-size ring chunks). Measured
+#                        2.4x SLOWER on the 1/5-scale dummy-weight model (two Python forwards per chunk pace the GPU;
+#                        docs/dsv41-sm120-port.md "Dual-batch overlap of the prefill all-reduces") - an experiment
+#                        switch, not a serving option, until the host side of the prefill is halved.
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
@@ -104,6 +112,9 @@ SPEC_TOKENS="${SPEC_TOKENS:-5}"
 INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
 KV_RECORD="${KV_RECORD:-nvfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
+PREFILL_DBO="${PREFILL_DBO:-0}"
+DBO_PREFILL_THRESHOLD="${DBO_PREFILL_THRESHOLD:-1024}"
+DBO_DECODE_THRESHOLD="${DBO_DECODE_THRESHOLD:-4096}"
 KV_OFFLOAD_GIB="${KV_OFFLOAD_GIB:-0}"
 KV_OFFLOAD_FS_DIR="${KV_OFFLOAD_FS_DIR:-}"
 KV_OFFLOAD_PROMPT_ONLY="${KV_OFFLOAD_PROMPT_ONLY:-1}"
@@ -122,6 +133,16 @@ if [[ "$SPEC_TOKENS" != "0" ]]; then
     "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
+case "$PREFILL_DBO" in
+  0) ;;
+  1)
+    if [[ "$(docker image inspect --format '{{index .Config.Labels "com.vllm-moet.prefill-dbo"}}' "$IMAGE" 2>/dev/null)" != "1" ]]; then
+      echo "PREFILL_DBO=1 needs an image built with Dockerfile step 15 (label com.vllm-moet.prefill-dbo=1); $IMAGE has none" >&2; exit 1
+    fi
+    ARGS+=(--enable-dbo --dbo-prefill-token-threshold "$DBO_PREFILL_THRESHOLD"
+           --dbo-decode-token-threshold "$DBO_DECODE_THRESHOLD") ;;
+  *) echo "PREFILL_DBO must be 0 or 1, got $PREFILL_DBO" >&2; exit 1 ;;
+esac
 case "$KV_OFFLOAD_PROMPT_ONLY" in
   0|1) ;;
   *) echo "KV_OFFLOAD_PROMPT_ONLY must be 0 or 1, got $KV_OFFLOAD_PROMPT_ONLY" >&2; exit 1 ;;
@@ -222,3 +243,5 @@ docker run -d --name "$NAME" --restart no \
 echo "container $NAME started; logs: docker logs -f $NAME ; API: http://${BIND:-0.0.0.0:}${PORT}/v1"
 echo "expect in the log: 'Using Sm120GemvMxfp8BmmLinearKernel for MXFP8 GEMM', 'wo_a stays MXFP8 on sm_120',"
 echo "  'Using ${INDEXER_KV_DTYPE^^} indexer cache for Lightning Indexer'"
+[[ "$PREFILL_DBO" == "1" ]] && echo "  'vllm-moet prefill DBO: eager steps of >= ${DBO_PREFILL_THRESHOLD} tokens ... run as 2 microbatches'"
+exit 0

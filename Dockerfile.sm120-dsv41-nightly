@@ -113,6 +113,20 @@
 #      joined after the gather (disjoint lines: the gather reads only real rows) - another -3.7 us per MoE layer at
 #      6 tokens in the bench graph on 4x RTX PRO 6000, but in the served decode graph (window 9) the gather next to
 #      the discard took 6.5 us instead of 3.3 and every FFN segment +1.7 us; the default stays the inline launch.
+#  15. Dual-batch overlap of the prefill's TP all-reduces (patch_vllm_prefill_dbo_sm120.py + prefill_dbo/): a
+#      4096-token chunk spends a third of its time in two [4096, 5120] bf16 all-reduces per non-trimmed layer (1.6 ms
+#      each on the PCIe ring, 180 SMs idle). With `vllm serve ... --enable-dbo` an eager step of >= the prefill
+#      threshold splits into two microbatches on two threads (vLLM's own ubatching, V2 runner) that hand the GPU to
+#      each other at every TP all-reduce (mhc_shifted_post_pre, the Engram boundary, the final collapse) and Engram
+#      all-gather, so one half's collective runs on a high-priority comm stream behind the other half's GEMMs
+#      (measured without the model: 80-97 % of the all-reduce hidden, nccl_graph/nccl_overlap_bench.py). Made to
+#      work without DP / EP and with Engram (hashes and rows fetched once per step), the DSpark drafter (merged aux
+#      states), the decoder SWA bounded replay (a replay batch per microbatch) and the row-indexed top-k / candidate
+#      buffers (one storage per microbatch). Not bit-identical (half-size ring chunks). Off without --enable-dbo;
+#      decode steps stay one batch (--dbo-decode-token-threshold above the capture size). NOT SERVED: on the 1/5-scale
+#      dummy-weight model (tools/dsv41_sm120/mini_model/) the split step is 2.4x slower - two microbatches are two Python
+#      forwards, ~1.2-1.5 ms of host enqueue per sublayer each, against ~1 ms of GPU work per half-chunk sublayer in the
+#      full model whose single-batch prefill already keeps the CPU 68 % busy; the step is paced by the host (port doc).
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -122,7 +136,8 @@
 #  Every vLLM-file step has a build-arg (=0 leaves it out) so a step whose patcher does not fit a newer vLLM yet
 #  can be built around: VLLM_MOET_REASONING_EFFORT (4), VLLM_MOET_NVFP4_KV (2's indexer gate + 5),
 #  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10; VLLM_MOET_DSPARK_MHC_STREAM for the drafter's stream alone),
-#  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14).
+#  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14),
+#  VLLM_MOET_PREFILL_DBO (15).
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .
@@ -272,6 +287,13 @@ RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41
     && python3 -c "import vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe as d; import inspect; assert hasattr(d, '_moet_drop_padding_rows') and hasattr(d, '_moet_l2_side_stream') and 'wait_stream(_moet_l2_side)' in inspect.getsource(d.DeepGemmFP4Experts.apply); print('moe fc2 discard patched')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_l2_discard_sm120/*.so; fi
 
+# 15. Dual-batch overlap of the prefill's TP all-reduces (header); no extension, off unless `vllm serve` gets
+#     --enable-dbo (docker/sm120/run-dsv41.sh PREFILL_DBO=1). Needs step 10's fused all-reduce. GPU test:
+#     tools/dsv41_sm120/README.md (prefill_dbo/test_prefill_dbo_tp4.py).
+ARG VLLM_MOET_PREFILL_DBO=1
+RUN if [ "$VLLM_MOET_PREFILL_DBO" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_dbo_sm120.py \
+    && python3 -c "import vllm.v1.worker.moet_prefill_dbo as d, vllm.v1.worker.gpu.ubatch_utils as u, vllm.v1.worker.gpu.dp_utils as p, vllm.models.deepseek_v41.nvidia.model_state as s; import inspect; assert hasattr(u, '_moet_dbo') and 'check_ubatch_thresholds(parallel_config, num_tokens, uniform_decode)' in inspect.getsource(p.dispatch_cg_and_sync_dp) and '_moet_num_ubatches' in inspect.getsource(s.DeepseekV41ModelState); print('prefill dbo patched')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="vllm/vllm-openai:nightly 21d93d0d + FlashInfer ${FLASHINFER_VERSION} (DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules) + DeepGEMM e1f418c2 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2" \
@@ -287,4 +309,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.bf16-gemm="${VLLM_MOET_BF16_GEMM}" \
       com.vllm-moet.engram-wkv-tp="${VLLM_MOET_ENGRAM_WKV_TP}" \
       com.vllm-moet.nccl-graph-records="${VLLM_MOET_NCCL_GRAPH_RECORDS}" \
-      com.vllm-moet.moe-fc2-discard="${VLLM_MOET_MOE_FC2_DISCARD}"
+      com.vllm-moet.moe-fc2-discard="${VLLM_MOET_MOE_FC2_DISCARD}" \
+      com.vllm-moet.prefill-dbo="${VLLM_MOET_PREFILL_DBO}"

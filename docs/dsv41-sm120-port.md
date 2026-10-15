@@ -1487,6 +1487,160 @@ per boundary at prefill (9.2 %) read the [4096, 4, 5120] residual three times; t
 + norm of `mhc_overlap/` extended to prefill token counts would save one pass (~3 %). Larger chunks only trim the
 per‑call latencies (~1 %) and raise the activation peak.
 
+## Dual‑batch overlap of the prefill all‑reduces (2026‑10‑15/16)
+
+The previous section left one lever for the third of the prefill that is the TP all‑reduce: run one half of
+the chunk's all‑reduce behind the other half's GEMMs. This section measures the premise on the host, lists what
+kept vLLM's dual‑batch overlap (DBO) from this deployment, and describes the patch set that makes it serve the
+TP4 prefill (`tools/dsv41_sm120/patch_vllm_prefill_dbo_sm120.py` + `prefill_dbo/`, Dockerfile step 15; off
+unless `vllm serve` gets `--enable-dbo`, `docker/sm120/run-dsv41.sh PREFILL_DBO=1`) — and ends with the
+measurement that says why it is not served: the two microbatches cost two Python forwards, and this prefill's host
+side has no room for a second one.
+
+**The premise, without the model (`nccl_graph/nccl_overlap_bench.py`, 4× RTX PRO 6000 on GPUs 0–3 next to the
+serving job, 2026‑10‑15).** vLLM's PyNccl communicator on an explicit comm stream, events between the streams
+exactly as `v1/worker/ubatching.py` records them, cuBLAS / cuBLASLt GEMMs plus elementwise passes over a
+[tokens, 4, 5120] residual as the compute of one half‑chunk between two comm points, 10 layers × 2 phases:
+
+| per phase, H = 2048 | compute (both halves) | all‑reduce (two halves) | serial (one batch) | dbo | hidden |
+|---|---:|---:|---:|---:|---:|
+| 3 × GEMM[5120×6144] bf16 + 2 elementwise | 2,548 µs | 1,606 | 4,638 | 2,617 | 96 % |
+| 3 × GEMM fp8, comm stream priority 0 | 1,723 | 1,606 | 3,713 | 2,043 | 80 % |
+| 3 × GEMM fp8, **priority −1** | 1,717 | 1,607 | 3,716 | **1,909** | **88 %** |
+| 2 × GEMM fp8 (compute < comm) | 1,257 | 1,606 | 3,314 | 1,972 | 71 % |
+| 5 × GEMM fp8 (compute > comm) | 2,647 | 1,607 | 4,444 | 2,703 | 97 % |
+
+"Hidden" is (compute + comm − dbo) / min(compute, comm). The two half‑size all‑reduces together cost 0.7 % more
+than the full one, and under concurrent GEMMs the collective does not slow down: the dbo time sits within
+2–7 % of max(compute, comm). A high‑priority comm stream is worth 8 points with the short FP8 kernels (the ring's
+blocks get SMs as GEMM blocks retire). In the served prefill one non‑trimmed layer is ≈ 6.5 ms of compute
+against 3.2 ms of all‑reduce per 4096‑token chunk, the compute‑heavy row of the table: the expectation for the
+163K prefill is ≈ 6.1 s of compute + bubbles instead of 9.04 s.
+
+**What kept DBO from this deployment (vLLM main 21d93d0d).** `--enable-dbo` exists, DeepSeek‑V4.1 runs on the
+V2 GPU model runner (DSpark is V2‑only), and the V2 runner has its own microbatch machinery
+(`v1/worker/gpu/ubatch_utils.py`: `UBatchRunner`, a thread and a forward context per microbatch, attention
+metadata built per microbatch with one metadata builder per microbatch) — but it was written for DP + EP:
+
+- the runner is built only for `data_parallel_size > 1` and the split decision lives in the DP handshake
+  (`dp_utils.sync_cudagraph_and_dp_padding`; at DP = 1 `dispatch_cg_and_sync_dp` returns without one);
+- the config refuses it with Engram ("does not support DBO or microbatching"), with speculative decoding,
+  with multimodal models, without an explicit `VLLM_USE_V2_MODEL_RUNNER`, and asserts an EP all‑to‑all backend;
+- the model turns the decoder SWA bounded replay off under `use_ubatching` ("the replay‑layer batch shrinks per
+  rank, which … microbatching cannot follow") — the 1.63–1.75× of the CED, more than DBO would give back;
+- the MoE asserts `not dbo_enabled()` whenever its prepare/finalize has no async path, which the no‑DP/EP
+  class never has; the sm_120 mHC overlap (ours and upstream's) refuses `use_ubatching`;
+- the only yield points are in the EP all‑to‑all prepare/finalize; the two TP all‑reduces per layer run on the
+  compute stream like any kernel;
+- state the layers share by batch row would be clobbered between microbatches: the indexer's top‑k indices
+  (written by an index‑source layer, read by the layers below it) and the candidate blocks (layer 20 → 24/28/32/36)
+  live in buffers indexed from row 0; the Engram module stages its fetched rows in one buffer and the n‑gram
+  hash needs each request's lookback tokens; the drafter's aux hidden states come back as a list the output
+  merge does not know.
+
+**The patch set.** Ten files, each hunk marked `[vllm-moet] prefill DBO`, plus `vllm/v1/worker/moet_prefill_dbo.py`:
+
+- *The comm region* (`moet_prefill_dbo.all_reduce` / `all_gather`), the pattern vllm#57773 later added for ROCm:
+  `yield_and_switch_from_compute_to_comm` (record the compute stream, hand the CPU to the other microbatch,
+  switch to the comm stream, wait for the record), the collective through PyNccl on the comm stream,
+  `switch_to_compute_sync` (record the comm stream, switch back, wait). The output is allocated on the compute
+  stream before the switch and the input recorded on the comm stream, so the caching allocator keeps each for
+  the stream that uses it. Sites: the sublayer all‑reduce of `mhc_shifted_post_pre` (two per layer with
+  `fuse_mhc_all_reduce`), the Engram layer's pre‑boundary all‑reduce, the final collapse, Engram's head
+  all‑gather. Outside a microbatch thread every helper is the plain collective.
+- *The split without DP*: `maybe_build_ubatch_runner` builds the runner at DP = 1; `dispatch_cg_and_sync_dp`
+  marks an eager step of ≥ `--dbo-prefill-token-threshold` tokens (uniform decodes: `--dbo-decode-token-threshold`)
+  for `num_ubatches` microbatches. FULL graphs are never split, so with the decode threshold above the capture
+  size (4096) decode steps keep today's graphs and the mHC side stream; prefill steps of ≥ 1024 tokens split.
+  The comm stream has priority −1 (`VLLM_MOET_DBO_COMM_PRIORITY`).
+- *Config*: the Engram, DSpark, multimodal and `VLLM_USE_V2_MODEL_RUNNER` gates admit `DeepseekV41ForCausalLM`
+  at DP = 1 (the DSpark speculator builds its own attention metadata and reads the merged aux hidden states; the
+  vision tower runs before the decoder forward that is split); the all‑to‑all assertion applies only with
+  expert parallelism. `prefill_dbo/check_dbo_config.py`: the served configuration validates with `--enable-dbo`.
+- *Row buffers per microbatch* (`RowBufferSwitch`): the top‑k and candidate‑block buffers get a second storage,
+  and a restore hook `ubatching.py` runs whenever a microbatch thread enters or resumes points the tensor at
+  that microbatch's storage (`Tensor.set_`). Every holder of the tensor — the indexer ops, the attention
+  backends, the replay layers' row compaction — sees its microbatch's rows at local row numbers; kernels the
+  other thread already enqueued keep the pointers they were launched with. Reset to storage 0 after the join,
+  so the decode graphs (captured on storage 0) are untouched.
+- *Engram once per step*: before the threads start, `UBatchRunner.begin_capturable_run` calls the model's
+  `moet_prepare_ubatched_forward` with the whole batch's inputs and query offsets (`UBatchState` carries them):
+  the n‑gram hashes (the V2 hash is stateless: ids, positions, offsets, the runner's lookback window) and
+  `prepare_embeddings` for the full batch. Each microbatch slices the hashes and mask and reads the staged rows
+  at its token offset (`UBatchContext.token_offset`, ported from vllm#57773).
+- *The decoder SWA bounded replay per microbatch*: `_decoder_replay_supported` no longer refuses ubatching;
+  `DeepseekV41ModelState` keeps the replay batch's buffers, UVA staging pools and metadata builders per
+  microbatch (`prepare_attn` runs once per microbatch, the threads consume them at the same time), and
+  `DecoderReplayLayers` keeps rows and forward context per microbatch and installs the replay context on the
+  microbatch context for the duration — the yields inside the replay layers' all‑reduces assert the current
+  forward context is the thread's. Each microbatch replays the last 128 rows of its own query (the second one
+  the prompt's true tail; the first's window is extra work, 18 trimmed layers × 128 rows, that nothing reads).
+- *MoE*: the two assertions admit the no‑DP/EP prepare/finalize. *Output merge*: a tuple's list elements
+  (the drafter's aux hidden states) concatenate element‑wise.
+
+**Correctness without the model.** `prefill_dbo/test_prefill_dbo_tp4.py` (4 ranks, NCCL): two microbatch threads
+under real `UBatchContext`s run a stand‑in stack — GEMM, the all‑reduce and the all‑gather through the comm region,
+the row buffer written before and checked after the collectives, a replay‑style forward‑context swap with a
+collective inside — and each microbatch's result equals the same microbatch run alone on one stream bit for bit
+(2026‑10‑15, ALL OK, both schedules). Against the one‑batch all‑reduce of the full chunk the bits differ (NCCL's
+ring reduces each chunk's elements in a rank order that depends on the chunk, and a half‑size buffer chunks
+differently), so the serving gate for DBO would be a quality window, as for the rebase. The served configuration
+validates with `--enable-dbo` on the patched tree and is rejected on the unpatched one
+(`prefill_dbo/check_dbo_config.py`).
+
+**The dry run on a 1/5‑scale model, and what it says (2026‑10‑15 22:00–22:35Z).** `mini_model/make_mini_config.py`
+makes an 8‑layer DeepSeek‑V4.1 config that keeps every structural feature of the 40‑layer model (two KV‑source
+layers, three index‑source layers, a candidate‑source layer, three decoder‑replay layers behind the last KV source,
+two Engram layers, the DSpark drafter's three target layers, the same hidden sizes) with 16 routed experts and
+~60K‑row Engram tables, so `vllm serve --load-format dummy` runs at TP4 on GPUs 0–3 next to the serving job
+(~3 GiB per GPU plus a small KV pool; `mini_model/serve_mini.sh`). The weights are noise, the plumbing is the
+full model's: with `--enable-dbo` the server started, split every eager step of ≥ 512 tokens (1,148‑, 2,478‑ and
+5,708‑token prompts, three concurrent prompts, mixed batches with decodes) and answered every request with no error
+in the log — the replay batches per microbatch, the Engram hashes prepared once per step, the row‑buffer storages,
+the drafter after a split step all work. One fix came out of it (the microbatch forward contexts asked for DP
+metadata, which asserts DP > 1). Then the timing, fresh prompts, `max_tokens=1`, medians of 5:
+
+| 8‑layer dummy model, 4× RTX PRO 6000 | one batch | two microbatches |
+|---|---:|---:|
+| 5,727 tokens (3 chunks of ≤ 2048) | 88.9 ms (64K tok/s) | 212–223 ms (26K tok/s) |
+| 1,927 tokens (1 chunk) | 31.1 ms | 72–73 ms |
+
+2.4× slower, with either collective order. The profiler trace (`mini_model/trace_timeline.py`) shows why: the
+two‑microbatch step has 165–176 ms of NCCL in a 240 ms wall of which 0–29 ms run concurrently with any other
+kernel, each half‑size all‑reduce takes 1.3–1.5 ms instead of the 0.4 ms its 10 MB cost on the ring, and the GPU
+timeline is compute segment (0.25 ms) → all‑reduce (1.5 ms) → compute segment → … strictly alternating: the
+all‑reduce spins until every rank's *host thread* has enqueued its contribution, and the host needs ~1.2–1.5 ms
+of Python per sublayer per microbatch (105 handoffs at 0.54 ms, plus the launches) for ~0.25 ms of GPU work. The
+step is paced by the CPU. The single‑batch step on the same model is GPU‑bound (91 % busy) with the CPU 58 % busy;
+in the served 163K prefill (`run27`) the CPU is 68 % busy and runs 60–160 ms ahead of the GPU. Two microbatches
+double the Python per chunk: the full model's half‑chunk sublayer is ~1 ms of GPU work against ~1.2–1.5 ms of host
+enqueue per microbatch, so **DBO on this stack is CPU‑bound and would not be faster than today's prefill — at best
+even, more likely slower.** The code stays in the tree (step 15, off by default) because the comm region, the
+per‑microbatch model state and the dry‑run harness are what any later overlap builds on; the first run with the
+model is not worth a window until the Python side is halved.
+
+**Where this leaves the prefill.** The all‑reduce is a third of the time and overlapping it with the other half's
+compute works at the GPU level (the bench, 92–94 % with the served MXFP8 GEMM; 55–66 % against a persistent
+Triton GEMM); what does not work is paying for two Python forwards. Options, by expected value:
+
+- *Sequence‑parallel boundary without expert parallelism*: reduce‑scatter the sublayer output, run the mHC
+  post + pre, the norm, the Engram injection (and the router) on this rank's quarter of the tokens, all‑gather what
+  the next sublayer needs. Same bytes on the ring (RS + AG = AR), one more collective per boundary, no extra Python
+  per token, bit‑identical per token; the boundary's 17 % of the prefill (mHC 9.2 %, elementwise 8.3 %) divides by
+  four: ≈ −7…9 %. Gathering the *MXFP8‑quantized* input the big GEMMs take anyway instead of bf16 halves the
+  all‑gather (the small bf16 consumers — the router, the indexer's `weights_proj` — run on the shard and gather their
+  outputs): ≈ −15 % in total, still bit‑identical. Weeks of model‑side work, a window per step.
+- *CUDA graphs for the half‑chunk segments*: replaying graphs removes the Python per microbatch and makes DBO's
+  −25 % reachable, but the breakable graphs need the all‑reduce as a break point, the replay batches have dynamic
+  shapes, and the graph pools cost activation memory the KV pool pays for.
+- *Fewer launches per sublayer* (fusing the prefill glue as `moe_quant_scatter` did for decode; the DeepGEMM and
+  FlashInfer Python launch paths): every 10 % off the host side is 10 % more room for overlap, but DBO needs 50 %.
+- *Larger chunks* (`--max-num-batched-tokens 8192`) double the GPU work per launch and would make DBO GPU‑bound,
+  at the price of the single‑batch profile run's 4 GiB activation peak (−2 GiB of KV) and twice the decode stalls
+  behind another user's prefill.
+- *FP8 all‑reduce*: half the bytes, but a ring cannot sum rows that carry different scales per rank; the honest
+  form is the FP8 all‑gather of the SP boundary above.
+
 ## Apply / build / run
 
 ```bash
