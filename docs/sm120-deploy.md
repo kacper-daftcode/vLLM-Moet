@@ -140,6 +140,13 @@ tokens runs as two microbatches whose TP all-reduces overlap each other's comput
 step is paced by the Python that launches each microbatch (measured 2.4× slower on a 1/5-scale dummy-weight model;
 `docs/dsv41-sm120-port.md`, "Dual-batch overlap of the prefill all-reduces").
 
+The 3f1bcfd82b images take `INDEXER_TP_SHARD_MIN_ROWS=N` (step 16, the vllm#61647 backport): from N prefill rows in
+a step the sparse indexer scores each rank's share of the rows and the ranks exchange the top-k (vllm#54951). Unset,
+vLLM's own 65,536 never fires with 4096-token chunks, and a full chunk holds 4,092 rows (DSpark keeps 4 draft slots
+per request out of the budget), so N has to stay below that. Production runs 2048 since window 11 (2026-10-16): fresh
+prefill of 391K tokens −4 %, 163K −0.5 %, the outputs identical, decode and KV unchanged; `INDEXER_TP_SHARD_MIN_ROWS=
+./run.sh` turns it off.
+
 The image also runs the report's CED prefill: the layers after the last KV-source layer run on each
 prompt's last 128 tokens only (vllm#58132, not merged yet, applied as a patch). Fresh prefill of long
 prompts is ~1.7× faster (19K / 163K / 391K tokens: 1.63 / 1.68 / 1.75×), decode unchanged, GPU KV

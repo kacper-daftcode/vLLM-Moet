@@ -1691,6 +1691,22 @@ What changed on our side:
   [vllm#61647](https://github.com/vllm-project/vllm/pull/61647): the indexer's TP row sharding of the base engages
   from `16,384 × TP` = 65,536 prefill rows in a step, which a 4096‑token chunk never reaches, so it is dead code here
   until the threshold (`AttentionConfig.indexer_tp_shard_min_rows`, launcher `INDEXER_TP_SHARD_MIN_ROWS`) is lowered.
+- The threshold, measured offline (the 40‑layer dummy‑weight model of `mini_model/make_deep_config.py` with the full
+  model's 1,048,576 positions, TP4 on GPUs 0–3, fresh prefills, medians of three). A full chunk holds **4,092**
+  prefill rows, not 4,096 — the scheduler keeps `max_num_new_slots_for_drafting` (4 with DSpark k = 5) per request
+  out of the budget — so 4096 never fires: its profile matches the unsharded one kernel for kernel. At 2048, against
+  the mean of seven unsharded servers: 60K 2,716 → 2,678 ms (−1.4 %), 120K 5,523 → 5,426 ms (−1.8 %), 250K
+  11,973 → 11,509 ms (−3.9 %; the unsharded servers spread over 1.7 %). A 60K prefill's profile (rank 0): indexer
+  logits 39.4 → 22.5 ms, top‑k 10.0 → 2.3 ms, and 45 `AllGatherV` of the top‑k rows (15 chunks × 3 layers) at 9.7
+  ms. Three of V4.1's eight indexer layers shard (2, 8, 14): layer 20 publishes the candidate blocks the later ones
+  read, and those rows stay replicated (`row_shard = None if candidate_blocks is not None`); since vllm#59894 the
+  layers from 20 on score 128 replay rows anyway. The logits grow with the context and the exchange does not, so the
+  gain does. Mixed steps (six concurrent prompts, decode) run clean.
+- Served since window 11 (2026‑10‑16, `INDEXER_TP_SHARD_MIN_ROWS=2048` in production's wrapper). Against window 10:
+  fresh prefill 19K 1.00–1.01 → 1.00–1.03 s, 163K 8.64–8.66 → 8.60–8.61 s, 391K 22.59–22.61 → 21.62–21.78 s (−4 %);
+  decode graph 9,456.8 → 9,455.7 µs, steps per second and KV (2,229,898 at 0.92) unchanged; the outputs identical
+  (agreement 24/24, raw 128 tokens 12/12, needle 6/6 the same), GSM8K‑200 195 → 193 (2 + 0 flips, p = 0.5, within
+  the C4 floor). Rows are scored where they are, so the sharding changes no number.
 - The replay graphs of vllm#59532 do not engage either: with `--max-cudagraph-capture-size 64` their default capture
   list is [64] and a replay batch holds ≥ 128 rows.
 
@@ -1717,8 +1733,10 @@ recompiled quantizer, the replay from layer 20 — a rebase is gated on quality,
 drafter's graph is **1,030.6 → 1,077.0 µs** although its layers now take the mHC side stream (window 9 on 21d93d0d:
 987.7): 182 kernels instead of 163, one more `mxfp8_mma_gemv_v3` launch of ~56 µs — the size of DSpark's 15360 → 5120
 `main_proj` — and a few small kernels of upstream's drafter (`_token_request_mapping_kernel`, comparisons, a norm);
-the steps per second do not show it, so the projection most likely moved into the graph rather than being added
-(open: compare the drafter's eager part). The production start at 0.94 on production's disk tier (ready 13:20Z,
+the steps per second do not show it. The whole step says why (rank 0, median period between target decode graphs):
+11,195.5 µs on 21d93d0d, 11,186.2 on 3f1bcfd82b — on the old base that GEMV (56.8 µs) ran eagerly between the
+graphs, on the new one it is inside the drafter's graph, and the eager kernel time per step fell 543.4 → 471.9 µs.
+Moved, not added. The production start at 0.94 on production's disk tier (ready 13:20Z,
 20.9 min, the autotune cache filled by the test start) has **4.71 GiB = 3,737,321 tokens of KV, +10.5 % against the
 21d93d0d image's 3,380,873**; the service was down 12:27–12:48Z and 12:59–13:20Z (~42 min; the test server took the
 traffic in between).
@@ -1830,7 +1848,8 @@ JIT when the AOT artifact fails to load) and the rebuilt `_C.so` over
     [vllm#61647](https://github.com/vllm-project/vllm/pull/61647) — the indexer's replicated prefill rows sharded
     across the TP ranks (`SparseAttnIndexer`, the class behind `DeepseekV4Indexer`; the gate admits CUDA, TP > 1,
     no DCP/PCP, a mixed cudagraph mode other than FULL — FULL_AND_PIECEWISE passes), so the indexer's 5.2 % + top‑k
-    on long prompts divide by four; [vllm#59532](https://github.com/vllm-project/vllm/pull/59532) runs the replay
+    on long prompts divide by four (measured after the rebase: three of the eight indexer layers shard, −1.4…−3.9 %
+    at 60–250K; section "The rebase onto vLLM nightly 3f1bcfd82b"); [vllm#59532](https://github.com/vllm-project/vllm/pull/59532) runs the replay
     layers in CUDA graphs and trims in PIECEWISE graphs; [vllm#61039](https://github.com/vllm-project/vllm/pull/61039)
     length‑aware candidate blocks in the decode indexer.
   - The pattern for the all‑reduce overlap this document asks for:

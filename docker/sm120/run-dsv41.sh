@@ -71,7 +71,9 @@
 #                        switch, not a serving option, until the host side of the prefill is halved.
 #            INDEXER_TP_SHARD_MIN_ROWS ("")  the sparse indexer splits a step's prefill rows across the TP ranks
 #                        (vllm#54951) from this many rows on; "" keeps vLLM's 65,536, which a 4096-token chunk never
-#                        reaches. Images on vLLM 3f1bcfd82b+ (vllm#61647, backported by
+#                        reaches. A full chunk holds 4,092 prefill rows with DSpark (the scheduler keeps 4 draft
+#                        slots per request out of the budget), so 4096 never fires either; 2048 is the measured value.
+#                        Images on vLLM 3f1bcfd82b+ (vllm#61647, backported by
 #                        patch_vllm_indexer_shard_rows.py); goes into --attention-config with INDEXER_KV_DTYPE=mxfp4.
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
