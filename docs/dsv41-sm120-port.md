@@ -1840,6 +1840,50 @@ its bind‑mounted `~/.cache` cannot shadow it. `Dockerfile.sm120-dsv41-nightly`
 `kv_scale_placement="interleaved"` on both calls and its probe requires FlashInfer to take it (on 3f1bcfd82b both stay
 as they were). The upstream PR is prepared (internal); until it is merged the patch rides in the image like the others.
 
+## The rebase onto vLLM nightly 49cb2bbf (2026‑10‑16)
+
+`Dockerfile.sm120-dsv41-nightly` moved to `nightly-49cb2bbf` (vLLM 0.32.0rc1.dev281, 2026‑10‑16; index digest
+`a8d84c55…`), the first nightly after vllm#61371 and still the newest that evening: FlashInfer 0.7.2 (python, cubin,
+jit‑cache and the sm120f provider at one version), DeepGEMM `a7a92773` ([vllm#61744](https://github.com/vllm-project/vllm/pull/61744):
+the vllm‑project fork on torch's stable ABI, the SM100 mega‑MoE Stepfun activation; `_C_extension.abi3.so` keeps its
+name), torch 2.14 / Triton 3.8 / NCCL 2.30.7 as before. Every patcher of steps 3–16 applies unchanged (step 15, DBO,
+stays off); `patch_deepgemm.py` applies to `a7a92773` unchanged (the stable‑ABI alignment schema hunk included).
+Step 5 is new: the base writes the interleaved records, so FlashInfer is patched first (`flashinfer_interleaved/`,
+section above; its `sparse_mla_sm120` built in the image without a GPU), the nvfp4 patch passes the placement, and
+the image is labeled `com.vllm-moet.v41-kv-records=interleaved` — the build fails if the label does not match what
+the base writes — so the launcher puts the KV offload's disk tier under `…/v41-interleaved`: a block file holds the
+compressed records, the disk tier's directory name does not cover their placement, and the footer files of the
+earlier images would load as garbage.
+
+Tests (GPUs 0–3, image `-49cb2bbf-rebase`): the 27 single‑GPU in‑image tests and the 3 at TP4 pass (DeepGEMM paged
+MQA 40/40 for FP8 and MXFP4 with the production strides, the MoE alignment 64, the MXFP4 indexer, the FP4 extra
+cache 48/48 on the footer path, the interleaved test with `FLASHINFER_DISABLE_JIT=1`, i.e. on the installed
+module). vLLM's own writers against FlashInfer's (`flashinfer_interleaved/test_vllm_writers_interleaved.py`): the
+same BF16 latents through `quantize_and_insert_k_cache` (528‑byte MXFP8) and `rope_quant_insert` (288‑byte NVFP4,
+identity RoPE) give **byte‑equal records** to FlashInfer's footer writers re‑laid out, and FlashInfer's attention
+with `kv_scale_placement="interleaved"` over vLLM's caches equals its footer attention over its own, bit for bit —
+the chain from vLLM's writer to the served reader, checked.
+
+The 91 commits also bring fixes this deployment runs into: the block verification's random draws are no longer
+reused across rounds ([vllm#61161](https://github.com/vllm-project/vllm/pull/61161); DSpark verifies with
+`rejection_sample_method="block"`), the routing rows survive the decoder replay
+([vllm#61643](https://github.com/vllm-project/vllm/pull/61643)), stop‑trimmed speculative tokens are uncounted
+([vllm#58668](https://github.com/vllm-project/vllm/pull/58668)), and our vllm#61647 backport is upstream (step 16
+skips itself).
+
+The 40‑layer dummy model (`--long` positions, TP4, `INDEXER_TP_SHARD_MIN_ROWS=2048`) against the -r2 image: fresh
+prefill 60/120/250K 2,677/5,472/11,558 ms against 2,678/5,426/11,509 (noise), decode 106.9 against 106.5 tok/s, six
+concurrent prompts alike, KV 15.94M against 16.27M tokens (−2 %; the 1/5 model said −2 % at the last rebase too and
+the full model came out +10.5 %). Short requests lost ~20 ms each — 2.2K tokens 127.3 against 102.1 ms, a prefix hit
+202.4 against 179.6 — and only with the KV offload's disk tier: without offload 106.0 / 181.8 ms, with the host RAM
+tier alone 102.9 / 180.2, while -r2 has no such cost (103.4 / 180.7 without offload). The `fs` tier itself did not
+change; the offload commits in between are the tiering manager's lock and off‑thread polling
+([vllm#58168](https://github.com/vllm-project/vllm/pull/58168), which polls only the `p2p` tier), the per‑worker
+pinning ([vllm#59544](https://github.com/vllm-project/vllm/pull/59544); the served layout still registers the whole
+region), the shm split ([vllm#59546](https://github.com/vllm-project/vllm/pull/59546)) and a promotion‑latency metric.
+The fixed cost looks like one more engine‑loop round before a new request's disk‑tier lookup is consumed — open; a
+1–20 s prefill does not notice it.
+
 ## Apply / build / run
 
 ```bash

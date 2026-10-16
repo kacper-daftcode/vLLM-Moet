@@ -2,26 +2,27 @@
 #
 # The rebase of Dockerfile.sm120-dsv41 (vllm-openai:deepseekv41-flash-0909 + our patches) onto
 # vllm/vllm-openai:nightly (vLLM main; the recipe marks 0909 "superseded"). Same idea as the 0909 image: the
-# official image plus the sm_120 gaps closed, nothing else. Base since 2026-10-16: nightly 3f1bcfd82b (vLLM main
-# of 2026-10-15: torch 2.14 / triton 3.8, FlashInfer 0.7.1, DeepGEMM 6ce1c5ec, the decoder replay starting at the
-# last KV-source layer (vllm#59894), the indexer's TP row sharding (vllm#54951)). It is the last nightly before
-# vllm#61371 (f8460ef236), which interleaves each V4.1 KV record's scales with its data for FlashMLA 2026.09.30,
-# while FlashInfer's SM120 DSv4.1 reader (0.7.1 and 0.7.2) reads the footer layout (a page's data, then its
-# scales). On a later base step 5 teaches FlashInfer the interleaved placement first (flashinfer_interleaved/,
-# kv_scale_placement, its sparse_mla_sm120 module rebuilt) and the vLLM patch passes it.
+# official image plus the sm_120 gaps closed, nothing else. Base: nightly 49cb2bbf (vLLM main of 2026-10-16: torch
+# 2.14 / triton 3.8, FlashInfer 0.7.2, DeepGEMM a7a92773 on torch's stable ABI, the decoder replay starting at the
+# last KV-source layer (vllm#59894), the indexer's TP row sharding (vllm#54951)). It writes the V4.1 KV records
+# interleaved (vllm#61371, f8460ef236: each token's scales right after its data, for FlashMLA 2026.09.30), while
+# FlashInfer's SM120 DSv4.1 reader (0.7.1, 0.7.2) reads the footer layout (a page's data, then its scales): step 5
+# teaches FlashInfer the interleaved placement first (flashinfer_interleaved/, kv_scale_placement, its
+# sparse_mla_sm120 module rebuilt into data/aot) and the vLLM patch passes it. The 3f1bcfd8 images (nightly
+# 3f1bcfd82b, the last before vllm#61371, FlashInfer 0.7.1, DeepGEMM 6ce1c5ec) came from this file at c17e262.
 #
-#   1. FlashInfer 0.7.1 from the base image (python / cubin / jit-cache + every per-arch AOT provider incl. sm120f):
+#   1. FlashInfer 0.7.2 from the base image (python / cubin / jit-cache + every per-arch AOT provider incl. sm120f):
 #      runtime page-size / head / top-k dispatch for the SM120 sparse MLA (the 0909 image needed our own
 #      instantiations + dispatch hook: tools/dsv41_sm120/patch_flashinfer.py and sparse_mla_sm120_dsv41.cu -- NOT
 #      applied here) and the DSv4.1 dual cache of flashinfer-ai/flashinfer#5197 that reads the 288-B NVFP4
 #      compressed record with the 528-B V4.1 fp8 sliding-window record (`kv_cache_format="fp8_dsv41_fp4_ca"`), so
 #      the fp8_ds_mla scratch/pool of the 0909 image (nvfp4_kv/patch_vllm_packed_kv_sm120.py) is NOT applied
-#      either. Its sm_120 sparse MLA and MXFP8 GEMM sources are byte-identical to the 0.7.1rc2 that the
-#      21d93d0d images installed over the base's 0.7.0.post1 (and to the 0.7.0.dev20260922 nightly before them).
-#      FlashInfer loads its sm_120 modules AOT from the sm120f provider; only its autotuner's delay kernel
+#      either. Step 5 patches its DSv4.1 reader for the interleaved records and installs the rebuilt
+#      sparse_mla_sm120 module as data/aot/, which FlashInfer loads before the sm120f provider's copy.
+#      FlashInfer loads its other sm_120 modules AOT from the sm120f provider; only its autotuner's delay kernel
 #      (trtllm_utils, AOT for sm90 / sm100 / sm103 only) JIT-compiles while it autotunes (4 s, first start of a
 #      FlashInfer version).
-#   2. DeepGEMM at the commit vLLM vendors (vllm-project/DeepGEMM 6ce1c5ec): SM120 FP8 and MXFP4 paged MQA logits
+#   2. DeepGEMM at the commit vLLM vendors (vllm-project/DeepGEMM a7a92773): SM120 FP8 and MXFP4 paged MQA logits
 #      accept the 128-row indexer pages of the compress_ratio=1 layers - the kernels take the page size and run
 #      64-row tiles inside it, the launchers get 128 admitted and their TMA boxes / smem stages / warp groups
 #      sized by the tile - and the SM120 per-group BLOCK_M of the contiguous grouped layout is restored (the
@@ -130,7 +131,7 @@
 #      dummy-weight model (tools/dsv41_sm120/mini_model/) the split step is 2.4x slower - two microbatches are two Python
 #      forwards, ~1.2-1.5 ms of host enqueue per sublayer each, against ~1 ms of GPU work per half-chunk sublayer in the
 #      full model whose single-batch prefill already keeps the CPU 68 % busy; the step is paced by the host (port doc).
-#      Written for vLLM 21d93d0d; on 3f1bcfd82b (ubatching.py, the replay of vllm#59894 / #59532, model_state.py) its
+#      Written for vLLM 21d93d0d; on 3f1bcfd82b and 49cb2bbf (ubatching.py, the replay of vllm#59894 / #59532, model_state.py) its
 #      anchors do not fit yet, so the build-arg defaults to 0 here.
 #  16. (backport) vllm#61647: the indexer's TP row sharding (vllm#54951, in the base) engages from
 #      AttentionConfig.indexer_tp_shard_min_rows rows (patch_vllm_indexer_shard_rows.py) instead of the constant
@@ -150,26 +151,27 @@
 #  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16).
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-3f1bcfd8-<tag> .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-49cb2bbf-<tag> .
 #   The 21d93d0d images came from this file at 59a0136 (base vllm-openai:nightly-21d93d0d + FlashInfer 0.7.1rc2 installed
 #   over the base's 0.7.0.post1 + DeepGEMM e1f418c2): -pdl (steps 1-14, served since 2026-10-13 16:27Z, window 8) and
 #   -side (6aafbb6, window 9 on 2026-10-14, not kept, see the port doc). The images on vllm-openai:nightly 0961bbae with
 #   FlashInfer 0.7.0.dev20260922 came from it before that: -pdl at c066be9, -engram (steps 1-12) at f7cc6d9, and with
 #   fewer steps -bf16, -mhc, -moeqs, -ced, -kvdedup and dsv41-nightly-20260923 (git log).
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-3f1bcfd8-<tag> KV_MODE=upstream
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-49cb2bbf-<tag> KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla). A new FlashInfer
 #   version starts with an empty FlashInfer autotune cache (vLLM keys it by FlashInfer's version / arch dir): the
 #   first start autotunes again (GPU_MEM_UTIL 0.92 for that start, as for any empty autotune cache).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
-ARG BASE_IMAGE=vllm/vllm-openai:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:cb9bc64f0f038c2c2ebf13b31248fb87aca40c356c3d20f363be087cfcff1fcd
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-49cb2bbf71cfd36ee5aa33d1e184b1cddff55294@sha256:a8d84c552462d1c60da4d7fc97f8f8f48a8fbfbf6820f73477fa0efe2571bf9d
 
 # ---------------------------------------------------------------- deep_gemm
 FROM ${BASE_IMAGE} AS deepgemm-builder
 # vLLM's pin (cmake/external_projects/deepgemm.cmake / tools/install_deepgemm.sh): the vllm-project fork of
-# DeepGEMM, 6ce1c5ec (2026-10-12, upstream 2.8.1 + the SM120 port); needs the cutlass and deep_jit submodules.
+# DeepGEMM, a7a92773 (2026-10-16 via vllm#61744: upstream 2.8.1 + the SM120 port, on torch's stable ABI); needs the
+# cutlass and deep_jit submodules.
 ARG DEEPGEMM_REPO=https://github.com/vllm-project/DeepGEMM.git
-ARG DEEPGEMM_REF=6ce1c5ec6627a6bf11dbcc698b0b1e19c9248432
+ARG DEEPGEMM_REF=a7a927731b109fdfec770df7c2a5be5d7e2216b5
 # libdw-dev: deep_jit's exception.hpp includes elfutils/libdwfl.h (compile-time only; the
 # vendored _C_extension links neither libdw nor libelf).
 RUN apt-get update && apt-get install -y --no-install-recommends git libdw-dev \
@@ -220,9 +222,14 @@ RUN if [ "$VLLM_MOET_REASONING_EFFORT" = "1" ]; then python3 /opt/vllm-moet/dsv4
 # 5. nvfp4_ds_mla on sm_120 through FlashInfer's DSv4.1 dual cache + the MXFP4 indexer cache gate (header). On a
 #    vLLM that writes the V4.1 records interleaved (vllm#61371) FlashInfer first learns kv_scale_placement and its
 #    sparse_mla_sm120 module is rebuilt into data/aot (flashinfer_interleaved/, ~1 min).
+#    VLLM_MOET_V41_KV_RECORDS names the base's placement for the image label the launcher reads (the KV offload's disk
+#    tier keeps the two placements apart); the build fails if it is not what this vLLM writes.
 ARG VLLM_MOET_NVFP4_KV=1
-RUN if [ "$VLLM_MOET_NVFP4_KV" = "1" ]; then \
-      if grep -q "The V4.1 records are interleaved" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common/ops/cache_utils.py; then \
+ARG VLLM_MOET_V41_KV_RECORDS=interleaved
+RUN records=footer; grep -q "The V4.1 records are interleaved" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common/ops/cache_utils.py && records=interleaved; \
+    [ "$records" = "$VLLM_MOET_V41_KV_RECORDS" ] || { echo "VLLM_MOET_V41_KV_RECORDS=$VLLM_MOET_V41_KV_RECORDS but this vLLM writes $records V4.1 records" >&2; exit 1; }; \
+    if [ "$VLLM_MOET_NVFP4_KV" = "1" ]; then \
+      if [ "$records" = "interleaved" ]; then \
         python3 /opt/vllm-moet/dsv41_sm120/flashinfer_interleaved/patch_flashinfer_dsv41_interleaved.py --build \
         && python3 -c "import inspect; from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4 as f; from flashinfer.jit.env import get_aot_artifacts; assert 'kv_scale_placement' in inspect.signature(f).parameters; a = get_aot_artifacts('sparse_mla_sm120'); assert a and a[0].provider_id == 'flashinfer-python', a; print('flashinfer reads interleaved V4.1 rows:', a[0].path)" \
         || exit 1; \
@@ -280,7 +287,7 @@ RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41
 
 # 15. Dual-batch overlap of the prefill's TP all-reduces (header); no extension, off unless `vllm serve` gets
 #     --enable-dbo (docker/sm120/run-dsv41.sh PREFILL_DBO=1). Needs step 10's fused all-reduce. GPU test:
-#     tools/dsv41_sm120/README.md (prefill_dbo/test_prefill_dbo_tp4.py). Not ported to vLLM 3f1bcfd82b yet (header).
+#     tools/dsv41_sm120/README.md (prefill_dbo/test_prefill_dbo_tp4.py). Not ported to vLLM 3f1bcfd82b / 49cb2bbf yet (header).
 ARG VLLM_MOET_PREFILL_DBO=0
 RUN if [ "$VLLM_MOET_PREFILL_DBO" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_dbo_sm120.py \
     && python3 -c "import vllm.v1.worker.moet_prefill_dbo as d, vllm.v1.worker.gpu.ubatch_utils as u, vllm.v1.worker.gpu.dp_utils as p, vllm.models.deepseek_v41.nvidia.model_state as s; import inspect; assert hasattr(u, '_moet_dbo') and 'check_ubatch_thresholds(parallel_config, num_tokens, uniform_decode)' in inspect.getsource(p.dispatch_cg_and_sync_dp) and '_moet_num_ubatches' in inspect.getsource(s.DeepseekV41ModelState); print('prefill dbo patched')"; fi
@@ -293,7 +300,7 @@ RUN if [ "$VLLM_MOET_INDEXER_SHARD_ROWS" = "1" ]; then python3 /opt/vllm-moet/ds
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly 3f1bcfd82b (FlashInfer 0.7.1: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules) + DeepGEMM 6ce1c5ec with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647)" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly 49cb2bbf (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM a7a92773 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647)" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -308,4 +315,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.nccl-graph-records="${VLLM_MOET_NCCL_GRAPH_RECORDS}" \
       com.vllm-moet.moe-fc2-discard="${VLLM_MOET_MOE_FC2_DISCARD}" \
       com.vllm-moet.prefill-dbo="${VLLM_MOET_PREFILL_DBO}" \
-      com.vllm-moet.indexer-shard-rows="${VLLM_MOET_INDEXER_SHARD_ROWS}"
+      com.vllm-moet.indexer-shard-rows="${VLLM_MOET_INDEXER_SHARD_ROWS}" \
+      com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"

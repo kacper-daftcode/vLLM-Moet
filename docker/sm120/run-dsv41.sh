@@ -55,7 +55,9 @@
 #                        221K-token context read back from disk (virtio on this KVM host) in 1.6 s instead of
 #                        a 22 s prefill, 896 B/token on disk (-kvdedup / -ced), prefill unchanged while the
 #                        writes run. INDEXER_KV_DTYPE other than mxfp4 writes to DIR/indexer-<dtype>: vLLM's
-#                        directory name does not cover the indexer format.
+#                        directory name does not cover the indexer format; neither does it the V4.1 record
+#                        placement, so images labeled com.vllm-moet.v41-kv-records=interleaved (vLLM after
+#                        vllm#61371) write to .../v41-interleaved.
 #            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (offload_prompt_only=false), so the
 #                        next turn also hits the previous answer. The V4.1 encoder keeps earlier reasoning and
 #                        tool calls in the history when the request has tools (agents) and drops the reasoning
@@ -161,9 +163,14 @@ if [[ "$KV_OFFLOAD_GIB" != "0" ]]; then
   [[ "$KV_OFFLOAD_PROMPT_ONLY" == "0" ]] && OFFLOAD_EXTRA="\"offload_prompt_only\":false"
   # The fs tier's directory name covers the model path, TP, KV dtype and layer names but not the indexer
   # format, and a block file is read up to the block size whatever its length: files written with the other
-  # INDEXER_KV_DTYPE would load as garbage, so that format gets its own subdirectory.
+  # INDEXER_KV_DTYPE would load as garbage, so that format gets its own subdirectory. So do images whose vLLM
+  # writes the V4.1 records interleaved (vllm#61371, label com.vllm-moet.v41-kv-records): same bytes per block,
+  # another order.
   FS_ROOT="$KV_OFFLOAD_FS_DIR"
   [[ "$INDEXER_KV_DTYPE" != "mxfp4" ]] && FS_ROOT="$KV_OFFLOAD_FS_DIR/indexer-$INDEXER_KV_DTYPE"
+  if [[ "$(docker image inspect --format '{{index .Config.Labels "com.vllm-moet.v41-kv-records"}}' "$IMAGE" 2>/dev/null)" == "interleaved" ]]; then
+    FS_ROOT="$FS_ROOT/v41-interleaved"
+  fi
   [[ -n "$KV_OFFLOAD_FS_DIR" ]] && OFFLOAD_EXTRA="\"spec_name\":\"TieringOffloadingSpec\",\"secondary_tiers\":[{\"type\":\"fs\",\"root_dir\":\"$FS_ROOT\",\"n_read_threads\":16,\"n_write_threads\":16,\"locality\":\"LOCAL\"}]${OFFLOAD_EXTRA:+,$OFFLOAD_EXTRA}"
   [[ -n "$OFFLOAD_EXTRA" ]] && ARGS+=(--kv-transfer-config
     "{\"kv_connector\":\"OffloadingConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{$OFFLOAD_EXTRA}}")
