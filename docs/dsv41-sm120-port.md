@@ -1884,6 +1884,16 @@ region), the shm split ([vllm#59546](https://github.com/vllm-project/vllm/pull/5
 The fixed cost looks like one more engine‑loop round before a new request's disk‑tier lookup is consumed — open; a
 1–20 s prefill does not notice it.
 
+Served since window 12 (2026‑10‑16, image `-49cb2bbf-r1` from 206c353), against window 11's -r2 with the same
+`INDEXER_TP_SHARD_MIN_ROWS=2048`: the outputs are identical — agreement 24/24, raw 128‑token texts 12/12, needle 6/6
+with the same answers, GSM8K‑200 193 = 193 with no flip — so the new base changes no number on the served path;
+fresh prefill 19K 1.00–1.03 → 1.00–1.01 s, 163K 8.60–8.61 → 8.50–8.51 s, 391K 21.62–21.78 → 21.39–21.47 s (−1.2 %);
+decode graph 9,455.7 → 9,457.8 µs, C1 steps per second +0.3 / 0.0 %, C8 −1.3 / −1.9 % inside the waves' ranges; KV
+at 0.92 2,229,898 → 2,213,707 tokens (−0.7 %); stress 8×122K without errors (49.1 → 48.8 s), the offload probe's GPU
+hit 0.50 → 0.38 s. The first start of FlashInfer 0.7.2 autotunes (22.2 min to ready at 0.92). The disk tier of these
+images is `/mnt/k3x/kvcache/v41-interleaved`; the footer files above it age out under the TTL cron (or serve a
+rollback to -r2).
+
 ## Apply / build / run
 
 ```bash

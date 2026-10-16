@@ -39,7 +39,8 @@ Everything below the model weights is produced by the two Dockerfiles from publi
 |---|---|---|
 | base image, DeepSeek (served 2026-09-23 .. 10-13) | Docker Hub `vllm/vllm-openai:nightly@sha256:42090442…` (vLLM main 0961bbae, torch 2.13+cu130) + FlashInfer nightly wheels `0.7.0.dev20260922` (`flashinfer.ai/whl/nightly`) + `vllm-project/DeepGEMM` e1f418c2 | digest / version pins in `Dockerfile.sm120-dsv41-nightly` at f7cc6d9 |
 | base image, DeepSeek (served 2026-10-13 .. 10-16) | Docker Hub `vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` (vLLM main 21d93d0d = 0.30.1rc1.dev709, the same torch 2.13+cu130 build) + FlashInfer `0.7.1rc2` (python, cubin, jit-cache shim and the `sm120f` AOT provider from `flashinfer.ai/whl`, sha256-pinned) + `vllm-project/DeepGEMM` e1f418c2 | digest / version / hash pins in `Dockerfile.sm120-dsv41-nightly` at 59a0136 |
-| base image, DeepSeek (served since 2026-10-16) | Docker Hub `vllm/vllm-openai:nightly-3f1bcfd82b…@sha256:cb9bc64f…` (vLLM main 3f1bcfd82b = 0.32.0rc1.dev190, torch 2.14+cu130, FlashInfer 0.7.1 with all its AOT providers) + `vllm-project/DeepGEMM` 6ce1c5ec; the last nightly before vllm#61371, whose interleaved V4.1 KV records FlashInfer's SM120 reader does not read (on a later base step 5 patches the reader: `tools/dsv41_sm120/flashinfer_interleaved/`) | digest / commit pins in `Dockerfile.sm120-dsv41-nightly` |
+| base image, DeepSeek (served 2026-10-16, windows 10-11) | Docker Hub `vllm/vllm-openai:nightly-3f1bcfd82b…@sha256:cb9bc64f…` (vLLM main 3f1bcfd82b = 0.32.0rc1.dev190, torch 2.14+cu130, FlashInfer 0.7.1 with all its AOT providers) + `vllm-project/DeepGEMM` 6ce1c5ec; the last nightly before vllm#61371, whose interleaved V4.1 KV records FlashInfer's SM120 reader does not read (on a later base step 5 patches the reader: `tools/dsv41_sm120/flashinfer_interleaved/`) | digest / commit pins in `Dockerfile.sm120-dsv41-nightly` |
+| base image, DeepSeek (served since 2026-10-16, window 12) | Docker Hub `vllm/vllm-openai:nightly-49cb2bbf…@sha256:a8d84c55…` (vLLM main 49cb2bbf = 0.32.0rc1.dev281, torch 2.14+cu130, FlashInfer 0.7.2 with all its AOT providers; its SM120 DSv4.1 reader patched for the interleaved V4.1 records vLLM writes since vllm#61371, `tools/dsv41_sm120/flashinfer_interleaved/`) + `vllm-project/DeepGEMM` a7a92773 | digest / commit pins in `Dockerfile.sm120-dsv41-nightly` |
 | base image, DeepSeek (0909, rollback) | Docker Hub `vllm/vllm-openai:deepseekv41-flash-0909` (vLLM 0.30, FlashInfer 0.6.18, vendored DeepGEMM, nvcc 13.0, torch 2.13) | the vLLM recipe's NVIDIA tag |
 | base image, Qwen | Docker Hub `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` (= the `qwen38-flash-next` nightly, v0.1.dev20073+g8e685d198) | digest |
 | DeepGEMM source (rebuilt inside the DeepSeek image with three host-side asserts relaxed) | `github.com/deepseek-ai/DeepGEMM` | commit `8b1392b978f5a03c828dd1711090d7fb50958b8a` |
@@ -88,11 +89,15 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm
 # 0.7.1rc2 with its sm120f AOT modules ("The rebase onto vLLM nightly 21d93d0d"); steps 7 and 9 are vLLM's own there.
 # Built from this file at 59a0136 or before (its base, FlashInfer and DeepGEMM pins); -side (6aafbb6) ran window 9.
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .   # ~15 min
-# DeepSeek, served image since 2026-10-16 (window 10; commit 4e73df6): the same patches on vLLM nightly 3f1bcfd82b (torch 2.14,
+# DeepSeek, served 2026-10-16 (windows 10-11; commit 4e73df6): the same patches on vLLM nightly 3f1bcfd82b (torch 2.14,
 # FlashInfer 0.7.1 from the base, DeepGEMM 6ce1c5ec), the DSpark drafter's mHC side stream (step 10;
 # --build-arg VLLM_MOET_DSPARK_MHC_STREAM=0 leaves it out), the opt-in side-stream FC2 discard (step 14), the indexer
 # row-sharding threshold (step 16); the prefill DBO (step 15) does not fit this base ("The rebase onto vLLM nightly 3f1bcfd82b")
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-3f1bcfd8-r2 .   # ~10 min
+# DeepSeek, served image since 2026-10-16 21:35Z (window 12; commit 206c353): the same patches on vLLM nightly 49cb2bbf
+# (FlashInfer 0.7.2 taught the interleaved V4.1 records in step 5, DeepGEMM a7a92773 on the stable ABI); the image label
+# com.vllm-moet.v41-kv-records=interleaved sends the launcher's disk tier to $KV_OFFLOAD_FS_DIR/v41-interleaved
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-49cb2bbf-r1 .   # ~10 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
