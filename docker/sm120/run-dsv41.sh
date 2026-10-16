@@ -69,6 +69,10 @@
 #                        2.4x SLOWER on the 1/5-scale dummy-weight model (two Python forwards per chunk pace the GPU;
 #                        docs/dsv41-sm120-port.md "Dual-batch overlap of the prefill all-reduces") - an experiment
 #                        switch, not a serving option, until the host side of the prefill is halved.
+#            INDEXER_TP_SHARD_MIN_ROWS ("")  the sparse indexer splits a step's prefill rows across the TP ranks
+#                        (vllm#54951) from this many rows on; "" keeps vLLM's 65,536, which a 4096-token chunk never
+#                        reaches. Images on vLLM 3f1bcfd82b+ (vllm#61647, backported by
+#                        patch_vllm_indexer_shard_rows.py); goes into --attention-config with INDEXER_KV_DTYPE=mxfp4.
 #            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
@@ -113,6 +117,7 @@ INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
 KV_RECORD="${KV_RECORD:-nvfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
 PREFILL_DBO="${PREFILL_DBO:-0}"
+INDEXER_TP_SHARD_MIN_ROWS="${INDEXER_TP_SHARD_MIN_ROWS:-}"
 DBO_PREFILL_THRESHOLD="${DBO_PREFILL_THRESHOLD:-1024}"
 DBO_DECODE_THRESHOLD="${DBO_DECODE_THRESHOLD:-4096}"
 KV_OFFLOAD_GIB="${KV_OFFLOAD_GIB:-0}"
@@ -183,11 +188,19 @@ case "$KV_MODE" in
     esac ;;
   *) echo "KV_MODE must be auto, moet or upstream, got $KV_MODE" >&2; exit 1 ;;
 esac
+ATTN_CONFIG=()
 case "$INDEXER_KV_DTYPE" in
   fp8) ;;
-  mxfp4) ARGS+=(--attention-config "{\"indexer_kv_dtype\":\"mxfp4\"}") ;;
+  mxfp4) ATTN_CONFIG+=("\"indexer_kv_dtype\":\"mxfp4\"") ;;
   *) echo "INDEXER_KV_DTYPE must be fp8 or mxfp4, got $INDEXER_KV_DTYPE" >&2; exit 1 ;;
 esac
+if [[ -n "$INDEXER_TP_SHARD_MIN_ROWS" ]]; then
+  [[ "$INDEXER_TP_SHARD_MIN_ROWS" =~ ^[1-9][0-9]*$ ]] || { echo "INDEXER_TP_SHARD_MIN_ROWS must be a positive integer, got $INDEXER_TP_SHARD_MIN_ROWS" >&2; exit 1; }
+  ATTN_CONFIG+=("\"indexer_tp_shard_min_rows\":$INDEXER_TP_SHARD_MIN_ROWS")
+fi
+if (( ${#ATTN_CONFIG[@]} )); then
+  ARGS+=(--attention-config "{$(IFS=,; echo "${ATTN_CONFIG[*]}")}")
+fi
 MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$CACHE_DIR/deep_gemm:/root/.deep_gemm")
 if [[ "$KV_OFFLOAD_GIB" != "0" && -n "$KV_OFFLOAD_FS_DIR" ]]; then
   mkdir -p "$KV_OFFLOAD_FS_DIR"

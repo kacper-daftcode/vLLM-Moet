@@ -190,6 +190,24 @@ FP8_SIG_NEW = (
     ") -> tuple[torch.Tensor, torch.Tensor]:\n"
     f"    # {MARKER}: m_indices (DeepGEMM grouped layout, -1 = padding row) skips padding rows\n"
 )
+# vLLM main since 2026-10 (DeepGEMM's prefix-sum layout on SM90 / SM100): keyword-only expert_ends /
+# expert_alignment and an EXPERT_ALIGNMENT constexpr. sm_120 keeps the contiguous layout (-1 rows).
+FP8_SIG_OLD_PSUM = (
+    "    beta: float = 0.0,\n"
+    "    *,\n"
+    "    expert_ends: torch.Tensor | None = None,\n"
+    "    expert_alignment: int = 0,\n"
+    ") -> tuple[torch.Tensor, torch.Tensor]:\n"
+)
+FP8_SIG_NEW_PSUM = (
+    "    beta: float = 0.0,\n"
+    "    *,\n"
+    "    expert_ends: torch.Tensor | None = None,\n"
+    "    expert_alignment: int = 0,\n"
+    f"    # {MARKER}: m_indices (DeepGEMM contiguous layout, -1 = padding row) skips padding rows\n"
+    "    m_indices: torch.Tensor | None = None,\n"
+    ") -> tuple[torch.Tensor, torch.Tensor]:\n"
+)
 FP8_KSIG_OLD = (
     "    BLOCK_M: tl.constexpr,\n"
     "    HAS_CLAMP: tl.constexpr,\n"
@@ -200,6 +218,24 @@ FP8_KSIG_OLD = (
 FP8_KSIG_NEW = (
     "    BLOCK_M: tl.constexpr,\n"
     "    HAS_CLAMP: tl.constexpr,\n"
+    "    m_indices_ptr,\n"
+    "    HAS_M_INDICES: tl.constexpr,\n"
+    "):\n"
+    "    GROUPS_PER_PACK: tl.constexpr = 4\n"
+    "    hidden_size: tl.constexpr = N // 2\n"
+)
+FP8_KSIG_OLD_PSUM = (
+    "    BLOCK_M: tl.constexpr,\n"
+    "    HAS_CLAMP: tl.constexpr,\n"
+    "    EXPERT_ALIGNMENT: tl.constexpr,\n"
+    "):\n"
+    "    GROUPS_PER_PACK: tl.constexpr = 4\n"
+    "    hidden_size: tl.constexpr = N // 2\n"
+)
+FP8_KSIG_NEW_PSUM = (
+    "    BLOCK_M: tl.constexpr,\n"
+    "    HAS_CLAMP: tl.constexpr,\n"
+    "    EXPERT_ALIGNMENT: tl.constexpr,\n"
     "    m_indices_ptr,\n"
     "    HAS_M_INDICES: tl.constexpr,\n"
     "):\n"
@@ -239,6 +275,43 @@ FP8_LAUNCH_NEW = (
     "    )\n"
     "\n"
     "    return output_q, output_scale_packed\n"
+)
+FP8_LAUNCH_OLD_PSUM = (
+    "        BLOCK_M=BM,\n"
+    "        HAS_CLAMP=has_clamp,\n"
+    "        EXPERT_ALIGNMENT=expert_alignment,\n"
+    "        num_warps=num_warps,\n"
+    "        num_stages=num_stages,\n"
+    "    )\n"
+    "\n"
+    "    return output_q, output_scale_packed\n"
+)
+FP8_LAUNCH_NEW_PSUM = (
+    "        BLOCK_M=BM,\n"
+    "        HAS_CLAMP=has_clamp,\n"
+    "        EXPERT_ALIGNMENT=expert_alignment,\n"
+    "        m_indices_ptr=m_indices if m_indices is not None else input,\n"
+    "        HAS_M_INDICES=m_indices is not None,\n"
+    "        num_warps=num_warps,\n"
+    "        num_stages=num_stages,\n"
+    "    )\n"
+    "\n"
+    "    return output_q, output_scale_packed\n"
+)
+FP8_GRID_OLD_PSUM = (
+    "    else:\n"
+    "        assert expert_alignment == 0\n"
+    "\n"
+    "    has_clamp = clamp_limit is not None\n"
+    "    _silu_mul_quant_fp8_packed_kernel[grid](\n"
+)
+FP8_GRID_NEW_PSUM = (
+    "    else:\n"
+    "        assert expert_alignment == 0\n"
+    "    assert m_indices is None or expert_ends is None, \"one padding layout at a time\"\n"
+    "\n"
+    "    has_clamp = clamp_limit is not None\n"
+    "    _silu_mul_quant_fp8_packed_kernel[grid](\n"
 )
 
 # --- experts/deep_gemm_moe.py (FP4 experts): hand m_indices to the activation kernel ----------
@@ -319,6 +392,10 @@ def apply(src: str) -> str:  # deep_gemm_utils.py
 
 
 def apply_fp8_utils(src: str) -> str:
+    if "EXPERT_ALIGNMENT: tl.constexpr" in src:  # vLLM main with the prefix-sum layout
+        return _apply(src, ((FP8_SIG_OLD_PSUM, FP8_SIG_NEW_PSUM), (FP8_KSIG_OLD_PSUM, FP8_KSIG_NEW_PSUM),
+                            (FP8_MASK_OLD, FP8_MASK_NEW), (FP8_GRID_OLD_PSUM, FP8_GRID_NEW_PSUM),
+                            (FP8_LAUNCH_OLD_PSUM, FP8_LAUNCH_NEW_PSUM)))
     return _apply(src, ((FP8_SIG_OLD, FP8_SIG_NEW), (FP8_KSIG_OLD, FP8_KSIG_NEW), (FP8_MASK_OLD, FP8_MASK_NEW),
                         (FP8_LAUNCH_OLD, FP8_LAUNCH_NEW)))
 

@@ -99,7 +99,10 @@ def with_replicas(kv: KVCacheConfig, tp: int) -> KVCacheConfig:
     """kv_tp_replicas as get_kv_cache_configs sets it for this TP size."""
     if not HAS_TP_REPLICAS:
         return kv
-    from vllm.v1.core.kv_cache_utils import kv_cache_groups_tp_replicas
+    try:
+        from vllm.v1.core.kv_cache_planning import kv_cache_groups_tp_replicas
+    except ImportError:  # vLLM before the kv_cache_planning split
+        from vllm.v1.core.kv_cache_utils import kv_cache_groups_tp_replicas
 
     return replace(kv, kv_tp_replicas=kv_cache_groups_tp_replicas(kv.kv_cache_groups, tp))
 

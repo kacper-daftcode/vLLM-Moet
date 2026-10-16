@@ -81,6 +81,10 @@ ATTENTION: list[tuple[str, str]] = [
     (
         "def _use_v41_mxfp8_kv_record() -> bool:\n"
         "    return current_platform.is_device_capability_family(100)\n",
+        "def _use_v41_mxfp8_kv_record() -> bool:\n"
+        "    return current_platform.is_device_capability_family(100)\n"
+        "\n"
+        "\n"
         "# [vllm-moet] sm_120 takes the V4.1 records for nvfp4_ds_mla when FlashInfer's\n"
         "# DSv4.1 dual-cache sparse MLA (flashinfer#5197) reads them; fp8_ds_mla keeps V4.\n"
         "def _use_v41_kv_records(kv_cache_dtype: CacheDType | None) -> bool:\n"
@@ -261,11 +265,29 @@ def patched_text(path: Path, edits: list[tuple[str, str]]) -> str | None:
     return s
 
 
+INTERLEAVED_V41_MARKERS = (
+    "The V4.1 records are interleaved",
+    "pos_in_block * (head_dim + scale_dim)",
+)
+
+
+def writes_interleaved_v41_records(vllm_dir: Path) -> bool:
+    """vLLM after vllm#61371 (FlashMLA 2026.09.30) writes each V4.1 token's scales right after its data;
+    FlashInfer's SM120 DSv4.1 reader (0.7.1 / 0.7.2) reads the footer layout (a page's data, then its scales)."""
+    cache_utils = vllm_dir / "models/deepseek_v41/common/ops/cache_utils.py"
+    return cache_utils.exists() and any(m in cache_utils.read_text() for m in INTERLEAVED_V41_MARKERS)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--vllm-dir", type=Path, default=DEFAULT_VLLM)
     ap.add_argument("--check", action="store_true", help="verify anchors, write nothing")
     args = ap.parse_args()
+    if writes_interleaved_v41_records(args.vllm_dir):
+        print("this vLLM writes the V4.1 KV records interleaved (vllm#61371) while FlashInfer's SM120 sparse MLA "
+              "reads the footer layout: nvfp4_ds_mla on sm_120 would decode garbage - nothing written",
+              file=sys.stderr)
+        return 1
     # All three files or none: a half-applied patch would leave e.g. the capability probe without its users.
     out = {}
     for rel, edits in FILES.items():

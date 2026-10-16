@@ -164,6 +164,21 @@ GATE_CUBLAS_NEW = (
     "        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:\n"
     '            output = _moet_bf16_mm(x, self.weight, True, "router")\n'
 )
+# vLLM main since 2026-10 (tier 6): a gfx950 branch in front of the cuBLAS call.
+GATE_CUBLAS_OLD_GFX950 = (
+    "        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:\n"
+    "            if self.is_gfx950:\n"
+    "                output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight, False)\n"
+    "            else:\n"
+    "                output = torch.mm(x, self.weight.T, out_dtype=torch.float32)\n"
+)
+GATE_CUBLAS_NEW_GFX950 = (
+    "        if self.allow_cublas_router_gemm and x.dtype == torch.bfloat16:\n"
+    "            if self.is_gfx950:\n"
+    "                output = torch.ops.vllm.fp32_router_gemm_dispatch(x, self.weight, False)\n"
+    "            else:\n"
+    '                output = _moet_bf16_mm(x, self.weight, True, "router")\n'
+)
 
 
 def _replace(src: str, old: str, new: str, name: str) -> str:
@@ -192,6 +207,8 @@ def patch_gate(src: str, kernel_dir: str) -> str:
         return src
     helper = HELPER.replace("{marker}", MARKER).replace("{kernel_dir}", kernel_dir)
     out = _replace(src, GATE_ANCHOR_HELPER, GATE_ANCHOR_HELPER + helper, "gate_linear helper")
+    if GATE_CUBLAS_OLD_GFX950 in out:
+        return _replace(out, GATE_CUBLAS_OLD_GFX950, GATE_CUBLAS_NEW_GFX950, "GateLinear cuBLAS tier")
     return _replace(out, GATE_CUBLAS_OLD, GATE_CUBLAS_NEW, "GateLinear cuBLAS tier")
 
 
@@ -202,6 +219,8 @@ def main() -> int:
     ap.add_argument("--kernel-dir", default=DEFAULT_KERNEL_DIR)
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
+    # all-or-nothing: both files are patched in memory before either is written
+    todo = []
     for path, fn in ((args.attention_file, patch_attention), (args.gate_file, patch_gate)):
         src = path.read_text()
         if MARKER in src:
@@ -209,6 +228,8 @@ def main() -> int:
             continue
         patched = fn(src, args.kernel_dir)
         compile(patched, str(path), "exec")
+        todo.append((path, patched))
+    for path, patched in todo:
         if args.check:
             print(f"{path}: patch applies cleanly (not written)")
             continue
