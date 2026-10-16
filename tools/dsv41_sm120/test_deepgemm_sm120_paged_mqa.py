@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import itertools
 import sys
 import time
@@ -178,6 +179,14 @@ def _finish(res: dict, out_by_pbs: dict) -> dict:
     return res
 
 
+def paged_logits_kwargs(dg, **kw) -> dict:
+    """DeepGEMM 2.8.1 (6ce1c5ec) dropped clean_logits / logits_dtype (fp32 logits on sm_120); keep what the API takes."""
+    params = inspect.signature(dg.fp8_fp4_paged_mqa_logits).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
+
+
 def run_case(dg, dgm, fmt: str, bsz: int, next_n: int, avg_kv: int, device, packed: bool) -> dict:
     torch.manual_seed(7)
     heads, dim = HEADS, DIM
@@ -204,8 +213,9 @@ def run_case(dg, dgm, fmt: str, bsz: int, next_n: int, avg_kv: int, device, pack
             kv_in = repack_strided(kv_in, fmt, block_kv)
         sim_logits = ref_paged_mqa_logits(q_sim, kv_sim, weights, context_lens, block_table, max_model_len, True)
         meta = dg.get_paged_mqa_logits_metadata(ctx2d, block_kv, dg.get_num_sms())
-        kw = dict(q=q_in, kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=block_table,
-                  schedule_meta=meta, max_context_len=max_model_len, clean_logits=False, logits_dtype=torch.float)
+        kw = paged_logits_kwargs(dg, q=q_in, kv_cache=kv_in, weights=weights, context_lens=ctx2d,
+                                 block_table=block_table, schedule_meta=meta, max_context_len=max_model_len,
+                                 clean_logits=False, logits_dtype=torch.float)
         logits = dg.fp8_fp4_paged_mqa_logits(**kw)
         torch.cuda.synchronize()
         again = dg.fp8_fp4_paged_mqa_logits(**kw)
@@ -254,9 +264,9 @@ def run_case_varlen(dg, dgm, fmt: str, bsz: int, max_tokens_per_seq: int, avg_kv
         row_block_table = block_table[indices.long()].contiguous()  # one block-table row per query row
         sim_logits = ref_paged_mqa_logits(q_sim, kv_sim, weights, ctx_rows, row_block_table, max_model_len, True)
         meta = dg.get_paged_mqa_logits_metadata(ctx2d, block_kv, dg.get_num_sms(), indices=indices)
-        kw = dict(q=q_in, kv_cache=kv_in, weights=weights, context_lens=ctx2d, block_table=row_block_table,
-                  schedule_meta=meta, max_context_len=max_model_len, clean_logits=False, logits_dtype=torch.float,
-                  indices=indices)
+        kw = paged_logits_kwargs(dg, q=q_in, kv_cache=kv_in, weights=weights, context_lens=ctx2d,
+                                 block_table=row_block_table, schedule_meta=meta, max_context_len=max_model_len,
+                                 clean_logits=False, logits_dtype=torch.float, indices=indices)
         logits = dg.fp8_fp4_paged_mqa_logits(**kw)
         torch.cuda.synchronize()
         again = dg.fp8_fp4_paged_mqa_logits(**kw)

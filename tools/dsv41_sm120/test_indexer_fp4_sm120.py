@@ -31,10 +31,19 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import inspect
 import math
 import sys
 
 import torch
+
+
+def paged_logits_kwargs(dg, **kw) -> dict:
+    """DeepGEMM 2.8.1 (6ce1c5ec) dropped clean_logits / logits_dtype (fp32 logits on sm_120); keep what the API takes."""
+    params = inspect.signature(dg.fp8_fp4_paged_mqa_logits).parameters
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        return kw
+    return {k: v for k, v in kw.items() if k in params}
 
 E2M1_VALUES = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 E2M1_MIDPOINTS = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0])
@@ -274,10 +283,10 @@ def main() -> int:
         ctx2d = torch.full((1, next_n), ctx, device=dev, dtype=torch.int32)
         kv_view = torch.as_strided(k_cache, size=(num_pages, page, 1, row_bytes), stride=(page * row_bytes, row_bytes, row_bytes, 1))
         meta = dg.get_paged_mqa_logits_metadata(ctx2d, page, dg.get_num_sms())
-        logits = dg.fp8_fp4_paged_mqa_logits(
-            q=(q_rows.view(torch.int8).view(1, next_n, H, 64), q_sf_rows), kv_cache=kv_view, weights=w_rows,
+        logits = dg.fp8_fp4_paged_mqa_logits(**paged_logits_kwargs(
+            dg, q=(q_rows.view(torch.int8).view(1, next_n, H, 64), q_sf_rows), kv_cache=kv_view, weights=w_rows,
             context_lens=ctx2d, block_table=block_table, schedule_meta=meta,
-            max_context_len=num_pages * page, clean_logits=False, logits_dtype=torch.float)
+            max_context_len=num_pages * page, clean_logits=False, logits_dtype=torch.float))
         torch.cuda.synchronize()
         got = logits[:, :ctx]
         # dequantized reference (what the kernel should compute exactly, up to fp32 summation order)
@@ -312,10 +321,10 @@ def main() -> int:
         cache64[perm64, 64 * 64:] = pads.view(n_full, 64 * 4)
         kv64 = torch.as_strided(cache64, size=(pages64, 64, 1, row_bytes), stride=(64 * row_bytes, row_bytes, row_bytes, 1))
         meta64 = dg.get_paged_mqa_logits_metadata(ctx2d, 64, dg.get_num_sms())
-        logits64 = dg.fp8_fp4_paged_mqa_logits(
-            q=(q_rows.view(torch.int8).view(1, next_n, H, 64), q_sf_rows), kv_cache=kv64, weights=w_rows,
+        logits64 = dg.fp8_fp4_paged_mqa_logits(**paged_logits_kwargs(
+            dg, q=(q_rows.view(torch.int8).view(1, next_n, H, 64), q_sf_rows), kv_cache=kv64, weights=w_rows,
             context_lens=ctx2d, block_table=perm64.to(torch.int32).view(1, -1).contiguous(), schedule_meta=meta64,
-            max_context_len=pages64 * 64, clean_logits=False, logits_dtype=torch.float)
+            max_context_len=pages64 * 64, clean_logits=False, logits_dtype=torch.float))
         torch.cuda.synchronize()
         parity = torch.equal(logits64[:, :ctx], got)
         all_ok &= parity
