@@ -1626,10 +1626,10 @@ Triton GEMM); what does not work is paying for two Python forwards. Options, by 
 - *Sequence‑parallel boundary without expert parallelism*: reduce‑scatter the sublayer output, run the mHC
   post + pre, the norm, the Engram injection (and the router) on this rank's quarter of the tokens, all‑gather what
   the next sublayer needs. Same bytes on the ring (RS + AG = AR), one more collective per boundary, no extra Python
-  per token, bit‑identical per token; the boundary's 17 % of the prefill (mHC 9.2 %, elementwise 8.3 %) divides by
-  four: ≈ −7…9 %. Gathering the *MXFP8‑quantized* input the big GEMMs take anyway instead of bf16 halves the
-  all‑gather (the small bf16 consumers — the router, the indexer's `weights_proj` — run on the shard and gather their
-  outputs): ≈ −15 % in total, still bit‑identical. Weeks of model‑side work, a window per step.
+  per token; the boundary's 17 % of the prefill (mHC 9.2 %, elementwise 8.3 %) divides by four: ≈ −7…9 % estimated.
+  Measured on 4 ranks the next day (section "A sequence‑parallel mHC boundary, measured" below): ≈ −0.2 ms per
+  full‑chunk boundary, about −5 % of the prefill, and not bit‑identical (NCCL's reduce‑scatter sums in another order
+  than its all‑reduce); the MXFP8 all‑gather is not one tensor here (three consumer formats).
 - *CUDA graphs for the half‑chunk segments*: replaying graphs removes the Python per microbatch and makes DBO's
   −25 % reachable, but the breakable graphs need the all‑reduce as a break point, the replay batches have dynamic
   shapes, and the graph pools cost activation memory the KV pool pays for.
@@ -1640,6 +1640,112 @@ Triton GEMM); what does not work is paying for two Python forwards. Options, by 
   behind another user's prefill.
 - *FP8 all‑reduce*: half the bytes, but a ring cannot sum rows that carry different scales per rank; the honest
   form is the FP8 all‑gather of the SP boundary above.
+
+## The rebase onto vLLM nightly 3f1bcfd82b (2026‑10‑16)
+
+`Dockerfile.sm120-dsv41-nightly` moved from `nightly-21d93d0d` to `nightly-3f1bcfd82b` (vLLM 0.32.0rc1.dev190,
+2026‑10‑15; index digest `cb9bc64f…`): torch 2.14.0 / Triton 3.8.0 (CUDA 13.0, NCCL 2.30.7, cutlass‑dsl 4.8.0 and
+TileLang 0.1.12 unchanged), FlashInfer 0.7.1 in the base, DeepGEMM `6ce1c5ec` (2.8.1 + the fork's SM120 port), and
+for the prefill [vllm#59894](https://github.com/vllm-project/vllm/pull/59894) (the replay starts at the last
+KV‑source layer, which writes every row's KV and runs the rest of itself on the replay rows),
+[vllm#59532](https://github.com/vllm-project/vllm/pull/59532) (the replay layers in breakable CUDA graphs) and
+[vllm#54951](https://github.com/vllm-project/vllm/pull/54951) (the indexer's prefill rows sharded across the TP
+ranks). Image tag `dsv41-nightly-3f1bcfd8-r2`.
+
+**Why not the newest nightly.** vLLM main after f8460ef236 ([vllm#61371](https://github.com/vllm-project/vllm/pull/61371),
+FlashMLA 2026.09.30) interleaves the V4.1 KV records: each token's 16 (528‑B fp8 SWA record) or 32 (288‑B NVFP4
+compressed record) scale bytes now follow its own data, in the compiled insert kernel
+(`fused_deepseek_v4_qnorm_rope_kv_insert`) and in the Triton compressor writers. FlashInfer's SM120 DSv4.1 reader —
+0.7.1 and 0.7.2 alike, its `sparse` and `cake` backends — reads the footer layout (a page's data, then its scales).
+Upstream never runs the V4.1 records on SM120 (`_use_v41_mxfp8_kv_record` is SM100 only); our `nvfp4_ds_mla` does, and
+on such a vLLM it would decode garbage. 3f1bcfd82b is the last nightly before it; the nvfp4 patcher now refuses a
+vLLM that writes the interleaved records, and it keeps upstream's `_use_v41_mxfp8_kv_record` next to its own decision
+(the later base calls it from the indexer cache's block‑stride alignment). A later rebase needs either a FlashInfer
+that reads the interleaved records or our own writers in the footer layout.
+
+What changed on our side:
+
+- *FlashInfer*: the base's 0.7.1 (python, cubin, jit‑cache and all six per‑arch AOT providers, `sm120f` with 562
+  modules) replaces the 0.7.1rc2 the 21d93d0d images installed; `mla/_sparse_mla_sm120`, the
+  `sparse_mla_sm120` headers and sources, the SM120 MXFP8 CUTLASS GEMM and `jit/mla.py` are byte‑identical to rc2.
+  Step 2 is a check now.
+- *DeepGEMM 6ce1c5ec*: the SM120 FP8 / MXFP4 paged MQA kernels take the page size (`PAGE_KV` 32…256) and run
+  `BLOCK_KV = min(PAGE_KV, 64)` tiles inside a page, but the launchers still admit 32 / 64 only and size the TMA
+  boxes, the shared‑memory stages and the warp groups with the page. `patch_deepgemm.py` admits the 128‑row indexer
+  page and sizes those with the tile (the metadata kernel splits by `SPLIT_KV = 128` and needs nothing), and puts the
+  SM120 per‑group BLOCK_M back into the alignment op, whose registration is a TORCH_LIBRARY schema now. vLLM's MoE
+  caller swallows every exception there, so without it the two‑argument call would silently pad every routed
+  expert to 128 rows again. The extension is `_C_extension.abi3.so` (47 s).
+- *Ports*: the MoE glue's activation skip (upstream added a prefix‑sum `expert_ends` path for SM90 / SM100; sm_120
+  keeps the contiguous layout with −1 rows), the BF16 router GEMM (`GateLinear`'s cuBLAS tier is tier 6 behind a
+  gfx950 branch; the patcher is now all‑or‑nothing), the offload test (`kv_cache_groups_tp_replicas` moved to
+  `kv_cache_planning`), the extensions build as C++20 (torch 2.14's headers refuse C++17), and the tests follow
+  DeepGEMM 2.8.1's `fp8_fp4_paged_mqa_logits` (no `clean_logits` / `logits_dtype`; fp32 logits on sm_120).
+- Unchanged and still on the path sm_120 takes: the GEMV / `wo_a` (`prioritize_humming` only moves Humming ahead of
+  Marlin), mHC (`mhc.py` unchanged; the new `write_kv` all‑reduces in eager steps), the drafter's stream, Engram's
+  `wkv` (the `EngramBatch` of [vllm#59923](https://github.com/vllm-project/vllm/pull/59923) is DP‑only), NCCL
+  records (the replay graphs use `BreakableCUDAGraphWrapper`), FC2 discard, quant+scatter, effort, offload dedup.
+- Step 15 (prefill DBO) does not fit 3f1bcfd82b and defaults to off. Step 16 backports
+  [vllm#61647](https://github.com/vllm-project/vllm/pull/61647): the indexer's TP row sharding of the base engages
+  from `16,384 × TP` = 65,536 prefill rows in a step, which a 4096‑token chunk never reaches, so it is dead code here
+  until the threshold (`AttentionConfig.indexer_tp_shard_min_rows`, launcher `INDEXER_TP_SHARD_MIN_ROWS`) is lowered.
+- The replay graphs of vllm#59532 do not engage either: with `--max-cudagraph-capture-size 64` their default capture
+  list is [64] and a replay batch holds ≥ 128 rows.
+
+Tests (RTX PRO 6000, GPUs 0–3 free since qwen38 was stopped): 27 single‑GPU in‑image tests and 3 at TP4 pass as
+before; DeepGEMM's paged MQA logits 40/40 cases (FP8 and MXFP4, native next_n 1/2/6 and varlen, dense and with the
+served block strides) with 128‑row pages BIT‑EXACT to 64‑row pages, reference diff 2.4e‑6; the MXFP4 indexer end to
+end ALL OK; vLLM's MoE sizing gets alignment 64 at 1…4096 tokens × top‑6 over 384 experts. On the 1/5 model (whose
+config had to follow vllm#59894: the last KV source at compress ratio 1) against the served image, same config,
+fresh prompts: 11.4K tokens 165.7 → 152.0 ms (−8.3 %), 5.7K 89.2 → 82.5 ms (−7.5 %), 1.9K 35.0 → 36.0 ms; the
+profile run's activation peak 1.65 → 1.78 GiB (−2 % KV at that model's 0.12).
+
+**Served (window 10, 2026‑10‑16; against window 8's `w8_rebase`, the 21d93d0d image's first start).** The test start
+(`GPU_MEM_UTIL=0.92`: FlashInfer 0.7.1 is a new autotune key; a scratch disk tier) was up in 20.2 min with every
+`vllm-moet` line, and at 0.92 the full model's KV pool is **2,229,898 tokens against 1,873,450** — the opposite of
+the 1/5 model: the new base profiles a smaller activation peak for the full model. Fresh prefill **19K 1.02–1.04 →
+1.00–1.01 s, 163K 9.04–9.07 → 8.64–8.66 s (−4.5 %), 391K 24.48–24.49 → 22.59–22.61 s (−7.7 %)**: the replay that
+starts at layer 20 (vllm#59894) is worth more the longer the prompt. Quality: arithmetic 5/5 + 5/5, coherence 0
+degenerate, greedy agreement 24/24, tools / JSON / vision PASS, needle 6/6 with the same answers (29K / 106K / 367K),
+GSM8K‑200 nothink C4 195 against 194 (flips 0 + 1, McNemar p = 1), 8 × 122K fresh stress 0 errors (49.2 s), offload
+probe 4/4. The raw 128‑token completions are not the old bits (10 of 12 differ in wording; torch 2.14, cutlass‑dsl's
+recompiled quantizer, the replay from layer 20 — a rebase is gated on quality, as for 21d93d0d). Decode graph
+(rank 0, median of 10 replays; the four ranks within 2 µs): **9,467.4 → 9,457.8 µs** (attention +8, FFN −6, outside
+−9); spec_matrix one stream 87.5–89.8 / 90.0–90.2 steps/s (prose / code), eight 34.3–34.9 / 36.8–39.1, as before. The
+drafter's graph is **1,030.6 → 1,077.0 µs** although its layers now take the mHC side stream (window 9 on 21d93d0d:
+987.7): 182 kernels instead of 163, one more `mxfp8_mma_gemv_v3` launch of ~56 µs — the size of DSpark's 15360 → 5120
+`main_proj` — and a few small kernels of upstream's drafter (`_token_request_mapping_kernel`, comparisons, a norm);
+the steps per second do not show it, so the projection most likely moved into the graph rather than being added
+(open: compare the drafter's eager part).
+
+## A sequence‑parallel mHC boundary, measured (2026‑10‑16)
+
+The first step of the sequence‑parallel option above, without the model: `sp_boundary/test_sp_boundary_tp4.py` runs
+the served eager prefill boundary — the pynccl all‑reduce of the sublayer's partial output, then
+`mhc_shifted_post_pre` (TileLang post kernel, DeepGEMM TF32 pre‑norm GEMM, fused epilogue) on all T rows — against a
+sequence‑parallel one: reduce‑scatter, the same `mhc_shifted_post_pre` on this rank's T/4 rows, all‑gather of the
+next sublayer's input. 4× RTX PRO 6000 on the 3f1bcfd82b image, random partials per rank, every output compared with
+the served rows:
+
+| one boundary, T = 4096 (µs, median, max over ranks) | served | sequence parallel |
+|---|---:|---:|
+| collective(s) + mHC | 2,101.7 | 1,861.9 (vLLM's split‑k) / 1,896.7 (the full T's split‑k) |
+| the mHC alone | 529.4 (all rows) | 120.0 / 147.8 (a rank's 1,024 rows) |
+| the collectives alone (`nccl_rs_ag_bench.py`) | 1,600.8 (AR) | 1,722.7 (RS 878.0 + AG 853.1) |
+
+So −0.2 ms per boundary at a 4096‑token chunk: the mHC loses ~0.4 ms, the collectives gain ~0.12–0.17 ms. At 1,024
+tokens the sequence‑parallel boundary is slower (+24…30 µs), so it would engage from ~2,048 tokens per step. With
+42 full‑row boundaries per chunk (layers 0–20; the replay layers run on 128 rows a request) and Engram's `wkv` on a
+quarter of the rows, about −13 ms of a ~230 ms chunk: **≈ −5 % of the prefill**, not the −7…9 % estimated above.
+Gathering the next input in MXFP8 instead of bf16 would cut ~0.28 ms more per boundary (all‑gather 450.9 µs instead
+of 853.1), but the consumers take three formats — MXFP8 1×32 (the dense GEMMs), FP8 1×128 UE8M0 (the routed
+experts), bf16 (the router, the compressor's and the indexer's small GEMMs) — so only the bf16 gather is one tensor.
+
+Bits: NCCL's reduce‑scatter sums in another order than its all‑reduce, and 32.0 % of the reduced rows' elements
+differ by an ulp or two (the same effect as the replay's row‑subset all‑reduce, above). The mHC itself is per‑row
+identical on a row subset only with the full T's split‑k count (`compute_mhc_pre_num_splits` picks 4 at 4,096 tokens
+and 16 at 1,024; with vLLM's choice 98–99 % of the fp32 mixes change). A sequence‑parallel prefill is therefore a
+quality‑gated change like DBO, not a bit‑identical one.
 
 ## Apply / build / run
 

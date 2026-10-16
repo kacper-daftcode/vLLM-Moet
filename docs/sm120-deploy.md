@@ -38,7 +38,8 @@ Everything below the model weights is produced by the two Dockerfiles from publi
 | input | where it comes from | pin |
 |---|---|---|
 | base image, DeepSeek (served 2026-09-23 .. 10-13) | Docker Hub `vllm/vllm-openai:nightly@sha256:42090442…` (vLLM main 0961bbae, torch 2.13+cu130) + FlashInfer nightly wheels `0.7.0.dev20260922` (`flashinfer.ai/whl/nightly`) + `vllm-project/DeepGEMM` e1f418c2 | digest / version pins in `Dockerfile.sm120-dsv41-nightly` at f7cc6d9 |
-| base image, DeepSeek (served since 2026-10-13) | Docker Hub `vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` (vLLM main 21d93d0d = 0.30.1rc1.dev709, the same torch 2.13+cu130 build) + FlashInfer `0.7.1rc2` (python, cubin, jit-cache shim and the `sm120f` AOT provider from `flashinfer.ai/whl`, sha256-pinned) + `vllm-project/DeepGEMM` e1f418c2 | digest / version / hash pins in `Dockerfile.sm120-dsv41-nightly` |
+| base image, DeepSeek (served 2026-10-13 .. 10-16) | Docker Hub `vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` (vLLM main 21d93d0d = 0.30.1rc1.dev709, the same torch 2.13+cu130 build) + FlashInfer `0.7.1rc2` (python, cubin, jit-cache shim and the `sm120f` AOT provider from `flashinfer.ai/whl`, sha256-pinned) + `vllm-project/DeepGEMM` e1f418c2 | digest / version / hash pins in `Dockerfile.sm120-dsv41-nightly` at 59a0136 |
+| base image, DeepSeek (served since 2026-10-16) | Docker Hub `vllm/vllm-openai:nightly-3f1bcfd82b…@sha256:cb9bc64f…` (vLLM main 3f1bcfd82b = 0.32.0rc1.dev190, torch 2.14+cu130, FlashInfer 0.7.1 with all its AOT providers) + `vllm-project/DeepGEMM` 6ce1c5ec; the last nightly before vllm#61371, whose interleaved V4.1 KV records FlashInfer's SM120 reader does not read | digest / commit pins in `Dockerfile.sm120-dsv41-nightly` |
 | base image, DeepSeek (0909, rollback) | Docker Hub `vllm/vllm-openai:deepseekv41-flash-0909` (vLLM 0.30, FlashInfer 0.6.18, vendored DeepGEMM, nvcc 13.0, torch 2.13) | the vLLM recipe's NVIDIA tag |
 | base image, Qwen | Docker Hub `vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8` (= the `qwen38-flash-next` nightly, v0.1.dev20073+g8e685d198) | digest |
 | DeepGEMM source (rebuilt inside the DeepSeek image with three host-side asserts relaxed) | `github.com/deepseek-ai/DeepGEMM` | commit `8b1392b978f5a03c828dd1711090d7fb50958b8a` |
@@ -83,14 +84,15 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm
 # NCCL's per-collective graph event records reduced to one, FC2's padding rows out of L2 ("The idle GPU between the
 # decode kernels"; Dockerfile steps 13, 14)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-20260923-pdl .
-# DeepSeek, served image since 2026-10-13 (window 8; commit e4de0d9): the same patches on vLLM nightly 21d93d0d + FlashInfer
-# 0.7.1rc2 with its sm120f AOT modules ("The rebase onto vLLM nightly 21d93d0d"); steps 7 and 9 are vLLM's own there
+# DeepSeek, served 2026-10-13 .. 10-16 (window 8; commit e4de0d9): the same patches on vLLM nightly 21d93d0d + FlashInfer
+# 0.7.1rc2 with its sm120f AOT modules ("The rebase onto vLLM nightly 21d93d0d"); steps 7 and 9 are vLLM's own there.
+# Built from this file at 59a0136 or before (its base, FlashInfer and DeepGEMM pins); -side (6aafbb6) ran window 9.
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl .   # ~15 min
-# DeepSeek, this tree: + the DSpark drafter's mHC side stream (step 10; --build-arg VLLM_MOET_DSPARK_MHC_STREAM=0 leaves it
-# out) and the opt-in side-stream FC2 discard (step 14). Built from 6aafbb6 as -side for window 9 (2026-10-14), not kept:
-# drafter graph -43 us per step, but the side-stream discard +70 us and GPU KV -1.5 % ("The drafter's boundaries"); the
-# drafter's stream alone (= this tree's defaults) profiles GPU KV 3,374,600 (-0.19 %), a candidate for the next window
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-21d93d0d-side .   # ~8 min with the cached base
+# DeepSeek, served image since 2026-10-16 (window 10; commit 4e73df6): the same patches on vLLM nightly 3f1bcfd82b (torch 2.14,
+# FlashInfer 0.7.1 from the base, DeepGEMM 6ce1c5ec), the DSpark drafter's mHC side stream (step 10;
+# --build-arg VLLM_MOET_DSPARK_MHC_STREAM=0 leaves it out), the opt-in side-stream FC2 discard (step 14), the indexer
+# row-sharding threshold (step 16); the prefill DBO (step 15) does not fit this base ("The rebase onto vLLM nightly 3f1bcfd82b")
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-3f1bcfd8-r2 .   # ~10 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -132,7 +134,8 @@ hours per container, then it only logs "NEEDS A HUMAN". `touch /mnt/k3x/ds41flas
 by hand (`w8_stop.sh ds41-flash` does), `rm` it after the window; while it exists the watchdog does nothing but remind.
 Log: `/mnt/k3x/logs/watchdog.log` (a healthy minute writes nothing).
 
-Images built after 2026-10-15 carry an experiment switch, `PREFILL_DBO=1` (`--enable-dbo`): a prefill step of ≥ 1024
+Images built on 21d93d0d after 2026-10-15 carry an experiment switch (not the 3f1bcfd82b images: step 15 does not fit
+that base yet), `PREFILL_DBO=1` (`--enable-dbo`): a prefill step of ≥ 1024
 tokens runs as two microbatches whose TP all-reduces overlap each other's compute. Leave it off: on this host the
 step is paced by the Python that launches each microbatch (measured 2.4× slower on a 1/5-scale dummy-weight model;
 `docs/dsv41-sm120-port.md`, "Dual-batch overlap of the prefill all-reduces").
@@ -147,7 +150,8 @@ changes what a prefill computes, so it has a switch: `EXTRA_DOCKER_ARGS="-e VLLM
 takes the SWA KV back into prefix caching (the upstream flag covers both sides of the replay; a decoder-only switch
 like `VLLM_MOET_DECODER_REPLAY=0` does not exist there).
 
-All bases are pinned (`vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` + FlashInfer `0.7.1rc2`, before it
+All bases are pinned (`vllm/vllm-openai:nightly-3f1bcfd82b…@sha256:cb9bc64f…` with its own FlashInfer 0.7.1, before it
+`vllm/vllm-openai:nightly-21d93d0d…@sha256:bcee860c…` + FlashInfer `0.7.1rc2` and
 `vllm/vllm-openai:nightly@sha256:42090442…` + FlashInfer `0.7.0.dev20260922`, `vllm/vllm-openai:deepseekv41-flash-0909`,
 `vllm/vllm-openai@sha256:fc120ece…` = the `qwen38-flash-next` nightly, v0.1.dev20073); the patchers are anchored on
 those exact files and refuse to apply to anything else. To move a host without rebuilding, `docker save` /
@@ -159,7 +163,8 @@ wheels (`flashinfer-jit-cache-sm120f` carries the sm_120 / sm_121 modules: `spar
 installed the shim with `--no-deps`, i.e. without any provider: FlashInfer JIT-compiled its sm_120 modules at the
 first start into the launcher's `CACHE_DIR/dot-cache` (that is the ~25 min first start; losing that directory means
 compiling again). The 21d93d0d image installs the sm120f provider and removes the base image's other providers, so
-FlashInfer loads its modules AOT (checked on an RTX PRO 6000 with `FLASHINFER_DISABLE_JIT=1`). Still compiled at
+FlashInfer loads its modules AOT (checked on an RTX PRO 6000 with `FLASHINFER_DISABLE_JIT=1`); the 3f1bcfd82b base
+ships FlashInfer 0.7.1 with every provider already (vLLM installs them since vllm#58765). Still compiled at
 runtime: FlashInfer's autotuner delay kernel `trtllm_utils` (not in FlashInfer's sm_120 AOT list; 4 s, only while
 autotuning, i.e. the first start of a FlashInfer version), the CuTe-DSL MXFP8 activation quantizer (cutlass-dsl,
 in-process), and the Triton / TileLang / DeepGEMM kernels.
