@@ -18,6 +18,11 @@ merged. Three files:
                                                "fp8_dsv41" for SWA-only calls (compress_ratio 0 layers, DSpark
                                                drafter); fp8_ds_mla passes no keyword (older FlashInfer keeps working)
 
+On a vLLM that writes the V4.1 records interleaved (vllm#61371, FlashMLA 2026.09.30: each token's scales right
+after its data) both calls also pass kv_scale_placement="interleaved", and the probe additionally requires a
+FlashInfer that takes it (flashinfer_interleaved/patch_flashinfer_dsv41_interleaved.py); without one, nvfp4_ds_mla
+is refused on sm_120 with that reason instead of decoding the footer-ordered bytes it does not have.
+
 With this patch the launcher's KV_RECORD=nvfp4 becomes `--kv-cache-dtype nvfp4_ds_mla` (KV_MODE=upstream) and
 neither the fp8_ds_mla scratch/pool of patch_vllm_packed_kv_sm120.py nor the FlashInfer TU/hook of
 patch_flashinfer.py are needed: FlashInfer >= 0.7.0.dev20260919 dispatches page sizes / heads / top-k at runtime.
@@ -273,9 +278,62 @@ INTERLEAVED_V41_MARKERS = (
 
 def writes_interleaved_v41_records(vllm_dir: Path) -> bool:
     """vLLM after vllm#61371 (FlashMLA 2026.09.30) writes each V4.1 token's scales right after its data;
-    FlashInfer's SM120 DSv4.1 reader (0.7.1 / 0.7.2) reads the footer layout (a page's data, then its scales)."""
+    FlashInfer's SM120 DSv4.1 reader reads the footer layout (a page's data, then its scales) unless told
+    kv_scale_placement="interleaved"."""
     cache_utils = vllm_dir / "models/deepseek_v41/common/ops/cache_utils.py"
     return cache_utils.exists() and any(m in cache_utils.read_text() for m in INTERLEAVED_V41_MARKERS)
+
+
+# The same sites on a vLLM that writes the records interleaved: the probe also wants FlashInfer's
+# kv_scale_placement, and both calls pass it.
+INTERLEAVED: list[tuple[str, str]] = [
+    (
+        "    try:\n"
+        "        parameter = inspect.signature(trtllm_batch_decode_sparse_mla_dsv4).parameters[\n"
+        '            "kv_cache_format"\n'
+        "        ]\n"
+        "    except (KeyError, TypeError, ValueError):\n"
+        "        return False\n"
+        '    return "fp8_dsv41_fp4_ca" in str(parameter.annotation)\n',
+        "    try:\n"
+        "        parameters = inspect.signature(trtllm_batch_decode_sparse_mla_dsv4).parameters\n"
+        '        parameter = parameters["kv_cache_format"]\n'
+        "    except (KeyError, TypeError, ValueError):\n"
+        "        return False\n"
+        "    # This vLLM writes the V4.1 records interleaved (vllm#61371, FlashMLA\n"
+        "    # 2026.09.30); FlashInfer reads them so only when told kv_scale_placement.\n"
+        "    return (\n"
+        '        "fp8_dsv41_fp4_ca" in str(parameter.annotation)\n'
+        '        and "kv_scale_placement" in parameters\n'
+        "    )\n",
+    ),
+    (
+        '        # and selects "fp8_dsv41_fp4_ca" (dual cache) / "fp8_dsv41" (SWA cache alone).\n',
+        '        # and selects "fp8_dsv41_fp4_ca" (dual cache) / "fp8_dsv41" (SWA cache alone),\n'
+        "        # with each token's scales after its data (vllm#61371): kv_scale_placement.\n",
+    ),
+    (
+        '                "kv_cache_format": "fp8_dsv41_fp4_ca"\n',
+        '                "kv_cache_format": "fp8_dsv41_fp4_ca",\n'
+        '                "kv_scale_placement": "interleaved",\n',
+    ),
+    (
+        '                "kv_cache_format": "fp8_dsv41"\n',
+        '                "kv_cache_format": "fp8_dsv41",\n'
+        '                "kv_scale_placement": "interleaved",\n',
+    ),
+]
+
+
+def placed(edits: list[tuple[str, str]], interleaved: bool) -> list[tuple[str, str]]:
+    if not interleaved:
+        return edits
+    out = []
+    for old, new in edits:
+        for footer, inter in INTERLEAVED:
+            new = new.replace(footer, inter)
+        out.append((old, new))
+    return out
 
 
 def main() -> int:
@@ -283,11 +341,8 @@ def main() -> int:
     ap.add_argument("--vllm-dir", type=Path, default=DEFAULT_VLLM)
     ap.add_argument("--check", action="store_true", help="verify anchors, write nothing")
     args = ap.parse_args()
-    if writes_interleaved_v41_records(args.vllm_dir):
-        print("this vLLM writes the V4.1 KV records interleaved (vllm#61371) while FlashInfer's SM120 sparse MLA "
-              "reads the footer layout: nvfp4_ds_mla on sm_120 would decode garbage - nothing written",
-              file=sys.stderr)
-        return 1
+    interleaved = writes_interleaved_v41_records(args.vllm_dir)
+    print(f"V4.1 records: {'interleaved (vllm#61371), kv_scale_placement' if interleaved else 'footer'}")
     # All three files or none: a half-applied patch would leave e.g. the capability probe without its users.
     out = {}
     for rel, edits in FILES.items():
@@ -295,7 +350,7 @@ def main() -> int:
         if not path.exists():
             print(f"{path}: missing (vLLM main layout expected)", file=sys.stderr)
             return 1
-        out[path] = patched_text(path, edits)
+        out[path] = patched_text(path, placed(edits, interleaved))
     if any(s is None for s in out.values()):
         print("nothing written", file=sys.stderr)
         return 1

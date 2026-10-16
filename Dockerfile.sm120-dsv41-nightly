@@ -7,7 +7,8 @@
 # last KV-source layer (vllm#59894), the indexer's TP row sharding (vllm#54951)). It is the last nightly before
 # vllm#61371 (f8460ef236), which interleaves each V4.1 KV record's scales with its data for FlashMLA 2026.09.30,
 # while FlashInfer's SM120 DSv4.1 reader (0.7.1 and 0.7.2) reads the footer layout (a page's data, then its
-# scales): on a later vLLM, nvfp4_ds_mla on sm_120 would decode garbage, and step 5's patcher refuses it.
+# scales). On a later base step 5 teaches FlashInfer the interleaved placement first (flashinfer_interleaved/,
+# kv_scale_placement, its sparse_mla_sm120 module rebuilt) and the vLLM patch passes it.
 #
 #   1. FlashInfer 0.7.1 from the base image (python / cubin / jit-cache + every per-arch AOT provider incl. sm120f):
 #      runtime page-size / head / top-k dispatch for the SM120 sparse MLA (the 0909 image needed our own
@@ -216,10 +217,18 @@ ARG VLLM_MOET_REASONING_EFFORT=1
 RUN if [ "$VLLM_MOET_REASONING_EFFORT" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
     && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py; fi
 
-# 5. nvfp4_ds_mla on sm_120 through FlashInfer's DSv4.1 dual cache + the MXFP4 indexer cache gate (header).
+# 5. nvfp4_ds_mla on sm_120 through FlashInfer's DSv4.1 dual cache + the MXFP4 indexer cache gate (header). On a
+#    vLLM that writes the V4.1 records interleaved (vllm#61371) FlashInfer first learns kv_scale_placement and its
+#    sparse_mla_sm120 module is rebuilt into data/aot (flashinfer_interleaved/, ~1 min).
 ARG VLLM_MOET_NVFP4_KV=1
-RUN if [ "$VLLM_MOET_NVFP4_KV" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
-    && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py; fi
+RUN if [ "$VLLM_MOET_NVFP4_KV" = "1" ]; then \
+      if grep -q "The V4.1 records are interleaved" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/common/ops/cache_utils.py; then \
+        python3 /opt/vllm-moet/dsv41_sm120/flashinfer_interleaved/patch_flashinfer_dsv41_interleaved.py --build \
+        && python3 -c "import inspect; from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4 as f; from flashinfer.jit.env import get_aot_artifacts; assert 'kv_scale_placement' in inspect.signature(f).parameters; a = get_aot_artifacts('sparse_mla_sm120'); assert a and a[0].provider_id == 'flashinfer-python', a; print('flashinfer reads interleaved V4.1 rows:', a[0].path)" \
+        || exit 1; \
+      fi; \
+      python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
+      && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py; fi
 
 # 6. Single-copy KV offload of the TP-replicated V4.1 KV (header).
 ARG VLLM_MOET_OFFLOAD_DEDUP=1

@@ -1,0 +1,683 @@
+diff --git a/data/csrc/sparse_mla_sm120/attention_binding.cu b/data/csrc/sparse_mla_sm120/attention_binding.cu
+index 5eb72c5..0604a51 100644
+--- a/data/csrc/sparse_mla_sm120/attention_binding.cu
++++ b/data/csrc/sparse_mla_sm120/attention_binding.cu
+@@ -422,6 +422,7 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
+   p.indices_stride_elems = m.indices_stride;
+   p.out_lse_stride_elems = m.lse_stride;
+   p.extra_fp4 = m.extra_fp4;
++  p.interleaved_scales = m.interleaved_scales;
+   p.topk_length =
+       lengths.has_value() ? static_cast<const int*>(lengths.value().data_ptr()) : nullptr;
+   p.attn_sink = sink.has_value() ? static_cast<const float*>(sink.value().data_ptr()) : nullptr;
+diff --git a/data/csrc/sparse_mla_sm120/attention_descriptor.h b/data/csrc/sparse_mla_sm120/attention_descriptor.h
+index 61f8c4f..f88a103 100644
+--- a/data/csrc/sparse_mla_sm120/attention_descriptor.h
++++ b/data/csrc/sparse_mla_sm120/attention_descriptor.h
+@@ -15,20 +15,23 @@
+ 
+ namespace flashinfer::sparse_mla_sm120::execution {
+ 
++// 18 fields, or 19 with the DSV4_1 interleaved-scales flag last (absent = footer).
+ inline AttentionMetadata unpack_metadata(const ffi::Array<int64_t>& d, size_t i = 0) {
+-  TVM_FFI_ICHECK_EQ(d.size() - i, 18) << "attention metadata ABI mismatch";
++  TVM_FFI_ICHECK(d.size() - i == 18 || d.size() - i == 19) << "attention metadata ABI mismatch";
+   for (size_t j = i; j < d.size(); ++j) {
+     TVM_FFI_ICHECK_GE(d[j], 0) << "negative attention metadata";
+     const auto field = j - i;
+     if (field != 7 && field != 8 && field != 10 && field != 11 && field != 12)
+       TVM_FFI_ICHECK_LE(d[j], INT_MAX) << "attention metadata integer range";
+-    if (field >= 13 && field <= 16) TVM_FFI_ICHECK_LE(d[j], 1);
++    if ((field >= 13 && field <= 16) || field == 18) TVM_FFI_ICHECK_LE(d[j], 1);
+   }
+-  return {int(d[i]),         int(d[i + 1]),   int(d[i + 2]),     int(d[i + 3]),
+-          int(d[i + 4]),     int(d[i + 5]),   int(d[i + 6]),     size_t(d[i + 7]),
+-          size_t(d[i + 8]),  int(d[i + 9]),   size_t(d[i + 10]), size_t(d[i + 11]),
+-          size_t(d[i + 12]), bool(d[i + 13]), bool(d[i + 14]),   bool(d[i + 15]),
+-          bool(d[i + 16]),   int(d[i + 17])};
++  AttentionMetadata m{int(d[i]),         int(d[i + 1]),   int(d[i + 2]),     int(d[i + 3]),
++                      int(d[i + 4]),     int(d[i + 5]),   int(d[i + 6]),     size_t(d[i + 7]),
++                      size_t(d[i + 8]),  int(d[i + 9]),   size_t(d[i + 10]), size_t(d[i + 11]),
++                      size_t(d[i + 12]), bool(d[i + 13]), bool(d[i + 14]),   bool(d[i + 15]),
++                      bool(d[i + 16]),   int(d[i + 17])};
++  m.interleaved_scales = d.size() - i == 19 && d[i + 18] != 0;
++  return m;
+ }
+ 
+ inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata& m) {
+@@ -49,7 +52,8 @@ inline ffi::Array<int64_t> pack_metadata(const AttentionMetadata& m) {
+           m.has_extra_lengths,
+           m.has_sink,
+           m.extra_fp4,
+-          m.variant};
++          m.variant,
++          m.interleaved_scales};
+ }
+ 
+ class AttentionPlanObj : public ffi::ModuleObj {
+diff --git a/data/csrc/sparse_mla_sm120/attention_resolve.cu b/data/csrc/sparse_mla_sm120/attention_resolve.cu
+index 71119d2..16dcffe 100644
+--- a/data/csrc/sparse_mla_sm120/attention_resolve.cu
++++ b/data/csrc/sparse_mla_sm120/attention_resolve.cu
+@@ -118,6 +118,8 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
+       << "invalid indices/LSE stride";
+   TVM_FFI_ICHECK(!m.extra_fp4 || (mt == ModelType::DSV4_1 && dual))
+       << "extra FP4 requires DSV41 dual cache";
++  TVM_FFI_ICHECK(!m.interleaved_scales || mt == ModelType::DSV4_1)
++      << "interleaved scales are a DSV41 record placement";
+   TVM_FFI_ICHECK(!dual || mt == ModelType::DSV4 || mt == ModelType::DSV4_1)
+       << "sparse-MLA has no dual-cache form";
+   TVM_FFI_ICHECK(!dual || (main_page_supported(mt, m.extra_page_size) &&
+diff --git a/data/csrc/sparse_mla_sm120/prefill_dispatch.cu b/data/csrc/sparse_mla_sm120/prefill_dispatch.cu
+index 9b520c7..2a17c3e 100644
+--- a/data/csrc/sparse_mla_sm120/prefill_dispatch.cu
++++ b/data/csrc/sparse_mla_sm120/prefill_dispatch.cu
+@@ -25,6 +25,7 @@ PrefillLaunchResult dispatch_prefill(const execution::AttentionParams& p,
+                          p.extra_kv,          p.extra_indices,
+                          m.extra_page_size,   m.page_size};
+   cold.lse_scale = p.lse_scale;
++  cold.interleaved_scales = m.interleaved_scales;
+   if (cache_format_info(mt).inline_scale) cold.kv_stride_bytes = m.row_stride_bytes;
+   if (mt == ModelType::DSV4 || mt == ModelType::DOTS3_SWA) {
+     cold.main_div = flashinfer::uint_fastdiv(uint32_t(m.page_size));
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_params.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_params.cuh
+index 8cdcd65..9f04148 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_params.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_params.cuh
+@@ -28,6 +28,7 @@ struct PrefillColdParams {
+   flashinfer::uint_fastdiv main_div;
+   flashinfer::uint_fastdiv extra_div;
+   float lse_scale = 1.f;
++  bool interleaved_scales = false;  // DSV4_1: rows carry their own scales (no page footer).
+ };
+ 
+ struct Dsv4PageDivisors {
+@@ -35,6 +36,13 @@ struct Dsv4PageDivisors {
+   flashinfer::uint_fastdiv extra;
+ };
+ 
++// DSV4_1 decode: the main page size and whether both caches interleave each row's scales with
++// its data instead of keeping them in the page footer.
++struct Dsv41Pages {
++  int size;
++  bool interleaved;
++};
++
+ // Copyright (c) 2026 by FlashInfer team.
+ // SPDX-License-Identifier: Apache-2.0
+ namespace flashinfer::sparse_mla_sm120::nvfp4 {
+@@ -95,6 +103,7 @@ struct AttentionParams {
+   int page_size;
+   bool extra_fp4;
+   float lse_scale = 1.f;
++  bool interleaved_scales = false;
+ };
+ 
+ }  // namespace flashinfer::sparse_mla_sm120::execution
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h b/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h
+index e1ba8a6..306da31 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/execution/attention_plan.h
+@@ -131,6 +131,7 @@ struct AttentionMetadata {
+   bool has_sink;
+   bool extra_fp4;
+   int variant;
++  bool interleaved_scales = false;  // DSV4_1 rows with their scales inline (FlashMLA 2026.09.30).
+ };
+ 
+ struct DeviceCaps {
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/execution/decode_launch.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/execution/decode_launch.cuh
+index 56017e0..236bc2c 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/execution/decode_launch.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/execution/decode_launch.cuh
+@@ -43,7 +43,7 @@ cudaError_t launch_decode(const AttentionParams& p, const ExecutionPlan& plan,
+     else if constexpr (MT == ModelType::DOTS3_SWA)
+       return flashinfer::uint_fastdiv(uint32_t(p.page_size));
+     else
+-      return p.page_size;
++      return Dsv41Pages{p.page_size, p.interleaved_scales};
+   }();
+   kernel<<<dim3(p.num_tokens, h_blocks, p.allocated_splits), dim3(block_threads), smem_bytes,
+            stream>>>(p.q, p.kv, p.indices, p.mid_out, p.mid_lse, p.topk_length, p.extra_kv,
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh
+index 46b66b2..54b7c6f 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/decode.cuh
+@@ -5,6 +5,7 @@
+ #include "../../arch/matrix_memory.cuh"
+ #include "../../arch/mma_sm120.cuh"
+ #include "../../compute/packed_to_bf16.cuh"
++#include "../../execution/attention_params.cuh"
+ #include "../../model/dsv41_layout.cuh"
+ #include "resources.cuh"
+ 
+@@ -20,8 +21,10 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
+         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int pbs_extra,
+         size_t extra_page_stride_bytes, int num_tokens, int num_heads, int topk,
+         int scratch_split_stride, int chunks_per_block, float sm_scale, size_t page_stride_bytes,
+-        size_t indices_stride_elems, size_t extra_indices_stride_elems, int main_page_block_size) {
++        size_t indices_stride_elems, size_t extra_indices_stride_elems, Dsv41Pages pages) {
+   using R = Dsv41Bf16Resources;
++  const int main_page_block_size = pages.size;
++  const bool interleaved = pages.interleaved;
+   using Geometry = R::Geometry;
+   const int t = blockIdx.x, hs = blockIdx.y * R::HEADS_PER_CTA, split = blockIdx.z;
+   const int qh = NUM_HEADS ? NUM_HEADS : num_heads;
+@@ -74,12 +77,12 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
+           const int slot = index - page * pbs;
+           const uint8_t* base = cache + (size_t)page * stride;
+           const auto data_offset =
+-              Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, size_t(slot));
++              Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, interleaved, size_t(slot));
+           const uint8_t* src = base + data_offset + (fp4 ? d / 2 : d);
+           raw = fp4 ? uint64_t(*reinterpret_cast<const uint32_t*>(src))
+                     : *reinterpret_cast<const uint64_t*>(src);
+-          const auto scale_offset =
+-              Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(fp4, size_t(pbs), slot);
++          const auto scale_offset = Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(
++              fp4, interleaved, size_t(pbs), size_t(slot));
+           const uint8_t sc = base[scale_offset + d / (fp4 ? Dsv41Fp4Layout::SCALE_GROUP
+                                                           : Dsv41Fp8Layout::QUANT_TILE)];
+           scale = decode_e4m3_or_ue8m0_scale_bf16(sc, fp4);
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/prefill.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/prefill.cuh
+index 458cc34..b6073bc 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/prefill.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_bf16/prefill.cuh
+@@ -18,7 +18,7 @@ __device__ __forceinline__ void run_bf16_tiles(
+     const uint8_t* __restrict__ extra_KV_cache, const int32_t* __restrict__ extra_indices, int t,
+     int lo, int hi, int len, int elen, int main_chunks, int main_page_block_size, int pbs_extra,
+     size_t page_stride_bytes, size_t extra_page_stride_bytes, size_t indices_stride_elems,
+-    size_t extra_indices_stride_elems, float sm_scale,
++    size_t extra_indices_stride_elems, bool interleaved, float sm_scale,
+     float (&acc)[Dsv41Bf16Resources::PV_TILES_PER_WARP][4], float (&m)[2], float (&sum)[2]) {
+   using R = Dsv41Bf16Resources;
+   using Geometry = R::Geometry;
+@@ -52,11 +52,11 @@ __device__ __forceinline__ void run_bf16_tiles(
+             const int page = power_of_two ? (index >> (__ffs(pbs) - 1)) : (index / pbs);
+             const int slot = index - page * pbs;
+             const uint8_t* base = cache + (size_t)page * stride;
+-            const auto data_offset =
+-                Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(fp4, size_t(slot));
++            const auto data_offset = Dsv41Fp4Layout::selected_data_offset<Dsv41Fp8Layout>(
++                fp4, interleaved, size_t(slot));
+             data_addr[item] = base + data_offset + (fp4 ? d / 2 : d);
+-            const auto scale_offset =
+-                Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(fp4, size_t(pbs), slot);
++            const auto scale_offset = Dsv41Fp4Layout::selected_scale_offset<Dsv41Fp8Layout>(
++                fp4, interleaved, size_t(pbs), size_t(slot));
+             constexpr int fp4_scale_shift = []() constexpr {
+               int shift = 0;
+               for (int group = Dsv41Fp4Layout::SCALE_GROUP; group > 1; group >>= 1) ++shift;
+@@ -235,11 +235,11 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
+   }
+   float acc[R::PV_TILES_PER_WARP][4] = {};
+   float m[2] = {-1e30f, -1e30f}, sum[2] = {0.f, 0.f};
+-  run_bf16_tiles<EXTRA_FP4>(sm, params.kv, params.indices, params.extra_kv, params.extra_indices, t,
+-                            0, chunks, len, elen, main_chunks, params.page_size,
+-                            params.extra_page_size, params.page_stride_bytes,
+-                            params.extra_page_stride_bytes, params.indices_stride_elems,
+-                            params.extra_indices_stride_elems, params.sm_scale, acc, m, sum);
++  run_bf16_tiles<EXTRA_FP4>(
++      sm, params.kv, params.indices, params.extra_kv, params.extra_indices, t, 0, chunks, len, elen,
++      main_chunks, params.page_size, params.extra_page_size, params.page_stride_bytes,
++      params.extra_page_stride_bytes, params.indices_stride_elems,
++      params.extra_indices_stride_elems, params.interleaved_scales, params.sm_scale, acc, m, sum);
+ #pragma unroll
+   for (int h = 0; h < 2; ++h) {
+     const int head = hs + gid + h * 8;
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/decode_schedule.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/decode_schedule.cuh
+index 7734123..56302d0 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/decode_schedule.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/decode_schedule.cuh
+@@ -35,8 +35,10 @@ struct Dsv41MixedCacheDecodeSchedule
+           const int page_idx = power_of_two ? (idx >> (__ffs(sec.pbs) - 1)) : (idx / sec.pbs);
+           const uint8_t* page = sec.kv + (size_t)page_idx * sec.stride;
+           int local = idx - page_idx * sec.pbs;
+-          data = page + Raw::selected_data_offset<Dsv41Fp8Layout>(sec.extra, local);
+-          scales = page + Raw::selected_scale_offset<Dsv41Fp8Layout>(sec.extra, sec.pbs, local);
++          data =
++              page + Raw::selected_data_offset<Dsv41Fp8Layout>(sec.extra, sec.interleaved, local);
++          scales = page + Raw::selected_scale_offset<Dsv41Fp8Layout>(sec.extra, sec.interleaved,
++                                                                     sec.pbs, local);
+         }
+         if (!sec.extra && tid < BI)
+           *reinterpret_cast<uint4*>(sm.kv_sc(buf) + tid * KV::SCALE_BYTES_PER_TOKEN) =
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_gather.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_gather.cuh
+index 0689bed..d2acbcb 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_gather.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_gather.cuh
+@@ -28,8 +28,8 @@ struct Dsv41PrefillGatherSchedule {
+     if (idx >= 0) {
+       const uint8_t* page = sec.kv + (size_t)(idx / sec.page_block_size) * sec.block_stride;
+       const int local = idx % sec.page_block_size;
+-      data = page + Dsv41Fp8Layout::data_offset(local);
+-      scales = page + Dsv41Fp8Layout::scale_offset(sec.page_block_size, local);
++      data = page + Dsv41Fp8Layout::data_offset(sec.interleaved, local);
++      scales = page + Dsv41Fp8Layout::scale_offset(sec.interleaved, sec.page_block_size, local);
+     }
+     if (tid < Cfg::BI)
+       *reinterpret_cast<uint4*>(sm.kv_scale_buf(buf) + tid * KV::SCALE_BYTES_PER_TOKEN) =
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_schedule.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_schedule.cuh
+index 5bfee5e..a4af816 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_schedule.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/dsv41_fp8/prefill_schedule.cuh
+@@ -40,9 +40,10 @@ struct Dsv41MixedCachePrefillSchedule
+         if (idx >= 0) {
+           const uint8_t* page = sec.kv + (size_t)(idx / sec.page_block_size) * sec.block_stride;
+           const int local = idx % sec.page_block_size;
+-          data = page + Raw::selected_data_offset<Dsv41Fp8Layout>(sec.extra, local);
+-          scales = page + Raw::selected_scale_offset<Dsv41Fp8Layout>(sec.extra, sec.page_block_size,
+-                                                                     local);
++          data =
++              page + Raw::selected_data_offset<Dsv41Fp8Layout>(sec.extra, sec.interleaved, local);
++          scales = page + Raw::selected_scale_offset<Dsv41Fp8Layout>(sec.extra, sec.interleaved,
++                                                                     sec.page_block_size, local);
+         }
+         if (!sec.extra && role_tid < BI)
+           *reinterpret_cast<uint4*>(sm.kv_scale_buf(buf) + role_tid * KV::SCALE_BYTES_PER_TOKEN) =
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_decode/decode.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_decode/decode.cuh
+index cbc8bce..ce1abb7 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_decode/decode.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_decode/decode.cuh
+@@ -72,7 +72,7 @@ __global__ void __launch_bounds__(
+         size_t indices_stride_elems, size_t extra_indices_stride_elems,
+         std::conditional_t<
+             MT == ModelType::DSV4, Dsv4PageDivisors,
+-            std::conditional_t<MT == ModelType::DOTS3_SWA, flashinfer::uint_fastdiv, int>>
++            std::conditional_t<MT == ModelType::DOTS3_SWA, flashinfer::uint_fastdiv, Dsv41Pages>>
+             pages) {
+   using KV = KVCacheTraits<MT>;
+   using Cfg = DecodeTileCfg<MT, GatherSchedule::RAW_PIPELINE>;
+@@ -96,7 +96,13 @@ __global__ void __launch_bounds__(
+     else if constexpr (MT == ModelType::DOTS3_SWA)
+       return int(uint32_t(pages));
+     else
+-      return pages;
++      return pages.size;
++  }();
++  const bool interleaved = [&]() {
++    if constexpr (MT == ModelType::DSV4_1)
++      return pages.interleaved;
++    else
++      return false;
+   }();
+   // Kernel always computes a full HPB×CAND tile (zero-Q-padded for unused
+   // head slots). NUM_HEADS == 0 selects the runtime-head-count instantiation:
+@@ -242,6 +248,7 @@ __global__ void __launch_bounds__(
+       size_t stride;
+       int pbs, start, end;
+       bool extra;
++      bool interleaved;
+       __device__ int index(int row) const { return start + row < end ? indices[start + row] : -1; }
+     };
+     auto section = [&](int tile) {
+@@ -254,7 +261,8 @@ __global__ void __launch_bounds__(
+                      extra ? pbs_extra : pbs,
+                      start,
+                      min(start + Cfg::BI, extra ? extra_topk_len : topk_len),
+-                     extra};
++                     extra,
++                     interleaved};
+     };
+     if (is_io) {
+       GatherSchedule::produce(sm, smem_raw + RAW_OFFSET, section, chunk_hi - chunk_lo);
+@@ -329,7 +337,7 @@ __global__ void __launch_bounds__(
+         const int local_idx_g = idx - block_idx_g * section_pbs;
+         const uint8_t* scale_base =
+             section_kv + (size_t)block_idx_g * section_stride +
+-            CacheLayout::scale_offset(size_t(section_pbs), size_t(local_idx_g));
++            CacheLayout::scale_offset(interleaved, size_t(section_pbs), size_t(local_idx_g));
+         scale_word[e] = __ldg(reinterpret_cast<const ScaleWord*>(scale_base));
+       }
+     }
+@@ -357,9 +365,10 @@ __global__ void __launch_bounds__(
+       const int idx = valid ? idx_raw[e] : 0;
+       const int block_idx_g = page_index(idx);
+       const int local_idx_g = idx - block_idx_g * section_pbs;
+-      const uint8_t* data_base = valid ? section_kv + (size_t)block_idx_g * section_stride +
+-                                             CacheLayout::data_offset(size_t(local_idx_g))
+-                                       : sparse_mla_zero_row;
++      const uint8_t* data_base =
++          valid ? section_kv + (size_t)block_idx_g * section_stride +
++                      CacheLayout::data_offset(interleaved, size_t(local_idx_g))
++                : sparse_mla_zero_row;
+       static_assert(DSV4_BULK_NOPE_BYTES + DSV4_BULK_ROPE_BYTES <= SPARSE_MLA_ZERO_ROW_BYTES);
+       cp_async_bulk_g2s(kv_fp8_dst + (size_t)entry_idx * KV_SMEM_STRIDE, data_base,
+                         DSV4_BULK_NOPE_BYTES, sm.mbar_full(buf));
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_common.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_common.cuh
+index 8028d2c..c09fad7 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_common.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/kernels/fp8_prefill/prefill_common.cuh
+@@ -43,6 +43,7 @@ struct PrefillSection {
+   int length;
+   int page_block_size;
+   bool extra;
++  bool interleaved;
+ 
+   __device__ __forceinline__ int index(int entry, int bi) const {
+     const int pos = tile * bi + entry;
+@@ -69,7 +70,8 @@ __device__ __forceinline__ PrefillSection prefill_section(const PrefillColdParam
+             tile - main_tiles,
+             extra_len,
+             cold.extra_page_block_size,
+-            true};
++            true,
++            cold.interleaved_scales};
+   }
+   return {kv,
+           indices + (size_t)token * cold.topk,
+@@ -77,7 +79,8 @@ __device__ __forceinline__ PrefillSection prefill_section(const PrefillColdParam
+           tile,
+           main_len,
+           cold.page_block_size,
+-          false};
++          false,
++          cold.interleaved_scales};
+ }
+ 
+ struct Fp8PrefillSync {
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/model/kv_storage.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/model/kv_storage.cuh
+index bade307..5114d9b 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/model/kv_storage.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/model/kv_storage.cuh
+@@ -72,4 +72,29 @@ struct FooterScaleLayout {
+     return page_size * (selected ? DataBytes : Other::DATA_BYTES) +
+            row * (selected ? ScaleBytes : Other::SCALE_BYTES);
+   }
++
++  // Runtime placement of the same record: footer (above) or interleaved, where each row carries
++  // its scales right after its data (FlashMLA's DSV4_1 / V41_FP4 ABI since its 2026.09.30
++  // release). Either way a row is BYTES_PER_TOKEN of the page; only the order differs.
++  template <typename Index>
++  __host__ __device__ static constexpr auto data_offset(bool interleaved, Index row) {
++    return row * (interleaved ? BYTES_PER_TOKEN : DataBytes);
++  }
++  template <typename PageSize, typename Index>
++  __host__ __device__ static constexpr auto scale_offset(bool interleaved, PageSize page_size,
++                                                         Index row) {
++    return interleaved ? row * BYTES_PER_TOKEN + DataBytes
++                       : page_size * DataBytes + row * ScaleBytes;
++  }
++  template <typename Other, typename Index>
++  __host__ __device__ static constexpr auto selected_data_offset(bool selected, bool interleaved,
++                                                                 Index row) {
++    return selected ? data_offset(interleaved, row) : Other::data_offset(interleaved, row);
++  }
++  template <typename Other, typename PageSize, typename Index>
++  __host__ __device__ static constexpr auto selected_scale_offset(bool selected, bool interleaved,
++                                                                  PageSize page_size, Index row) {
++    return selected ? scale_offset(interleaved, page_size, row)
++                    : Other::scale_offset(interleaved, page_size, row);
++  }
+ };
+diff --git a/mla/_core.py b/mla/_core.py
+index 3f80a05..b8a0cb6 100644
+--- a/mla/_core.py
++++ b/mla/_core.py
+@@ -410,7 +410,10 @@ def _trtllm_batch_decode_sparse_mla_sm120(
+     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
+     backend: Literal["sparse", "cake"] = "sparse",
+     enable_pdl: Optional[bool] = None,
++    kv_scale_placement: Literal["footer", "interleaved"] = "footer",
+ ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
++    if kv_scale_placement == "interleaved" and backend != "sparse":
++        raise ValueError("kv_scale_placement='interleaved' requires backend='sparse'")
+     if not is_sm12x_supported(query.device):
+         raise ValueError(
+             "SM120 sparse MLA requires SM120a (CUDA >= 12.8) or SM121a (CUDA >= 13.0)"
+@@ -550,6 +553,7 @@ def _trtllm_batch_decode_sparse_mla_sm120(
+         is_dsv4_nvfp4=(kv_cache_format == "nvfp4"),
+         extra_fp4=kv_cache_format == "fp8_dsv41_fp4_ca",
+         lse_scale=lse_scale,
++        interleaved_scales=kv_scale_placement == "interleaved",
+     )
+ 
+     if return_lse:
+@@ -1356,6 +1360,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
+     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"],
+     backend: Literal["sparse", "cake"] = "sparse",
+     enable_pdl: Optional[bool] = None,
++    kv_scale_placement: Literal["footer", "interleaved"] = "footer",
+ ) -> torch.Tensor:
+     if bmm2_scale != 1.0:
+         raise ValueError("SM120 DSv4 sparse MLA does not support bmm2_scale")
+@@ -1578,6 +1583,7 @@ def _trtllm_batch_decode_sparse_mla_dsv4_sm120(
+             kv_cache_format=kv_cache_format,
+             backend=backend,
+             enable_pdl=enable_pdl,
++            kv_scale_placement=kv_scale_placement,
+         ),
+     )
+     if query.ndim == 3:
+@@ -1920,6 +1926,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
+     multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None,
+     *,
+     kv_cache_format: Literal["fp8", "nvfp4", "fp8_dsv41", "fp8_dsv41_fp4_ca"] = "fp8",
++    kv_scale_placement: Literal["footer", "interleaved"] = "footer",
+ ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+     r"""Decode DeepSeek V4 sparse MLA.
+ 
+@@ -2248,11 +2255,30 @@ def trtllm_batch_decode_sparse_mla_dsv4(
+         With ``backend="cake"`` on SM120/SM121 the ``fp8_dsv41_fp4_ca`` form
+         selects the Cake mixed-cache decode instead (BF16 numerics route,
+         both caches dequantized exactly on chip).
++    kv_scale_placement : {"footer", "interleaved"}
++        Where the DeepSeek-V4.1 rows (``"fp8_dsv41"`` / ``"fp8_dsv41_fp4_ca"``)
++        keep their scales. ``"footer"`` (default): a page holds all its data
++        rows, then all its scale rows. ``"interleaved"``: each row's scales
++        directly follow its own data — FlashMLA's V4.1 cache since its
++        2026.09.30 release. Row widths (528 / 288 bytes) and page strides are
++        the same either way. ``"interleaved"`` requires ``backend="sparse"``.
+     """
+     backend = _resolve_dsv4_sparse_mla_backend(query.device, backend)
+     _check_dsv4_kv_cache_format_backend(
+         kv_cache_format, backend, sm120_cake=_is_sm120_family(query.device)
+     )
++    if kv_scale_placement not in ("footer", "interleaved"):
++        raise ValueError(
++            "kv_scale_placement must be 'footer' or 'interleaved', "
++            f"got {kv_scale_placement!r}"
++        )
++    if kv_scale_placement == "interleaved" and (
++        backend != "sparse" or kv_cache_format not in ("fp8_dsv41", "fp8_dsv41_fp4_ca")
++    ):
++        raise ValueError(
++            "kv_scale_placement='interleaved' requires backend='sparse' and "
++            "kv_cache_format 'fp8_dsv41' or 'fp8_dsv41_fp4_ca'"
++        )
+ 
+     rope_quant = dsv4_inv_rope_cos_sin_cache is not None
+     if dsv4_output_scale is not None and not rope_quant:
+@@ -2478,6 +2504,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
+             kv_cache_format=kv_cache_format,
+             backend="cake" if cake_sm120 else "sparse",
+             enable_pdl=enable_pdl if cake_sm120 else None,
++            kv_scale_placement=kv_scale_placement,
+         )
+ 
+     if backend == "cake" and kv_cache_format == "nvfp4":
+diff --git a/mla/_sparse_mla_sm120/_api.py b/mla/_sparse_mla_sm120/_api.py
+index a43ddd1..9a3b0a4 100644
+--- a/mla/_sparse_mla_sm120/_api.py
++++ b/mla/_sparse_mla_sm120/_api.py
+@@ -901,6 +901,12 @@ class _SparseMLAPagedAttentionRunner:
+         accumulation / softmax / split merge), ``"fp8"`` the separately
+         validated FP8 QK route when the generated family exports it;
+         ``"nvfp4"`` is rejected for this storage.
++    kv_scale_placement : str
++        ``"footer"`` (default) or ``"interleaved"``: where the DeepSeek-V4.1
++        rows (``kv_scale_format="ue8m0_g32"``, and the V41_FP4 extra cache)
++        keep their scales — after all of a page's data rows, or directly after
++        each row's own data (FlashMLA's V4.1 cache since its 2026.09.30
++        release). ``"interleaved"`` runs on the hand-written kernels only.
+ 
+     Example
+     -------
+@@ -921,12 +927,18 @@ class _SparseMLAPagedAttentionRunner:
+         compute_precision: str = "default",
+         device: Optional[torch.device] = None,
+         backend: str = "auto",
++        kv_scale_placement: str = "footer",
+     ) -> None:
+         if backend not in ("auto", "sparse", "cake"):
+             raise ValueError(
+                 f"backend must be 'auto', 'sparse', or 'cake', got {backend!r}"
+             )
+         self._backend = backend
++        if kv_scale_placement not in ("footer", "interleaved"):
++            raise ValueError(
++                "kv_scale_placement must be 'footer' or 'interleaved', "
++                f"got {kv_scale_placement!r}"
++            )
+         if (max_num_tokens is None) != (max_num_heads is None):
+             raise ValueError(
+                 "max_num_tokens and max_num_heads must be provided together"
+@@ -975,6 +987,16 @@ class _SparseMLAPagedAttentionRunner:
+                 "and kv_scale_format='ue8m0_g32' (a DSV4_1 main cache)"
+             )
+         self._extra_kv_fp4 = extra_kv_fp4
++        if kv_scale_placement == "interleaved" and (
++            backend == "cake"
++            or kv_cache_format != "fp8"
++            or self._kv_scale_format != "ue8m0_g32"
++        ):
++            raise ValueError(
++                "kv_scale_placement='interleaved' is the DeepSeek-V4.1 row placement "
++                "(kv_cache_format='fp8', kv_scale_format='ue8m0_g32') of the sparse backend"
++            )
++        self._interleaved_scales = kv_scale_placement == "interleaved"
+         # backend="cake": the DSv4 NVFP4 route (kv_cache_format="nvfp4") or the DeepSeek-V4.1
+         # mixed-cache route (kv_cache_format="fp8" + ue8m0_g32 + extra_kv_fp4), whose numerics
+         # route is fixed here: "default" and "bf16" select the BF16 route (the only one exported).
+diff --git a/mla/_sparse_mla_sm120/_execution.py b/mla/_sparse_mla_sm120/_execution.py
+index 7e87030..864faf6 100644
+--- a/mla/_sparse_mla_sm120/_execution.py
++++ b/mla/_sparse_mla_sm120/_execution.py
+@@ -150,6 +150,8 @@ class AttentionMetadata(NamedTuple):
+     has_sink: bool
+     extra_fp4: bool
+     variant: int
++    # DSV4_1 only: each row's scales follow its data (FlashMLA 2026.09.30) instead of the page footer.
++    interleaved_scales: bool = False
+ 
+ 
+ @functools.cache
+@@ -229,6 +231,7 @@ def resolve_attention(
+     cpb: int,
+     sm_count: int,
+     max_shared_bytes: int,
++    interleaved_scales: bool = False,
+ ) -> ExecutionPlan:
+     metadata = (
+         model,
+@@ -249,6 +252,7 @@ def resolve_attention(
+         int(has_sink),
+         int(extra_fp4),
+         variant,
++        int(interleaved_scales),
+     )
+     requested = _precision_code(precision)
+     return get_sparse_mla_sm120_module().resolve_attention(
+diff --git a/mla/_sparse_mla_sm120/_prepared.py b/mla/_sparse_mla_sm120/_prepared.py
+index 2e12616..8ca74fa 100644
+--- a/mla/_sparse_mla_sm120/_prepared.py
++++ b/mla/_sparse_mla_sm120/_prepared.py
+@@ -126,8 +126,11 @@ def resolve_execution(
+             shared,
+             False,
+         )
++    # Route selection and calibration see the footer form: the placement only moves
++    # where a row's scales are read from, and every DSV4_1 route serves both.
++    footer = m._replace(interleaved_scales=False)
+     selected = (
+-        policy.profile_selection(m, device, precision) if preference == 0 else None
++        policy.profile_selection(footer, device, precision) if preference == 0 else None
+     )
+     if decode_only:
+         cpb = (
+@@ -166,7 +169,7 @@ def resolve_execution(
+     )
+     sm, shared = device_caps(device)
+     selected = policy.filter_metadata_selection(
+-        selected, m, precision, sm, shared, preference
++        selected, footer, precision, sm, shared, preference
+     )
+     if selected is None:
+         from ._api import _decode_dispatch_error_message
+@@ -436,7 +439,7 @@ def wrapper_run(
+             is_dsv4_nvfp4=is_dsv4_nvfp4,
+             extra_fp4=wrapper._extra_kv_fp4,
+             value_dim=wrapper._d_v,
+-        )
++        )._replace(interleaved_scales=getattr(wrapper, "_interleaved_scales", False))
+         updated = prepare(
+             m,
+             q.device,
+@@ -486,6 +489,7 @@ def _functional_plan(
+     preference=0,
+     value_dim=0,
+     decode_only=False,
++    interleaved_scales=False,
+ ):
+     q = tensors[0]
+     key = (
+@@ -495,6 +499,7 @@ def _functional_plan(
+         preference,
+         value_dim,
+         decode_only,
++        interleaved_scales,
+         tuple(tensor_signature(x) for x in tensors),
+     )
+     capturing = torch.cuda.is_current_stream_capturing()
+@@ -517,7 +522,7 @@ def _functional_plan(
+             is_dsv4_nvfp4=is_dsv4_nvfp4,
+             extra_fp4=extra_fp4,
+             value_dim=value_dim,
+-        )
++        )._replace(interleaved_scales=interleaved_scales)
+         current = prepare(
+             m,
+             q.device,
+@@ -555,6 +560,7 @@ def caller_run(
+     extra_fp4,
+     decode_only=False,
+     lse_scale=1.0,
++    interleaved_scales=False,
+ ):
+     indices = (
+         indices.squeeze(1) if indices.ndim == 3 and indices.shape[1] == 1 else indices
+@@ -580,7 +586,14 @@ def caller_run(
+         None,
+     )
+     current = _functional_plan(
+-        tensors, model, False, extra_fp4, preference, value_dim, decode_only
++        tensors,
++        model,
++        False,
++        extra_fp4,
++        preference,
++        value_dim,
++        decode_only,
++        interleaved_scales,
+     )
+     if current.workspace[0][2]:
+         from ._api import _decode_scratch_views
+@@ -630,6 +643,7 @@ def functional_run(
+     is_dsv4_nvfp4=False,
+     extra_fp4=False,
+     lse_scale=1.0,
++    interleaved_scales=False,
+ ):
+     from ._execution import resolve_model_type as _resolve_model_type
+ 
+@@ -648,7 +662,9 @@ def functional_run(
+         None,
+         None,
+     )
+-    current = _functional_plan(tensors, model, is_dsv4_nvfp4, extra_fp4)
++    current = _functional_plan(
++        tensors, model, is_dsv4_nvfp4, extra_fp4, interleaved_scales=interleaved_scales
++    )
+     capturing = torch.cuda.is_current_stream_capturing()
+     requirements = current.workspace[:2] if lse is not None else current.workspace
+     views, offset = [], 0

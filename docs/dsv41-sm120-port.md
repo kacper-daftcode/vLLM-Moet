@@ -1660,10 +1660,10 @@ compressed record) scale bytes now follow its own data, in the compiled insert k
 (`fused_deepseek_v4_qnorm_rope_kv_insert`) and in the Triton compressor writers. FlashInfer's SM120 DSv4.1 reader —
 0.7.1 and 0.7.2 alike, its `sparse` and `cake` backends — reads the footer layout (a page's data, then its scales).
 Upstream never runs the V4.1 records on SM120 (`_use_v41_mxfp8_kv_record` is SM100 only); our `nvfp4_ds_mla` does, and
-on such a vLLM it would decode garbage. 3f1bcfd82b is the last nightly before it; the nvfp4 patcher now refuses a
-vLLM that writes the interleaved records, and it keeps upstream's `_use_v41_mxfp8_kv_record` next to its own decision
-(the later base calls it from the indexer cache's block‑stride alignment). A later rebase needs either a FlashInfer
-that reads the interleaved records or our own writers in the footer layout.
+on such a vLLM it would decode garbage. 3f1bcfd82b is the last nightly before it; the nvfp4 patcher keeps upstream's
+`_use_v41_mxfp8_kv_record` next to its own decision (the later base calls it from the indexer cache's block‑stride
+alignment). A later rebase needs either a FlashInfer that reads the interleaved records or our own writers in the
+footer layout — the first exists since the same day (section "Interleaved V4.1 records on SM120").
 
 What changed on our side:
 
@@ -1802,6 +1802,43 @@ differ by an ulp or two (the same effect as the replay's row‑subset all‑redu
 identical on a row subset only with the full T's split‑k count (`compute_mhc_pre_num_splits` picks 4 at 4,096 tokens
 and 16 at 1,024; with vLLM's choice 98–99 % of the fp32 mixes change). A sequence‑parallel prefill is therefore a
 quality‑gated change like DBO, not a bit‑identical one.
+
+## Interleaved V4.1 records on SM120 (2026‑10‑16)
+
+What blocked the next rebase ([vllm#61371](https://github.com/vllm-project/vllm/pull/61371), section "The rebase onto
+vLLM nightly 3f1bcfd82b"): FlashMLA 2026.09.30 puts each V4.1 token's scales right after its own data — the 528‑byte
+FP8 SWA row (512 E4M3 + 16 UE8M0) and the 288‑byte compressed row (256 packed E2M1 + 32 E4M3) — and vLLM writes it so
+since 2026‑10‑15, while FlashInfer's SM120 reader (0.7.1, 0.7.2 and main of 2026‑10‑16, `sparse` and `cake` backends)
+reads a page's data rows and then its scale rows. Upstream vLLM runs the V4.1 records on SM100 only
+(`_use_v41_mxfp8_kv_record`); our `nvfp4_ds_mla` is what brings them to SM120 (3,057,484 KV tokens against the V4
+record's 2,288,673 when it came in), so nobody upstream needed the footer kept.
+
+`tools/dsv41_sm120/flashinfer_interleaved/` teaches FlashInfer's `sparse` backend the other placement:
+`kv_scale_placement="footer"|"interleaved"` on `trtllm_batch_decode_sparse_mla_dsv4` and `SparseMLASm120Wrapper`. All
+six DSV4_1 routes already addressed a row through `FooterScaleLayout::data_offset` / `scale_offset`; the patch gives
+those a runtime `interleaved` argument (data at `row·528`, scales at `row·528 + 512`; FP4 `row·288` and `+256`), carries
+it in the gather sections (`Dsv41Pages` in place of the DSV4_1 decode kernels' `int` page argument, a field in the
+prefill parameters) and in an optional 19th execution‑metadata field — 18‑field tuples, as the calibration and the
+NVFP4 module build them, still mean footer — and lets route selection and calibration see the footer form, so both
+placements run the same kernels with the same plans. Row widths, page strides (padded pages included) and the
+16‑byte alignment of every `cp.async.bulk` source are unchanged (528 = 33·16, 288 = 18·16). 19 files, +175/−45; the
+CUDA sources of the `sparse` backend are byte‑identical in 0.7.2 and main, so one patch serves both.
+
+Measured on an RTX PRO 6000 (FlashInfer 0.7.2 + the patch, JIT‑built for 12.0f inside the 3f1bcfd82b image): footer
+pages from FlashInfer's own writers, re‑laid out byte for byte, read through every route — the call vLLM makes (its
+policy picked `ordinary/fp8` for 1–33 tokens without a compressed cache, `mixed/fp8` for 1–256 with it, `sg/fp8` for
+256 without) and the wrapper at fp8 and bf16 (`full_bf16` decode and prefill) — for both formats, compressed pages of
+32 and 64 rows, 1/4/33/256 tokens, padded pages or not: **72 of 72 outputs bit‑identical** to the footer run, and the
+interleaved bytes read as a footer always differ (the flag reaches every route). The footer path's 72 outputs are
+bit‑identical to an unpatched 0.7.2 build. FlashInfer's pytest for it (in the upstream branch): 33 passed.
+
+In the image: `patch_flashinfer_dsv41_interleaved.py --build` patches the installed package and compiles
+`sparse_mla_sm120` (~30 s on the 4‑GPU host) into `flashinfer/data/aot/`, the path FlashInfer loads before any
+jit‑cache provider — verified with `FLASHINFER_DISABLE_JIT=1` — so the served container compiles nothing at start and
+its bind‑mounted `~/.cache` cannot shadow it. `Dockerfile.sm120-dsv41-nightly` step 5 runs it only on a base whose
+`cache_utils.py` writes the interleaved records; `patch_vllm_nvfp4_sm120_upstream.py` then passes
+`kv_scale_placement="interleaved"` on both calls and its probe requires FlashInfer to take it (on 3f1bcfd82b both stay
+as they were). The upstream PR is prepared (internal); until it is merged the patch rides in the image like the others.
 
 ## Apply / build / run
 
