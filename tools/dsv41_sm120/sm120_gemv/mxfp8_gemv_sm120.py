@@ -32,14 +32,14 @@ def _ext():
     # kernel is sm_120-only (uses the e4m3 cvt intrinsics), so compile just that.
     os.environ.setdefault("VLLM_MOET_GEMV_ARCH", "12.0")
     os.environ["TORCH_CUDA_ARCH_LIST"] = os.environ["VLLM_MOET_GEMV_ARCH"]
-    cuda_flags = ["-O3", "--use_fast_math", "-std=c++17"]
+    cuda_flags = ["-O3", "--use_fast_math", "-std=c++20"]
     if os.environ.get("VLLM_MOET_GEMV_PTXAS", "0") == "1":
         cuda_flags += ["-Xptxas", "-v"]  # register / spill report per instantiation
     return load(
         name="vllm_moet_mxfp8_gemv_sm120",
         sources=[str(_HERE / "mxfp8_gemv_sm120.cu")],
         extra_cuda_cflags=cuda_flags,
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++20"],
         verbose=bool(int(os.environ.get("VLLM_MOET_GEMV_VERBOSE", "0"))),
     )
 

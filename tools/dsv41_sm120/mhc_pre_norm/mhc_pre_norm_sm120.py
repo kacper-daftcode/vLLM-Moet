@@ -36,8 +36,8 @@ def _ext():
     return load(
         name="vllm_moet_mhc_pre_norm_sm120",
         sources=[str(_HERE / "mhc_pre_norm_sm120.cu")],
-        extra_cuda_cflags=["-O3", "-std=c++17"],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++20"],
+        extra_cflags=["-O3", "-std=c++20"],
         verbose=bool(int(os.environ.get("VLLM_MOET_MHC_VERBOSE", "0"))),
     )
 

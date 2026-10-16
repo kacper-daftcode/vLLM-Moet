@@ -120,8 +120,8 @@ def load_ref(path: str):
     return load(
         name="vllm_moet_mxfp8_gemv_sm120_ref",
         sources=[path],
-        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++17"],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "--use_fast_math", "-std=c++20"],
+        extra_cflags=["-O3", "-std=c++20"],
     )
 
 
@@ -133,7 +133,7 @@ def load_race():
     src = d / "race.cu"
     if not src.exists() or src.read_text() != RACE_SRC:
         src.write_text(RACE_SRC)
-    return load(name="vllm_moet_gemv_pdl_race", sources=[str(src)], extra_cuda_cflags=["-O3", "-std=c++17"])
+    return load(name="vllm_moet_gemv_pdl_race", sources=[str(src)], extra_cuda_cflags=["-O3", "-std=c++20"])
 
 
 def bits(t: torch.Tensor) -> torch.Tensor:

@@ -31,8 +31,8 @@ def _ext():
         return load(
             name="vllm_moet_moe_l2_discard_sm120",
             sources=[str(_HERE / "moe_l2_discard_sm120.cu")],
-            extra_cuda_cflags=["-O3", "-std=c++17"],
-            extra_cflags=["-O3", "-std=c++17"],
+            extra_cuda_cflags=["-O3", "-std=c++20"],
+            extra_cflags=["-O3", "-std=c++20"],
             verbose=bool(int(os.environ.get("VLLM_MOET_MOE_L2_VERBOSE", "0"))),
         )
     finally:

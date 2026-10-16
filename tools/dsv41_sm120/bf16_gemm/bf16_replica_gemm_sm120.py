@@ -94,14 +94,14 @@ def _ext():
     from torch.utils.cpp_extension import load
 
     os.environ["TORCH_CUDA_ARCH_LIST"] = os.environ.get("VLLM_MOET_BF16_GEMM_ARCH", "12.0")
-    cuda_flags = ["-O3", "-std=c++17"]  # no fast-math: the reduction adds must keep denormals
+    cuda_flags = ["-O3", "-std=c++20"]  # no fast-math: the reduction adds must keep denormals
     if os.environ.get("VLLM_MOET_BF16_GEMM_PTXAS", "0") == "1":
         cuda_flags += ["-Xptxas", "-v"]
     return load(
         name="vllm_moet_bf16_replica_gemm_sm120",
         sources=[str(_HERE / "bf16_replica_gemm_sm120.cu")],
         extra_cuda_cflags=cuda_flags,
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cflags=["-O3", "-std=c++20"],
         verbose=bool(int(os.environ.get("VLLM_MOET_BF16_GEMM_VERBOSE", "0"))),
     )
 

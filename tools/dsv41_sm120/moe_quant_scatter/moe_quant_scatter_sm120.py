@@ -50,8 +50,8 @@ def _ext():
     return load(
         name="vllm_moet_moe_quant_scatter_sm120",
         sources=[str(_HERE / "moe_quant_scatter_sm120.cu")],
-        extra_cuda_cflags=["-O3", "-std=c++17"],
-        extra_cflags=["-O3", "-std=c++17"],
+        extra_cuda_cflags=["-O3", "-std=c++20"],
+        extra_cflags=["-O3", "-std=c++20"],
         verbose=bool(int(os.environ.get("VLLM_MOET_MOE_QS_VERBOSE", "0"))),
     )
 
