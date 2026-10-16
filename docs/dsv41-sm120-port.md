@@ -1632,7 +1632,9 @@ Triton GEMM); what does not work is paying for two Python forwards. Options, by 
   than its all‑reduce); the MXFP8 all‑gather is not one tensor here (three consumer formats).
 - *CUDA graphs for the half‑chunk segments*: replaying graphs removes the Python per microbatch and makes DBO's
   −25 % reachable, but the breakable graphs need the all‑reduce as a break point, the replay batches have dynamic
-  shapes, and the graph pools cost activation memory the KV pool pays for.
+  shapes, and the graph pools cost activation memory the KV pool pays for. Measured the next day (section "CUDA
+  graphs for prefill‑size steps: what they cost"): the Python goes (−4×), and one 2,048‑token size takes 1.2 GiB of
+  KV at the full depth — a quarter of the served pool, about half for two microbatches.
 - *Fewer launches per sublayer* (fusing the prefill glue as `moe_quant_scatter` did for decode; the DeepGEMM and
   FlashInfer Python launch paths): every 10 % off the host side is 10 % more room for overlap, but DBO needs 50 %.
 - *Larger chunks* (`--max-num-batched-tokens 8192`) double the GPU work per launch and would make DBO GPU‑bound,
@@ -1716,7 +1718,43 @@ drafter's graph is **1,030.6 → 1,077.0 µs** although its layers now take the 
 987.7): 182 kernels instead of 163, one more `mxfp8_mma_gemv_v3` launch of ~56 µs — the size of DSpark's 15360 → 5120
 `main_proj` — and a few small kernels of upstream's drafter (`_token_request_mapping_kernel`, comparisons, a norm);
 the steps per second do not show it, so the projection most likely moved into the graph rather than being added
-(open: compare the drafter's eager part).
+(open: compare the drafter's eager part). The production start at 0.94 on production's disk tier (ready 13:20Z,
+20.9 min, the autotune cache filled by the test start) has **4.71 GiB = 3,737,321 tokens of KV, +10.5 % against the
+21d93d0d image's 3,380,873**; the service was down 12:27–12:48Z and 12:59–13:20Z (~42 min; the test server took the
+traffic in between).
+
+The 163K prefill on the served image, profiled like `run27` (production idle, `/start_profile` around one fresh
+4600‑line prompt; `run28_prefill163k_3f1`, rank 0): 163,075 tokens in 9.04 s under the profiler (8.65 s without),
+GPU busy 98 % — NCCL all‑reduce 2,893 ms (**34.0 %**, was 2,943 / 32.6 %), MoE FP4 grouped GEMM 1,614 (19.0 %),
+sparse MLA prefill 920 (10.8 %), mHC 809 (9.5 %), MXFP8 dense GEMMs 795 (9.3 %), elementwise 651 (7.6 %), indexer
+325 (3.8 %, was 471: 416 instead of 519 logits launches, top‑k 171 → 90 ms), BF16 GEMMs 285 (3.4 %). One layer's
+worth of MoE / attention launches per chunk less (vllm#59894) and the indexer pay for the gain; the all‑reduce did not
+move and is now a larger share.
+
+## CUDA graphs for prefill‑size steps: what they cost (2026‑10‑16)
+
+The prefill DBO above lost to the host: two microbatches are two Python forwards. CUDA graphs remove the Python, so
+whether they fit is the question for any overlap of the all‑reduce. Measured without the model on GPUs 0–3, the
+3f1bcfd82b image through the serving launcher with `--load-format dummy`:
+
+- *Do prefill steps run in graphs at all?* The 8‑layer 1/5 model with PIECEWISE capture sizes 1,024 / 2,048 / 4,096
+  (`--max-cudagraph-capture-size 4096 --compilation-config '{"cudagraph_capture_sizes": [1, …, 64, 1024, 2048, 4096]}'`)
+  starts, serves and replays them: 1,671 of a fresh 11.4K prefill's 2,209 kernels came from 48 graph launches (eager:
+  543 of 2,203, the drafter's). Python time on the host fell from 60 ms (`cpu_op`, three chunks) to 16 ms; the
+  launches look expensive (`cudaGraphLaunch` 708 µs, `cuLaunchKernelEx` 51 µs) only because the GPU runs 49 ms behind
+  and the launch queue is full. The prefill time does not change (a single batch is GPU‑bound: 155.9 vs 158.1 ms).
+  So graphs would make two microbatches GPU‑bound.
+- *What do they cost?* There, KV −32 % (capture 2.24 GiB). At the full depth — the model's own 40‑layer structure with
+  16 routed experts, activation peak 1.90 GiB eager against the served model's 2.0 —, one PIECEWISE size of 2,048
+  tokens: capture 1.82 GiB instead of 0.63, the profiled peak 3.08 GiB instead of 1.90, **KV −1.22 GiB**; prefill
+  519.9 vs 521.0 ms. On the served model that is a quarter of its 4.71 GiB KV pool for one half‑chunk size, and an
+  overlap of two microbatches holds both microbatches' activations in the graphs (upstream's ubatched capture records
+  both threads into one graph), i.e. about half of the KV.
+
+So the overlap that would move the 34 % (up to ≈ −25…30 % of the prefill if 80–90 % of the all‑reduce hides, the
+bench above) costs a quarter to a half of the GPU KV pool and a DBO + PIECEWISE‑graph combination upstream does not
+have (the DBO patch did not even survive this rebase). Not pursued for now; it becomes interesting if the KV budget
+grows or upstream ships ubatching inside piecewise graphs.
 
 ## A sequence‑parallel mHC boundary, measured (2026‑10‑16)
 
