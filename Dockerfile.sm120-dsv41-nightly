@@ -172,6 +172,14 @@
 #      graph's DAG span 767 -> 707 us per decode step (five launches, 36.6 us cold + 4 x 12.9 us from L2, replace the
 #      five bias GEMMs' 103 us and their small kernels: 145 kernels instead of 180), step period 9,324 -> 9,227 us.
 #      VLLM_MOET_FUSED_MARKOV=0 keeps vLLM's loop.
+#  21. The target's lm_head at <= 16 rows as an MXFP8 GEMV on step 3's kernel (patch_vllm_target_lm_head_mxfp8_sm120.py; the
+#      target-side twin of step 18, sharing the MXFP8 copy with the drafter through a cache keyed by the weight's address):
+#      the BF16 lm_head runs once per decode step outside the CUDA graphs and streamed in ~214 us (torch profile
+#      run30_df3b_b12x_c1); the GEMV takes ~104-136 us, 6-7 rows are padded to 8. Unlike step 18 this changes the target's
+#      logits (~3.8 % relative error on random data, top-5 overlap 0.96) and therefore the outputs - owner's decision
+#      2026-10-20, gated by GSM8K-200 / needle / tools in the serving window. Full-depth dummy-weight model (325 W, memory
+#      +5000 MHz, C1): kernels outside the graphs 378 -> 297 us, step period 9,487 -> 9,393 us (-1.0 %).
+#      Built in but OFF by default: VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 at runtime turns it on.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -362,9 +370,14 @@ ARG VLLM_MOET_FUSED_MARKOV=1
 RUN if [ "$VLLM_MOET_FUSED_MARKOV" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_fused_markov_sm120.py \
     && python3 -c "import vllm.models.deepseek_v41.nvidia.dspark as d, vllm.models.deepseek_v41.amd.ops.fused_markov as f; assert hasattr(d.DSparkDeepseekV4ForCausalLM, 'sample_sequential') and hasattr(f, 'sample_sequential'); print('dspark fused markov patched')"; fi
 
+# 21. The target's lm_head as an MXFP8 GEMV at decode row counts (runtime switch VLLM_MOET_TARGET_LM_HEAD_MXFP8=1, default off).
+ARG VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH=1
+RUN if [ "$VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_target_lm_head_mxfp8_sm120.py \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.model as m; assert hasattr(m, '_moet_target_mxfp8_lm_head'); print('target lm_head mxfp8 patched')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch)" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
