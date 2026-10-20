@@ -180,6 +180,14 @@
 #      2026-10-20, gated by GSM8K-200 / needle / tools in the serving window. Full-depth dummy-weight model (325 W, memory
 #      +5000 MHz, C1): kernels outside the graphs 378 -> 297 us, step period 9,487 -> 9,393 us (-1.0 %).
 #      Built in but OFF by default: VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 at runtime turns it on.
+#  22. FC2 of b12x's compact W4A8 micro MoE path grouped by expert (patch_flashinfer_b12x_fc2_grouped_sm120.py +
+#      b12x_fc2/): b12x's direct phase 2 computes each (token, expert) pair of a decode step in its own CTAs, so an
+#      expert chosen by several of the step's tokens has its w2 tile read once per pair; the grouped kernel computes all
+#      pairs of an expert in one CTA per 128-column tile with b12x's MMA sequence and epilogue, so route_output keeps its
+#      bits (GPU test: the same bits at 6-36 distinct experts, and the patched MoE's outputs equal b12x's). On routing
+#      recorded from the served model (160 decode-step layers, 22.5 distinct experts of 36 pairs; 325 W, memory +5000)
+#      FC2 takes 22.6 instead of 27.6 us per layer: -199 us per decode step. VLLM_MOET_B12X_FC2_GROUPED=0 at runtime keeps
+#      b12x's phase 2.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -191,7 +199,8 @@
 #  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10; VLLM_MOET_DSPARK_MHC_STREAM for the drafter's stream alone),
 #  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14),
 #  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16), VLLM_MOET_B12X_COMPACT_BIND (17),
-#  VLLM_MOET_DRAFTER_LM_HEAD_MXFP8 (18), VLLM_MOET_DSV4_TOPK (19), VLLM_MOET_FUSED_MARKOV (20).
+#  VLLM_MOET_DRAFTER_LM_HEAD_MXFP8 (18), VLLM_MOET_DSV4_TOPK (19), VLLM_MOET_FUSED_MARKOV (20),
+#  VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH (21), VLLM_MOET_B12X_FC2_GROUPED (22).
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> .
@@ -375,9 +384,18 @@ ARG VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH=1
 RUN if [ "$VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_target_lm_head_mxfp8_sm120.py \
     && python3 -c "import vllm.models.deepseek_v41.nvidia.model as m; assert hasattr(m, '_moet_target_mxfp8_lm_head'); print('target lm_head mxfp8 patched')"; fi
 
+# 22. FC2 of b12x's compact W4A8 MoE path grouped by expert (header); the extension is compiled here.
+#     GPU test: tools/dsv41_sm120/b12x_fc2/test_b12x_fc2_grouped_sm120.py.
+ARG VLLM_MOET_B12X_FC2_GROUPED=1
+RUN if [ "$VLLM_MOET_B12X_FC2_GROUPED" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer_b12x_fc2_grouped_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_fc2'); import b12x_fc2_grouped_sm120 as f; e = f._ext(); assert hasattr(e, 'fc2_grouped'); print('sm120 b12x grouped FC2 extension built')" \
+    && grep -q "_moet_fc2_grouped_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
+    && grep -q "_moet_fc2_grouped_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_preparation.py \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_fc2_grouped_sm120/*.so; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch)" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -397,4 +415,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.drafter-lm-head-mxfp8="${VLLM_MOET_DRAFTER_LM_HEAD_MXFP8}" \
       com.vllm-moet.dsv4-topk="${VLLM_MOET_DSV4_TOPK}" \
       com.vllm-moet.fused-markov="${VLLM_MOET_FUSED_MARKOV}" \
+      com.vllm-moet.b12x-fc2-grouped="${VLLM_MOET_B12X_FC2_GROUPED}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
