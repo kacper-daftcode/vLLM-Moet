@@ -149,6 +149,12 @@
 #      C1 +22-23 %, C8 +38-43 % (the MoE kernels no longer compute 64-row padding, so the power-capped clocks rise),
 #      163K prefill +1 %, GPU KV 3.80M -> 9.90M tokens; GSM8K-200 194 vs 193, needle / tools / vision unchanged.
 #      Serve with EXTRA_ARGS="--moe-backend b12x" plus "moe_backend":"b12x" in the DSpark config.
+#  18. The DSpark drafter's lm_head at <= 16 rows as an MXFP8 GEMV on step 3's kernel (patch_vllm_dspark_lm_head_mxfp8_sm120.py):
+#      the drafter aliases the target's BF16 lm_head ([32320, 5120] per TP4 rank), which cuBLAS streamed in ~210 us per decode
+#      step; an MXFP8 copy (+170 MB per GPU) takes ~104 us at 5 rows. Only the drafts change - the target's logits stay BF16.
+#      Measured 2026-10-20 with step 17's b12x MoE: 104.7 -> 106.1 steps/s on Fraser Price's LocalMaxxing prompt, code-v1
+#      103.5 -> 105.2, acceptance 0.728 -> 0.723 and 0.687 -> 0.693 (inside the run-to-run spread), GPU KV -1.2 %.
+#      VLLM_MOET_DRAFTER_LM_HEAD_MXFP8=0 turns it off at runtime.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -159,7 +165,8 @@
 #  can be built around: VLLM_MOET_REASONING_EFFORT (4), VLLM_MOET_NVFP4_KV (2's indexer gate + 5),
 #  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10; VLLM_MOET_DSPARK_MHC_STREAM for the drafter's stream alone),
 #  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14),
-#  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16), VLLM_MOET_B12X_COMPACT_BIND (17).
+#  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16), VLLM_MOET_B12X_COMPACT_BIND (17),
+#  VLLM_MOET_DRAFTER_LM_HEAD_MXFP8 (18).
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> .
@@ -318,9 +325,15 @@ RUN if [ "$VLLM_MOET_B12X_COMPACT_BIND" = "1" ]; then python3 /opt/vllm-moet/dsv
     && grep -q "_moet_compact_launches(self)" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_impl.py \
     && echo "b12x compact bind patched"; fi
 
+# 18. The DSpark drafter's lm_head at decode row counts on the MXFP8 GEMV (header); needs step 3's patched linear kernel.
+ARG VLLM_MOET_DRAFTER_LM_HEAD_MXFP8=1
+RUN if [ "$VLLM_MOET_DRAFTER_LM_HEAD_MXFP8" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_lm_head_mxfp8_sm120.py \
+    && grep -q "_moet_mxfp8_lm_head(self, normed)" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/dspark.py \
+    && echo "drafter lm_head mxfp8 patched"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -337,4 +350,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.prefill-dbo="${VLLM_MOET_PREFILL_DBO}" \
       com.vllm-moet.indexer-shard-rows="${VLLM_MOET_INDEXER_SHARD_ROWS}" \
       com.vllm-moet.b12x-compact-bind="${VLLM_MOET_B12X_COMPACT_BIND}" \
+      com.vllm-moet.drafter-lm-head-mxfp8="${VLLM_MOET_DRAFTER_LM_HEAD_MXFP8}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
