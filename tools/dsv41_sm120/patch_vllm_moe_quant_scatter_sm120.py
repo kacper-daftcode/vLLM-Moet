@@ -187,17 +187,64 @@ PERMUTE_NEW = (
 )
 
 
+# vLLM main after 49cb2bbf: deepgemm_moe_permute returns DeepGEMM's prefix-sum layout on the SM100 family and the
+# contiguous m_indices elsewhere (`grouped_layout`); the fused kernel writes the contiguous layout only.
+_FP4_PSUM_LINE = "        use_psum_layout = current_platform.is_device_capability_family(100)\n"
+_PERMUTE_CALL_PSUM = (
+    "        a1q, a1q_scale, grouped_layout, inv_perm, align_used = deepgemm_moe_permute(\n"
+    "            aq=a1q,\n"
+    "            aq_scale=a1q_scale,\n"
+    "            topk_ids=topk_ids,\n"
+    "            local_num_experts=local_num_experts,\n"
+    "            expert_map=expert_map,\n"
+    "            expert_tokens_meta=expert_tokens_meta,\n"
+    "            aq_out=a1q_perm,\n"
+    "            use_psum_layout=use_psum_layout,\n"
+    "        )\n"
+)
+_PERMUTE_TAIL = (
+    "        assert a1q.size(0) == M_sum\n"
+    "\n"
+    "        # Cap DG's BLOCK_M heuristic at the workspace's per-expert alignment;\n"
+    "        # see DeepGemmExperts.apply for rationale.\n"
+)
+PERMUTE_OLD_PSUM = (
+    PERMUTE_OLD.split("        a1q, a1q_scale, expert_ids, inv_perm, align_used")[0]
+    + _FP4_PSUM_LINE
+    + _PERMUTE_CALL_PSUM
+    + _PERMUTE_TAIL
+)
+PERMUTE_NEW_PSUM = (
+    PERMUTE_NEW.split("        if fused_qs:\n")[0]
+    + _FP4_PSUM_LINE
+    + "        if fused_qs and not use_psum_layout:\n"
+    + f"            {MARKER}: quantize + permute in one launch (same\n"
+    + "            # M_sum / alignment as deepgemm_moe_permute computes; contiguous layout)\n"
+    + "            a1q, a1q_scale, grouped_layout, inv_perm = _qs.fused_quant_permute(\n"
+    + "                a1q, topk_ids, local_num_experts, M_sum, align_used, aq_out=a1q_perm\n"
+    + "            )\n"
+    + "        else:\n"
+    + "            if fused_qs:\n"
+    + "                a1q, a1q_scale = per_token_group_quant_fp8(a1q, self._ACT_BLOCK_K)\n"
+    + "".join("    " + line + "\n" for line in _PERMUTE_CALL_PSUM.splitlines())
+    + _PERMUTE_TAIL
+)
+
+
 def patch_text(src: str, qs_dir: str) -> str:
     if MARKER in src:
         return src
+    permute_old, permute_new = PERMUTE_OLD, PERMUTE_NEW
+    if _FP4_PSUM_LINE in src:
+        permute_old, permute_new = PERMUTE_OLD_PSUM, PERMUTE_NEW_PSUM
     for name, anchor in (("helper", HELPER_ANCHOR), ("property", PROP_ANCHOR),
-                         ("apply head", APPLY_HEAD_OLD), ("permute", PERMUTE_OLD)):
+                         ("apply head", APPLY_HEAD_OLD), ("permute", permute_old)):
         if src.count(anchor) != 1:
             raise SystemExit(f"{name} anchor found {src.count(anchor)} times (expected 1)")
     out = src.replace(HELPER_ANCHOR, HELPER_ANCHOR + HELPER_TEMPLATE.format(marker=MARKER, qs_dir=qs_dir), 1)
     out = out.replace(PROP_ANCHOR, PROP_NEW, 1)
     out = out.replace(APPLY_HEAD_OLD, APPLY_HEAD_NEW, 1)
-    out = out.replace(PERMUTE_OLD, PERMUTE_NEW, 1)
+    out = out.replace(permute_old, permute_new, 1)
     return out
 
 

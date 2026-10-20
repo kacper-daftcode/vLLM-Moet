@@ -157,12 +157,32 @@ FC2_GATHER_NEW = (
     + f"            {MARKER}: joined after the gather, the last reader of mm2_out\n"
     + "            torch.cuda.current_stream().wait_stream(_moet_l2_side)\n"
 )
+# vLLM main after 49cb2bbf: `grouped_layout` is the contiguous m_indices unless use_psum_layout (SM100 family), which
+# has no padding rows to discard.
+FC2_ANCHOR_PSUM = FC2_ANCHOR.replace(
+    "                expert_ids,\n", "                grouped_layout,\n                use_psum_layout=use_psum_layout,\n"
+)
+FC2_GATHER_ANCHOR_PSUM = FC2_ANCHOR_PSUM + GATHER
+FC2_GATHER_NEW_PSUM = (
+    FC2_ANCHOR_PSUM
+    + f"            {MARKER}: the padding rows FC2 just wrote are never read\n"
+    + "            _moet_l2_side = None if use_psum_layout else _moet_drop_padding_rows(\n"
+    + "                mm2_out, grouped_layout, align_used, topk_ids.size(0)\n"
+    + "            )\n"
+    + GATHER
+    + "        if _moet_l2_side is not None:\n"
+    + f"            {MARKER}: joined after the gather, the last reader of mm2_out\n"
+    + "            torch.cuda.current_stream().wait_stream(_moet_l2_side)\n"
+)
 
 
 def patch_text(src: str, l2_dir: str) -> str:
     if MARKER in src:
         return src
-    for name, anchor in (("helper", HELPER_ANCHOR), ("FC2 call + gather", FC2_GATHER_ANCHOR)):
+    gather_old, gather_new = FC2_GATHER_ANCHOR, FC2_GATHER_NEW
+    if "        use_psum_layout = current_platform.is_device_capability_family(100)\n" in src:
+        gather_old, gather_new = FC2_GATHER_ANCHOR_PSUM, FC2_GATHER_NEW_PSUM
+    for name, anchor in (("helper", HELPER_ANCHOR), ("FC2 call + gather", gather_old)):
         n = src.count(anchor)
         if n != 1:
             raise SystemExit(f"deep_gemm_moe.py: {name} anchor found {n} times (expected 1)")
@@ -170,7 +190,7 @@ def patch_text(src: str, l2_dir: str) -> str:
         raise SystemExit("deep_gemm_moe.py: current_platform is not imported (the helper uses it)")
     helper = HELPER_TEMPLATE.replace("{marker}", MARKER).replace("{l2_dir}", l2_dir)
     out = src.replace(HELPER_ANCHOR, helper + HELPER_ANCHOR, 1)
-    return out.replace(FC2_GATHER_ANCHOR, FC2_GATHER_NEW, 1)
+    return out.replace(gather_old, gather_new, 1)
 
 
 def main() -> int:

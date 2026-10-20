@@ -2,9 +2,11 @@
 #
 # The rebase of Dockerfile.sm120-dsv41 (vllm-openai:deepseekv41-flash-0909 + our patches) onto
 # vllm/vllm-openai:nightly (vLLM main; the recipe marks 0909 "superseded"). Same idea as the 0909 image: the
-# official image plus the sm_120 gaps closed, nothing else. Base: nightly 49cb2bbf (vLLM main of 2026-10-16: torch
-# 2.14 / triton 3.8, FlashInfer 0.7.2, DeepGEMM a7a92773 on torch's stable ABI, the decoder replay starting at the
-# last KV-source layer (vllm#59894), the indexer's TP row sharding (vllm#54951)). It writes the V4.1 KV records
+# official image plus the sm_120 gaps closed, nothing else. Base: nightly df3bd094 (vLLM main of 2026-10-20,
+# 0.32.1rc1.dev117: torch 2.14 / triton 3.8, FlashInfer 0.7.2, DeepGEMM 727f8470 on torch's stable ABI, the decoder
+# replay starting at the last KV-source layer (vllm#59894), the indexer's TP row sharding (vllm#54951) with its
+# threshold configurable (vllm#61647)); the 49cb2bbf images (vLLM main of 2026-10-16, DeepGEMM a7a92773) came from
+# this file at 213d5fa, and steps 3, 8 and 14 still apply to both. It writes the V4.1 KV records
 # interleaved (vllm#61371, f8460ef236: each token's scales right after its data, for FlashMLA 2026.09.30), while
 # FlashInfer's SM120 DSv4.1 reader (0.7.1, 0.7.2) reads the footer layout (a page's data, then its scales): step 5
 # teaches FlashInfer the interleaved placement first (flashinfer_interleaved/, kv_scale_placement, its
@@ -137,7 +139,16 @@
 #      AttentionConfig.indexer_tp_shard_min_rows rows (patch_vllm_indexer_shard_rows.py) instead of the constant
 #      16,384 x TP, which a 4096-token prefill chunk never reaches. The default stays 65,536 (= upstream at TP4,
 #      nothing changes); docker/sm120/run-dsv41.sh INDEXER_TP_SHARD_MIN_ROWS lowers it. Skips itself on a vLLM
-#      that has the field.
+#      that has the field (df3bd094 has it).
+#  17. `--moe-backend b12x` (FlashInfer 0.7.2's b12x W4A8 MoE: MXFP4 weights x MXFP8 activations) works at TP4:
+#      vLLM binds the TPMoEScratchPlan it plans through the tensor-based API, and at 576 intermediate rows per rank
+#      (576 % 128 == 64) b12x runs the compact N64 micro kernels, whose launchers only the canonical preparation path
+#      attached - the first decode-sized call stopped with "compact W4A8 execution requires its prepared native
+#      launchers". patch_flashinfer_b12x_compact_bind.py compiles them on a plan's first bind (outside graph capture)
+#      and attaches them. Measured 2026-10-20 on 4x RTX PRO 6000 at 300 W against DeepGEMM in the same image: decode
+#      C1 +22-23 %, C8 +38-43 % (the MoE kernels no longer compute 64-row padding, so the power-capped clocks rise),
+#      163K prefill +1 %, GPU KV 3.80M -> 9.90M tokens; GSM8K-200 194 vs 193, needle / tools / vision unchanged.
+#      Serve with EXTRA_ARGS="--moe-backend b12x" plus "moe_backend":"b12x" in the DSpark config.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -148,30 +159,30 @@
 #  can be built around: VLLM_MOET_REASONING_EFFORT (4), VLLM_MOET_NVFP4_KV (2's indexer gate + 5),
 #  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10; VLLM_MOET_DSPARK_MHC_STREAM for the drafter's stream alone),
 #  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14),
-#  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16).
+#  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16), VLLM_MOET_B12X_COMPACT_BIND (17).
 #
 # Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-49cb2bbf-<tag> .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> .
 #   The 21d93d0d images came from this file at 59a0136 (base vllm-openai:nightly-21d93d0d + FlashInfer 0.7.1rc2 installed
 #   over the base's 0.7.0.post1 + DeepGEMM e1f418c2): -pdl (steps 1-14, served since 2026-10-13 16:27Z, window 8) and
 #   -side (6aafbb6, window 9 on 2026-10-14, not kept, see the port doc). The images on vllm-openai:nightly 0961bbae with
 #   FlashInfer 0.7.0.dev20260922 came from it before that: -pdl at c066be9, -engram (steps 1-12) at f7cc6d9, and with
 #   fewer steps -bf16, -mhc, -moeqs, -ced, -kvdedup and dsv41-nightly-20260923 (git log).
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-49cb2bbf-<tag> KV_MODE=upstream
+# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> KV_MODE=upstream
 #   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla). A new FlashInfer
 #   version starts with an empty FlashInfer autotune cache (vLLM keys it by FlashInfer's version / arch dir): the
 #   first start autotunes again (GPU_MEM_UTIL 0.92 for that start, as for any empty autotune cache).
 # Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
 
-ARG BASE_IMAGE=vllm/vllm-openai:nightly-49cb2bbf71cfd36ee5aa33d1e184b1cddff55294@sha256:a8d84c552462d1c60da4d7fc97f8f8f48a8fbfbf6820f73477fa0efe2571bf9d
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-df3bd094aeea829f27baa0a5282830464f601d9f@sha256:b91d90a63b75d00e780287e4236123a281ee3d29122c864a7044a19a680fdf9d
 
 # ---------------------------------------------------------------- deep_gemm
 FROM ${BASE_IMAGE} AS deepgemm-builder
 # vLLM's pin (cmake/external_projects/deepgemm.cmake / tools/install_deepgemm.sh): the vllm-project fork of
-# DeepGEMM, a7a92773 (2026-10-16 via vllm#61744: upstream 2.8.1 + the SM120 port, on torch's stable ABI); needs the
-# cutlass and deep_jit submodules.
+# DeepGEMM, 727f8470 (one commit after a7a92773 of vllm#61744 - upstream 2.8.1 + the SM120 port, on torch's stable
+# ABI - writing FP8 einsum output scale factors in the 128x4 tiled layout); needs the cutlass and deep_jit submodules.
 ARG DEEPGEMM_REPO=https://github.com/vllm-project/DeepGEMM.git
-ARG DEEPGEMM_REF=a7a927731b109fdfec770df7c2a5be5d7e2216b5
+ARG DEEPGEMM_REF=727f847082d2e7946f70dc02b94949db206310d3
 # libdw-dev: deep_jit's exception.hpp includes elfutils/libdwfl.h (compile-time only; the
 # vendored _C_extension links neither libdw nor libelf).
 RUN apt-get update && apt-get install -y --no-install-recommends git libdw-dev \
@@ -298,9 +309,18 @@ ARG VLLM_MOET_INDEXER_SHARD_ROWS=1
 RUN if [ "$VLLM_MOET_INDEXER_SHARD_ROWS" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_shard_rows.py \
     && python3 -c "from vllm.config.attention import AttentionConfig as A; import inspect, vllm.v1.attention.backends.mla.indexer as i; assert A().indexer_tp_shard_min_rows == 65536 and 'min_rows' in inspect.signature(i.balanced_prefill_row_shard).parameters; print('indexer shard rows configurable')"; fi
 
+# 17. b12x W4A8 MoE through `--moe-backend b12x` at 576 intermediate rows per rank (TP4): FlashInfer's TPMoEScratchPlan.bind
+#     attaches the compact N64 launchers the canonical preparation path attaches (patch_flashinfer_b12x_compact_bind.py);
+#     without it the first decode-sized call stops with "compact W4A8 execution requires its prepared native launchers".
+#     The default MoE backend (DeepGEMM, steps 3/8/14) is unchanged.
+ARG VLLM_MOET_B12X_COMPACT_BIND=1
+RUN if [ "$VLLM_MOET_B12X_COMPACT_BIND" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer_b12x_compact_bind.py \
+    && grep -q "_moet_compact_launches(self)" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_impl.py \
+    && echo "b12x compact bind patched"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly 49cb2bbf (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM a7a92773 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647)" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -316,4 +336,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.moe-fc2-discard="${VLLM_MOET_MOE_FC2_DISCARD}" \
       com.vllm-moet.prefill-dbo="${VLLM_MOET_PREFILL_DBO}" \
       com.vllm-moet.indexer-shard-rows="${VLLM_MOET_INDEXER_SHARD_ROWS}" \
+      com.vllm-moet.b12x-compact-bind="${VLLM_MOET_B12X_COMPACT_BIND}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
