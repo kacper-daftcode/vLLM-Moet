@@ -172,7 +172,7 @@ __global__ void wait_reduce_kernel(const __nv_bfloat16* __restrict__ x_local, in
 
 
 // ---- all-gather (bit-exact): the same phased push, generic row width (16-B chunks), consumer concatenates the 4 sources ----
-#define CH_MAX 1024  // 16 KB rows: logits [rows, 8080] bf16 = 1010 chunks
+#define CH_MAX 4096  // 64 KB rows: the lm_head logits [rows, 32320] bf16 = 4040 chunks per rank
 
 __global__ void push_phased_gather_kernel(const uint4* __restrict__ x, int M, int row_chunks, int rank, Peers3 peers,
                                           unsigned* __restrict__ ctrl, int ctas_per_dest) {

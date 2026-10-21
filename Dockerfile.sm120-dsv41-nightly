@@ -207,8 +207,9 @@
 #      An output change at C1 (not NCCL's ring order) - gated in the serving window. VLLM_MOET_P2P_AR=1 plus
 #      VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16 at runtime turns it on.
 #  25. The vocab all-gather of the MXFP8 lm_head helpers (steps 18 and 21) on the P2P push (same patcher; bit-exact - a gather
-#      moves bytes): logits [6, 8080] bf16 16.9 us vs NCCL's all-gather 31.7 from a graph; the served step runs one for the
-#      target (outside the graphs, ~50 us) and one in the drafter graph (~42 us). VLLM_MOET_P2P_AG=1 at runtime turns it on.
+#      moves bytes). On the real per-rank shape ([rows, 32320] bf16, 64 KB rows) it is only marginally ahead of NCCL's
+#      all-gather ([6, 32320] 54.6 vs 62.1 us from a graph: 1.16 MB egress per rank, bandwidth-bound) - about 15 us per decode
+#      step - so it is built in but off. VLLM_MOET_P2P_AG=1 at runtime turns it on.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC

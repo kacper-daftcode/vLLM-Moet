@@ -79,8 +79,9 @@ def _init() -> dict | None:
         peers_flags = [ext.ipc_open(handles[r][1]) for r in peers]
         ctrl = torch.zeros(8, dtype=torch.int32, device=dev)
         timeout = torch.zeros(1, dtype=torch.int32, device=dev)
-        # all-gather buffers (16 KB rows x 64 x 4 sources x 4 slots = 16 MB) with their own flags and counters
-        gdata = ext.alloc_shared(NSLOTS * 4 * 64 * 1024 * 16)
+        # all-gather buffers (64 KB rows x 64 x 4 sources x 4 slots = 64 MB: the lm_head's 32,320-wide bf16 logits) with
+        # their own flags and counters
+        gdata = ext.alloc_shared(NSLOTS * 4 * 64 * 4096 * 16)
         gflags = ext.alloc_shared(NSLOTS * 4 * 32 * 4)
         ghandles: list = [None] * ws
         dist.all_gather_object(ghandles, (ext.ipc_handle(gdata), ext.ipc_handle(gflags)), group=tp.cpu_group)
@@ -166,7 +167,7 @@ def gather_applicable(x: torch.Tensor) -> bool:
     if not (x.dim() == 2 and x.is_cuda and 0 < x.shape[0] <= 64):
         return False
     row_bytes = x.shape[1] * x.element_size()
-    return row_bytes % 16 == 0 and row_bytes <= 16384
+    return row_bytes % 16 == 0 and row_bytes <= 4096 * 16
 
 
 def all_gather(x: torch.Tensor) -> torch.Tensor:
