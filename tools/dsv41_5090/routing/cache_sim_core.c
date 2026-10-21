@@ -39,7 +39,7 @@ int sim_cache(const int16_t* ids, int T, int L, int K, int E, int group, const i
                 int e = acc[i];
                 if (res[e]) { key[e] = s; continue; }
                 ++m;
-                if (policy == 1) {
+                if (policy == 1 && c > 0) {
                     if (nres < c) { res[e] = 1; key[e] = s; ++nres; }
                     else {
                         int v = -1;

@@ -87,12 +87,18 @@ def placement(freq: np.ndarray, resident: float, alloc: str) -> tuple[np.ndarray
 GPU_MOE_SHARE = 0.4   # share of a layer's GPU time spent in the expert GEMMs after the router (what the CPU can hide behind)
 
 
+# the GPU step grows with the DSpark verify window: measured on 4x PRO 6000 TP4 native 9.4 ms (no drafter) ->
+# 15.1 ms (k = 5), i.e. x1.6; k = 3 interpolated. --spec-factor overrides.
+SPEC_STEP_FACTOR = {0: 1.0, 3: 1.35, 5: 1.6}
+
+
 def step_time(miss_row: np.ndarray, group: int, gpu_step_ms: float) -> tuple[float, float, float]:
     """(serial, mid, overlap) ms per step. serial: no overlap at all; overlap: the CPU hides behind the whole GPU
     layer (needs the routing one layer ahead); mid: the CPU starts after the layer's router and hides only behind
     the GPU's own expert GEMMs (GPU_MOE_SHARE of the layer), the rest of the layer is serial."""
     te = t_expert(group) * 1e-3  # ms; every position of the step routes to the expert at most once -> <= group tokens
     cpu_l = miss_row.astype(np.float64) * te
+    gpu_step_ms = gpu_step_ms * SPEC_STEP_FACTOR.get(group - 1, 1.0 + 0.1 * (group - 1))
     hand = L * T_HANDOFF_US * 1e-3
     per_layer = gpu_step_ms / L
     serial = gpu_step_ms + cpu_l.sum() + hand
@@ -129,10 +135,15 @@ def main():
     ap.add_argument("--resident", default="0.25,0.28,0.31")
     ap.add_argument("--alloc", default="uniform,global")
     ap.add_argument("--k", default="0,3,5")
-    ap.add_argument("--gpu-step-ms", type=float, default=14.0)
+    ap.add_argument("--gpu-step-ms", type=float, default=14.0, help="miss-free GPU decode step at k = 0")
+    ap.add_argument("--spec-factor", default="", help="k:factor,... GPU step multipliers for DSpark steps (default 3:1.35,5:1.6)")
     ap.add_argument("--json", default="")
     args = ap.parse_args()
     lib = load_core()
+    if args.spec_factor:
+        for kv in args.spec_factor.split(","):
+            kk, f = kv.split(":")
+            SPEC_STEP_FACTOR[int(kk)] = float(f)
     if args.synthetic:
         R = synthetic_routes(n_seq=args.synthetic * 20)
     else:
