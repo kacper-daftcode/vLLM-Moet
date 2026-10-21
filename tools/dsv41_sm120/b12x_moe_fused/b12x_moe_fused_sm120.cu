@@ -23,11 +23,16 @@
 //   FC2: accumulate-in-C QMMA over the 4.5 K128 slices (the tail slice's K32 columns 2-3 with zero A and B, as b12x),
 //        alpha2[e] * down_scale * token_weight * acc -> cvt.rn.satfinite.bf16x2 into route_output[pair][hidden];
 //        a pair with an invalid id (padding, -1) gets zeros.
-// Measured (RTX PRO 6000, 325 W, memory +5000; 22.5 distinct experts of 36 pairs, cold L2): 65.9 us vs b12x's
+// Measured (RTX PRO 6000, 325 W, memory +5000; 22.5 distinct experts of 36 pairs, cold L2): 65.9 us (65.3 with the
+// evict_first weight loads) vs b12x's
 // projection 41.9 + activation 1.8 + grouped FC2 (step 22) 23.8 us; in a CUDA graph of the served MoE path -2.5 us per
 // layer (two kernel nodes fewer). Tried and measured no better: FC1 L2 prefetch deeper than 4 slices, a static share of
 // FC2 items preloaded by the CTAs idle during FC1, b12x's TopKSum fused into the FC2 epilogue (the fence after every
-// item serializes the pipeline: +5 us).
+// item serializes the pipeline: +5 us), the launch's w2 prefetched into L2 by the CTAs idle during FC1 (the prefetch
+// traffic slows the FC1 streams by what the FC2 phase gains at best: +6..+12 us), b12x's rows-quant fused into the
+// FC1 stream (+3.5 us: the quant on the K64 stage path and a shallower ring). The kernel sits at the DRAM floor of its
+// access pattern: 113 MB at 24 experts / 1.84 TB/s + ramp + prologue = 65 us (every FC1 stream is bandwidth-share
+// bound; SMs that host two FC1 streams finish 17 % later, the FC2 items of the early experts fill the DRAM meanwhile).
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -126,6 +131,16 @@ __device__ __forceinline__ void st_shared_zero16(uint32_t addr) {
   asm volatile("st.shared.v4.u32 [%0], {%1, %1, %1, %1};" ::"r"(addr), "r"(0u));
 }
 __device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" ::"l"(p)); }
+// the weights are streamed once: an evict_first L2 policy keeps them from displacing the activations and the rows
+// (FC1 -0.6 us per layer on the recorded routing, FC2 within noise)
+__device__ __forceinline__ uint64_t policy_evict_first() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;" : "=l"(pol));
+  return pol;
+}
+__device__ __forceinline__ void cp_async16_ef(uint32_t dst, const void* src, uint64_t pol) {
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2;" ::"r"(dst), "l"(src), "l"(pol));
+}
 __device__ __forceinline__ int ld_acquire(const int* p) {
   int v;
   asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
@@ -279,6 +294,7 @@ __device__ __forceinline__ void fc1_tile(const Args& a, Tables& T, uint8_t* smem
   const int tile_words_per_k32 = n32_chunks * 128;  // 2 KB (full) or 1 KB (tail) per K32 block
   const uint32_t s_rowsc = sbase + kF1Stages * kF1Stage;  // [row][K/32 bytes]
   const int sc_vecs = K / 32 / 16;                        // 16-byte granules of a row's scales (10)
+  const uint64_t pol = policy_evict_first();
   if (tid < nrows * 16) {
     const int row = tid >> 4, v = tid & 15;
     if (v < sc_vecs) cp_async16(s_rowsc + row * kF1RowScales + v * 16, a.a_scales + (size_t)T.tok[u][row] * (K / 32) + v * 16);
@@ -295,12 +311,12 @@ __device__ __forceinline__ void fc1_tile(const Args& a, Tables& T, uint8_t* smem
       const int idx = tid + i * kThreads;
       const int l = idx & 31, w = (idx >> 5) & 3, kb = idx >> 7;
       const uint32_t dst = st + kF1A + ((kb * 4 + w) * 32 + l) * 16;
-      if (w < n32_chunks) cp_async16(dst, wtile + (size_t)(j * 2 + kb) * tile_words_per_k32 + w * 128 + l * 4);
+      if (w < n32_chunks) cp_async16_ef(dst, wtile + (size_t)(j * 2 + kb) * tile_words_per_k32 + w * 128 + l * 4, pol);
       else st_shared_zero16(dst);
     }
     if (tid < 32) {  // 16 B = 4 columns' scale words
       const uint32_t dst = st + kF1A + kF1B + tid * 16;
-      if (tid < n_cols / 4) cp_async16(dst, stile + (size_t)(j >> 1) * n_cols + tid * 4);
+      if (tid < n_cols / 4) cp_async16_ef(dst, stile + (size_t)(j >> 1) * n_cols + tid * 4, pol);
       else st_shared_zero16(dst);
     }
     const int pj = j + T.pf_depth;
@@ -422,15 +438,16 @@ __device__ __forceinline__ void fc2_issue_w(const Args& a, uint8_t* smem, int e,
   const uint32_t* wsrc = a.w2 + (size_t)e * expert_words + (size_t)tile * (kTileN * kTotalK32 * 4) + half * 256;
   const uint8_t* sfsrc = a.w2_sf + ((size_t)e * a.out_tiles + tile) * kTileN * kTotalK32;
   const uint32_t sb = static_cast<uint32_t>(__cvta_generic_to_shared(smem)) + buf * kF2Buf;
+  const uint64_t pol = policy_evict_first();
   // B: per K32 block the half tile's two n32 chunks (1 KB contiguous); 18 blocks = 18 KB
   const int l = tid & 31, n32 = (tid >> 5) & 1, kbo = tid >> 6;  // 128 threads: two K32 blocks per pass
 #pragma unroll 1
   for (int kb = kbo; kb < kTotalK32; kb += 2)
-    cp_async16(sb + (kb * 2 + n32) * 512 + l * 16, wsrc + (size_t)kb * 512 + n32 * 128 + l * 4);
+    cp_async16_ef(sb + (kb * 2 + n32) * 512 + l * 16, wsrc + (size_t)kb * 512 + n32 * 128 + l * 4, pol);
   // scales: slices 0-3: 64 columns x 4 B (256 B each); tail: 64 columns x 2 B (128 B)
   if (tid < 4 * 16 + 8) {
     const int s = tid >> 4, v = tid & 15;
-    cp_async16(sb + kF2BItem + s * 256 + v * 16, sfsrc + (size_t)s * 512 + half * (s == 4 ? 128 : 256) + v * 16);
+    cp_async16_ef(sb + kF2BItem + s * 256 + v * 16, sfsrc + (size_t)s * 512 + half * (s == 4 ? 128 : 256) + v * 16, pol);
   }
   cp_async_commit();
 }
