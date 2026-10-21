@@ -23,7 +23,7 @@ import numpy as np
 import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-HID, SCALES, MAX_PAIRS, MAX_TOKENS = 5120, 160, 64, 8
+HID, SCALES, MAX_PAIRS, MAX_TOKENS = 5120, 160, 96, 16
 
 
 @functools.lru_cache(maxsize=None)

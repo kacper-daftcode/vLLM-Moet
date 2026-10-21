@@ -7,8 +7,8 @@
 
 #define CPU_TIER_HID 5120
 #define CPU_TIER_SCALES 160      // ue8m0 bytes per token (5120 / 32)
-#define CPU_TIER_MAX_PAIRS 64    // pairs per layer per step the mailbox can hold (8 tokens x top-6 = 48 for decode)
-#define CPU_TIER_MAX_TOKENS 8
+#define CPU_TIER_MAX_PAIRS 96    // pairs per layer per step the mailbox can hold (16 tokens x top-6; vLLM pads decode batches to its capture sizes)
+#define CPU_TIER_MAX_TOKENS 16
 
 struct CpuTierPair {
     uint16_t token;   // index into the request's a_values / a_scales

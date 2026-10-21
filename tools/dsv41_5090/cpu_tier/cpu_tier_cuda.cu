@@ -218,7 +218,7 @@ void publish(int64_t req_dev_ptr, torch::Tensor step_dev, torch::Tensor topk_ids
     TORCH_CHECK(slot_table.scalar_type() == torch::kInt32 && remapped.scalar_type() == torch::kInt32);
     TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous() && remapped.is_contiguous());
     TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_scales.scalar_type() == torch::kUInt8);
-    TORCH_CHECK(n_tokens >= 0 && n_tokens <= CPU_TIER_MAX_TOKENS, "at most 8 tokens per step on the CPU tier");
+    TORCH_CHECK(n_tokens >= 0 && n_tokens <= CPU_TIER_MAX_TOKENS, "at most CPU_TIER_MAX_TOKENS tokens per step on the CPU tier");
     const int n_pairs = (int)topk_ids.numel();
     TORCH_CHECK(n_pairs <= CPU_TIER_MAX_PAIRS && topk_ids.dim() == 2);
     publish_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(

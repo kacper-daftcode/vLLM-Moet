@@ -195,8 +195,8 @@ def main():
     # ---- 2. captured steps with promotions between them ----------------------------------------------------------
     tier.start(first_step=1)
     x_bf16 = torch.zeros(T, B.HID, dtype=torch.bfloat16, device=dev)
-    a_values = torch.zeros(8, B.HID, dtype=torch.uint8, device=dev)
-    a_scales = torch.zeros(8, B.B1, dtype=torch.uint8, device=dev)
+    a_values = torch.zeros(16, B.HID, dtype=torch.uint8, device=dev)
+    a_scales = torch.zeros(16, B.B1, dtype=torch.uint8, device=dev)
     ids = torch.zeros(T, TOPK, dtype=torch.int32, device=dev)
     wts = torch.zeros(T, TOPK, dtype=torch.float32, device=dev)
     remapped = [torch.zeros(T, TOPK, dtype=torch.int32, device=dev) for _ in range(L)]
