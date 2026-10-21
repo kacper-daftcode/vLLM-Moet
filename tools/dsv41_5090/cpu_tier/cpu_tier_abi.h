@@ -25,7 +25,9 @@ struct CpuTierRequest {
     uint32_t n_tokens;
     uint32_t flags;
     uint64_t t_publish_ns;  // GPU globaltimer at publish (for the KPIs)
-    uint64_t reserved;
+    uint32_t n_all;         // all pairs of the step (hits and misses): their global expert ids below, -1 = padding
+    uint32_t reserved;
+    int16_t ids[CPU_TIER_MAX_PAIRS];
     CpuTierPair pairs[CPU_TIER_MAX_PAIRS];
     uint8_t a_values[CPU_TIER_MAX_TOKENS][CPU_TIER_HID];
     uint8_t a_scales[CPU_TIER_MAX_TOKENS][CPU_TIER_SCALES];

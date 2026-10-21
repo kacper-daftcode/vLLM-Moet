@@ -17,6 +17,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import os
+import time
 
 import numpy as np
 import torch
@@ -58,6 +59,13 @@ def host_lib(path: str | None = None):
     lib.cpu_tier_totals.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64)]
     lib.cpu_tier_kpis.restype = ctypes.c_int
     lib.cpu_tier_kpis.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
+    lib.cpu_tier_misses.restype = ctypes.c_int
+    lib.cpu_tier_misses.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+    lib.cpu_tier_uses.restype = ctypes.c_int
+    lib.cpu_tier_uses.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int32), ctypes.c_int]
+    lib.cpu_tier_store_load.restype = ctypes.c_int64
+    lib.cpu_tier_store_load.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_void_p,
+                                        ctypes.c_void_p, ctypes.c_int64, ctypes.c_void_p, ctypes.c_int]
     lib.cpu_tier_request_bytes.restype = ctypes.c_int64
     lib.cpu_tier_ack_bytes.restype = ctypes.c_int64
     lib.cpu_tier_staging_bytes.restype = ctypes.c_int64
@@ -72,6 +80,56 @@ def init_tables(lib, tables_dir: str):
     inv = np.ascontiguousarray(np.fromfile(os.path.join(tables_dir, "b12x_ue8m0_inv.f32"), dtype=np.float32))
     assert act.shape == (65536,) and inv.shape == (256,)
     assert lib.moe_b12x_init_tables(act.ctypes.data, inv.ctypes.data) == 0
+
+
+RECORD_BYTES = 4700160
+
+
+class ExpertStore:
+    """A rank's expert records in one host arena (pinned through the extension, or a plain allocation), loaded
+    from build_store.py's files for the (layer, expert) pairs of `mask` ([n_layers, n_experts] bool; None = all)."""
+
+    def __init__(self, store_dir: str, rank: int, n_layers: int, n_experts: int, mask=None, pinned: bool = True,
+                 nthreads: int = 16, lib=None, ext=None):
+        self.lib = lib or host_lib()
+        self.dir, self.rank, self.n_layers, self.n_experts = store_dir, rank, n_layers, n_experts
+        m = np.ones((n_layers, n_experts), dtype=np.uint8) if mask is None else np.ascontiguousarray(mask, dtype=np.uint8)
+        self.n_records = int(m.sum())
+        self.nbytes = self.n_records * RECORD_BYTES
+        self.pinned = pinned
+        if pinned:
+            self.ext = ext or cuda_ext()
+            self.base = int(self.ext.alloc_pinned(self.nbytes))
+        else:
+            self._buf = np.empty(self.nbytes, dtype=np.uint8)
+            self.base = int(self._buf.ctypes.data)
+        self.slot_of = np.full((n_layers, n_experts), -1, dtype=np.int32)
+        t0 = time.perf_counter()
+        rc = self.lib.cpu_tier_store_load(store_dir.encode(), rank, n_layers, n_experts, m.ctypes.data, self.base,
+                                          self.nbytes, self.slot_of.ctypes.data, nthreads)
+        self.load_seconds = time.perf_counter() - t0
+        if rc != self.n_records:
+            raise RuntimeError(f"store load failed: rc={rc}")
+
+    def ptr(self, layer: int, expert: int) -> int:
+        s = int(self.slot_of[layer, expert])
+        if s < 0:
+            raise KeyError((layer, expert))
+        return self.base + s * RECORD_BYTES
+
+    def record(self, layer: int, expert: int) -> torch.Tensor:
+        """uint8 [RECORD_BYTES] CPU tensor view (pinned when the arena is: a non_blocking H2D source)."""
+        if self.pinned:
+            return self.ext.host_view(self.ptr(layer, expert), RECORD_BYTES)
+        s = int(self.slot_of[layer, expert])
+        return torch.from_numpy(self._buf[s * RECORD_BYTES:(s + 1) * RECORD_BYTES])
+
+    def attach(self, tier: "CpuTier") -> None:
+        for layer in range(self.n_layers):
+            for e in range(self.n_experts):
+                s = int(self.slot_of[layer, e])
+                if s >= 0:
+                    tier.set_record(layer, e, self.base + s * RECORD_BYTES)
 
 
 class CpuTier:
@@ -104,6 +162,8 @@ class CpuTier:
         for L in range(n_layers):
             assert self.lib.cpu_tier_set_mailboxes(self.handle, L, self.req[L], self.ack[L], self.staging[L]) == 0
         self._err_view = (ctypes.c_uint32 * 16).from_address(self.err)
+        self._miss_cursor = ctypes.c_int64(0)
+        self._use_cursor = ctypes.c_int64(0)
         self.started = False
 
     # ---- store ------------------------------------------------------------------------------------------------
@@ -160,6 +220,24 @@ class CpuTier:
         buf = (ctypes.c_int64 * (8 * cap))()
         n = self.lib.cpu_tier_kpis(self.handle, buf, cap)
         return np.frombuffer(buf, dtype=np.int64, count=8 * n).reshape(n, 8).copy()
+
+    def misses(self, cap: int = 65536) -> np.ndarray:
+        """New miss-log entries since the last call: [n, 4] int32 (step, layer, expert, pairs), one per distinct
+        (step, layer, expert) the CPU served."""
+        buf = (ctypes.c_int32 * (4 * cap))()
+        n = self.lib.cpu_tier_misses(self.handle, ctypes.byref(self._miss_cursor), buf, cap)
+        return np.frombuffer(buf, dtype=np.int32, count=4 * n).reshape(n, 4).copy()
+
+    def uses(self, cap: int = 16384) -> list[tuple[int, int, np.ndarray]]:
+        """New use-log entries since the last call: (step, layer, ids[int16] of all the step's pairs, -1 = padding)."""
+        buf = (ctypes.c_int32 * (67 * cap))()
+        n = self.lib.cpu_tier_uses(self.handle, ctypes.byref(self._use_cursor), buf, cap)
+        raw = np.frombuffer(buf, dtype=np.int32, count=67 * n).reshape(n, 67)
+        out = []
+        for i in range(n):
+            ids = raw[i, 3:].view(np.int16)[: int(raw[i, 2])]
+            out.append((int(raw[i, 0]), int(raw[i, 1]), ids.copy()))
+        return out
 
     def now_ns(self) -> int:
         return int(self.lib.cpu_tier_now_ns())

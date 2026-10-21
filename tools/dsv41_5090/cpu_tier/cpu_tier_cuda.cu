@@ -40,6 +40,7 @@ __global__ void publish_kernel(CpuTierRequest* req, const int* step_dev, const i
     for (int p = tid; p < n_pairs; p += blockDim.x) {
         const int e = ids[p];
         remapped[p] = e >= 0 ? slot[e] : -1;
+        req->ids[p] = (int16_t)e;  // the use log for the placement manager (hits and misses)
     }
     if (tid == 0) {
         int n = 0;
@@ -73,6 +74,7 @@ __global__ void publish_kernel(CpuTierRequest* req, const int* step_dev, const i
     if (tid == 0) {
         req->n_pairs = (uint32_t)s_n;
         req->n_tokens = (uint32_t)n_tokens;
+        req->n_all = (uint32_t)n_pairs;
         req->flags = 0;
         req->t_publish_ns = gtimer();
         __threadfence_system();
@@ -118,7 +120,76 @@ __global__ void wait_inject_kernel(const CpuTierAck* ack, const CpuTierRequest* 
     }
 }
 
+// ---- promotion: a checkpoint-layout record -> b12x's prepared layout at pool slot s (the permutations measured by
+// b12x_layout_probe.py). Record: w1n [576][2560] | w1s [576][160] | w3n | w3s | w2n [5120][288] | w2s [5120][18].
+// The w13 input b12x saw is [w1; w3] nibbles (gate rows then up rows), its scales [w1s; w3s] bytes.
+constexpr int64_t REC_W1N = 0, REC_W1S = 1474560, REC_W3N = 1566720, REC_W3S = 3041280, REC_W2N = 3133440, REC_W2S = 4608000;
+constexpr int64_t W13_NIB = 2 * 2949120, W13S_B = 2 * 92160, W2_NIB = 2949120, W2S_B = 92160;
+
+__device__ __forceinline__ uint8_t rec_nibble_w13(const uint8_t* rec, int64_t i) {  // input nibble i of [w1n; w3n]
+    const int64_t byte = i >> 1;
+    const uint8_t b = byte < 1474560 ? rec[REC_W1N + byte] : rec[REC_W3N + byte - 1474560];
+    return (i & 1) ? (b >> 4) : (b & 0xF);
+}
+__device__ __forceinline__ uint8_t rec_nibble_w2(const uint8_t* rec, int64_t i) {
+    const uint8_t b = rec[REC_W2N + (i >> 1)];
+    return (i & 1) ? (b >> 4) : (b & 0xF);
+}
+__device__ __forceinline__ uint8_t rec_scale_w13(const uint8_t* rec, int64_t i) {
+    return i < 92160 ? rec[REC_W1S + i] : rec[REC_W3S + i - 92160];
+}
+
+__global__ void repack_kernel(const uint8_t* rec, const int32_t* idx_w13, const int32_t* idx_w13s, const int32_t* idx_w2,
+                              const int32_t* idx_w2s, uint8_t* out_w13, uint8_t* out_w13s, uint8_t* out_w2, uint8_t* out_w2s) {
+    const int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // output bytes: w13 2,949,120; w2 1,474,560; w13s 184,320; w2s 92,160 — one grid, ranges in that order
+    if (j < W13_NIB / 2) {
+        out_w13[j] = rec_nibble_w13(rec, idx_w13[2 * j]) | (rec_nibble_w13(rec, idx_w13[2 * j + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2) {
+        const int64_t k = j - W13_NIB / 2;
+        out_w2[k] = rec_nibble_w2(rec, idx_w2[2 * k]) | (rec_nibble_w2(rec, idx_w2[2 * k + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2;
+        out_w13s[k] = rec_scale_w13(rec, idx_w13s[k]);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2 - W13S_B;
+        out_w2s[k] = rec[REC_W2S + idx_w2s[k]];
+    }
+}
+
 }  // namespace
+
+// record (device uint8 [4,700,160]) -> slot `slot` of the pool tensors ([R, words] int32 each, b12x's prepared layout)
+void repack_record(torch::Tensor record, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                   torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                   torch::Tensor pool_w2s, int64_t slot) {
+    TORCH_CHECK(record.scalar_type() == torch::kUInt8 && record.numel() == 4700160 && record.is_cuda());
+    TORCH_CHECK(idx_w13.numel() == W13_NIB && idx_w2.numel() == W2_NIB && idx_w13s.numel() == W13S_B && idx_w2s.numel() == W2S_B);
+    TORCH_CHECK(pool_w13.size(1) * (int64_t)pool_w13.element_size() == W13_NIB / 2 && pool_w2.size(1) * (int64_t)pool_w2.element_size() == W2_NIB / 2);
+    TORCH_CHECK(pool_w13s.size(1) * (int64_t)pool_w13s.element_size() == W13S_B && pool_w2s.size(1) * (int64_t)pool_w2s.element_size() == W2S_B);
+    TORCH_CHECK(slot >= 0 && slot < pool_w13.size(0));
+    const int64_t total = W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    repack_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        record.data_ptr<uint8_t>(), idx_w13.data_ptr<int32_t>(), idx_w13s.data_ptr<int32_t>(), idx_w2.data_ptr<int32_t>(),
+        idx_w2s.data_ptr<int32_t>(), reinterpret_cast<uint8_t*>(pool_w13.data_ptr()) + slot * (W13_NIB / 2),
+        reinterpret_cast<uint8_t*>(pool_w13s.data_ptr()) + slot * W13S_B, reinterpret_cast<uint8_t*>(pool_w2.data_ptr()) + slot * (W2_NIB / 2),
+        reinterpret_cast<uint8_t*>(pool_w2s.data_ptr()) + slot * W2S_B);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// pinned (page-locked, portable) host memory for the expert store: H2D promotions DMA from it; not zeroed
+int64_t alloc_pinned(int64_t nbytes) {
+    void* p = nullptr;
+    TORCH_CHECK(cudaHostAlloc(&p, (size_t)nbytes, cudaHostAllocPortable) == cudaSuccess, "cudaHostAlloc (pinned) failed");
+    return (int64_t)(uintptr_t)p;
+}
+
+// a CPU uint8 tensor view of host memory (the store's records as copy sources)
+torch::Tensor host_view(int64_t ptr, int64_t nbytes) {
+    return torch::from_blob((void*)(uintptr_t)ptr, {nbytes}, torch::TensorOptions().dtype(torch::kUInt8));
+}
 
 int64_t alloc_mapped(int64_t nbytes) {
     void* p = nullptr;
@@ -175,11 +246,14 @@ int64_t staging_bytes() { return (int64_t)CPU_TIER_MAX_PAIRS * CPU_TIER_HID * 2;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("alloc_mapped", &alloc_mapped);
+    m.def("alloc_pinned", &alloc_pinned);
+    m.def("host_view", &host_view);
     m.def("free_mapped", &free_mapped);
     m.def("device_ptr", &device_ptr);
     m.def("step_begin", &step_begin);
     m.def("publish", &publish);
     m.def("wait_inject", &wait_inject);
+    m.def("repack_record", &repack_record);
     m.def("request_bytes", &request_bytes);
     m.def("ack_bytes", &ack_bytes);
     m.def("staging_bytes", &staging_bytes);
