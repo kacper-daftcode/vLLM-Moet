@@ -37,14 +37,24 @@ def _ext():
     )
 
 
+# Rows of at most SMALL columns are done by one CTA even when the launch has a cluster per row (on 6 rows one CTA is
+# faster up to ~8K columns, a 16-CTA cluster from ~16K).
+SMALL = int(os.environ.get("VLLM_MOET_DET_TOPK_SMALL", "12288"))
+
+
 def topk_prefill(logits: torch.Tensor, row_starts: torch.Tensor | None, row_ends: torch.Tensor, out: torch.Tensor,
-                 num_rows: int, k: int, relative: bool) -> None:
-    _ext().det_topk_prefill(logits, row_starts, row_ends, out, int(num_rows), int(k), bool(relative))
+                 num_rows: int, k: int, relative: bool, cluster: int = -1, small: int | None = None) -> None:
+    """cluster: CTAs per row (-1: the largest of 16 / 8 / 4 / 2 whose clusters for all rows are resident at once, else
+    one CTA per row)."""
+    _ext().det_topk_prefill(logits, row_starts, row_ends, out, int(num_rows), int(k), bool(relative), int(cluster),
+                            SMALL if small is None else int(small))
 
 
-def topk_decode(logits: torch.Tensor, seq_lens: torch.Tensor, next_n: int, out: torch.Tensor, k: int) -> None:
+def topk_decode(logits: torch.Tensor, seq_lens: torch.Tensor, next_n: int, out: torch.Tensor, k: int,
+                cluster: int = -1, small: int | None = None) -> None:
     lens = seq_lens if seq_lens.is_contiguous() else seq_lens.contiguous()
-    _ext().det_topk_decode(logits, lens, int(next_n), out, int(logits.shape[0]), int(k))
+    _ext().det_topk_decode(logits, lens, int(next_n), out, int(logits.shape[0]), int(k), int(cluster),
+                           SMALL if small is None else int(small))
 
 
 def decode_row_ends(seq_lens: torch.Tensor, next_n: int, num_rows: int) -> torch.Tensor:

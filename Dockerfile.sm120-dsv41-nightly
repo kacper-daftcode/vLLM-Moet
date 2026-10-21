@@ -217,11 +217,13 @@
 #      FlashInfer's sparse MLA - deterministic for identical inputs - gives different bits for the same indices in another
 #      order. The served model therefore answered the same prompt (same nonce, fresh prefill, b12x det on) with different
 #      text from the 2nd token on. det_topk_sm120.cu: exact (radix select over order-preserving keys, integer histograms),
-#      ties to the lower column, the selected columns in ascending order, -1 fill; bit-exact against a torch reference
-#      on 702 cases (tied, -inf-masked, NaN / +-0 rows, short rows, strided outputs, prefill and decode row forms),
-#      identical over 30 runs and from a CUDA graph. 6 rows: 1K columns 4.2 us vs persistent_topk 5.8, 8K 5.9 vs 7.5, 32K
-#      16.3 vs 15.1, 100K 44 vs 15; prefill 4096 x 2K 24-30 vs 21-281 us. Built in but OFF by default (it changes which
-#      tied positions the indexer keeps): VLLM_MOET_DET_TOPK=1 at runtime turns it on.
+#      ties to the lower column, the selected columns in ascending order, -1 fill; decode rows on a cluster of up to 16
+#      CTAs each (slice histograms combined through distributed shared memory). Bit-exact against a torch reference on
+#      1215 cases (bf16-valued, tied, -inf-masked, NaN / +-0 rows, short rows, strided outputs, prefill and decode row
+#      forms, every cluster size, up to 512K columns), identical over 30 runs and from a CUDA graph. 6 rows, bf16-valued:
+#      4K columns 4.9 us vs persistent_topk 7.4, 32K 7.8 vs 15.5, 131K 9.4 vs 15.1, 300K 12.7 vs 15.8, 512K 20.5 vs 29.4
+#      (faster at every width 1K-512K); prefill 4096 x 2K 28 vs 21 us (tied rows 29 vs 286). Built in but OFF by default
+#      (it changes which tied positions the indexer keeps): VLLM_MOET_DET_TOPK=1 at runtime turns it on.
 #  27. The decode MoE of b12x's compact W4A8 micro path in one persistent kernel (patch_flashinfer_b12x_moe_fused_sm120.py
 #      + b12x_moe_fused/): FC1 (gate/up projection) -> SwiGLU + MXFP8 activation -> FC2 (down projection) from one grid,
 #      with the same bits as b12x's three kernels (and step 22's FC2) in projections, intermediate and route_output; b12x's
