@@ -81,7 +81,8 @@ _TABLES_LOADED = False
 
 
 def lib_path() -> str:
-    return os.path.join(_HERE, "libcpu_moe_b12x.so")
+    # DSV41_B12X_LIB may point at any library with the moe_b12x_* API (libcpu_tier.so carries it too)
+    return os.environ.get("DSV41_B12X_LIB") or os.path.join(_HERE, "libcpu_moe_b12x.so")
 
 
 def load_tables(tables_dir: str | None = None) -> tuple[np.ndarray, np.ndarray]:
