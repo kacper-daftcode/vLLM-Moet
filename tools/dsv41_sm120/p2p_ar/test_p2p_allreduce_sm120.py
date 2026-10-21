@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """Test + bench of the sm_120 P2P all-reduce (p2p_allreduce_sm120.cu): one-shot push and two-shot (reduce-scatter +
-all-gather) against a fixed-order fp32 reference, identical bits on every rank, 50 repeated all-reduces (slot rotation),
-the fused add + RMSNorm consumer against torch; timings of 80 all-reduces replayed from a CUDA graph next to NCCL's
-(PyNccl, the communicator vLLM's graphs capture). 4 GPUs: torchrun --nproc_per_node=4 test_p2p_allreduce_sm120.py
-[--rows 6,24,48] [--ars 80] [--replays 100] [--no-nccl]. Exit code 1 on any mismatch.
+all-gather) against NCCL's bits (PyNccl, the communicator vLLM's graphs capture; the summation order measured by
+nccl_order_tables), identical bits on every rank, 50 repeated all-reduces (slot rotation), the fused add + RMSNorm
+consumer against torch; timings of 80 all-reduces replayed from a CUDA graph next to NCCL's. 4 GPUs:
+torchrun --nproc_per_node=4 test_p2p_allreduce_sm120.py [--rows 6,24,48] [--ars 80] [--replays 100] [--no-nccl]
+(--no-nccl: no NCCL timing). Exit code 1 on any mismatch.
 """
 import argparse
 import os
+import sys
 import time
 
 import torch
 import torch.distributed as dist
 from torch.utils.cpp_extension import load
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from p2p_allreduce_sm120 import nccl_order_tables  # noqa: E402
+from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator  # noqa: E402
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--rows", default="6,12,48")
@@ -48,15 +54,22 @@ peers_data2 = [ext.ipc_open(h2[r][0]) for r in peers]
 peers_flags2 = [ext.ipc_open(h2[r][1]) for r in peers]
 ctrl2 = torch.zeros(8, dtype=torch.int32, device=dev)
 dist.barrier()
+comm = PyNcclCommunicator(dist.group.WORLD, device=dev)
+ROWS = [int(r) for r in a.rows.split(",")]
+orders = nccl_order_tables(comm.all_reduce, rank, dev, ROWS)
+if set(orders) != set(ROWS):
+    raise SystemExit(f"[rank {rank}] NCCL's order not measurable for rows {sorted(set(ROWS) - set(orders))}")
 
 
 def ar2(x, out):
-    ext.all_reduce_twoshot(x, out, M_MAX, rank, data2, flags2, peers_data2, peers_flags2, ctrl2, timeout, a.max_ctas)
+    ext.all_reduce_twoshot(x, out, M_MAX, rank, data2, flags2, peers_data2, peers_flags2, ctrl2, orders[x.shape[0]],
+                           timeout, a.max_ctas)
 
 
 def ar(x, out, residual=None, weight=None, residual_out=None, eps=1e-6):
     ext.push(x, M_MAX, rank, peers_data, peers_flags, ctrl, a.max_ctas)
-    ext.wait_reduce(x, rank, M_MAX, data, flags, ctrl, out, residual, weight, residual_out, eps, timeout)
+    ext.wait_reduce(x, rank, M_MAX, data, flags, ctrl, orders[x.shape[0]], out, residual, weight, residual_out, eps,
+                    timeout)
 
 
 def check_timeout(tag):
@@ -90,18 +103,13 @@ def time_graph(fn, label):
 
 
 results = []
-for M in [int(r) for r in a.rows.split(",")]:
+for M in ROWS:
     g = torch.Generator(device=dev).manual_seed(1000 + rank)
     x = torch.randn(M, H, device=dev, dtype=torch.float32, generator=g).to(torch.bfloat16)
     out = torch.empty_like(x)
     ar(x, out); torch.cuda.synchronize(); check_timeout("plain")
-    xs = [torch.empty(M, H, dtype=torch.bfloat16) for _ in range(ws)]
-    dist.all_gather(xs, x.cpu())
-    ref = torch.zeros(M, H, dtype=torch.float32)
-    for r in range(ws):
-        ref += xs[r].float()
-    ref = ref.to(torch.bfloat16)
-    ok_ref = torch.equal(out.cpu(), ref)
+    ref = comm.all_reduce(x).cpu()  # NCCL's bits
+    ok_ref = torch.equal(out.cpu().view(torch.int16), ref.view(torch.int16))
     outs = [torch.empty_like(ref) for _ in range(ws)]
     dist.all_gather(outs, out.cpu())
     ok_ranks = all(torch.equal(outs[0], o) for o in outs)
@@ -111,25 +119,27 @@ for M in [int(r) for r in a.rows.split(",")]:
     ar(x, y, residual, weight, res_out); torch.cuda.synchronize(); check_timeout("norm")
     z = (ref.to(dev).float() + residual.float()).to(torch.bfloat16); zf = z.float()
     y_ref = (zf * torch.rsqrt(zf.pow(2).mean(-1, keepdim=True) + 1e-6) * weight.float()).to(torch.bfloat16)
-    ok_res = torch.equal(res_out, z); ok_norm = torch.equal(y, y_ref)
+    # the residual add must have the bits; the RMSNorm sums its squares in another order than torch: within 1 bf16 ulp
+    ok_res = torch.equal(res_out.view(torch.int16), z.view(torch.int16))
+    ok_norm = int((y.view(torch.int16).int() - y_ref.view(torch.int16).int()).abs().max()) <= 1
     y_diff = (y.float() - y_ref.float()).abs().max().item()
     # repeated correctness across many ARs (slot rotation / seq wrap-around of counters)
     bad = 0
     for _ in range(50):
         ar(x, out)
     torch.cuda.synchronize(); check_timeout("rep")
-    bad += 0 if torch.equal(out.cpu(), ref) else 1
-    # two-shot correctness: == fixed-order reference (same bits as one-shot), identical across ranks, 50x repeat
+    bad += 0 if torch.equal(out.cpu().view(torch.int16), ref.view(torch.int16)) else 1
+    # two-shot correctness: NCCL's bits (as the one-shot), identical across ranks, 50x repeat
     out2 = torch.empty_like(x)
     ar2(x, out2); torch.cuda.synchronize(); check_timeout("twoshot")
-    ok2 = torch.equal(out2.cpu(), ref)
+    ok2 = torch.equal(out2.cpu().view(torch.int16), ref.view(torch.int16))
     outs2 = [torch.empty_like(ref) for _ in range(ws)]
     dist.all_gather(outs2, out2.cpu())
     ok2_ranks = all(torch.equal(outs2[0], o) for o in outs2)
     for _ in range(50):
         ar2(x, out2)
     torch.cuda.synchronize(); check_timeout("twoshot-rep")
-    bad2 = 0 if torch.equal(out2.cpu(), ref) else 1
+    bad2 = 0 if torch.equal(out2.cpu().view(torch.int16), ref.view(torch.int16)) else 1
     timings = {"two-shot AR": time_graph(lambda: ar2(x, out2), "two-shot"),
                "push-AR": time_graph(lambda: ar(x, out), "push-AR"),
                "push-AR+add+RMSNorm": time_graph(lambda: ar(x, y, residual, weight, res_out), "norm"),
@@ -138,9 +148,6 @@ for M in [int(r) for r in a.rows.split(",")]:
     # (flags >= seq always holds here), then continue
     ar(x, out); torch.cuda.synchronize()
     if not a.no_nccl:
-        from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-        if "comm" not in globals():
-            comm = PyNcclCommunicator(dist.group.WORLD, device=dev)
         xn = x.clone()
         s = torch.cuda.Stream()
         timings["NCCL-AR (PyNccl, graph)"] = time_graph(lambda: comm.all_reduce(xn, out_tensor=xn, stream=torch.cuda.current_stream()), "nccl")
@@ -150,8 +157,9 @@ failed = False
 if rank == 0:
     for M, ok_ref, ok_ranks, ok_res, ok_norm, y_diff, bad, timings, ok2, ok2_ranks, bad2 in results:
         failed |= not (ok_ref and ok_ranks and ok_res and bad == 0 and ok2 and ok2_ranks and bad2 == 0) or (M <= 16 and not ok_norm)
-        print(f"[{M}x{H}] one-shot: ==ref {ok_ref}, identical ranks {ok_ranks}, 50x mismatches {bad}; norm==ref {ok_norm} "
-              f"(max|diff| {y_diff:.3g}) | two-shot: ==ref {ok2}, identical ranks {ok2_ranks}, 50x mismatches {bad2}")
+        print(f"[{M}x{H}] one-shot: ==NCCL {ok_ref}, identical ranks {ok_ranks}, 50x mismatches {bad}; + residual ==ref {ok_res}, "
+              f"RMSNorm within 1 ulp {ok_norm} "
+              f"(max|diff| {y_diff:.3g}) | two-shot: ==NCCL {ok2}, identical ranks {ok2_ranks}, 50x mismatches {bad2}")
         print("        " + "  ".join(f"{k}: {v:6.2f} us" for k, v in timings.items()), flush=True)
 dist.barrier()
 if rank == 0:

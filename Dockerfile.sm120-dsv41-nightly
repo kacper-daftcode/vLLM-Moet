@@ -193,19 +193,23 @@
 #      all-reduce sites of the overlap path (boundary in front of mhc_post_norm, Engram layers, last layer). Two-shot
 #      (reduce-scatter + all-gather, every phase to one peer at a time - on this host a kernel writing to several peers
 #      concurrently is ~16x slower) for 17..64 rows, NCCL otherwise; one-shot push for small rows is built in but off (neutral
-#      in the full C1 graph: both sit on the rank-skew + flag floor). Fixed-order fp32 sum: deterministic, identical on
-#      every rank, but not NCCL's ring order - an output change, gated at concurrency (GSM8K-200 at C4 takes this path).
+#      in the full C1 graph: both sit on the rank-skew + flag floor). The four contributions are added in NCCL's own order
+#      with NCCL's bf16 rounding after every add, so the result has NCCL's bits: that order (ring chunks, channels and LL
+#      steps, i.e. per position of the element) is measured at start-up on the TP group's NCCL communicator for every row
+#      count 1-64, each row count is then checked against NCCL on random data, and one that does not reproduce NCCL bit for
+#      bit stays on NCCL. Test: one-shot and two-shot == NCCL for 16 row counts 1-64; served dummy-weight model: 64 of 64.
 #      4x RTX PRO 6000 (325 W, memory +5000), 80 all-reduces from a graph: [48, 5120] 23.5 vs NCCL 69.8 us; full-depth
 #      dummy model at C8: step 29,864 -> 28,959 us (-3.0 %), all-reduce on the critical path 80 x 47 -> 80 x 39 us.
 #      Built in but OFF by default: VLLM_MOET_P2P_AR=1 at runtime turns it on (VLLM_MOET_P2P_AR_MAX_ROWS,
 #      VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS tune the ranges).
 #  24. The all-reduce consumer fused into the boundary kernel (same patcher as 23; mhc_overlap/mhc_post_norm_sm120.cu template
 #      kAR): for <= VLLM_MOET_P2P_AR_FUSED_MAX_ROWS rows (default 0 = off) the push is issued and mhc_post_norm waits for the
-#      three peers' flags, sums the four partials in fixed source order (fp32, rounded once - the same bits as the one-shot
-#      consumer) before the post-mix and hands the reduced x to the side stream's projection. Full-depth dummy model, C1:
-#      step 9,482 -> 9,363 us (-1.25 %); per boundary push 5.7 + fused kernel 7.7 us instead of NCCL 11.8 + post_norm 3.9.
-#      An output change at C1 (not NCCL's ring order) - gated in the serving window. VLLM_MOET_P2P_AR=1 plus
-#      VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16 at runtime turns it on.
+#      three peers' flags, adds the four partials in NCCL's order (step 23's measured order: NCCL's bits) before the
+#      post-mix and hands the reduced x to the side stream's projection. Full-depth dummy model, C1: step 9,482 -> 9,363 us
+#      (-1.25 %); per boundary push 5.7 + fused kernel 7.7 us instead of NCCL 11.8 + post_norm 3.9 (graph of 77 boundaries
+#      2026-10-21: 12.5 vs 14.4 us at 6 rows, but 20.0 vs 18.9 at 12 and 24.9 vs 21.4 at 16). Test: every output equals
+#      NCCL's all-reduce + the plain boundary kernel at 1-16 rows. VLLM_MOET_P2P_AR=1 plus VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16
+#      at runtime turns it on.
 #  25. The vocab all-gather of the MXFP8 lm_head helpers (steps 18 and 21) on the P2P push (same patcher; bit-exact - a gather
 #      moves bytes). On the real per-rank shape ([rows, 32320] bf16, 64 KB rows) it is only marginally ahead of NCCL's
 #      all-gather ([6, 32320] 54.6 vs 62.1 us from a graph: 1.16 MB egress per rank, bandwidth-bound) - about 15 us per decode

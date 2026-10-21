@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Fused all-reduce consumer in mhc_post_norm (step 24) vs the two-kernel path (one-shot P2P all-reduce, then the plain
-boundary kernel): every output bit-identical (residual_out, layer_input, aux, reduced x), identical across ranks, 50
-repeats; timings from a CUDA graph of 77 boundaries: NCCL AR + post_norm, P2P one-shot AR + post_norm, push + fused.
+"""Fused all-reduce consumer in mhc_post_norm (step 24) and the two-kernel P2P path (one-shot all-reduce, then the plain
+boundary kernel) vs NCCL's all-reduce + the plain boundary kernel: every output bit-identical (residual_out,
+layer_input, aux, reduced x; NCCL's summation order measured by p2p_allreduce_sm120.nccl_order_tables), identical
+across ranks, 50 repeats; timings from a CUDA graph of 77 boundaries: NCCL AR + post_norm, P2P one-shot AR + post_norm,
+push + fused.
 usage: torchrun --nproc_per_node=4 test_mhc_post_norm_ar_sm120.py [--rows 6,12] [--iters 77] [--replays 100]
 """
 import argparse, os, sys, time
@@ -33,10 +35,16 @@ def shared_set():
     peers = [r for r in range(ws) if r != rank]
     return dict(data=data, flags=flags, pd=[p2p.ipc_open(hs[r][0]) for r in peers], pf=[p2p.ipc_open(hs[r][1]) for r in peers],
                 ctrl=torch.zeros(8, dtype=torch.int32, device=dev))
-A_ = shared_set()   # for the two-kernel reference
+A_ = shared_set()   # for the two-kernel P2P path
 B_ = shared_set()   # for the fused path
 timeout = torch.zeros(1, dtype=torch.int32, device=dev)
 dist.barrier()
+from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator  # noqa: E402
+from p2p_allreduce_sm120 import nccl_order_tables  # noqa: E402
+comm = PyNcclCommunicator(dist.group.WORLD, device=dev)
+ROWS = [int(r) for r in a.rows.split(",")]
+orders = nccl_order_tables(comm.all_reduce, rank, dev, ROWS)
+assert set(orders) == set(ROWS), f"NCCL's order not measurable for rows {sorted(set(ROWS) - set(orders))}"
 EPS = 1e-6
 
 def inputs(T, seed):
@@ -50,10 +58,16 @@ def inputs(T, seed):
     w = (torch.rand(H, device=dev, generator=g2) + 0.5).to(torch.bfloat16)
     return x, residual, post, comb, pre, w
 
+def nccl_ref(x, residual, post, comb, pre, w, out):  # NCCL's all-reduce, then the plain boundary kernel
+    xr = comm.all_reduce(x)
+    ro, li, aux = out
+    mhc.mhc_post_norm(xr, residual, post, comb, pre, w, ro, li, aux, EPS, 1, True)
+    return xr
+
 def ref_path(x, residual, post, comb, pre, w, S, out):  # one-shot AR kernel, then the plain boundary kernel
     xr = torch.empty_like(x)
     p2p.push(x, M_MAX, rank, S["pd"], S["pf"], S["ctrl"], 64)
-    p2p.wait_reduce(x, rank, M_MAX, S["data"], S["flags"], S["ctrl"], xr, None, None, None, 0.0, timeout)
+    p2p.wait_reduce(x, rank, M_MAX, S["data"], S["flags"], S["ctrl"], orders[x.shape[0]], xr, None, None, None, 0.0, timeout)
     ro, li, aux = out
     mhc.mhc_post_norm(xr, residual, post, comb, pre, w, ro, li, aux, EPS, 1, True)
     return xr
@@ -61,7 +75,8 @@ def ref_path(x, residual, post, comb, pre, w, S, out):  # one-shot AR kernel, th
 def fused_path(x, residual, post, comb, pre, w, S, out, xo):
     p2p.push(x, M_MAX, rank, S["pd"], S["pf"], S["ctrl"], 64)
     ro, li, aux = out
-    mhc.mhc_post_norm(x, residual, post, comb, pre, w, ro, li, aux, EPS, 1, True, S["data"], S["flags"], S["ctrl"], rank, M_MAX, xo)
+    mhc.mhc_post_norm(x, residual, post, comb, pre, w, ro, li, aux, EPS, 1, True, S["data"], S["flags"], S["ctrl"], rank, M_MAX, xo,
+                      orders[x.shape[0]])
 
 def time_graph(fn, n):
     s = torch.cuda.Stream()
@@ -79,18 +94,19 @@ def time_graph(fn, n):
     us = (time.perf_counter() - t0) / a.replays / n * 1e6
     dist.barrier(); return us
 
-from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
-comm = PyNcclCommunicator(dist.group.WORLD, device=dev)
+bits = lambda t: t.view(torch.int16) if t.dtype == torch.bfloat16 else t  # noqa: E731
 failed = False
-for T in [int(r) for r in a.rows.split(",")]:
+for T in ROWS:
     x, residual, post, comb, pre, w = inputs(T, 1000 + rank)
     mk = lambda: (torch.empty_like(residual), torch.empty(T, H, dtype=torch.bfloat16, device=dev), torch.empty(T, H, dtype=torch.bfloat16, device=dev))
-    outA, outB = mk(), mk()
+    outN, outA, outB = mk(), mk(), mk()
+    xn_ref = nccl_ref(x, residual, post, comb, pre, w, outN)
     xr = ref_path(x, residual, post, comb, pre, w, A_, outA)
     xo = torch.empty_like(x)
     fused_path(x, residual, post, comb, pre, w, B_, outB, xo)
     torch.cuda.synchronize()
-    same = [torch.equal(p, q) for p, q in zip(outA, outB)] + [torch.equal(xr, xo)]
+    same = [torch.equal(bits(p), bits(q)) for p, q in zip(outN, outB)] + [torch.equal(bits(xn_ref), bits(xo))]
+    same_p2p = all(torch.equal(bits(p), bits(q)) for p, q in zip(outN, outA)) and torch.equal(bits(xn_ref), bits(xr))
     # identical across ranks
     flat = torch.cat([t.flatten() for t in outB] + [xo.flatten()]).cpu()
     gathered = [torch.empty_like(flat) for _ in range(ws)]; dist.all_gather(gathered, flat)
@@ -99,9 +115,10 @@ for T in [int(r) for r in a.rows.split(",")]:
     for _ in range(50):
         ref_path(x, residual, post, comb, pre, w, A_, outA); fused_path(x, residual, post, comb, pre, w, B_, outB, xo)
     torch.cuda.synchronize()
-    same50 = all(torch.equal(p, q) for p, q in zip(outA, outB))
+    same50 = all(torch.equal(bits(p), bits(q)) for p, q in zip(outN, outA)) and all(
+        torch.equal(bits(p), bits(q)) for p, q in zip(outN, outB))
     to = int(timeout.item()); timeout.zero_()
-    ok = all(same) and across and same50 and to == 0
+    ok = all(same) and same_p2p and across and same50 and to == 0
     failed |= not ok
     # timings
     xn = x.clone()
@@ -113,7 +130,8 @@ for T in [int(r) for r in a.rows.split(",")]:
     t_ref = time_graph(lambda: ref_path(x, residual, post, comb, pre, w, A_, outA), a.iters)
     t_fused = time_graph(lambda: fused_path(x, residual, post, comb, pre, w, B_, outB, xo), a.iters)
     if rank == 0:
-        print(f"[T={T}] fused == ref (residual, layer_input, aux, x): {same}; identical across ranks {across}; 50x {same50}; "
+        print(f"[T={T}] fused == NCCL path (residual, layer_input, aux, x): {same}; two-kernel P2P == NCCL path {same_p2p}; "
+              f"identical across ranks {across}; 50x {same50}; "
               f"timeouts {to}\n       per boundary: NCCL AR + post_norm {t_nccl:6.2f} us | P2P one-shot AR + post_norm {t_ref:6.2f} us | "
               f"push + fused post_norm {t_fused:6.2f} us", flush=True)
 dist.barrier()

@@ -47,8 +47,10 @@ namespace {
 // [vllm-moet] P2P all-reduce consumer fused into the boundary kernel (step 24): x is this rank's partial sum; the other
 // three ranks' partials sit in the slots of the one-shot push buffer (p2p_ar/p2p_allreduce_sm120.cu: data
 // [NSLOTS][4 src][M_MAX][H] bf16, flags [NSLOTS][4 src][32] u32, ctrl[0] = completed all-reduces). The kernel waits
-// for the three remote flags, sums the four contributions in fixed source order in fp32 and rounds once to bf16
-// (the same bits as the separate one-shot consumer), then proceeds as the plain kernel; its last CTA bumps ctrl[0].
+// for the three remote flags and adds the four contributions in NCCL's order with a bf16 rounding per add (order: a
+// byte per 8 elements, r0 | r1 << 2 | r2 << 4 | r3 << 6 for ((x_r0 + x_r1) + x_r2) + x_r3, measured at start-up by
+// p2p_allreduce_sm120.nccl_order_tables - NCCL's bits, as the separate one-shot consumer), then proceeds as the plain
+// kernel; its last CTA bumps ctrl[0].
 constexpr int kARSlots = 4;
 constexpr int kARSrc = 4;
 constexpr int kARFlagStride = 32;
@@ -108,6 +110,7 @@ __global__ void __launch_bounds__(kMaxThreads) mhc_post_norm_kernel(
     const unsigned* __restrict__ ar_flags,          // kAR: [kARSlots][kARSrc][kARFlagStride]
     unsigned* __restrict__ ar_ctrl,                 // kAR: [0] seq, [4] CTA counter
     const int ar_rank, const int ar_mmax,
+    const uint8_t* __restrict__ ar_order,           // kAR: [T * H / 8] NCCL's summation order
     __nv_bfloat16* __restrict__ ar_x_out) {         // kAR: [T, H] the reduced x (the side stream's projection reads it)
   extern __shared__ __align__(16) unsigned char smem_raw[];
   __nv_bfloat16* s_round = reinterpret_cast<__nv_bfloat16*>(smem_raw);                 // [H]
@@ -153,7 +156,7 @@ __global__ void __launch_bounds__(kMaxThreads) mhc_post_norm_kernel(
   unsigned ar_seq = 0u;
   int ar_slot = 0;
   if constexpr (kAR) {
-    // the all-reduce: wait for the three peers' partials of this sequence number, sum in fixed source order
+    // the all-reduce: wait for the three peers' partials of this sequence number, add them in NCCL's order
     ar_seq = ar_ld_volatile(ar_ctrl) + 1u;
     ar_slot = static_cast<int>(ar_seq % kARSlots);
     if (ct < kARSrc && ct != ar_rank) {
@@ -162,25 +165,23 @@ __global__ void __launch_bounds__(kMaxThreads) mhc_post_norm_kernel(
     }
     __syncthreads();
     __threadfence();
-    float acc[kVec];
+    const unsigned ord = ar_order[(static_cast<int64_t>(i) * H + h0) >> 3];
+    uint4 v[kARSrc];
 #pragma unroll
-    for (int k = 0; k < kVec; ++k) acc[k] = 0.f;
-#pragma unroll
-    for (int sidx = 0; sidx < kARSrc; ++sidx) {
-      uint4 v;
-      if (sidx == ar_rank) {
-        v = *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(i) * H + h0);
-      } else {
-        v = __ldcg(reinterpret_cast<const uint4*>(
-            ar_buf + (static_cast<int64_t>(ar_slot * kARSrc + sidx) * ar_mmax + i) * H + h0));
-      }
-      const __nv_bfloat16* pv = reinterpret_cast<const __nv_bfloat16*>(&v);
-#pragma unroll
-      for (int k = 0; k < kVec; ++k) acc[k] += __bfloat162float(pv[k]);
+    for (int p = 0; p < kARSrc; ++p) {
+      const int sidx = static_cast<int>((ord >> (2 * p)) & 3u);
+      v[p] = sidx == ar_rank ? *reinterpret_cast<const uint4*>(x + static_cast<int64_t>(i) * H + h0)
+                             : __ldcg(reinterpret_cast<const uint4*>(
+                                   ar_buf + (static_cast<int64_t>(ar_slot * kARSrc + sidx) * ar_mmax + i) * H + h0));
     }
-    __nv_bfloat16* xo = reinterpret_cast<__nv_bfloat16*>(&xv);
+    __nv_bfloat162* xo = reinterpret_cast<__nv_bfloat162*>(&xv);
 #pragma unroll
-    for (int k = 0; k < kVec; ++k) xo[k] = __float2bfloat16(acc[k]);
+    for (int k = 0; k < kVec / 2; ++k) {
+      xo[k] = __hadd2(__hadd2(__hadd2(reinterpret_cast<const __nv_bfloat162*>(&v[0])[k],
+                                      reinterpret_cast<const __nv_bfloat162*>(&v[1])[k]),
+                              reinterpret_cast<const __nv_bfloat162*>(&v[2])[k]),
+                      reinterpret_cast<const __nv_bfloat162*>(&v[3])[k]);
+    }
     *reinterpret_cast<uint4*>(ar_x_out + static_cast<int64_t>(i) * H + h0) = xv;
   }
 
@@ -475,12 +476,15 @@ void mhc_post_norm(const at::Tensor& x, const at::Tensor& residual_in, const at:
                    at::Tensor residual_out, at::Tensor layer_input, const c10::optional<at::Tensor>& aux, double norm_eps,
                    int64_t mode, bool pdl, const c10::optional<at::Tensor>& ar_buf, const c10::optional<at::Tensor>& ar_flags,
                    const c10::optional<at::Tensor>& ar_ctrl, int64_t ar_rank, int64_t ar_mmax,
-                   const c10::optional<at::Tensor>& ar_x_out) {
+                   const c10::optional<at::Tensor>& ar_x_out, const c10::optional<at::Tensor>& ar_order) {
   const bool ar = ar_buf.has_value();
   if (ar) {
     TORCH_CHECK(ar_flags.has_value() && ar_ctrl.has_value() && ar_x_out.has_value() && 0 <= ar_rank && ar_rank < kARSrc &&
                     residual_in.size(0) <= ar_mmax && ar_x_out->is_contiguous() && ar_x_out->sizes() == x.sizes(),
                 "all-reduce: buf, flags, ctrl, x_out [T, H], rank in [0, 4), T <= M_MAX");
+    TORCH_CHECK(ar_order.has_value() && ar_order->is_cuda() && ar_order->scalar_type() == at::kByte &&
+                    ar_order->is_contiguous() && ar_order->numel() >= x.numel() / 8,
+                "all-reduce: order uint8 [T * H / 8] (p2p_allreduce_sm120.push_for_fused)");
   }
   TORCH_CHECK(residual_in.is_cuda() && residual_in.dim() == 3 && residual_in.scalar_type() == at::kBFloat16 &&
                   residual_in.is_contiguous(),
@@ -536,6 +540,7 @@ void mhc_post_norm(const at::Tensor& x, const at::Tensor& residual_in, const at:
         ar ? reinterpret_cast<const __nv_bfloat16*>(ar_buf->data_ptr()) : nullptr,
         ar ? reinterpret_cast<const unsigned*>(ar_flags->data_ptr()) : nullptr,
         ar ? reinterpret_cast<unsigned*>(ar_ctrl->data_ptr()) : nullptr, static_cast<int>(ar_rank), static_cast<int>(ar_mmax),
+        ar ? ar_order->data_ptr<uint8_t>() : nullptr,
         ar ? reinterpret_cast<__nv_bfloat16*>(ar_x_out->data_ptr()) : nullptr));
   };
   if (ar) {
@@ -565,7 +570,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("x"), py::arg("residual_in"), py::arg("post_layer_mix"), py::arg("comb_res_mix"), py::arg("pre_mix_in"),
         py::arg("norm_w"), py::arg("residual_out"), py::arg("layer_input"), py::arg("aux"), py::arg("norm_eps"),
         py::arg("mode") = 1, py::arg("pdl") = true, py::arg("ar_buf") = py::none(), py::arg("ar_flags") = py::none(),
-        py::arg("ar_ctrl") = py::none(), py::arg("ar_rank") = 0, py::arg("ar_mmax") = 64, py::arg("ar_x_out") = py::none());
+        py::arg("ar_ctrl") = py::none(), py::arg("ar_rank") = 0, py::arg("ar_mmax") = 64, py::arg("ar_x_out") = py::none(),
+        py::arg("ar_order") = py::none());
   m.def("mhc_proj", &mhc_proj,
         "DeepSeek-V4.1 mHC fn projection of the fp32 post-mix, split partials (mhc_fused_tilelang's outputs, one CTA per token x split)",
         py::arg("x"), py::arg("residual_in"), py::arg("post_layer_mix"), py::arg("comb_res_mix"), py::arg("fn"), py::arg("mixes"),

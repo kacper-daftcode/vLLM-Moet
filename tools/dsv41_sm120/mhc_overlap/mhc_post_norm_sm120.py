@@ -88,10 +88,10 @@ def mhc_post_norm(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns (residual_out [T, hc, H] bf16, layer_input [T, H] bf16, aux [T or 0, H] bf16).
 
-    ar: the fused P2P all-reduce consumer (step 24) - a dict with data, flags, ctrl, rank, m_max from
+    ar: the fused P2P all-reduce consumer (step 24) - a dict with data, flags, ctrl, rank, m_max, order from
     p2p_allreduce_sm120.push_for_fused(x): x is then this rank's partial sum and the kernel adds the three peers'
-    partials (fixed source order, fp32, rounded once) before the post-mix; a fourth tensor, the reduced x [T, H], is
-    then returned too (the side stream's projection reads it).
+    partials in NCCL's order with NCCL's bf16 rounding (NCCL's bits) before the post-mix; a fourth tensor, the reduced
+    x [T, H], is then returned too (the side stream's projection reads it).
     """
     if pdl is None:
         pdl = PDL_DEFAULT
@@ -114,7 +114,7 @@ def mhc_post_norm(
         _ext().mhc_post_norm(
             x, residual, post_layer_mix.reshape(T, hc).contiguous(), comb_res_mix.contiguous(), pre_mix.contiguous(),
             norm_weight.contiguous(), residual_out, layer_input, aux if capture_aux else None, float(norm_eps), int(mode),
-            bool(pdl), ar["data"], ar["flags"], ar["ctrl"], int(ar["rank"]), int(ar["m_max"]), x_out,
+            bool(pdl), ar["data"], ar["flags"], ar["ctrl"], int(ar["rank"]), int(ar["m_max"]), x_out, ar["order"],
         )
         return residual_out, layer_input, aux, x_out
     return residual_out, layer_input, aux

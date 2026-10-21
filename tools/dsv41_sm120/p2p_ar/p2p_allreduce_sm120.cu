@@ -51,6 +51,24 @@ __device__ __forceinline__ unsigned ld_volatile_u32(const unsigned* p) {
   return v;
 }
 
+// NCCL's summation order, measured at start-up (p2p_allreduce_sm120.py: nccl_order_tables): one byte per 8
+// consecutive elements of the [M, H] message, r0 | r1 << 2 | r2 << 4 | r3 << 6 for ((x_r0 + x_r1) + x_r2) + x_r3 with
+// one bf16 rounding per add, as NCCL's reduce kernels add (__hadd2). src(r) points at rank r's 8 elements.
+template <typename Src>
+__device__ __forceinline__ uint4 nccl_order_sum8(unsigned order, Src src) {
+  uint4 v[NSRC];
+#pragma unroll
+  for (int p = 0; p < NSRC; ++p) v[p] = __ldcg(src((order >> (2 * p)) & 3u));
+  uint4 acc;
+  const __nv_bfloat162* a[NSRC];
+#pragma unroll
+  for (int p = 0; p < NSRC; ++p) a[p] = reinterpret_cast<const __nv_bfloat162*>(&v[p]);
+  __nv_bfloat162* o = reinterpret_cast<__nv_bfloat162*>(&acc);
+#pragma unroll
+  for (int k = 0; k < 4; ++k) o[k] = __hadd2(__hadd2(__hadd2(a[0][k], a[1][k]), a[2][k]), a[3][k]);
+  return acc;
+}
+
 // ctrl: [0] seq counter (completed all-reduces), [1..3] phase counters, [4] consumer done counter
 __global__ void push_phased_kernel(const __nv_bfloat16* __restrict__ x, int M, int M_MAX, int rank, Peers3 peers,
                                    unsigned* __restrict__ ctrl, int ctas_per_dest) {
@@ -84,11 +102,12 @@ __global__ void push_phased_kernel(const __nv_bfloat16* __restrict__ x, int M, i
 }
 
 // grid: M CTAs (one row each), block: H/16 = 320 threads, 16 elements per thread.
-// Sums x_local (own contribution, read from the producer's output) and the 3 peers' slots in fixed source order.
+// Sums x_local (own contribution, read from the producer's output) and the 3 peers' slots in NCCL's order.
 template <bool NORM>
 __global__ void wait_reduce_kernel(const __nv_bfloat16* __restrict__ x_local, int rank, int M_MAX,
                                    const __nv_bfloat16* __restrict__ rbuf, const unsigned* __restrict__ flags,
-                                   unsigned* __restrict__ ctrl, const __nv_bfloat16* __restrict__ residual,
+                                   unsigned* __restrict__ ctrl, const uint8_t* __restrict__ order,
+                                   const __nv_bfloat16* __restrict__ residual,
                                    const __nv_bfloat16* __restrict__ weight, float eps, __nv_bfloat16* __restrict__ out,
                                    __nv_bfloat16* __restrict__ residual_out, unsigned* __restrict__ timeout_flag) {
   __shared__ float red[32];
@@ -105,28 +124,22 @@ __global__ void wait_reduce_kernel(const __nv_bfloat16* __restrict__ x_local, in
   __syncthreads();
   __threadfence();
   const int c = threadIdx.x * 16;
-  float acc[16];
+  const size_t e0 = (size_t)m * H + c;
+  uint4 sum[2];
 #pragma unroll
-  for (int k = 0; k < 16; ++k) acc[k] = 0.f;
-#pragma unroll
-  for (int s = 0; s < NSRC; ++s) {
-    const __nv_bfloat16* src = (s == rank) ? x_local + (size_t)m * H + c
-                                           : rbuf + ((size_t)(slot * NSRC + s) * M_MAX + m) * H + c;
-    const uint4 a = __ldcg(reinterpret_cast<const uint4*>(src));
-    const uint4 bq = __ldcg(reinterpret_cast<const uint4*>(src) + 1);
-    const __nv_bfloat16* pa = reinterpret_cast<const __nv_bfloat16*>(&a);
-    const __nv_bfloat16* pb = reinterpret_cast<const __nv_bfloat16*>(&bq);
-#pragma unroll
-    for (int k = 0; k < 8; ++k) { acc[k] += __bfloat162float(pa[k]); acc[8 + k] += __bfloat162float(pb[k]); }
+  for (int h = 0; h < 2; ++h) {
+    sum[h] = nccl_order_sum8(order[(e0 >> 3) + h], [&](unsigned s) {
+      return reinterpret_cast<const uint4*>((s == (unsigned)rank)
+                                                ? x_local + e0 + 8 * h
+                                                : rbuf + ((size_t)(slot * NSRC + s) * M_MAX + m) * H + c + 8 * h);
+    });
   }
+  const __nv_bfloat16* acc = reinterpret_cast<const __nv_bfloat16*>(sum);
   if (!NORM) {
-    __nv_bfloat16 o[16];
-#pragma unroll
-    for (int k = 0; k < 16; ++k) o[k] = __float2bfloat16(acc[k]);
-    reinterpret_cast<uint4*>(out + (size_t)m * H + c)[0] = reinterpret_cast<uint4*>(o)[0];
-    reinterpret_cast<uint4*>(out + (size_t)m * H + c)[1] = reinterpret_cast<uint4*>(o)[1];
+    reinterpret_cast<uint4*>(out + e0)[0] = sum[0];
+    reinterpret_cast<uint4*>(out + e0)[1] = sum[1];
   } else {
-    // all-reduce result rounded to bf16 (== NCCL output), + residual in fp32, residual stored as bf16, RMSNorm over it
+    // all-reduce result (NCCL's bits), + residual in fp32, residual stored as bf16, RMSNorm over it
     float z[16]; float ss = 0.f;
     const __nv_bfloat16* r = residual + (size_t)m * H + c;
     const uint4 a = reinterpret_cast<const uint4*>(r)[0], bq = reinterpret_cast<const uint4*>(r)[1];
@@ -135,7 +148,7 @@ __global__ void wait_reduce_kernel(const __nv_bfloat16* __restrict__ x_local, in
     __nv_bfloat16 ro[16];
 #pragma unroll
     for (int k = 0; k < 16; ++k) {
-      const float v = __bfloat162float(__float2bfloat16(acc[k])) + __bfloat162float(k < 8 ? pa[k] : pb[k - 8]);
+      const float v = __bfloat162float(acc[k]) + __bfloat162float(k < 8 ? pa[k] : pb[k - 8]);
       ro[k] = __float2bfloat16(v);
       z[k] = __bfloat162float(ro[k]);
       ss += z[k] * z[k];
@@ -287,11 +300,12 @@ __global__ void push_twoshot_kernel(const uint4* __restrict__ src_rows, int M, i
   }
 }
 
-// grid: M CTAs, block: SLICE_CH threads (one 16-B chunk = 8 bf16 each). out[:, slice rank] = sum over sources in order 0..3.
+// grid: M CTAs, block: SLICE_CH threads (one 16-B chunk = 8 bf16 each). out[:, slice rank] = sum over sources in NCCL's
+// order.
 __global__ void reduce_slice_kernel(const __nv_bfloat16* __restrict__ x_local, int rank, int M_MAX,
                                     const __nv_bfloat16* __restrict__ rbuf, const unsigned* __restrict__ flags,
-                                    const unsigned* __restrict__ ctrl, __nv_bfloat16* __restrict__ out,
-                                    unsigned* __restrict__ timeout_flag) {
+                                    const unsigned* __restrict__ ctrl, const uint8_t* __restrict__ order,
+                                    __nv_bfloat16* __restrict__ out, unsigned* __restrict__ timeout_flag) {
   const unsigned n = ld_volatile_u32(ctrl);
   const unsigned seq = 2u * n + 1u;
   const int slot = n % NSLOTS;
@@ -306,22 +320,11 @@ __global__ void reduce_slice_kernel(const __nv_bfloat16* __restrict__ x_local, i
   __syncthreads();
   __threadfence();
   const int c = (rank * SLICE_CH + threadIdx.x) * 8;  // element column
-  float acc[8];
-#pragma unroll
-  for (int k = 0; k < 8; ++k) acc[k] = 0.f;
-#pragma unroll
-  for (int s = 0; s < NSRC; ++s) {
-    const __nv_bfloat16* src = (s == rank) ? x_local + (size_t)m * H + c
-                                           : rbuf + ((size_t)(slot * NSRC + s) * M_MAX + m) * H + c;
-    const uint4 a = (s == rank) ? *reinterpret_cast<const uint4*>(src) : __ldcg(reinterpret_cast<const uint4*>(src));
-    const __nv_bfloat16* pa = reinterpret_cast<const __nv_bfloat16*>(&a);
-#pragma unroll
-    for (int k = 0; k < 8; ++k) acc[k] += __bfloat162float(pa[k]);
-  }
-  __nv_bfloat16 o[8];
-#pragma unroll
-  for (int k = 0; k < 8; ++k) o[k] = __float2bfloat16(acc[k]);
-  *reinterpret_cast<uint4*>(out + (size_t)m * H + c) = *reinterpret_cast<uint4*>(o);
+  const size_t e0 = (size_t)m * H + c;
+  *reinterpret_cast<uint4*>(out + e0) = nccl_order_sum8(order[e0 >> 3], [&](unsigned s) {
+    return reinterpret_cast<const uint4*>((s == (unsigned)rank) ? x_local + e0
+                                                                : rbuf + ((size_t)(slot * NSRC + s) * M_MAX + m) * H + c);
+  });
 }
 
 // grid: M CTAs, block: SLICE_CH threads. out[:, slice s] = received slice s for s != rank; the last CTA bumps ctrl[0].
@@ -402,17 +405,26 @@ void push(torch::Tensor x, int64_t M_MAX, int64_t rank, std::vector<int64_t> pee
                                                          (int)rank, peers, reinterpret_cast<unsigned*>(ctrl.data_ptr()), ctas);
 }
 
+// order: NCCL's summation order for this M (uint8, M * H / 8 bytes; see nccl_order_sum8)
+static const uint8_t* order_ptr(const torch::Tensor& order, int64_t M) {
+  TORCH_CHECK(order.is_cuda() && order.scalar_type() == torch::kUInt8 && order.is_contiguous() &&
+                  order.numel() >= M * H / 8,
+              "order: uint8 [M * H / 8] on the GPU");
+  return order.data_ptr<uint8_t>();
+}
+
 void wait_reduce(torch::Tensor x_local, int64_t rank, int64_t M_MAX, torch::Tensor rbuf, torch::Tensor flags,
-                 torch::Tensor ctrl, torch::Tensor out, c10::optional<torch::Tensor> residual,
+                 torch::Tensor ctrl, torch::Tensor order, torch::Tensor out, c10::optional<torch::Tensor> residual,
                  c10::optional<torch::Tensor> weight, c10::optional<torch::Tensor> residual_out, double eps,
                  torch::Tensor timeout_flag) {
   const int M = x_local.size(0);
+  const uint8_t* ord = order_ptr(order, M);
   auto stream = c10::cuda::getCurrentCUDAStream();
   if (residual.has_value()) {
     wait_reduce_kernel<true><<<M, H / 16, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_local.data_ptr()), (int)rank, (int)M_MAX,
         reinterpret_cast<const __nv_bfloat16*>(rbuf.data_ptr()), reinterpret_cast<const unsigned*>(flags.data_ptr()),
-        reinterpret_cast<unsigned*>(ctrl.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(residual->data_ptr()),
+        reinterpret_cast<unsigned*>(ctrl.data_ptr()), ord, reinterpret_cast<const __nv_bfloat16*>(residual->data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(weight->data_ptr()), (float)eps,
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), reinterpret_cast<__nv_bfloat16*>(residual_out->data_ptr()),
         reinterpret_cast<unsigned*>(timeout_flag.data_ptr()));
@@ -420,7 +432,7 @@ void wait_reduce(torch::Tensor x_local, int64_t rank, int64_t M_MAX, torch::Tens
     wait_reduce_kernel<false><<<M, H / 16, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(x_local.data_ptr()), (int)rank, (int)M_MAX,
         reinterpret_cast<const __nv_bfloat16*>(rbuf.data_ptr()), reinterpret_cast<const unsigned*>(flags.data_ptr()),
-        reinterpret_cast<unsigned*>(ctrl.data_ptr()), nullptr, nullptr, 0.f,
+        reinterpret_cast<unsigned*>(ctrl.data_ptr()), ord, nullptr, nullptr, 0.f,
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), nullptr, reinterpret_cast<unsigned*>(timeout_flag.data_ptr()));
   }
 }
@@ -459,9 +471,10 @@ void wait_gather(torch::Tensor x_local, int64_t rank, torch::Tensor rbuf, torch:
 // two-shot all-reduce: 4 launches (push RS, reduce slice, push AG, assemble) on the second buffer set.
 void all_reduce_twoshot(torch::Tensor x, torch::Tensor out, int64_t M_MAX, int64_t rank, torch::Tensor rbuf2,
                         torch::Tensor flags2, std::vector<int64_t> peers_data2, std::vector<int64_t> peers_flags2,
-                        torch::Tensor ctrl2, torch::Tensor timeout_flag, int64_t max_ctas_per_dest) {
+                        torch::Tensor ctrl2, torch::Tensor order, torch::Tensor timeout_flag, int64_t max_ctas_per_dest) {
   TORCH_CHECK(x.is_contiguous() && x.dtype() == torch::kBFloat16 && x.size(1) == H && x.size(0) <= M_MAX);
   TORCH_CHECK(out.is_contiguous() && out.sizes() == x.sizes());
+  const uint8_t* ord = order_ptr(order, x.size(0));
   Peers3 peers;
   for (int p = 0; p < NPEER; ++p) {
     peers.data[p] = reinterpret_cast<__nv_bfloat16*>(peers_data2[p]);
@@ -480,7 +493,7 @@ void all_reduce_twoshot(torch::Tensor x, torch::Tensor out, int64_t M_MAX, int64
   push_twoshot_kernel<0><<<ctas * NPEER, block, 0, stream>>>(reinterpret_cast<const uint4*>(x.data_ptr()), M, (int)M_MAX,
                                                              (int)rank, peers, ctrl, ctas);
   reduce_slice_kernel<<<M, SLICE_CH, 0, stream>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)rank, (int)M_MAX,
-                                                  rb, fl, ctrl, o, to);
+                                                  rb, fl, ctrl, ord, o, to);
   push_twoshot_kernel<1><<<ctas * NPEER, block, 0, stream>>>(reinterpret_cast<const uint4*>(out.data_ptr()), M, (int)M_MAX,
                                                              (int)rank, peers, ctrl, ctas);
   assemble_kernel<<<M, SLICE_CH, 0, stream>>>((int)rank, (int)M_MAX, rb, fl, ctrl, o, to);
