@@ -84,12 +84,21 @@ def placement(freq: np.ndarray, resident: float, alloc: str) -> tuple[np.ndarray
     return init, cap
 
 
-def step_time(miss_row: np.ndarray, group: int, gpu_step_ms: float) -> tuple[float, float]:
+GPU_MOE_SHARE = 0.4   # share of a layer's GPU time spent in the expert GEMMs after the router (what the CPU can hide behind)
+
+
+def step_time(miss_row: np.ndarray, group: int, gpu_step_ms: float) -> tuple[float, float, float]:
+    """(serial, mid, overlap) ms per step. serial: no overlap at all; overlap: the CPU hides behind the whole GPU
+    layer (needs the routing one layer ahead); mid: the CPU starts after the layer's router and hides only behind
+    the GPU's own expert GEMMs (GPU_MOE_SHARE of the layer), the rest of the layer is serial."""
     te = t_expert(group) * 1e-3  # ms; every position of the step routes to the expert at most once -> <= group tokens
     cpu_l = miss_row.astype(np.float64) * te
-    serial = gpu_step_ms + cpu_l.sum() + L * T_HANDOFF_US * 1e-3
-    overlap = np.maximum(gpu_step_ms / L, cpu_l).sum() + L * T_HANDOFF_US * 1e-3
-    return serial, overlap
+    hand = L * T_HANDOFF_US * 1e-3
+    per_layer = gpu_step_ms / L
+    serial = gpu_step_ms + cpu_l.sum() + hand
+    overlap = np.maximum(per_layer, cpu_l).sum() + hand
+    mid = (np.maximum(per_layer * GPU_MOE_SHARE, cpu_l) + per_layer * (1 - GPU_MOE_SHARE)).sum() + hand
+    return serial, mid, overlap
 
 
 def synthetic_routes(n_seq: int = 40, T: int = 2048, seed: int = 0) -> dict:
@@ -130,7 +139,8 @@ def main():
         R = dict(np.load(args.routes, allow_pickle=False))
     kinds = R["kinds"]
     n = len(kinds)
-    seqs = [(i, str(kinds[i]), R[f"ids_{i}"], R[f"decode_{i}"].astype(bool)) for i in range(n)]
+    index = R["seq_index"] if "seq_index" in R else np.arange(n)
+    seqs = [(int(j), str(kinds[p]), R[f"ids_{j}"], R[f"decode_{j}"].astype(bool)) for p, j in enumerate(index)]
     # train / test halves by index parity within kind
     train, test = [], []
     per_kind = {}
@@ -143,11 +153,38 @@ def main():
         for l in range(L):
             freq[l] += np.bincount(ids[:, l].ravel().astype(np.int64), minlength=E)
     print(f"{n} sequences ({dict(per_kind)}); train {len(train)} / test {len(test)}; "
-          f"{sum(s[2].shape[0] for _, _, s, _ in [(0, 0, x[2], 0) for x in test])} test positions")
+          f"{sum(x[2].shape[0] for x in test)} test positions, {sum(int(x[3].sum()) for x in test)} of them decode")
     # routing flatness: experts needed for 80/90/95 % of the picks (train)
     cum = np.cumsum(np.sort(freq.ravel())[::-1]) / freq.sum()
     print(f"  (layer, expert) pairs for 80/90/95 % of routed picks: "
           + " / ".join(f"{int(np.searchsorted(cum, q) + 1) / (L * E) * 100:.0f} %" for q in (0.8, 0.9, 0.95)))
+    # per-layer routing perplexity (train) and temporal locality / prefill working sets (test)
+    p = freq / np.maximum(freq.sum(axis=1, keepdims=True), 1)
+    ppl = np.exp(-(p * np.log(np.maximum(p, 1e-12))).sum(axis=1))
+    print(f"  per-layer routing perplexity of {E}: min {ppl.min():.0f}, median {np.median(ppl):.0f}, max {ppl.max():.0f}")
+    stats = {}
+    for i, kind, ids, dmask in test:
+        st = stats.setdefault(kind, dict(prev=[], prev8=[], chunk_ws=[]))
+        d = ids[dmask] if dmask.any() else ids
+        if d.shape[0] > 9:
+            # share of a position's 6 picks that the previous position (and any of the previous 8) also routed
+            for lag_name, lag in (("prev", 1), ("prev8", 8)):
+                hits = 0
+                for t in range(lag, d.shape[0]):
+                    prev = d[t - lag:t]  # [lag, L, K]
+                    cur = d[t]           # [L, K]
+                    for l in range(L):
+                        hits += np.isin(cur[l], prev[:, l].ravel()).sum()
+                st[lag_name].append(hits / ((d.shape[0] - lag) * L * K))
+        for c in range(0, ids.shape[0] - 2047, 2048):
+            st["chunk_ws"].append(np.mean([np.unique(ids[c:c + 2048, l]).size for l in range(L)]))
+    for kind, st in stats.items():
+        line = f"  {kind:10s} decode positions: picks also routed at the previous position {np.mean(st['prev']) * 100:4.1f} %"
+        if st["prev8"]:
+            line += f", within the previous 8 positions {np.mean(st['prev8']) * 100:4.1f} %"
+        if st["chunk_ws"]:
+            line += f"; distinct experts per layer per 2048-token chunk {np.mean(st['chunk_ws']):.0f} of {E}"
+        print(line)
     results = []
     for resident in [float(x) for x in args.resident.split(",")]:
         for alloc in args.alloc.split(","):
@@ -164,22 +201,26 @@ def main():
                             continue
                         a, m = acc[dsteps], miss[dsteps]
                         times = np.array([step_time(m[j], group, args.gpu_step_ms) for j in range(m.shape[0])])
-                        d = by_kind.setdefault(kind, dict(acc=[], miss=[], serial=[], overlap=[]))
+                        d = by_kind.setdefault(kind, dict(acc=[], miss=[], serial=[], mid=[], overlap=[], w=[]))
                         d["acc"].append(a.sum(axis=1).mean())
                         d["miss"].append(m.sum(axis=1).mean())
                         d["serial"].append(times[:, 0].mean())
-                        d["overlap"].append(times[:, 1].mean())
+                        d["mid"].append(times[:, 1].mean())
+                        d["overlap"].append(times[:, 2].mean())
+                        d["w"].append(m.shape[0])
                     tps = TOKENS_PER_STEP.get(k, 1.0)
-                    row = dict(resident=resident, alloc=alloc, policy=pname, k=k, kinds={})
+                    row = dict(resident=resident, alloc=alloc, policy=pname, k=k, tokens_per_step=tps, kinds={})
                     line = []
                     for kind, d in by_kind.items():
-                        acc_m, miss_m = float(np.mean(d["acc"])), float(np.mean(d["miss"]))
-                        ser, ovl = float(np.mean(d["serial"])), float(np.mean(d["overlap"]))
+                        w = np.array(d["w"], dtype=np.float64)   # decode steps per sequence -> weight by steps
+                        acc_m, miss_m = float(np.average(d["acc"], weights=w)), float(np.average(d["miss"], weights=w))
+                        ser, mid, ovl = (float(np.average(d[x], weights=w)) for x in ("serial", "mid", "overlap"))
                         row["kinds"][kind] = dict(accesses=acc_m, misses=miss_m, hit=1 - miss_m / max(acc_m, 1e-9),
-                                                  ms_serial=ser, ms_overlap=ovl, toks_serial=tps / ser * 1e3,
-                                                  toks_overlap=tps / ovl * 1e3)
+                                                  ms_serial=ser, ms_mid=mid, ms_overlap=ovl, toks_serial=tps / ser * 1e3,
+                                                  toks_mid=tps / mid * 1e3, toks_overlap=tps / ovl * 1e3,
+                                                  decode_steps=int(w.sum()))
                         line.append(f"{kind}: hit {100 * (1 - miss_m / max(acc_m, 1e-9)):4.1f}% miss/step {miss_m:6.1f} "
-                                    f"-> {tps / ser * 1e3:5.1f}..{tps / ovl * 1e3:5.1f} tok/s")
+                                    f"-> {tps / ser * 1e3:5.1f} / {tps / mid * 1e3:5.1f} / {tps / ovl * 1e3:5.1f} tok/s")
                     print(f"resident {resident:.2f} {alloc:7s} {pname:6s} k={k}: " + " | ".join(line))
                     results.append(row)
     if args.json:

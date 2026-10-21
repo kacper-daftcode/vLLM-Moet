@@ -34,11 +34,32 @@ N_LAYERS = 40
 TOPK = 6
 
 
+def select(seqs, args):
+    """--kinds a,b restricts kinds; --every N --phase P keeps items with index-within-kind % N == P
+    (applied to the kinds in --every-kinds, default humaneval,math500)."""
+    kinds = set(args.kinds.split(",")) if args.kinds else None
+    every_kinds = set(args.every_kinds.split(","))
+    idx_in_kind = {}
+    out = []
+    for i, s in enumerate(seqs):
+        j = idx_in_kind.get(s["kind"], 0)
+        idx_in_kind[s["kind"]] = j + 1
+        if kinds and s["kind"] not in kinds:
+            continue
+        if args.every > 1 and s["kind"] in every_kinds and j % args.every != args.phase:
+            continue
+        out.append(i)
+    return out
+
+
 def send(args):
     seqs = [json.loads(l) for l in open(args.sequences)]
+    chosen = select(seqs, args)
+    print(f"sending {len(chosen)} of {len(seqs)} sequences, {sum(seqs[i]['tokens'] for i in chosen)} tokens", flush=True)
     manifest = []
     t_all = time.time()
-    for i, s in enumerate(seqs):
+    for n_done, i in enumerate(chosen):
+        s = seqs[i]
         body = {"model": args.model, "prompt": s["text"], "max_tokens": 1, "temperature": 0}
         req = urllib.request.Request(f"{args.base}/v1/completions", data=json.dumps(body).encode(),
                                      headers={"Content-Type": "application/json"})
@@ -47,8 +68,10 @@ def send(args):
             d = json.load(r)
         dt = time.time() - t0
         pt = d["usage"]["prompt_tokens"]
-        manifest.append(dict(i=i, id=s["id"], kind=s["kind"], prompt_tokens=pt, secs=round(dt, 2)))
-        print(f"[{i + 1}/{len(seqs)}] {s['id']:40s} {pt:6d} tokens  {dt:6.1f}s  ({pt / max(dt, 1e-9):.0f} tok/s)", flush=True)
+        manifest.append(dict(i=i, id=s["id"], kind=s["kind"], prompt_tokens=pt, local_tokens=s["tokens"],
+                             secs=round(dt, 2)))
+        print(f"[{n_done + 1}/{len(chosen)}] {s['id'][:40]:40s} {pt:6d} tokens  {dt:6.1f}s  "
+              f"({pt / max(dt, 1e-9):.0f} tok/s)", flush=True)
         with open(args.manifest, "w") as f:
             json.dump(manifest, f, indent=1)
     print(f"done: {sum(m['prompt_tokens'] for m in manifest)} tokens in {time.time() - t_all:.0f}s -> {args.manifest}")
@@ -67,7 +90,9 @@ def read_records(path: str):
 
 def parse(args):
     seqs = [json.loads(l) for l in open(args.sequences)]
-    manifest = json.load(open(args.manifest))
+    manifest = []
+    for mf in args.manifest.split(","):
+        manifest += json.load(open(mf))
     from transformers import AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(MODEL_DIR)
@@ -79,6 +104,10 @@ def parse(args):
     for m in manifest:
         T = m["prompt_tokens"]
         s = seqs[m["i"]]
+        # the server may prepend a BOS to the raw prompt: shift the character-span masks by the difference
+        shift = T - m.get("local_tokens", T)
+        if shift not in (0, 1):
+            print(f"  warning: {m['id']} server tokens {T} vs local {m.get('local_tokens')} (shift {shift})")
         rows = [[] for _ in range(N_LAYERS)]
         got = [0] * N_LAYERS
         # skip stray 1-row (decode) steps between sequences
@@ -98,8 +127,8 @@ def parse(args):
         # token-level decode mask from the character spans (tokenize the prefix up to each span boundary)
         mask = np.zeros(T, dtype=bool)
         for a, b in s.get("decode_spans", []):
-            ta = len(tok.encode(s["text"][:a], add_special_tokens=False))
-            tb = len(tok.encode(s["text"][:b], add_special_tokens=False))
+            ta = len(tok.encode(s["text"][:a], add_special_tokens=False)) + max(shift, 0)
+            tb = len(tok.encode(s["text"][:b], add_special_tokens=False)) + max(shift, 0)
             mask[min(ta, T):min(tb, T)] = True
         out[f"ids_{m['i']}"] = arr.astype(np.int16)
         out[f"decode_{m['i']}"] = mask
@@ -109,6 +138,7 @@ def parse(args):
     out["kinds"] = np.array(kinds)
     out["seq_ids"] = np.array(ids_list)
     out["tokens"] = np.array(ntoks)
+    out["seq_index"] = np.array([m["i"] for m in manifest])   # keys are ids_<seq_index>, decode_<seq_index>
     np.savez_compressed(args.out, **out)
     print(f"{len(manifest)} sequences, {sum(ntoks)} positions -> {args.out}; {len(recs) - r} records left over")
 
@@ -121,10 +151,14 @@ def main():
     a.add_argument("--manifest", required=True)
     a.add_argument("--base", default="http://127.0.0.1:8001")
     a.add_argument("--model", default="deepseek-ai/DeepSeek-V4.1-Flash")
+    a.add_argument("--kinds", default="", help="comma list of kinds to send (default all)")
+    a.add_argument("--every", type=int, default=1, help="keep every N-th item of --every-kinds")
+    a.add_argument("--phase", type=int, default=0)
+    a.add_argument("--every-kinds", default="humaneval,math500")
     a.set_defaults(fn=send)
     p = sub.add_parser("parse")
     p.add_argument("--sequences", required=True)
-    p.add_argument("--manifest", required=True)
+    p.add_argument("--manifest", required=True, help="one or more manifest files, comma-separated, in send order")
     p.add_argument("--dump", required=True)
     p.add_argument("--out", required=True)
     p.set_defaults(fn=parse)
