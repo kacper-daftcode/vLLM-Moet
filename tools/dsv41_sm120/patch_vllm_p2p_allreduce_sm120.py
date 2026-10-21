@@ -17,6 +17,11 @@ the rank skew + flag latency floor there), hence one-shot off by default.
 VLLM_MOET_P2P_AR=1 enables it at runtime (default off); VLLM_MOET_P2P_AR_DIR points at the module directory
 (default /opt/vllm-moet/dsv41_sm120/p2p_ar). Needs step 10 (mhc_overlap) applied first.
 
+Step 24 (same patcher, second marker): for rows <= VLLM_MOET_P2P_AR_FUSED_MAX_ROWS (default 0) the boundary all-reduce
+is not a kernel of its own - the push is issued and mhc_post_norm (mhc_overlap/, template kAR) adds the three peers'
+partials itself before the post-mix and hands the reduced x to the side stream's projection. Full-depth dummy model, C1:
+step period 9,482 -> 9,363 us (-1.25 %); per boundary push 5.7 + fused 7.7 us instead of NCCL 11.8 + post_norm 3.9.
+
 Usage: python3 patch_vllm_p2p_allreduce_sm120.py [--mhc PATH] [--model PATH] [--check]   (idempotent)
 """
 
@@ -30,12 +35,13 @@ VLLM = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nv
 MARKER = "[vllm-moet] sm_120 P2P all-reduce"
 
 MHC_HELPER_ANCHOR = "def _moet_mhc_overlap_supported("
+MARKER24 = "[vllm-moet] step 24 fused all-reduce consumer"
 MHC_HELPER = f'''# {MARKER}: the boundary all-reduce of the decode graphs on a push over PCIe P2P
 # (tools/dsv41_sm120/p2p_ar; VLLM_MOET_P2P_AR=1 enables it, larger shapes and every failure fall back to NCCL).
 _MOET_P2P_AR = None  # None = not resolved, False = off / unavailable, else the module
 
 
-def _moet_p2p_all_reduce(x: torch.Tensor) -> torch.Tensor:
+def _moet_p2p_resolve() -> None:
     global _MOET_P2P_AR
     if _MOET_P2P_AR is None:
         import os
@@ -52,9 +58,21 @@ def _moet_p2p_all_reduce(x: torch.Tensor) -> torch.Tensor:
                 _MOET_P2P_AR = _m
             except Exception as exc:  # noqa: BLE001
                 _moet_logger.warning("vllm-moet sm_120 P2P all-reduce module unavailable, NCCL stays: %r", exc)
+
+
+def _moet_p2p_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    _moet_p2p_resolve()
     if _MOET_P2P_AR:
         return _MOET_P2P_AR.all_reduce(x)
     return get_tp_group().all_reduce(x)
+
+
+def _moet_p2p_push_for_fused(x: torch.Tensor):
+    """{MARKER24}: issue the push and return the consumer's buffers, or None (the caller all-reduces x itself)."""
+    _moet_p2p_resolve()
+    if _MOET_P2P_AR and hasattr(_MOET_P2P_AR, "push_for_fused"):
+        return _MOET_P2P_AR.push_for_fused(x)
+    return None
 
 
 '''
@@ -64,9 +82,66 @@ MHC_SITE_OLD = (
     "            return _moet_mhc_shifted_post_pre_overlap(\n"
 )
 MHC_SITE_NEW = (
+    "            ar = None\n"
     "            if reduce_results:\n"
-    f"                x = _moet_p2p_all_reduce(x)  # {MARKER} (NCCL when not applicable)\n"
+    f"                ar = _moet_p2p_push_for_fused(x)  # {MARKER24}: push now, reduce inside the boundary kernel\n"
+    "                if ar is None:\n"
+    f"                    x = _moet_p2p_all_reduce(x)  # {MARKER} (NCCL when not applicable)\n"
     "            return _moet_mhc_shifted_post_pre_overlap(\n"
+)
+# the overlap call's trailing arguments and the overlap function's signature / kernel call (step 24)
+MHC_CALL_OLD = (
+    "                capture_aux,\n"
+    "                stream,\n"
+    "            )\n"
+    "    layer_input = None\n"
+)
+MHC_CALL_NEW = (
+    "                capture_aux,\n"
+    "                stream,\n"
+    "                ar=ar,\n"
+    "            )\n"
+    "    layer_input = None\n"
+)
+MHC_SIG_OLD = (
+    "    capture_aux: bool,\n"
+    "    stream: torch.cuda.Stream,\n"
+    ") -> tuple[\n"
+)
+MHC_SIG_NEW = (
+    "    capture_aux: bool,\n"
+    "    stream: torch.cuda.Stream,\n"
+    "    ar=None,\n"
+    ") -> tuple[\n"
+)
+MHC_KERNEL_OLD = (
+    "    residual_out, layer_input, aux = kernel_module.mhc_post_norm(\n"
+    "        x,\n"
+    "        residual,\n"
+    "        post_layer_mix,\n"
+    "        comb_res_mix,\n"
+    "        pre_mix,\n"
+    "        norm_weight,\n"
+    "        norm_eps,\n"
+    "        capture_aux=capture_aux,\n"
+    "    )\n"
+)
+MHC_KERNEL_NEW = (
+    f"    if ar is not None:  # {MARKER24}: x is this rank's partial; the kernel returns the reduced x for the side stream\n"
+    "        residual_out, layer_input, aux, x = kernel_module.mhc_post_norm(\n"
+    "            x, residual, post_layer_mix, comb_res_mix, pre_mix, norm_weight, norm_eps, capture_aux=capture_aux, ar=ar,\n"
+    "        )\n"
+    "    else:\n"
+    "        residual_out, layer_input, aux = kernel_module.mhc_post_norm(\n"
+    "            x,\n"
+    "            residual,\n"
+    "            post_layer_mix,\n"
+    "            comb_res_mix,\n"
+    "            pre_mix,\n"
+    "            norm_weight,\n"
+    "            norm_eps,\n"
+    "            capture_aux=capture_aux,\n"
+    "        )\n"
 )
 MODEL_IMPORT_ANCHOR = "from .ops.mhc import (\n"
 MODEL_IMPORT = f"    _moet_p2p_all_reduce,  # {MARKER}\n"
@@ -99,10 +174,14 @@ def _once(src: str, anchor: str, what: str, name: str) -> None:
 def patch_mhc(src: str) -> str:
     if MARKER in src:
         return src
-    for what, anchor in (("overlap helper (step 10)", MHC_HELPER_ANCHOR), ("boundary all-reduce", MHC_SITE_OLD)):
+    for what, anchor in (("overlap helper (step 10)", MHC_HELPER_ANCHOR), ("boundary all-reduce", MHC_SITE_OLD),
+                         ("overlap call", MHC_CALL_OLD), ("overlap signature", MHC_SIG_OLD), ("boundary kernel call", MHC_KERNEL_OLD)):
         _once(src, anchor, what, "ops/mhc.py")
     src = src.replace(MHC_HELPER_ANCHOR, MHC_HELPER + MHC_HELPER_ANCHOR, 1)
-    return src.replace(MHC_SITE_OLD, MHC_SITE_NEW, 1)
+    src = src.replace(MHC_SITE_OLD, MHC_SITE_NEW, 1)
+    src = src.replace(MHC_CALL_OLD, MHC_CALL_NEW, 1)
+    src = src.replace(MHC_SIG_OLD, MHC_SIG_NEW, 1)
+    return src.replace(MHC_KERNEL_OLD, MHC_KERNEL_NEW, 1)
 
 
 def patch_model(src: str) -> str:

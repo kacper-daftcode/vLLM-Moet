@@ -145,6 +145,23 @@ def all_reduce(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def fused_max_rows() -> int:
+    """Rows up to which the one-shot push feeds the boundary kernel's fused consumer (step 24; default 0 = off)."""
+    return int(os.environ.get("VLLM_MOET_P2P_AR_FUSED_MAX_ROWS", "0"))
+
+
+def push_for_fused(x: torch.Tensor) -> dict | None:
+    """Issue the one-shot push of x (this rank's partial) for a consumer fused into the next kernel; returns the
+    buffers that consumer needs (data, flags, ctrl, rank, m_max) or None when the fused path does not apply."""
+    st = _init() if enabled() else None
+    if st is None or not (x.dim() == 2 and x.shape[1] == H and x.dtype == torch.bfloat16 and x.is_cuda
+                          and 0 < x.shape[0] <= min(fused_max_rows(), M_MAX)):
+        return None
+    x = x.contiguous()
+    st["ext"].push(x, M_MAX, st["rank"], st["peers_data"], st["peers_flags"], st["ctrl"], 64)
+    return dict(data=st["data"], flags=st["flags"], ctrl=st["ctrl"], rank=st["rank"], m_max=M_MAX, x=x)
+
+
 def gather_applicable(x: torch.Tensor) -> bool:
     if not (x.dim() == 2 and x.is_cuda and 0 < x.shape[0] <= 64):
         return False

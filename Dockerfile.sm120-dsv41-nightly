@@ -199,6 +199,13 @@
 #      dummy model at C8: step 29,864 -> 28,959 us (-3.0 %), all-reduce on the critical path 80 x 47 -> 80 x 39 us.
 #      Built in but OFF by default: VLLM_MOET_P2P_AR=1 at runtime turns it on (VLLM_MOET_P2P_AR_MAX_ROWS,
 #      VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS tune the ranges).
+#  24. The all-reduce consumer fused into the boundary kernel (same patcher as 23; mhc_overlap/mhc_post_norm_sm120.cu template
+#      kAR): for <= VLLM_MOET_P2P_AR_FUSED_MAX_ROWS rows (default 0 = off) the push is issued and mhc_post_norm waits for the
+#      three peers' flags, sums the four partials in fixed source order (fp32, rounded once - the same bits as the one-shot
+#      consumer) before the post-mix and hands the reduced x to the side stream's projection. Full-depth dummy model, C1:
+#      step 9,482 -> 9,363 us (-1.25 %); per boundary push 5.7 + fused kernel 7.7 us instead of NCCL 11.8 + post_norm 3.9.
+#      An output change at C1 (not NCCL's ring order) - gated in the serving window. VLLM_MOET_P2P_AR=1 plus
+#      VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16 at runtime turns it on.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -409,7 +416,7 @@ RUN if [ "$VLLM_MOET_B12X_FC2_GROUPED" = "1" ]; then python3 /opt/vllm-moet/dsv4
 ARG VLLM_MOET_P2P_AR_PATCH=1
 RUN if [ "$VLLM_MOET_P2P_AR_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_p2p_allreduce_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/p2p_ar'); import p2p_allreduce_sm120 as m; e = m._build(); assert hasattr(e, 'all_reduce_twoshot') and hasattr(e, 'push'); print('sm120 P2P all-reduce extension built')" \
-    && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h, vllm.models.deepseek_v41.nvidia.model as mm; assert hasattr(h, '_moet_p2p_all_reduce'); print('p2p all-reduce patched')"; fi
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h, vllm.models.deepseek_v41.nvidia.model as mm; assert hasattr(h, '_moet_p2p_all_reduce') and hasattr(h, '_moet_p2p_push_for_fused'); print('p2p all-reduce patched (23 + fused consumer 24)')"; fi
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \

@@ -84,8 +84,15 @@ def mhc_post_norm(
     mode: int = POST_MIX_MODE,
     pdl: bool | None = None,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Returns (residual_out [T, hc, H] bf16, layer_input [T, H] bf16, aux [T or 0, H] bf16)."""
+    ar: dict | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (residual_out [T, hc, H] bf16, layer_input [T, H] bf16, aux [T or 0, H] bf16).
+
+    ar: the fused P2P all-reduce consumer (step 24) - a dict with data, flags, ctrl, rank, m_max from
+    p2p_allreduce_sm120.push_for_fused(x): x is then this rank's partial sum and the kernel adds the three peers'
+    partials (fixed source order, fp32, rounded once) before the post-mix; a fourth tensor, the reduced x [T, H], is
+    then returned too (the side stream's projection reads it).
+    """
     if pdl is None:
         pdl = PDL_DEFAULT
     T, hc, H = residual.shape
@@ -96,11 +103,20 @@ def mhc_post_norm(
     else:
         residual_out, layer_input, aux_ = out
         aux = aux_ if aux_ is not None else torch.empty(0, H, dtype=torch.bfloat16, device=residual.device)
-    _ext().mhc_post_norm(
-        x, residual, post_layer_mix.reshape(T, hc).contiguous(), comb_res_mix.contiguous(), pre_mix.contiguous(),
-        norm_weight.contiguous(), residual_out, layer_input, aux if capture_aux else None, float(norm_eps), int(mode),
-        bool(pdl),
-    )
+    if ar is None:
+        _ext().mhc_post_norm(
+            x, residual, post_layer_mix.reshape(T, hc).contiguous(), comb_res_mix.contiguous(), pre_mix.contiguous(),
+            norm_weight.contiguous(), residual_out, layer_input, aux if capture_aux else None, float(norm_eps), int(mode),
+            bool(pdl),
+        )
+    else:
+        x_out = torch.empty_like(x)
+        _ext().mhc_post_norm(
+            x, residual, post_layer_mix.reshape(T, hc).contiguous(), comb_res_mix.contiguous(), pre_mix.contiguous(),
+            norm_weight.contiguous(), residual_out, layer_input, aux if capture_aux else None, float(norm_eps), int(mode),
+            bool(pdl), ar["data"], ar["flags"], ar["ctrl"], int(ar["rank"]), int(ar["m_max"]), x_out,
+        )
+        return residual_out, layer_input, aux, x_out
     return residual_out, layer_input, aux
 
 
