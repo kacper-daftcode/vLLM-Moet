@@ -189,6 +189,16 @@
 #      FC2 takes 22.6 instead of 27.6 us per layer: -199 us per decode step; served model (window 2026-10-21, r6 vs r5):
 #      FC2 on the decode graph's critical path 1,085 -> 905 us, Fraser 123.6 vs 117.8 steps/s on the same-state baseline (r5:
 #      +2.5 %). Pairs of padding tokens (id -1) get zeros, as from b12x. VLLM_MOET_B12X_FC2_GROUPED=0 keeps b12x's phase 2.
+#  23. The decode step's TP4 all-reduces on a push over PCIe P2P (patch_vllm_p2p_allreduce_sm120.py + p2p_ar/): the three
+#      all-reduce sites of the overlap path (boundary in front of mhc_post_norm, Engram layers, last layer). Two-shot
+#      (reduce-scatter + all-gather, every phase to one peer at a time - on this host a kernel writing to several peers
+#      concurrently is ~16x slower) for 17..64 rows, NCCL otherwise; one-shot push for small rows is built in but off (neutral
+#      in the full C1 graph: both sit on the rank-skew + flag floor). Fixed-order fp32 sum: deterministic, identical on
+#      every rank, but not NCCL's ring order - an output change, gated at concurrency (GSM8K-200 at C4 takes this path).
+#      4x RTX PRO 6000 (325 W, memory +5000), 80 all-reduces from a graph: [48, 5120] 23.5 vs NCCL 69.8 us; full-depth
+#      dummy model at C8: step 29,864 -> 28,959 us (-3.0 %), all-reduce on the critical path 80 x 47 -> 80 x 39 us.
+#      Built in but OFF by default: VLLM_MOET_P2P_AR=1 at runtime turns it on (VLLM_MOET_P2P_AR_MAX_ROWS,
+#      VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS tune the ranges).
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -393,6 +403,13 @@ RUN if [ "$VLLM_MOET_B12X_FC2_GROUPED" = "1" ]; then python3 /opt/vllm-moet/dsv4
     && grep -q "_moet_fc2_grouped_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
     && grep -q "_moet_fc2_grouped_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_preparation.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_fc2_grouped_sm120/*.so; fi
+
+# 23. TP4 all-reduces of the decode step on a P2P push (runtime switch VLLM_MOET_P2P_AR=1, default off); the extension is
+#     compiled here so the first serving call does not build it.
+ARG VLLM_MOET_P2P_AR_PATCH=1
+RUN if [ "$VLLM_MOET_P2P_AR_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_p2p_allreduce_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/p2p_ar'); import p2p_allreduce_sm120 as m; e = m._build(); assert hasattr(e, 'all_reduce_twoshot') and hasattr(e, 'push'); print('sm120 P2P all-reduce extension built')" \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h, vllm.models.deepseek_v41.nvidia.model as mm; assert hasattr(h, '_moet_p2p_all_reduce'); print('p2p all-reduce patched')"; fi
 
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
