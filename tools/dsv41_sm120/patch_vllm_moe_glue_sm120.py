@@ -374,6 +374,74 @@ MOE_CALL_NEW = (
     "\n"
     "            # FC2: FP8 activations x FP4 weights\n"
 )
+# vLLM main after 49cb2bbf: the grouped layout is either DeepGEMM's prefix sums (SM100 family) or the contiguous
+# m_indices (sm_120: use_psum_layout is False, -1 = padding row), handed over as `grouped_layout`. The FP8 experts had
+# a multi-line `use_psum_layout = (` before, so the FP4 experts' one-line form tells the versions apart.
+FP4_PSUM_LINE = "        use_psum_layout = current_platform.is_device_capability_family(100)\n"
+MOE_SIG_OLD_PSUM = (
+    "        activation: MoEActivation,\n"
+    "        expert_ends: torch.Tensor | None = None,\n"
+    "        expert_alignment: int = 0,\n"
+    "    ) -> tuple[torch.Tensor, torch.Tensor]:\n"
+    "        block_k = self._ACT_BLOCK_K\n"
+    "        scale_fmt = DeepGemmQuantScaleFMT.from_oracle()\n"
+    "\n"
+    "        M_sum, N = input.size()\n"
+    "        activation_out_dim = self.adjust_N_for_activation(N, activation)\n"
+    "\n"
+    "        if activation == MoEActivation.SILU:\n"
+    "            # Fused gate+mul+quant kernels for the common SILU case.\n"
+    "            if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:\n"
+    "                return fused_silu_mul_fp8_quant_packed(\n"
+    "                    input=input,\n"
+    "                    output_q=output,\n"
+    "                    group_size=block_k,\n"
+    "                    clamp_limit=self.gemm1_clamp_limit,\n"
+    "                    expert_ends=expert_ends,\n"
+    "                    expert_alignment=expert_alignment,\n"
+    "                )\n"
+)
+MOE_SIG_NEW_PSUM = (
+    "        activation: MoEActivation,\n"
+    "        expert_ends: torch.Tensor | None = None,\n"
+    "        expert_alignment: int = 0,\n"
+    "        m_indices: torch.Tensor | None = None,\n"
+    "    ) -> tuple[torch.Tensor, torch.Tensor]:\n"
+    "        block_k = self._ACT_BLOCK_K\n"
+    "        scale_fmt = DeepGemmQuantScaleFMT.from_oracle()\n"
+    "\n"
+    "        M_sum, N = input.size()\n"
+    "        activation_out_dim = self.adjust_N_for_activation(N, activation)\n"
+    "\n"
+    "        if activation == MoEActivation.SILU:\n"
+    "            # Fused gate+mul+quant kernels for the common SILU case.\n"
+    "            if scale_fmt == DeepGemmQuantScaleFMT.UE8M0:\n"
+    f"                # {MARKER}: padding rows (m_indices == -1) are skipped\n"
+    "                return fused_silu_mul_fp8_quant_packed(\n"
+    "                    input=input,\n"
+    "                    output_q=output,\n"
+    "                    group_size=block_k,\n"
+    "                    clamp_limit=self.gemm1_clamp_limit,\n"
+    "                    expert_ends=expert_ends,\n"
+    "                    expert_alignment=expert_alignment,\n"
+    "                    m_indices=m_indices,\n"
+    "                )\n"
+)
+MOE_CALL_OLD_PSUM = (
+    "                expert_ends=grouped_layout if use_psum_layout else None,\n"
+    "                expert_alignment=align_used if use_psum_layout else 0,\n"
+    "            )\n"
+    "\n"
+    "            # FC2: FP8 activations x FP4 weights\n"
+)
+MOE_CALL_NEW_PSUM = (
+    "                expert_ends=grouped_layout if use_psum_layout else None,\n"
+    "                expert_alignment=align_used if use_psum_layout else 0,\n"
+    "                m_indices=None if use_psum_layout else grouped_layout,\n"
+    "            )\n"
+    "\n"
+    "            # FC2: FP8 activations x FP4 weights\n"
+)
 
 
 def _apply(src: str, pairs) -> str:
@@ -401,6 +469,8 @@ def apply_fp8_utils(src: str) -> str:
 
 
 def apply_deep_gemm_moe(src: str) -> str:
+    if FP4_PSUM_LINE in src:  # vLLM main with the prefix-sum layout in the FP4 experts
+        return _apply(src, ((MOE_SIG_OLD_PSUM, MOE_SIG_NEW_PSUM), (MOE_CALL_OLD_PSUM, MOE_CALL_NEW_PSUM)))
     return _apply(src, ((MOE_SIG_OLD, MOE_SIG_NEW), (MOE_CALL_OLD, MOE_CALL_NEW)))
 
 
