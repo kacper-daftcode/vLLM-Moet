@@ -186,8 +186,9 @@
 #      pairs of an expert in one CTA per 128-column tile with b12x's MMA sequence and epilogue, so route_output keeps its
 #      bits (GPU test: the same bits at 6-36 distinct experts, and the patched MoE's outputs equal b12x's). On routing
 #      recorded from the served model (160 decode-step layers, 22.5 distinct experts of 36 pairs; 325 W, memory +5000)
-#      FC2 takes 22.6 instead of 27.6 us per layer: -199 us per decode step. VLLM_MOET_B12X_FC2_GROUPED=0 at runtime keeps
-#      b12x's phase 2.
+#      FC2 takes 22.6 instead of 27.6 us per layer: -199 us per decode step; served model (window 2026-10-21, r6 vs r5):
+#      FC2 on the decode graph's critical path 1,085 -> 905 us, Fraser 123.6 vs 117.8 steps/s on the same-state baseline (r5:
+#      +2.5 %). Pairs of padding tokens (id -1) get zeros, as from b12x. VLLM_MOET_B12X_FC2_GROUPED=0 keeps b12x's phase 2.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
