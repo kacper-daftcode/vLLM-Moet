@@ -17,6 +17,9 @@ the rank skew + flag latency floor there), hence one-shot off by default.
 VLLM_MOET_P2P_AR=1 enables it at runtime (default off); VLLM_MOET_P2P_AR_DIR points at the module directory
 (default /opt/vllm-moet/dsv41_sm120/p2p_ar). Needs step 10 (mhc_overlap) applied first.
 
+Step 25 (same patcher, third marker): the vocab all-gather of the MXFP8 lm_head helpers of steps 18 (drafter) and 21
+(target) on the P2P push when VLLM_MOET_P2P_AG=1 (bit-exact: a gather moves bytes; [6, 8080] bf16 16.9 vs NCCL 31.7 us).
+
 Step 24 (same patcher, second marker): for rows <= VLLM_MOET_P2P_AR_FUSED_MAX_ROWS (default 0) the boundary all-reduce
 is not a kernel of its own - the push is issued and mhc_post_norm (mhc_overlap/, template kAR) adds the three peers'
 partials itself before the post-mix and hands the reduced x to the side stream's projection. Full-depth dummy model, C1:
@@ -36,6 +39,23 @@ MARKER = "[vllm-moet] sm_120 P2P all-reduce"
 
 MHC_HELPER_ANCHOR = "def _moet_mhc_overlap_supported("
 MARKER24 = "[vllm-moet] step 24 fused all-reduce consumer"
+MARKER25 = "[vllm-moet] step 25 P2P all-gather of the logits"
+# the lm_head helpers of steps 18 (dspark.py) and 21 (model.py) gather the vocab shards; on the P2P push when enabled
+LM_HEAD_GATHER_OLD = (
+    "    if model.lm_head.tp_size > 1:\n"
+    "        logits = lp._gather_logits(logits)\n"
+    "    return logits[..., : lp.org_vocab_size]\n"
+)
+LM_HEAD_GATHER_NEW = (
+    "    if model.lm_head.tp_size > 1:\n"
+    f"        if model.lm_head.tp_size == 4 and logits.dim() == 2:  # {MARKER25}\n"
+    "            from .ops.mhc import _moet_p2p_all_gather\n"
+    "\n"
+    "            logits = _moet_p2p_all_gather(logits)\n"
+    "        else:\n"
+    "            logits = lp._gather_logits(logits)\n"
+    "    return logits[..., : lp.org_vocab_size]\n"
+)
 MHC_HELPER = f'''# {MARKER}: the boundary all-reduce of the decode graphs on a push over PCIe P2P
 # (tools/dsv41_sm120/p2p_ar; VLLM_MOET_P2P_AR=1 enables it, larger shapes and every failure fall back to NCCL).
 _MOET_P2P_AR = None  # None = not resolved, False = off / unavailable, else the module
@@ -73,6 +93,16 @@ def _moet_p2p_push_for_fused(x: torch.Tensor):
     if _MOET_P2P_AR and hasattr(_MOET_P2P_AR, "push_for_fused"):
         return _MOET_P2P_AR.push_for_fused(x)
     return None
+
+
+def _moet_p2p_all_gather(x: torch.Tensor) -> torch.Tensor:
+    """{MARKER25}: TP all-gather along the last dim on the P2P push (bit-exact), NCCL otherwise."""
+    import os
+
+    _moet_p2p_resolve()
+    if _MOET_P2P_AR and os.environ.get("VLLM_MOET_P2P_AG", "0") == "1" and hasattr(_MOET_P2P_AR, "all_gather"):
+        return _MOET_P2P_AR.all_gather(x)
+    return get_tp_group().all_gather(x, dim=-1)
 
 
 '''
@@ -193,19 +223,31 @@ def patch_model(src: str) -> str:
     src = src.replace(MODEL_IMPORT_ANCHOR, MODEL_IMPORT_ANCHOR + MODEL_IMPORT, 1)
     for old, new in MODEL_SITES:
         src = src.replace(old, new, 1)
+    if src.count(LM_HEAD_GATHER_OLD) == 1:  # step 21 present: its vocab gather on the P2P push too
+        src = src.replace(LM_HEAD_GATHER_OLD, LM_HEAD_GATHER_NEW, 1)
     return src
+
+
+def patch_dspark(src: str) -> str:
+    """Step 18's drafter lm_head helper: the vocab gather on the P2P push (optional file)."""
+    if MARKER25 in src or src.count(LM_HEAD_GATHER_OLD) != 1:
+        return src
+    return src.replace(LM_HEAD_GATHER_OLD, LM_HEAD_GATHER_NEW, 1)
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--mhc", type=Path, default=VLLM / "ops" / "mhc.py")
     ap.add_argument("--model", type=Path, default=VLLM / "model.py")
+    ap.add_argument("--dspark", type=Path, default=VLLM / "dspark.py")
     ap.add_argument("--check", action="store_true")
     args = ap.parse_args()
-    for path, fn in ((args.mhc, patch_mhc), (args.model, patch_model)):
+    for path, fn in ((args.mhc, patch_mhc), (args.model, patch_model), (args.dspark, patch_dspark)):
+        if fn is patch_dspark and not path.exists():
+            continue
         src = path.read_text()
-        if MARKER in src:
-            print(f"{path}: already patched")
+        if (MARKER in src and fn is not patch_dspark) or (fn is patch_dspark and (MARKER25 in src or src.count(LM_HEAD_GATHER_OLD) != 1)):
+            print(f"{path}: already patched" if MARKER in src or MARKER25 in src else f"{path}: no step-18 gather to patch")
             continue
         out = fn(src)
         compile(out, str(path), "exec")
