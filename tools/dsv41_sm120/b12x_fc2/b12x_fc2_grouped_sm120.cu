@@ -12,7 +12,8 @@
 // route_output has the same bits. All 4.5 K128 slices of a tile are requested at once.
 //
 // Shapes: intermediate 576 (five K128 slices, the last one half), hidden a multiple of 128, at most 64 pairs and at
-// most 8 pairs per expert (each token chooses an expert once: tokens <= 8), int32 expert ids.
+// most 8 pairs per expert (each token chooses an expert once: tokens <= 8), int32 expert ids. A pair with an id outside
+// [0, experts) (a padding token: -1) gets zeros in route_output, as from b12x's phase 2.
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
@@ -46,6 +47,7 @@ struct Args {
   const float* global_scale;
   __nv_bfloat16* out;
   int gs_per_expert;
+  int num_experts;
   int num_pairs;
   int rows_capacity;
   int out_tiles;
@@ -104,6 +106,11 @@ __global__ void __launch_bounds__(kThreads, 2) fc2_grouped_kernel(Args a) {
   const int tile = blockIdx.x - p * a.out_tiles;
   if (p >= a.num_pairs) return;
   const int e = __ldg(a.ids + p);
+  if (e < 0 || e >= a.num_experts) {
+    // b12x's phase 2 stores zeros for an invalid route (padding tokens: id -1)
+    a.out[(size_t)p * a.hidden + tile * kTileN + tid] = __float2bfloat16_rn(0.f);
+    return;
+  }
 
   if (warp == 0) {
     const int v0 = lane < a.num_pairs ? __ldg(a.ids + lane) : -1;
@@ -248,6 +255,7 @@ void fc2_grouped(torch::Tensor intermediate, torch::Tensor w2, torch::Tensor w2_
   a.global_scale = global_scale.data_ptr<float>();
   a.out = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   a.gs_per_expert = global_scale.numel() > 1;
+  a.num_experts = (int)down_alpha.numel();
   a.num_pairs = (int)num_pairs;
   a.rows_capacity = (int)rows_capacity;
   a.hidden = (int)out.size(1);

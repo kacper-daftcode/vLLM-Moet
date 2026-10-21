@@ -6,7 +6,7 @@ Synthetic MXFP4 experts of one TP4 rank of DeepSeek-V4.1-Flash (384 experts, hid
 SwiGLU limit 10), prepared and run through b12x's planned API as vLLM's B12xExperts does; 6 tokens (a C1 decode step
 with five drafts), routings with 6, 12, 22 and 36 distinct experts, three seeds each.
 1. Kernel: with VLLM_MOET_B12X_FC2_GROUPED=0 (b12x's own phase 2) the grouped FC2 on the same scratch must give
-   route_output with the same bits. Prints cold-L2 kernel times of both (L2 refilled by a 256 MB read first).
+   route_output with the same bits, also with padding tokens (ids -1: zeros). Prints cold-L2 kernel times of both (L2 refilled by a 256 MB read first).
 2. Served path: a child process with VLLM_MOET_B12X_FC2_GROUPED=1 runs the patched b12x MoE on the same inputs; its MoE
    outputs must equal the parent's bit for bit, and its launches must hold the grouped kernel and no phase 2 kernel.
 """
@@ -21,7 +21,7 @@ import sys
 import tempfile
 
 E, H, N, TOPK, LIMIT, TOKENS = 384, 5120, 576, 6, 10.0, 6
-CASES = [(u, seed) for u in (6, 12, 22, 36) for seed in (1, 2, 3)]
+CASES = [(u, seed) for u in (6, 12, 22, 36) for seed in (1, 2, 3)] + [(22, -1), (12, -2)]  # seed < 0: padding tokens
 
 
 def _weights(torch, dev):
@@ -38,6 +38,8 @@ def _weights(torch, dev):
 
 
 def _routing(torch, unique, seed, dev):
+    pad = seed < 0  # the last -seed tokens are padding: ids -1, as the router's top-k writes for them
+    seed = abs(seed)
     g = torch.Generator().manual_seed(seed)
     pool = torch.randperm(E, generator=g)[:unique].tolist()
     ids, used = [], set()
@@ -47,6 +49,9 @@ def _routing(torch, unique, seed, dev):
         row = (must + rest)[:TOPK]
         used.update(row)
         ids.append(row)
+    if pad:
+        for t in range(TOKENS - seed, TOKENS):
+            ids[t] = [-1] * TOPK
     w = torch.rand(TOKENS, TOPK, generator=g) + 0.1
     x = torch.randn(TOKENS, H, generator=g) * 0.5
     return (torch.tensor(ids, dtype=torch.int32, device=dev), (w / w.sum(-1, keepdim=True) * 1.5).to(dev),
@@ -142,7 +147,7 @@ def main():
         torch.cuda.synchronize()
         same = torch.equal(route_mine.view(torch.int16), route.view(torch.int16))
         ok += same
-        if seed == 1:
+        if seed == 1:  # timing
             with profile(activities=[ProfilerActivity.CUDA]) as prof:
                 for _ in range(a.iters):
                     flush.view(torch.int32).sum()
