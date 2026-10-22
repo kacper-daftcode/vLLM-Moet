@@ -262,6 +262,20 @@
 #      per-shape table (sm120_gemv/mxfp8_gemv_sm120.cu, in step 3's extension) that keeps R = 1 everywhere: in a graph of
 #      back-to-back GEMVs R = 2 / 4 won on two shapes (7.13 -> 6.54, 4.96 -> 3.79 us, same bits for every R), in the served
 #      decode graph they lost (critical path +27 us per step). VLLM_MOET_GEMV_V3_R=1|2|4 forces one R (0 = table).
+#  30. The DSpark / DFlash drafter's input preparation in one launch for all draft KV-cache groups
+#      (patch_vllm_dflash_prepare_groups_sm120.py): the original Triton kernel with the per-group part (context / query
+#      slot mappings, their padding) instantiated for up to three groups, the shared outputs written once by the same
+#      expressions - every buffer bit-identical (96 random cases incl. padded tails); 3 launches x 9.4 us outside the
+#      graphs per decode step -> one: eager 45.2 -> 18.6 us per step. OFF by default: VLLM_MOET_DFLASH_PREP_GROUPS=1.
+#  31. The DSA candidate-block selection on the deterministic top-k (patch_vllm_candidate_short_sm120.py): the
+#      candidate-source indexer (layer 20) picks its top 2048 blocks of 8 positions per decode row through torch.topk
+#      over the static max_model_len-wide score row (no DeepSelect on sm_120): ~20 launches, ~45 us per step on the
+#      critical path, inside the FULL decode graph. torch.topk's set - the k largest, equal values to the lower index,
+#      NaN above +inf - is what step 26's det_topk kernel computes on [0, valid blocks) of the score row (one cluster
+#      launch per row count: graph-safe for every context length); a small kernel then applies the original's -inf ->
+#      -1 rule to the selected blocks. 72 random cases incl. long contexts with ties straddling the k-th place: the
+#      same sets and bit-identical logits after apply_candidate_mask; served shape in a graph 41.3 -> 3.2 us (2.7K
+#      context) / 39.8 -> 10.2 us (60K). OFF by default: VLLM_MOET_CANDIDATE_DET_TOPK=1.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -275,7 +289,8 @@
 #  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16), VLLM_MOET_B12X_COMPACT_BIND (17),
 #  VLLM_MOET_DRAFTER_LM_HEAD_MXFP8 (18), VLLM_MOET_DSV4_TOPK (19), VLLM_MOET_FUSED_MARKOV (20),
 #  VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH (21), VLLM_MOET_B12X_FC2_GROUPED (22), VLLM_MOET_DET_TOPK_PATCH (26),
-#  VLLM_MOET_B12X_MOE_FUSED_PATCH (27), VLLM_MOET_SPARSE_MLA_LDG_PATCH (28).
+#  VLLM_MOET_B12X_MOE_FUSED_PATCH (27), VLLM_MOET_SPARSE_MLA_LDG_PATCH (28), VLLM_MOET_DFLASH_PREP_GROUPS_PATCH (30),
+#  VLLM_MOET_CANDIDATE_DET_TOPK_PATCH (31).
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> .
@@ -502,9 +517,23 @@ RUN if [ "$VLLM_MOET_SPARSE_MLA_LDG_PATCH" = "1" ]; then python3 /opt/vllm-moet/
     && python3 -c "import flashinfer.mla._sparse_mla_sm120._prepared as p; assert hasattr(p, '_moet_sparse_mla_ldg_on') and hasattr(p, '_moet_sparse_mla_ldg_execute_fn'); print('sparse MLA prepare/execute patched')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_sparse_mla_ldg_sm120/*.so; fi
 
+# 30. The DSpark / DFlash drafter's input preparation for all draft KV-cache groups in one launch instead of one per group
+#     (runtime switch VLLM_MOET_DFLASH_PREP_GROUPS=1, default off; Triton, no extension). GPU test:
+#     tools/dsv41_sm120/dflash_prep_groups/test_dflash_prep_groups_sm120.py.
+ARG VLLM_MOET_DFLASH_PREP_GROUPS_PATCH=1
+RUN if [ "$VLLM_MOET_DFLASH_PREP_GROUPS_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dflash_prepare_groups_sm120.py \
+    && python3 -c "import vllm.v1.worker.gpu.spec_decode.dflash.speculator as s; assert hasattr(s, '_moet_prepare_dflash_inputs_groups_kernel') and hasattr(s, '_moet_prepare_dflash_inputs_groups'); print('drafter input prep for all KV groups patched')"; fi
+
+# 31. The DSA candidate-block selection (the candidate-source indexer's top 2048 blocks) on step 26's deterministic top-k
+#     kernel instead of torch.topk's ~20 launches (runtime switch VLLM_MOET_CANDIDATE_DET_TOPK=1, default off; needs step
+#     26's extension, built above). GPU test: tools/dsv41_sm120/candidate_short/test_candidate_short_sm120.py.
+ARG VLLM_MOET_CANDIDATE_DET_TOPK_PATCH=1
+RUN if [ "$VLLM_MOET_CANDIDATE_DET_TOPK_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_candidate_short_sm120.py \
+    && python3 -c "import vllm.model_executor.kernels.attention.dsa.candidate_blocks as c; assert hasattr(c, '_moet_candidates_det') and hasattr(c, '_moet_candidates_fixup_kernel'); print('candidate blocks on the deterministic top-k patched')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads, its softmax / XV section with four barriers per tile and its merge with hoisted loads (runtime switch)" \
+      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads, its softmax / XV section with four barriers per tile and its merge with hoisted loads (runtime switch) + the drafter's input preparation in one launch for all draft KV groups (runtime switch) + the DSA candidate-block selection on the deterministic top-k (runtime switch)" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -528,4 +557,6 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.det-topk="${VLLM_MOET_DET_TOPK_PATCH}" \
       com.vllm-moet.b12x-moe-fused="${VLLM_MOET_B12X_MOE_FUSED_PATCH}" \
       com.vllm-moet.sparse-mla-ldg="${VLLM_MOET_SPARSE_MLA_LDG_PATCH}" \
+      com.vllm-moet.dflash-prep-groups="${VLLM_MOET_DFLASH_PREP_GROUPS_PATCH}" \
+      com.vllm-moet.candidate-det-topk="${VLLM_MOET_CANDIDATE_DET_TOPK_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
