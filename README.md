@@ -21,13 +21,13 @@ df3bd094 (FlashInfer 0.7.2, DeepGEMM 727f8470) plus Dockerfile steps 17–28 in
 indexer top-k, P2P all-reduce in NCCL's summation order, the sparse-MLA gather — most behind runtime
 switches, the fused MoE and the sparse-MLA gather on as served).
 
-| | measured on the served image, 2026-10-16 |
+| | measured on the served image (`-r13`, DSpark k = 7), 2026-10-22 |
 |---|---|
-| decode, 1 stream | prose **190–224 tok/s**, code **436–466 tok/s** (88–90 steps/s) |
-| decode, 8 streams | prose 596–615 tok/s, code 1,494–1,597 tok/s aggregate |
-| fresh prefill | 163K tokens in 8.5 s, 391K in 21.4 s |
-| KV cache | **3.69M tokens** on the GPUs (7× concurrency at 512K), 76.7M more in 64 GiB of host RAM, plus a disk tier |
-| quality | GSM8K-200 193/200, needle 6/6 to 367K tokens, tool calls / JSON / vision pass |
+| decode, 1 stream | prose **253–265 tok/s**, code **737–859 tok/s** (122–123 steps/s; the Fraser bench below is the stricter single-prompt code measure) |
+| decode, 8 streams | prose 737–746 tok/s, code 2,202–2,228 tok/s aggregate |
+| fresh prefill | 180K tokens in 10.1 s (~18K tok/s) |
+| KV cache | **9.63M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
+| quality | GSM8K-200 193–194/200 on the b12x line (steps 26–28 are bit-identical to the paths they replace), needle PASS at 100K, tool calls / JSON pass |
 
 ### What we changed against official vLLM
 
