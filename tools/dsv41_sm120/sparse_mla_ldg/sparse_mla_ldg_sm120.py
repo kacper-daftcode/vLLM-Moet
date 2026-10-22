@@ -1,7 +1,9 @@
 """JIT loader for sparse_mla_ldg_sm120.cu: FlashInfer 0.7.2's DeepSeek-V4.1 mixed-cache sparse MLA decode kernel on
-sm_120 instantiated with a gather schedule that loads the candidate rows with plain 16-byte loads (one DRAM round trip
-per tile instead of 32-64 serialized bulk copies), and its merge kernel with the partial rows and the attention sink
-loaded before the LSE reductions. The attention math, the fp4 -> fp8 conversion and the merge arithmetic are
+sm_120 (its text copied from the installed header at build time by gen_spec_kernel.py, with the first tile's index
+words loaded before the candidate lengths) instantiated with a gather schedule that loads the candidate rows with plain
+16-byte loads (one DRAM round trip per tile instead of 32-64 serialized bulk copies) and shares the fp4 -> fp8
+conversion of a tile between the two producer groups, and its merge kernel with the partial rows and the attention
+sink loaded before the LSE reductions. The attention math, the conversion function and the merge arithmetic are
 FlashInfer's own code; output, LSE and the split scratch are bit-identical.
 
     from sparse_mla_ldg_sm120 import decode, supported
@@ -35,20 +37,26 @@ def _flashinfer_data() -> Path:
 
 @functools.lru_cache(maxsize=None)
 def _ext():
-    from torch.utils.cpp_extension import load
+    from torch.utils.cpp_extension import _get_build_directory, load
+
+    import gen_spec_kernel
 
     data = _flashinfer_data()
     inc = data / "include"
     cccl = data / "cccl"
+    name = "vllm_moet_sparse_mla_ldg_sm120"
+    # the decode kernel's text, copied from the installed header with the two insertions, into the build directory
+    build_dir = Path(_get_build_directory(name, verbose=False))
+    gen_spec_kernel.check(gen_spec_kernel.write(build_dir))
     os.environ["TORCH_CUDA_ARCH_LIST"] = os.environ.get("VLLM_MOET_SPARSE_MLA_LDG_ARCH", "12.0f")
     flags = ["-std=c++20", "-use_fast_math", "-O3", "-DNDEBUG", "-DFLASHINFER_ENABLE_F16", "-DFLASHINFER_ENABLE_BF16",
              "-DFLASHINFER_ENABLE_FP8_E4M3", "-DFLASHINFER_ENABLE_FP8_E5M2", "-DFLASHINFER_ENABLE_FP8_E8M0",
              "-DFLASHINFER_ENABLE_FP4_E2M1", "-gencode=arch=compute_120f,code=sm_120f"]
     return load(
-        name="vllm_moet_sparse_mla_ldg_sm120",
+        name=name,
         sources=[str(_HERE / "sparse_mla_ldg_sm120.cu")],
         extra_include_paths=[str(cccl / "libcudacxx/include"), str(cccl / "cub"), str(cccl / "thrust"), str(inc),
-                             str(inc / "flashinfer/attention/sparse_mla_sm120")],
+                             str(inc / "flashinfer/attention/sparse_mla_sm120"), str(build_dir)],
         extra_cuda_cflags=flags,
         extra_cflags=["-O3", "-std=c++20"],
         verbose=False,

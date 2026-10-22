@@ -1,14 +1,17 @@
 // DeepSeek-V4.1 sparse MLA decode on sm_120 (FlashInfer 0.7.2's sparse_mla_sm120 mixed-cache kernel) with the
-// candidate rows gathered by plain loads instead of one cp.async.bulk per row, and the split merge with its loads
-// issued up front. The attention kernel is FlashInfer's own `sparse_mla_decode_dsv4_kernel` template, compiled from
-// the installed headers with FlashInfer's flags and instantiated with the gather schedule below in place of
-// Dsv41MixedCacheDecodeSchedule: the math, the fp4 -> fp8 conversion and every barrier of the consumers are
-// FlashInfer's; only the producer's data movement differs (the same bytes land in the same shared-memory slots, the
-// same mbarrier completes). The merge kernel is FlashInfer's `sparse_mla_decode_dsv4_merge_kernel` expression by
-// expression, with the partial rows and the attention sink loaded before the LSE reductions instead of inside them.
+// candidate rows gathered by plain loads instead of one cp.async.bulk per row, the fp4 -> fp8 conversion of a tile
+// shared by the two producer groups, the first tile's index words loaded before the candidate lengths, and the split
+// merge with its loads issued up front. The attention kernel is FlashInfer's own `sparse_mla_decode_dsv4_kernel`
+// text (gen_spec_kernel.py copies it from the installed header at build time and inserts the speculative index loads
+// - two insertions, verified against the header), compiled with FlashInfer's flags and instantiated with the gather
+// schedule below in place of Dsv41MixedCacheDecodeSchedule: the math, the conversion function and every barrier of the
+// math group are FlashInfer's; only the producers' data movement and work split differ (the same bytes land in the
+// same shared-memory slots, the same handoffs complete). The merge kernel is FlashInfer's
+// `sparse_mla_decode_dsv4_merge_kernel` expression by expression, with the partial rows and the attention sink loaded
+// before the LSE reductions instead of inside them.
 //
 // Measured (6 tokens, 128 SWA fp8 + 512 compressed fp4 candidates, 10 splits, cold L2, CUDA graph): decode 10.5 ->
-// 9.1 us, merge 2.6-2.9 -> 2.2 us; output, LSE and the split scratch bit-identical on 40 random shapes.
+// 7.7 us, merge 2.6 -> 2.1 us; output, LSE and the split scratch bit-identical on 35 random mixed-cache shapes.
 //
 // Why the gather is faster: the mixed schedule's gather warp issues 32 (fp8) or 64 (fp4) bulk copies of 288-528 B
 // per tile; the TMA unit works them off one by one and the tile's bytes land ~2.5 us after the indices arrive. 128
@@ -32,14 +35,43 @@
 
 namespace flashinfer::sparse_mla_sm120 {
 
-// The mixed-cache decode schedule (kernels/dsv41_fp8/decode_schedule.cuh) with the gather group loading the rows.
+// The mixed-cache decode schedule (kernels/dsv41_fp8/decode_schedule.cuh) with the gather group loading the rows, and
+// the fp4 -> fp8 requantization of a tile shared between the convert group and the gather group (which has nothing to
+// do once a tile's rows are stored until the next tile's index arrives): 576 independent 32-dim tasks over 256 threads
+// instead of 128 (3 rounds per thread instead of 5). Every task is an element-wise function of its 16 packed bytes and 2
+// scale bytes writing its own 32 fp8 bytes + 1 scale byte, so the bytes in the slot do not depend on who computes them.
+// Both producer groups therefore acquire a KV slot before writing it and publish it when done (384-thread handoffs).
 struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources {
   using Plan = kernels::dsv41_fp8::Dsv41MixedCacheDecodeResources;
   static constexpr bool RAW_PIPELINE = true;
-  static constexpr int LDG_GATHER_REGS = 96;  // 128 x (240 + 112 + 96) = 57,344 <= 65,536
-  static_assert(GROUP_THREADS * (MATH_REGS + CONVERT_REGS + LDG_GATHER_REGS) <= 65536);
+  // The launch allocates 168 registers per thread (384 threads, __launch_bounds__(384, 1)): the roles' sum must fit that
+  // pool or the math group's setmaxnreg.inc blocks forever; the host checks the allocation (kRegPool).
+  static constexpr int LDG_GATHER_REGS = 144;  // the convert function (112) + a tile's loads in flight
+  static constexpr int LAUNCH_REGS = 168;
+  static constexpr int kRegPool = BLOCK_THREADS * LAUNCH_REGS;
+  static_assert(GROUP_THREADS * (MATH_REGS + CONVERT_REGS + LDG_GATHER_REGS) <= kRegPool);
   __device__ static void gather_registers_ldg() {
     asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(LDG_GATHER_REGS));
+  }
+  // The KV slot handoffs with two producer groups (gather + convert) instead of the convert group alone. The kernel body
+  // uses GatherSchedule::KvFree / KvReady, so the math side follows these counts.
+  using KvFree = pipeline::SlotRelease<4, 5, 2 * GROUP_THREADS, MATH_THREADS>;
+  using KvReady = pipeline::StoreHandoff<6, 7, 2 * GROUP_THREADS, MATH_THREADS>;
+
+  // convert_raw's tasks (row = task / groups, group = task % groups; the same conversion function) for one of the two
+  // producer groups: tasks first, first + 256, ... of the BI x CONVERSION_GROUPS_PER_ROW = 576.
+  static constexpr int CONVERT_TASKS = BI * CONVERSION_GROUPS_PER_ROW;
+  __device__ __forceinline__ static void convert_share(const uint8_t* raw, uint8_t* values, uint8_t* scales,
+                                                       int first) {
+    for (int task = first; task < CONVERT_TASKS; task += 2 * GROUP_THREADS) {
+      const int row = task / CONVERSION_GROUPS_PER_ROW, group = task % CONVERSION_GROUPS_PER_ROW;
+      requantize_e2m1_e4m3_g16_to_e4m3_ue8m0_g32(
+          *reinterpret_cast<const uint4*>(raw + row * Raw::DATA_BYTES + group * sizeof(uint4)),
+          *reinterpret_cast<const uint16_t*>(raw + RAW_SCALE_OFFSET + row * Raw::SCALE_BYTES +
+                                             group * sizeof(uint16_t)),
+          values + row * KV::KV_SMEM_STRIDE + group * KV::QUANT_TILE,
+          scales + row * KV::SCALE_BYTES_PER_TOKEN + group);
+    }
   }
 
   // One tile's rows by plain loads. FAST: power-of-two page size and a 32-bit page stride (shift / mask / one
@@ -129,9 +161,21 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
     }
   }
 
-  // Dsv41MixedCacheDecodeSchedule::produce with the gather branch replaced; the convert branch is the original's.
+  // Dsv41MixedCacheDecodeSchedule::produce with the gather branch replaced and the conversion shared.
+  //   gather, per tile: [acquire the slots if reused] load + store the rows, publish the raw slot (fp4) or the KV slot's
+  //     mbarrier (fp8); issue the next tile's index load; convert its share of an fp4 tile; publish KvReady.
+  //   convert, per tile: wait for the raw rows (fp4: convert its share) or the fp8 rows; release the raw slot; publish.
+  // The gather reads a raw slot only between its own GatherSync of that tile and its stores of the tile after next (which
+  // the convert group's RawFree release still gates), so the raw-slot protocol is unchanged.
+  // FlashInfer's signature (no speculation) and the spec kernel's: the first tile's index words the kernel loaded
+  // before the lengths, with the section starts they were loaded for (-1: none).
   template <typename Smem, typename Section>
   __device__ __forceinline__ static void produce(Smem sm, char* scratch, Section section, int count) {
+    produce(sm, scratch, section, count, -1, -1, -1, -1);
+  }
+  template <typename Smem, typename Section>
+  __device__ __forceinline__ static void produce(Smem sm, char* scratch, Section section, int count, int spec_main,
+                                                 int spec_main_start, int spec_extra, int spec_extra_start) {
     using pipeline::BulkReady;
     using pipeline::TwoSlotCursor;
     auto* ready = Plan::ready(scratch);
@@ -139,13 +183,27 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
     if (Plan::is_gather()) {
       gather_registers_ldg();
       const int lane = tid & 31;
+      // lane l of every warp holds row l's index (one 128 B line); rows are dealt to lanes by shuffles. The first
+      // tile's word comes from the speculative load when it was for this section and start (index() masks rows past
+      // the list end the same way).
+      int idx_next = -1;
+      if (count > 0) {
+        auto sec0 = section(0);
+        if (!sec0.extra && sec0.start == spec_main_start)
+          idx_next = sec0.start + lane < sec0.end ? spec_main : -1;
+        else if (sec0.extra && sec0.start == spec_extra_start)
+          idx_next = sec0.start + lane < sec0.end ? spec_extra : -1;
+        else
+          idx_next = sec0.index(lane);
+      }
       for (int t = 0; t < count; ++t) {
         int buf = TwoSlotCursor::slot(t);
         auto sec = section(t);
-        if (TwoSlotCursor::reuses(t)) RawFree::acquire(buf);
-        if (!sec.extra && TwoSlotCursor::reuses(t)) KvFree::acquire(buf);
-        // lane l of every warp holds row l's index (one 128 B line); rows are dealt to lanes by shuffles
-        const int idx_lane = sec.index(lane);
+        const int idx_lane = idx_next;
+        if (TwoSlotCursor::reuses(t)) {
+          RawFree::acquire(buf);
+          KvFree::acquire(buf);
+        }
         const bool fast = ((sec.pbs & (sec.pbs - 1)) == 0) && ((sec.stride >> 32) == 0);  // uniform
         if (fast)
           gather_tile<true>(sm, scratch, sec, buf, tid, idx_lane);
@@ -155,6 +213,9 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
         GatherSync::wait();
         auto* barrier = sec.extra ? ready + buf : sm.mbar_full(buf);
         if (tid == 0) pipeline::CountedHandoff<1>::publish(barrier);  // one arrival, no transaction bytes
+        if (t + 1 < count) idx_next = section(t + 1).index(lane);     // in flight during the conversion below
+        if (sec.extra) convert_share(Plan::raw(scratch, buf), sm.kv_fp8(buf), sm.kv_sc(buf), GROUP_THREADS + tid);
+        KvReady::publish(buf);
       }
     } else {
       Plan::convert_registers();
@@ -166,10 +227,10 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
           BulkReady::wait(ready + buf, phases.current(buf));
           phases.advance(buf);
           if (TwoSlotCursor::reuses(t)) KvFree::acquire(buf);
-          kernels::dsv41_fp8::convert_raw<Plan>(Plan::raw(scratch, buf), sm.kv_fp8(buf), sm.kv_sc(buf), tid,
-                                                [](int) { return true; });
+          convert_share(Plan::raw(scratch, buf), sm.kv_fp8(buf), sm.kv_sc(buf), tid);
         } else {
           BulkReady::wait(sm.mbar_full(buf), TwoSlotCursor::phase(t));
+          if (TwoSlotCursor::reuses(t)) KvFree::acquire(buf);  // the gather wrote the slot; this group participates
         }
         RawFree::release(buf);
         KvReady::publish(buf);
@@ -177,6 +238,10 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
     }
   }
 };
+
+// FlashInfer's decode kernel with the speculative index loads (generated from the installed header, see
+// gen_spec_kernel.py): sparse_mla_decode_dsv4_spec_kernel<MT, NUM_HEADS, GatherSchedule>.
+#include "sparse_mla_spec_kernel.inc"
 
 // FlashInfer's merge kernel (execution/merge.cuh) with its memory traffic re-scheduled: all splits' partial rows and
 // the attention sink are loaded up front (one round trip, before the LSE reductions) instead of one dependent load
@@ -338,12 +403,37 @@ PagedLayout parse_layout(const torch::Tensor& kv, int bpt, const char* name) {
   return {int(kv.size(axis)), size_t(kv.stride(0))};
 }
 
-void launch(const execution::AttentionParams& p, int head_blocks, int block_threads, int smem_bytes, bool hoisted_merge,
-            cudaStream_t stream) {
-  auto kernel = sparse_mla_decode_dsv4_kernel<kModel, kHeads, LdgMixedCacheDecodeSchedule>;
+// The restructured XV phase's buffers after the plan's shared memory (the kernel lays them out from the same
+// constants: gen_spec_kernel.py's SMEM_BLOCK).
+constexpr size_t extra_smem_bytes(size_t plan_shared_bytes) {
+  using Cfg = DecodeTileCfg<kModel, true>;
+  using KV = KVCacheTraits<kModel>;
+  const size_t w_offset = (plan_shared_bytes + 127) / 128 * 128;
+  const size_t w_bytes = (size_t)(KV::D_NOPE / KV::QUANT_TILE) * HPB * (Cfg::BI + 16);
+  const size_t amax_bytes = (size_t)(KV::D_NOPE / KV::QUANT_TILE) * HPB * Cfg::N_WARPS * sizeof(float);
+  return w_offset + w_bytes + amax_bytes - plan_shared_bytes;
+}
+
+void launch(const execution::AttentionParams& p, int head_blocks, int block_threads, int plan_smem_bytes,
+            bool hoisted_merge, cudaStream_t stream) {
+  auto kernel = sparse_mla_decode_dsv4_spec_kernel<kModel, kHeads, LdgMixedCacheDecodeSchedule>;
+  // the plan's shared bytes must be the schedule's layout total: the kernel places its extra buffers at that offset
+  using Layout = Fp8DecodeSharedLayout<kModel, true>;
+  constexpr size_t kRawOffset = Layout::OFF_W_FP8 + Layout::W_FP8_SLOTS * Layout::SMEM_W_FP8_BUF;
+  constexpr size_t kLayoutTotal = LdgMixedCacheDecodeSchedule::Layout<kRawOffset>::TOTAL_BYTES;
+  TORCH_CHECK((size_t)plan_smem_bytes == kLayoutTotal, "sparse MLA decode: the plan's shared bytes ", plan_smem_bytes,
+              " differ from the mixed schedule's layout ", kLayoutTotal);
+  const int smem_bytes = (int)(kLayoutTotal + extra_smem_bytes(kLayoutTotal));
   static bool attr_set = false;
   if (!attr_set) {
     TORCH_CHECK(execution::validate_mixed_smem(kernel, smem_bytes) == cudaSuccess, "mixed schedule shared memory");
+    cudaFuncAttributes fa{};
+    TORCH_CHECK(cudaFuncGetAttributes(&fa, kernel) == cudaSuccess);
+    using S = LdgMixedCacheDecodeSchedule;
+    TORCH_CHECK((long long)fa.numRegs * block_threads >=
+                    (long long)S::GROUP_THREADS * (S::MATH_REGS + S::CONVERT_REGS + S::LDG_GATHER_REGS),
+                "sparse MLA decode: the launch allocates ", fa.numRegs, " registers per thread; the roles need ",
+                S::MATH_REGS, " + ", S::CONVERT_REGS, " + ", S::LDG_GATHER_REGS, " per group of ", S::GROUP_THREADS);
     TORCH_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes) == cudaSuccess);
     attr_set = true;
   }
