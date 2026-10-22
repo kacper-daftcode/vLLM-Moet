@@ -23,7 +23,7 @@ switches, the fused MoE and the sparse-MLA gather on as served).
 
 | | measured on the served image (`-r13`, DSpark k = 7), 2026-10-22 |
 |---|---|
-| decode, 1 stream | prose **253–265 tok/s**, code **737–859 tok/s** (122–123 steps/s; the Fraser bench below is the stricter single-prompt code measure) |
+| decode, 1 stream | prose **253–265 tok/s**, code **~740 tok/s median (waves 706–859)** (122–125 steps/s; the Fraser bench below is the stricter single-prompt code measure) |
 | decode, 8 streams | prose 737–746 tok/s, code 2,202–2,228 tok/s aggregate |
 | fresh prefill | 180K tokens in 10.1 s (~18K tok/s) |
 | KV cache | **9.63M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
