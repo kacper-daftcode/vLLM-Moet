@@ -31,8 +31,10 @@ __global__ void step_begin_kernel(int* step_dev) {
     if (threadIdx.x == 0) step_dev[0] += 1;
 }
 
-// one CTA: remap, compact the misses (thread 0, pair order), copy the tokens, release the step
-__global__ void publish_kernel(CpuTierRequest* req, const int* step_dev, const int* ids, const float* wts,
+// one CTA: remap, compact the misses (thread 0, pair order), copy the tokens, release the request under the layer's
+// next sequence number (seq_dev: one int per layer, bumped here, read by the layer's wait kernel; a layer published
+// twice in one forward - a decoder replay - simply gets two requests)
+__global__ void publish_kernel(CpuTierRequest* req, int* seq_dev, const int* ids, const float* wts,
                                const int* slot, int* remapped, int n_pairs, int topk, const uint8_t* a_values,
                                const uint8_t* a_scales, int n_tokens) {
     __shared__ int s_n;
@@ -77,19 +79,21 @@ __global__ void publish_kernel(CpuTierRequest* req, const int* step_dev, const i
         req->n_all = (uint32_t)n_pairs;
         req->flags = 0;
         req->t_publish_ns = gtimer();
+        const int seq = seq_dev[0] + 1;
+        seq_dev[0] = seq;
         __threadfence_system();
-        st_release_sys(&req->step, (uint32_t)step_dev[0]);
+        st_release_sys(&req->step, (uint32_t)seq);
     }
 }
 
 // every CTA spins on the ack (thread 0), then copies its share of the rows from the staging area
 __global__ void wait_inject_kernel(const CpuTierAck* ack, const CpuTierRequest* req, const uint16_t* staging,
-                                   const int* step_dev, uint16_t* route, int route_stride, volatile uint32_t* err,
+                                   const int* seq_dev, uint16_t* route, int route_stride, volatile uint32_t* err,
                                    long long timeout_ns) {
     __shared__ int s_n;
     const int tid = threadIdx.x;
     if (tid == 0) {
-        const uint32_t step = (uint32_t)step_dev[0];
+        const uint32_t step = (uint32_t)seq_dev[0];  // the sequence number the layer's publish used
         int n = 0;
         if (ld_acquire_sys(err) == 0) {
             const unsigned long long t0 = gtimer();
@@ -211,7 +215,7 @@ void step_begin(torch::Tensor step_dev) {
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
-void publish(int64_t req_dev_ptr, torch::Tensor step_dev, torch::Tensor topk_ids, torch::Tensor topk_weights,
+void publish(int64_t req_dev_ptr, torch::Tensor seq_dev, torch::Tensor topk_ids, torch::Tensor topk_weights,
              torch::Tensor slot_table, torch::Tensor remapped, torch::Tensor a_values, torch::Tensor a_scales,
              int64_t n_tokens) {
     TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_weights.scalar_type() == torch::kFloat32);
@@ -222,19 +226,19 @@ void publish(int64_t req_dev_ptr, torch::Tensor step_dev, torch::Tensor topk_ids
     const int n_pairs = (int)topk_ids.numel();
     TORCH_CHECK(n_pairs <= CPU_TIER_MAX_PAIRS && topk_ids.dim() == 2);
     publish_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
-        (CpuTierRequest*)(uintptr_t)req_dev_ptr, step_dev.data_ptr<int>(), topk_ids.data_ptr<int>(),
+        (CpuTierRequest*)(uintptr_t)req_dev_ptr, seq_dev.data_ptr<int>(), topk_ids.data_ptr<int>(),
         topk_weights.data_ptr<float>(), slot_table.data_ptr<int>(), remapped.data_ptr<int>(), n_pairs,
         (int)topk_ids.size(1), a_values.data_ptr<uint8_t>(), a_scales.data_ptr<uint8_t>(), (int)n_tokens);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
-void wait_inject(int64_t ack_dev_ptr, int64_t req_dev_ptr, int64_t staging_dev_ptr, torch::Tensor step_dev,
+void wait_inject(int64_t ack_dev_ptr, int64_t req_dev_ptr, int64_t staging_dev_ptr, torch::Tensor seq_dev,
                  torch::Tensor route_output, int64_t err_dev_ptr, int64_t timeout_ns) {
     TORCH_CHECK(route_output.scalar_type() == torch::kBFloat16 && route_output.dim() == 2 &&
                 route_output.size(1) == CPU_TIER_HID && route_output.stride(1) == 1);
     wait_inject_kernel<<<8, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
         (const CpuTierAck*)(uintptr_t)ack_dev_ptr, (const CpuTierRequest*)(uintptr_t)req_dev_ptr,
-        (const uint16_t*)(uintptr_t)staging_dev_ptr, step_dev.data_ptr<int>(),
+        (const uint16_t*)(uintptr_t)staging_dev_ptr, seq_dev.data_ptr<int>(),
         reinterpret_cast<uint16_t*>(route_output.data_ptr()), (int)route_output.stride(0),
         (volatile uint32_t*)(uintptr_t)err_dev_ptr, timeout_ns);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);

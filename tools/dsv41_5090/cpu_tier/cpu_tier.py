@@ -54,6 +54,8 @@ def host_lib(path: str | None = None):
     lib.cpu_tier_set_record.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
     lib.cpu_tier_start.restype = ctypes.c_int
     lib.cpu_tier_start.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.cpu_tier_start_seq.restype = ctypes.c_int
+    lib.cpu_tier_start_seq.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
     lib.cpu_tier_stop.restype = ctypes.c_int
     lib.cpu_tier_stop.argtypes = [ctypes.c_void_p]
     lib.cpu_tier_totals.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64)]
@@ -158,7 +160,8 @@ class CpuTier:
             self.ack_d = [self.ext.device_ptr(p) for p in self.ack]
             self.staging_d = [self.ext.device_ptr(p) for p in self.staging]
             self.err_d = self.ext.device_ptr(self.err)
-            self.step_dev = torch.zeros(1, dtype=torch.int32, device=device)
+            self.step_dev = torch.zeros(1, dtype=torch.int32, device=device)       # the forward counter (KPIs)
+            self.seq_dev = torch.zeros(n_layers, dtype=torch.int32, device=device)  # per-layer request numbers
         for L in range(n_layers):
             assert self.lib.cpu_tier_set_mailboxes(self.handle, L, self.req[L], self.ack[L], self.staging[L]) == 0
         self._err_view = (ctypes.c_uint32 * 16).from_address(self.err)
@@ -173,6 +176,13 @@ class CpuTier:
     # ---- lifecycle --------------------------------------------------------------------------------------------
     def start(self, first_step: int = 1) -> None:
         assert self.lib.cpu_tier_start(self.handle, first_step) == 0
+        self.started = True
+
+    def restart_from_device(self) -> None:
+        """After a stop: expect every layer's next request number = its device counter + 1 (syncs the device)."""
+        seq = self.seq_dev.cpu().numpy().astype(np.uint32) + 1
+        arr = (ctypes.c_uint32 * self.n_layers)(*seq.tolist())
+        assert self.lib.cpu_tier_start_seq(self.handle, arr) == 0
         self.started = True
 
     def stop(self) -> None:
@@ -194,13 +204,13 @@ class CpuTier:
 
     def publish(self, layer: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor, slot_table: torch.Tensor,
                 a_values: torch.Tensor, a_scales: torch.Tensor, n_tokens: int, remapped: torch.Tensor) -> torch.Tensor:
-        self.ext.publish(self.req_d[layer], self.step_dev, topk_ids, topk_weights, slot_table, remapped, a_values,
-                         a_scales, int(n_tokens))
+        self.ext.publish(self.req_d[layer], self.seq_dev[layer:layer + 1], topk_ids, topk_weights, slot_table, remapped,
+                         a_values, a_scales, int(n_tokens))
         return remapped
 
     def wait_inject(self, layer: int, route_output: torch.Tensor) -> None:
-        self.ext.wait_inject(self.ack_d[layer], self.req_d[layer], self.staging_d[layer], self.step_dev, route_output,
-                             self.err_d, self.timeout_ns)
+        self.ext.wait_inject(self.ack_d[layer], self.req_d[layer], self.staging_d[layer], self.seq_dev[layer:layer + 1],
+                             route_output, self.err_d, self.timeout_ns)
 
     # ---- host-side observation (no device syncs) -------------------------------------------------------------
     def error(self) -> int:

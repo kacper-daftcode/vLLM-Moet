@@ -32,7 +32,8 @@ class ResidentPool:
     def __init__(self, layer: int, n_experts: int, R: int, device: torch.device, pool: dict | None = None,
                  slot_table: torch.Tensor | None = None):
         self.layer, self.E, self.R, self.device = layer, n_experts, R, device
-        self.pool = pool or {name: torch.zeros(R, w, dtype=torch.int32, device=device) for name, w in WORDS.items()}
+        # pool=None: own tensors; pool={}: attached later (vLLM's prepared storages, at the layer's first launch)
+        self.pool = pool if pool is not None else {name: torch.zeros(R, w, dtype=torch.int32, device=device) for name, w in WORDS.items()}
         self.slot_table = slot_table if slot_table is not None else torch.full((n_experts,), -1, dtype=torch.int32, device=device)
         self.expert_of_slot = [-1] * R          # host mirror of the table
         self.slot_of_expert: dict[int, int] = {}

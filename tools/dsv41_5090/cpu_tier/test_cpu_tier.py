@@ -283,7 +283,7 @@ def main():
     tot2 = tier.totals()
     # restart at the next step the graph will publish (the counter is already past the two failed steps)
     tier.clear_error()
-    tier.start(first_step=int(tier.step_dev.item()) + 1)
+    tier.restart_from_device()
     q, s, i_np, w_np = new_inputs()
     graph.replay()
     bad3, nm3 = verify(q, s, i_np, w_np, "after restart")

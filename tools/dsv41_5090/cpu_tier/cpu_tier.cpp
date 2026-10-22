@@ -67,8 +67,9 @@ struct Tier {
     std::thread thread;
     std::atomic<bool> running{false};
     std::atomic<bool> stop{false};
-    std::atomic<uint32_t> expected{1};
+    std::atomic<uint32_t> expected{1};   // the last served sequence number + 1 (informational)
     std::atomic<int> layer_cursor{0};
+    std::vector<uint32_t> expected_seq;  // per layer
     // totals
     std::atomic<int64_t> steps_done{0}, layers_done{0}, pairs_done{0}, busy_ns{0}, errors{0};
     // rings
@@ -174,30 +175,31 @@ static void serve(Tier& T, int layer, uint32_t step) {
     if (status) T.errors.fetch_add(1, std::memory_order_relaxed);
 }
 
+// Every layer has its own sequence of requests (the publish kernel numbers them); the dispatcher polls the layers
+// round-robin and serves whichever holds its next number - any layer order, a layer published twice per forward
+// (decoder replay) included.
 static void dispatcher_main(Tier* T) {
     pin_to_cpu(T->dispatcher_cpu);
-    uint32_t expected = T->expected.load();
     int layer = 0;
     while (!T->stop.load(std::memory_order_acquire)) {
         CpuTierRequest* req = T->layers[layer].req;
+        const uint32_t expected = T->expected_seq[layer];
         const uint32_t s = __atomic_load_n(&req->step, __ATOMIC_ACQUIRE);
         if (s == expected) {
             serve(*T, layer, expected);
-            if (++layer == T->n_layers) {
-                layer = 0;
-                ++expected;
-                T->expected.store(expected);
-                T->steps_done.fetch_add(1, std::memory_order_relaxed);
-            }
+            T->expected_seq[layer] = expected + 1;
+            if (layer == 0) T->steps_done.fetch_add(1, std::memory_order_relaxed);
+            T->expected.store(expected + 1);
             T->layer_cursor.store(layer);
+            // stay on this layer (the next layer in forward order is usually the next to come, but a replay may
+            // publish the same layer again): the round-robin below finds whichever is ready
         } else if (s > expected && s - expected < 0x40000000u) {
-            // the GPU is ahead of us: a step we never saw (should not happen; count it and resync)
+            // a request we never served (the GPU skipped ahead): count it and resync this layer
             T->errors.fetch_add(1, std::memory_order_relaxed);
-            expected = s;
-            T->expected.store(expected);
-        } else {
-            _mm_pause();
+            T->expected_seq[layer] = s;
         }
+        if (++layer == T->n_layers) layer = 0;
+        _mm_pause();
     }
     T->running.store(false);
 }
@@ -262,7 +264,22 @@ int cpu_tier_start(void* tier, uint32_t first_step) {
     if (!T || T->running.load()) return -1;
     for (auto& L : T->layers)
         if (!L.req || !L.ack || !L.staging) return -2;
+    T->expected_seq.assign(T->n_layers, first_step);
     T->expected.store(first_step);
+    T->stop.store(false);
+    T->running.store(true);
+    T->thread = std::thread(dispatcher_main, T);
+    return 0;
+}
+
+// start with a per-layer first sequence number (after a fail-closed stop: the device counters + 1)
+int cpu_tier_start_seq(void* tier, const uint32_t* first_seq) {
+    Tier* T = (Tier*)tier;
+    if (!T || T->running.load()) return -1;
+    for (auto& L : T->layers)
+        if (!L.req || !L.ack || !L.staging) return -2;
+    T->expected_seq.assign(first_seq, first_seq + T->n_layers);
+    T->expected.store(first_seq[0]);
     T->stop.store(false);
     T->running.store(true);
     T->thread = std::thread(dispatcher_main, T);
