@@ -33,15 +33,22 @@ switches, the fused MoE and the sparse-MLA gather on as served).
 
 | | official vLLM image on sm_120 | vLLM-Moet image |
 |---|---|---|
-| indexer pages | DeepGEMM's SM120 paged MQA logits admit 32/64-row pages, V4.1's ratio-1 layers use 128: the indexer asserts | 128-row pages admitted, bit-exact to 64-row pages |
-| KV formats | fp8 compressed record (584 B/state) and FP8 indexer cache (132 B/key); the checkpoint's FP4 record and the MXFP4 indexer are SM100-only | FP4 record (288 B) and MXFP4 indexer (68 B): **2× the GPU KV tokens** (1.49M → 3.06M on the same image) |
+| indexer pages | DeepGEMM's SM120 paged MQA logits admit 32/64-row pages, V4.1's ratio-1 layers use 128: the indexer asserts | the image's DeepGEMM build admits 128-row pages (bit-exact to 64-row pages), with the per-group BLOCK_M restored on sm_120 |
+| KV formats | fp8 compressed record (584 B/state) and FP8 indexer cache (132 B/key); the checkpoint's FP4 record and the MXFP4 indexer are SM100-only | FP4 record (288 B) read by FlashInfer's DSv4.1 dual cache (its reader taught the interleaved V4.1 records) and the MXFP4 indexer (68 B/key) enabled on sm_120: **9.63M GPU KV tokens** at 512K context |
 | KV offload | one host copy per TP rank, 3.6 KB per token | one copy, 896 B per token |
-| dense decode GEMMs | CUTLASS's 128-row tile on a 6-row batch; `wo_a` as BF16 weights through cuBLAS bmm | tensor-core MXFP8 GEMV: 1.8–3.4× faster, `wo_a` 2.9× |
-| MoE at decode | every routed expert padded to 128 rows (grouped GEMM 2× slower); 7 launches from router to FC1; FC2's padding rows written back to HBM | 64-row tiles, one fused launch, the padding dropped from L2 |
+| dense decode GEMMs | CUTLASS's 128-row tile on a 6-row batch; `wo_a` as BF16 weights through cuBLAS bmm | tensor-core MXFP8 GEMV: 1.8–3.4× faster, `wo_a` 2.9×; the target's `lm_head` on the same GEMV (runtime switch, served on) |
+| MoE at decode | DeepGEMM grouped MoE: every routed expert padded to 128 rows (grouped GEMM ~2× slower); the b12x W4A8 backend does not bind at TP4 | b12x W4A8 compact bound at TP4; FC2 grouped by expert (bit-identical, 27.6 → 22.6 µs/layer on recorded routing); the whole decode MoE — FC1 → activation → FC2 — in one persistent kernel (bit-identical, runtime switch, served on); the router's top-6 in one plain-launched CUDA kernel, bit-identical to Triton's (−136 µs on the served step's critical path) |
+| DSpark drafter | the drafter's `lm_head` as a BF16 GEMM; Markov sampling in several launches per draft step | the drafter's `lm_head` on the MXFP8 GEMV; Markov sampling in one launch per draft step (−60 µs of drafter graph per decode step) |
+| sparse MLA decode | FlashInfer's gather warp issues one `cp.async.bulk` per candidate row and the TMA unit works them off one by one (~2.5 µs until a tile's bytes land) | the same FlashInfer kernel with candidate rows gathered by plain 16-byte loads and the merge's loads hoisted (bit-identical; runtime switch, served on): decode 10.5 → 8.2 µs, merge 2.6 → 2.1 µs per layer at the served shape |
+| TP collectives | an NCCL all-reduce per sublayer boundary; in graphs each NCCL kernel starts ~2.8 µs after its predecessor | the decode step's all-reduces as a two-shot push over PCIe P2P, the C1 consumer fused into the mHC boundary kernel ([48, 5120] in 23.5 vs 69.8 µs from a graph), summed in NCCL's own order so the bits are NCCL's; NCCL's graph event records reduced to one |
+| indexer top-k (optional) | vLLM's sm_120 top-k kernels break FP4-logit ties differently from run to run, and sparse MLA's bits follow the selection order | an exact deterministic top-k (ties to the lower column, ascending output; runtime switch, served off) — the same prompt then reproduces token-for-token |
 | mHC boundary | on the model stream (the side-stream version is SM100-only) | off the critical path: +3–5 % steps/s |
-| launch gaps | the indexer's `weights_proj` on 2 cuBLAS CTAs (the main stream waits ~26 µs per layer); in graphs each NCCL kernel starts 2.8 µs after its predecessor | one launch with cuBLAS's bits; 0.4 µs; programmatic dependent launch in our kernels |
-| prefill | the indexer's TP row sharding starts at 65,536 rows, which a 4096-token chunk never reaches; Engram's `wkv` all-gathers on every chunk (+1.8 ms per layer) | sharding from 2048 rows (−4 % at 391K); `wkv` split over the ranks at decode only |
+| launch gaps | the indexer's `weights_proj` on 2 cuBLAS CTAs (the main stream waits ~26 µs per layer) | one launch with cuBLAS's bits; 0.4 µs; programmatic dependent launch in our kernels |
+| prefill | the indexer's TP row sharding starts at 65,536 rows, which a 4096-token chunk never reaches; Engram's `wkv` all-gathers on every chunk (+1.8 ms per layer) | sharding from 2048 rows (vllm#61647, −4 % at 391K); `wkv` split over the ranks at decode only |
 | `reasoning_effort` | `minimal` / `medium` answer HTTP 400 | accepted (25 / 62) |
+
+Two earlier items are upstream in the current base (vLLM nightly df3bd094) and are no longer differences:
+the SWA bounded replay and the fused query-norm + quantization gate; the image labels them `upstream`.
 
 Net on the same four cards, against the recipe's official image with only the fixes it needed to start
 (2026-09-17): single-stream decode **60 → 88–90 steps/s (1.5×)**, GPU KV **1.49M → 3.69M tokens
