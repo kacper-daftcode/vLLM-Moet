@@ -71,7 +71,13 @@ def case_lens(case, tokens):
 
 def case_inputs(case, dev):
     gen = torch.Generator(device=dev).manual_seed(100 + case)
+    # tokens: the served decode batches (1-8), and every 16th case a batch of 40 or 64 tokens, where FlashInfer's plan
+    # gives a CTA several tiles per slot (the producers reuse the shared-memory slots: the handoff protocol's waits)
     tokens = [6, 6, 6, 1, 2, 8, 5, 3][case % 8]
+    if case % 16 == 4:
+        tokens = 40
+    if case % 16 == 12:
+        tokens = 64
     swa_lens, extra_lens = case_lens(case, tokens)
     inp = make_inputs(tokens, gen, dev, swa_lens, extra_lens)
     if case % 8 == 7:  # SWA-only layer (no compressed cache): FlashInfer's ordinary schedule, not the extension's
@@ -184,6 +190,7 @@ def main():
     refs = {}
     ok = tot = 0
     first_bad = None
+    plans_seen = set()
     for case in range(a.cases):
         inp = case_inputs(case, dev)
         tokens = inp["q"].shape[0]
@@ -198,6 +205,7 @@ def main():
             continue  # the extension does not serve SWA-only plans; the subprocess checks the fall-through
         assert M.supported(last["plan"], last["q"], last["extra"], last["extra_indices"]), last["plan"]
         ns = last["plan"]["scratch_split_stride"]
+        plans_seen.add((tokens, int(last["plan"]["cpb"]), ns))
         mid_ref, mlse_ref, lse_ref = last["mid"].clone(), last["mlse"].clone(), last["lse"].clone()
         out = torch.full_like(out_ref, float("nan"))
         out_lse = torch.full_like(lse_ref, float("nan"))
@@ -218,7 +226,7 @@ def main():
         if not all(same) and first_bad is None:
             first_bad = (case, same)
     print(f"bits: {ok}/{tot} mixed-cache cases identical to FlashInfer (output, LSE, mid_out of the non-empty splits, "
-          f"mid_lse)" + (f"; first difference: case {first_bad[0]} (output, lse, mid, mlse) equal = {first_bad[1]}"
+          f"mid_lse); plans seen: {sorted(plans_seen)}" + (f"; first difference: case {first_bad[0]} (output, lse, mid, mlse) equal = {first_bad[1]}"
                          if first_bad else ""))
     assert ok == tot, "bit mismatch"
 

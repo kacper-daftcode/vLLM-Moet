@@ -196,14 +196,18 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
         else
           idx_next = sec0.index(lane);
       }
+      // KvFree (a reused KV slot, 384 participants: both producer groups wait, the math group arrives) must be
+      // waited on by both producers at points neither of which depends on the other's progress through the same
+      // tile - fp8 tiles: both before the gather's stores (the gather writes the KV slot directly; the convert group
+      // waits before its mbarrier wait); fp4 tiles: both after the raw rows are published (the gather after its
+      // arrival, the convert after its wait) - otherwise one producer waits for the other's arrival behind a handoff
+      // that producer has not reached yet.
       for (int t = 0; t < count; ++t) {
         int buf = TwoSlotCursor::slot(t);
         auto sec = section(t);
         const int idx_lane = idx_next;
-        if (TwoSlotCursor::reuses(t)) {
-          RawFree::acquire(buf);
-          KvFree::acquire(buf);
-        }
+        if (TwoSlotCursor::reuses(t)) RawFree::acquire(buf);
+        if (!sec.extra && TwoSlotCursor::reuses(t)) KvFree::acquire(buf);
         const bool fast = ((sec.pbs & (sec.pbs - 1)) == 0) && ((sec.stride >> 32) == 0);  // uniform
         if (fast)
           gather_tile<true>(sm, scratch, sec, buf, tid, idx_lane);
@@ -214,7 +218,10 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
         auto* barrier = sec.extra ? ready + buf : sm.mbar_full(buf);
         if (tid == 0) pipeline::CountedHandoff<1>::publish(barrier);  // one arrival, no transaction bytes
         if (t + 1 < count) idx_next = section(t + 1).index(lane);     // in flight during the conversion below
-        if (sec.extra) convert_share(Plan::raw(scratch, buf), sm.kv_fp8(buf), sm.kv_sc(buf), GROUP_THREADS + tid);
+        if (sec.extra) {
+          if (TwoSlotCursor::reuses(t)) KvFree::acquire(buf);
+          convert_share(Plan::raw(scratch, buf), sm.kv_fp8(buf), sm.kv_sc(buf), GROUP_THREADS + tid);
+        }
         KvReady::publish(buf);
       }
     } else {
@@ -229,8 +236,8 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
           if (TwoSlotCursor::reuses(t)) KvFree::acquire(buf);
           convert_share(Plan::raw(scratch, buf), sm.kv_fp8(buf), sm.kv_sc(buf), tid);
         } else {
+          if (TwoSlotCursor::reuses(t)) KvFree::acquire(buf);  // the gather writes the slot; this group participates
           BulkReady::wait(sm.mbar_full(buf), TwoSlotCursor::phase(t));
-          if (TwoSlotCursor::reuses(t)) KvFree::acquire(buf);  // the gather wrote the slot; this group participates
         }
         RawFree::release(buf);
         KvReady::publish(buf);
