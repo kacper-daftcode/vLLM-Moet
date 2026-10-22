@@ -134,6 +134,21 @@ put more bytes in flight per round but pipeline fewer rounds and cost shared mem
 one block per SM, 16 % warps active): 8.3 / 8.3 / 5.6 µs against R = 1's 7.5 / 8.3 / 5.5. `K = 576`
 (shared w2) is not a multiple of 128 and stays on v1 (3.7 µs, 0.8 TB/s).
 
+**Step 29 (2026-10-22): R per shape.** Those R = 2 / 4 measurements ran without PDL and without the
+evict-first policy (the dispatch instantiated `<R>` bare; only R = 1 had the `<1, PDL, EV>` variants).
+With the same launch for every R (`launch_v3_pdl<R>`), on the RTX PRO 6000 (325 W, memory +5000, M = 6,
+cold L2, CUDA graph): q_b+indexer 8192←1280 7.13 → **6.54 µs at R = 2** (1.25 units per warp: one round
+instead of two), shared w13 1152←5120 4.96 → **3.79 µs at R = 4** (144 blocks, more bytes in flight per
+warp); q_a+kv_a 6.60 / 6.52 / 7.96, wo_b 5.65 / 6.29 / 7.08, wq_b 3.65 / 3.90 / 4.83 at R = 1 / 2 / 4 stay
+on R = 1. The unit → warp mapping does not depend on R, so every R gives the same bits
+(`test_gemv_v3_rounds_sm120.py`: the table vs R = 1 / 2 / 4 at M = 1 / 6 / 8, five shapes, bit-equal).
+`v3_units_per_round_for(N, K)` holds the table; `VLLM_MOET_GEMV_V3_R=1|2|4` still forces one R for every
+shape (0 = the table, the default). About −1.8 µs per layer ≈ −70 µs per decode step. Per-warp timelines
+(`%globaltimer` stamps) of the served shapes show the loop itself at the DRAM floor — rounds land every
+~1.0 µs for 1,792 warps × 1 KB = 1.8 TB/s — and the loss in per-launch costs (prologue 0.2–0.3, the first
+round's latency, the epilogue and the warp imbalance within a block 0.3–0.7, wave quantization of 1024
+blocks on 752 slots), so instruction-level (SASS) tuning of the loop has little left to take.
+
 Where the last 30 % is: a 5–10 µs kernel pays ~2.5 µs of ramp (first DRAM round trip), tail (last
 wave) and reduction regardless of its inner loop — the 130 MB shape reaches 87 % of peak with the
 same code. The step-level effect (0.35 ms of 15.6) is therefore the ceiling for kernel-body work
