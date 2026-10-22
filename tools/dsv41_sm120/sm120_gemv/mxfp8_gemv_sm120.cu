@@ -1356,17 +1356,18 @@ static void launch_v3_pdl(const LaunchMode& m, const dim3& grid, const GemvArgs&
 }
 
 // Units per round per shape (step 29). The unit -> warp mapping does not depend on R, so every R
-// gives the same bits; R sets how many 128-byte units a warp requests per round. Measured with the
-// PDL + evict-first launch (RTX PRO 6000, M = 6, cold L2, CUDA graph): R = 2 for q_b+indexer
-// 8192 <- 1280 (7.2 -> 6.6 us: 1.25 units per warp, one round instead of two), R = 4 for the shared
-// w13 1152 <- 5120 (4.8 -> 3.8 us: 144 blocks, more bytes in flight per warp); every other served
-// shape is best at R = 1 (q_a+kv_a 6.6 / 6.6 / 7.8, wo_b 6.0 / 6.3 / 6.9, wq_b 3.7 / 3.9 / 4.8 at
-// R = 1 / 2 / 4). VLLM_MOET_GEMV_V3_R=1|2|4 overrides for every shape; 0 (default) = this table.
+// gives the same bits; R sets how many 128-byte units a warp requests per round. In a CUDA graph of
+// back-to-back GEMVs with cold L2 (RTX PRO 6000, M = 6, PDL + evict-first for every R) R = 2 made
+// q_b+indexer 8192 <- 1280 7.13 -> 6.54 us and R = 4 the shared w13 1152 <- 5120 4.96 -> 3.79 us,
+// every other served shape being best at R = 1 - but in the served decode graph (pb-deep C1, the
+// GEMVs behind norm / quant kernels, PDL) the same R made those two kernels slower (w13 5.92 -> 6.46,
+// q_b+indexer 8.35 -> 8.61 us; critical path +27 us per step), so the table keeps R = 1 for every
+// shape. VLLM_MOET_GEMV_V3_R=1|2|4 forces one R for every shape (0, the default: the table).
 static int v3_units_per_round_for(int N, int K) {
   const int forced = v3_units_per_round();
   if (forced > 0) return forced;
-  if (N == 8192 && K == 1280) return 2;
-  if (N == 1152 && K == 5120) return 4;
+  (void)N;
+  (void)K;
   return 1;
 }
 

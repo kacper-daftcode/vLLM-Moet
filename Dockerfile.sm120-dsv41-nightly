@@ -258,10 +258,10 @@
 #      round: 8.2 / 2.1; pb-deep: decode 10.08 -> 8.75 us, critical path -50 us per step). Built in but OFF by default:
 #      VLLM_MOET_SPARSE_MLA_LDG=1 at runtime turns it on (VLLM_MOET_SPARSE_MLA_LDG_MERGE=0 keeps FlashInfer's merge);
 #      SWA-only layers, prefill and NVFP4 plans stay on FlashInfer's execute.
-#  29. GEMV v3 units per round per shape (sm120_gemv/mxfp8_gemv_sm120.cu, in step 3's extension): R = 2 for q_b+indexer
-#      8192 <- 1280 and R = 4 for the shared w13 1152 <- 5120, R = 1 elsewhere, every R launched with PDL + evict-first
-#      (before, R = 2 / 4 ran without both). Same bits for every R (the unit -> warp mapping does not depend on it):
-#      7.13 -> 6.54 and 4.96 -> 3.79 us, about -70 us per decode step. VLLM_MOET_GEMV_V3_R=1|2|4 forces one R (0 = table).
+#  29. GEMV v3 units per round: every R now launched with PDL + evict-first (before, R = 2 / 4 ran without both) and a
+#      per-shape table (sm120_gemv/mxfp8_gemv_sm120.cu, in step 3's extension) that keeps R = 1 everywhere: in a graph of
+#      back-to-back GEMVs R = 2 / 4 won on two shapes (7.13 -> 6.54, 4.96 -> 3.79 us, same bits for every R), in the served
+#      decode graph they lost (critical path +27 us per step). VLLM_MOET_GEMV_V3_R=1|2|4 forces one R (0 = table).
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
