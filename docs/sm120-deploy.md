@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-20260923-engram` (served since 2026-10-02 18:23Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-bf16` = the same without the Engram wkv split, served 2026-10-01..02; `-mhc` = also without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | 80.7–83.4 / 82.8–83.2 steps/s (prose / code), 169–195 / 420–433 tok/s (DSpark k=5; `-bf16`: 80.2–81.8 / 81.9–82.1), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-df3bd094-r13` (served since 2026-10-22: vLLM nightly df3bd094 + steps 17–28, fused decode MoE and sparse-MLA gather on, DSpark k=7; before it `-r11` (2026-10-21), then `dsv41-nightly-20260923-engram` (served since 2026-10-02 18:23Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-bf16` = the same without the Engram wkv split, served 2026-10-01..02; `-mhc` = also without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | **641 tok/s median, 686 best-of-10, 118 steps/s on the Fraser bench (DSpark k=7, `-r13`)**; earlier: 80.7–83.4 / 82.8–83.2 steps/s (prose / code), 169–195 / 420–433 tok/s (DSpark k=5; `-bf16`: 80.2–81.8 / 81.9–82.1), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -98,6 +98,15 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm
 # (FlashInfer 0.7.2 taught the interleaved V4.1 records in step 5, DeepGEMM a7a92773 on the stable ABI); the image label
 # com.vllm-moet.v41-kv-records=interleaved sends the launcher's disk tier to $KV_OFFLOAD_FS_DIR/v41-interleaved
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-49cb2bbf-r1 .   # ~10 min
+# DeepSeek, served image since 2026-10-22 (-r13): the same line on vLLM nightly df3bd094 (FlashInfer 0.7.2 reading the
+# interleaved V4.1 records in its DSv4.1 dual cache, DeepGEMM 727f8470), plus Dockerfile steps 17-28: b12x compact MoE
+# at TP4, the DSpark drafter's and the target's lm_head on the MXFP8 GEMV, the router's top-6 in one CUDA kernel, DSpark's
+# Markov sampling in one launch, b12x FC2 grouped by expert, the two-shot P2P all-reduce with its consumer fused into the
+# mHC boundary (in NCCL's summation order since -r12), the deterministic indexer top-k, the fused decode MoE (step 27)
+# and the sparse-MLA candidate rows by plain loads (step 28). As served: VLLM_MOET_B12X_MOE_FUSED=1,
+# VLLM_MOET_SPARSE_MLA_LDG=1, VLLM_MOET_TARGET_LM_HEAD_MXFP8=1, VLLM_MOET_P2P_AR=1 (+ fused consumer to 16 rows),
+# DSpark k=7. Fraser bench on 4x RTX PRO 6000 (325 W, memory +5000): median 641 tok/s, best-of-10 686, 118 steps/s.
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r13 .   # ~10 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
@@ -221,10 +230,10 @@ docker run --rm --gpus '"device=0,1,2,3"' --ipc host -e NCCL_P2P_LEVEL=SYS --ent
 ## Serve
 
 ```bash
-# DeepSeek-V4.1-Flash, GPUs 0-3, port 8001 (first start ~25 min: FlashInfer autotune + DeepGEMM JIT fill CACHE_DIR; later ~17 min)
-MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash CACHE_DIR=/srv/cache/ds41 GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh
-# second start onwards: GPU_MEM_UTIL=0.94 (3.06M KV tokens with the defaults KV_RECORD=nvfp4 + INDEXER_KV_DTYPE=mxfp4;
-# 2.29M with KV_RECORD=fp8_ds_mla, 1.49M with INDEXER_KV_DTYPE=fp8 as well); 0.95 OOMs during the autotune sweep on a cold cache
+# DeepSeek-V4.1-Flash, GPUs 0-3, port 8001 (first start ~25 min: FlashInfer autotune + DeepGEMM JIT fill CACHE_DIR; later ~7 min)
+MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41 GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh
+# second start onwards: GPU_MEM_UTIL=0.94 (9.6M GPU KV tokens on the df3bd094 image with the defaults
+# KV_RECORD=nvfp4 + INDEXER_KV_DTYPE=mxfp4 at 512K context, DSpark on); 0.95 OOMs during the autotune sweep on a cold cache
 
 # Qwen3.8-Flash-Next-FP8, GPUs 4-7, port 8000 (first start ~10 min: torch.compile + FlashInfer JIT; later ~4 min)
 MODEL_DIR=/srv/models/Qwen3.8-Flash-Next-FP8 CACHE_DIR=/srv/cache/qwen38 GPUS=4,5,6,7 docker/sm120/run-qwen38.sh
@@ -258,7 +267,13 @@ records, as before), `VLLM_MOET_MOE_FC2_DISCARD=0` (FC2's padding rows stay in L
 instead of inline — opt-in, slower in the served graph of window 9),
 `VLLM_MOET_SM120_MOE_GEMV=0` (Qwen MoE GEMV → Triton), `VLLM_MOET_SM120_MOE_GEMV_FUSE_ACT=0`,
 `VLLM_MOET_SM120_LL_GEMM=0` (Qwen skinny GEMM → cuBLAS; changes the compiled graph, so use a fresh
-`CACHE_DIR`), `VLLM_PLE_CPU_OFFLOAD=1` (Qwen PLE table in a CPU worker; then `KV_CACHE_MEMORY=`).
+`CACHE_DIR`), `VLLM_PLE_CPU_OFFLOAD=1` (Qwen PLE table in a CPU worker; then `KV_CACHE_MEMORY=`),
+`VLLM_MOET_B12X_MOE_FUSED=0` (step 27 back to b12x's three kernels; bit-identical either way, served on),
+`VLLM_MOET_SPARSE_MLA_LDG=0` (step 28 back to FlashInfer's cp.async.bulk gather; bit-identical either way, served on),
+`VLLM_MOET_DET_TOPK=1` (step 26: the deterministic indexer top-k; served off),
+`VLLM_MOET_TARGET_LM_HEAD_MXFP8=0` (step 21: the target lm_head back to the BF16 GEMM; changes logits, served on),
+`VLLM_MOET_P2P_AR=0` / `VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=0` (steps 23/24: the TP all-reduces back to NCCL; the P2P
+sum follows NCCL's order, so the bits are NCCL's either way).
 
 ## Validate a new host
 
@@ -268,6 +283,7 @@ python3 tools/sm120_perf/decode_bench.py http://127.0.0.1:8001 deepseek-ai/DeepS
 python3 tools/sm120_perf/decode_bench.py http://127.0.0.1:8000 Qwen3.8-Flash-Next '{"enable_thinking": false}'
 python3 tools/sm120_perf/needle_any.py http://127.0.0.1:8000 Qwen3.8-Flash-Next '{"chat_template_kwargs": {"enable_thinking": false}}' 30000,100000
 python3 tools/sm120_perf/needle_any.py http://127.0.0.1:8001 deepseek-ai/DeepSeek-V4.1-Flash '{"chat_template_kwargs": {"thinking": false}}' 30000,100000
+python3 tools/sm120_perf/fraser_bench.py --base http://127.0.0.1:8001 --model deepseek-ai/DeepSeek-V4.1-Flash-1017 --prompt-file tools/sm120_perf/fraser_prompt.txt --reps 10
 ```
 
 Expected on 4× RTX PRO 6000 with P2P: DeepSeek 66–68 steps/s (prose ~2.2, code ~5.1 tok/step),
