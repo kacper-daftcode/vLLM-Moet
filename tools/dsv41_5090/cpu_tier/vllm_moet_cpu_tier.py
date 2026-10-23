@@ -27,6 +27,8 @@ Environment:
   VLLM_MOET_CPU_TIER_TIMEOUT_MS         bounded wait (default 500)
   VLLM_MOET_CPU_TIER_MAX_PROMOTIONS     per layer per step (default 4; 0 = static placement only)
   VLLM_MOET_CPU_TIER_LOG=1              KPI lines (every VLLM_MOET_CPU_TIER_LOG_EVERY steps, default 100)
+  VLLM_MOET_CPU_TIER_SCRATCH=<int>      slots of the prefill scratch pool (default 128; 0 = the missing experts of
+                                        non-compact calls are not computed - decode-only serving)
 """
 from __future__ import annotations
 
@@ -46,6 +48,9 @@ if _HERE not in sys.path:
 
 ENABLED = os.environ.get("VLLM_MOET_MOE_CPU_TIER", "0") == "1"
 DEBUG = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG", "0") == "1"
+DEBUG_PREFILL = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG_PREFILL", "0") == "1"
+DUMP_DIR = os.environ.get("VLLM_MOET_CPU_TIER_DUMP_DIR", "")   # eager runs only: per-call MoE inputs/outputs
+DUMP_MAX = int(os.environ.get("VLLM_MOET_CPU_TIER_DUMP_MAX", "400"))
 STORE = os.environ.get("VLLM_MOET_CPU_TIER_STORE", "")
 STORE_MODE = os.environ.get("VLLM_MOET_CPU_TIER_STORE_MODE", "nonresident")
 SPARE = int(os.environ.get("VLLM_MOET_CPU_TIER_SPARE", "0"))
@@ -58,6 +63,7 @@ _PROMOTE_RANKS = ([int(x) for x in os.environ["VLLM_MOET_CPU_TIER_PROMOTE_RANKS"
 _PROMOTE_LAYERS = ([int(x) for x in os.environ["VLLM_MOET_CPU_TIER_PROMOTE_LAYERS"].split("-")]
                    if os.environ.get("VLLM_MOET_CPU_TIER_PROMOTE_LAYERS") else None)
 COMPACT_MAX_TOKENS = 8   # b12x's direct compact micro path "owns one through eight live tokens"
+SCRATCH_SLOTS = int(os.environ.get("VLLM_MOET_CPU_TIER_SCRATCH", "0"))   # prefill scratch pool (0 = off; 2.5 under test)
 
 
 def _log(msg: str) -> None:
@@ -87,6 +93,8 @@ class _State:
         self.remapped: list[torch.Tensor] = []     # per layer, [MAX_PAIRS] int32 (sliced per call)
         self.arena: dict[int, int] = {}            # dummy mode: li -> pinned arena base (E records)
         self.store = None                          # store mode: cpu_tier.ExpertStore
+        self.scratch = None                        # phase 2.5: the prefill scratch pool (_Scratch)
+        self.layer_modules: dict[int, object] = {}  # li -> the RoutedExperts module
         self.store_layers = 0
         self.step = 0
         self.ctx = threading.local()
@@ -200,7 +208,13 @@ def _register(layer, E: int) -> _LayerCfg:
     name = getattr(layer, "layer_name", f"layer{li}")
     ml = _model_layer(layer)
     ml = li if ml is None else ml
-    cfg = _LayerCfg(li, name, ml, E, _residents_of(ml, E), SPARE)
+    residents = _residents_of(ml, E)
+    shift = int(os.environ.get("VLLM_MOET_CPU_TIER_RESIDENT_SHIFT", "0"))
+    shift_ranks = os.environ.get("VLLM_MOET_CPU_TIER_SHIFT_RANKS", "")   # "1,3" = only these ranks drop (shift*rank)
+    if shift and (not shift_ranks or _rank() in [int(x) for x in shift_ranks.split(",")]):
+        # diagnostics: rank r drops its first shift*r residents (different residency per rank, static)
+        residents = residents[shift * _rank():]
+    cfg = _LayerCfg(li, name, ml, E, residents, SPARE)
     S.cfgs[id(layer)] = cfg
     S.layers.append(cfg)
     S.E = E
@@ -390,6 +404,7 @@ def on_process_weights(experts_impl, layer, w13: torch.Tensor, w2: torch.Tensor,
          f"{'from the store' if STORE else 'in a pinned arena'}")
     layer._moet_cpu_tier_layer = li
     experts_impl._moet_cpu_tier_layer = li
+    S.layer_modules[li] = layer
     return sub
 
 
@@ -404,6 +419,8 @@ def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor) 
     # (prefill-sized calls) must not leave it behind for launches made outside apply (vLLM's b12x warmup units)
     li = getattr(experts_impl, "_moet_cpu_tier_layer", None)
     S.ctx.layer = li
+    S.ctx.prefill = None
+    S.ctx.last_ids = topk_ids
     if li is None:
         return topk_ids
     if not S.created:
@@ -424,15 +441,181 @@ def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor) 
     if li == 0:
         S.tier.step_begin()   # captured with the step: the device step counter the mailboxes carry
     if T > COMPACT_MAX_TOKENS:
-        # not the compact path: no publish / inject; keep the kernels inside the R-row weights
+        # not the compact path (prefill, batched decode): no publish / inject. The stock run gets the ids remapped
+        # through the slot table (resident experts; missing pairs -1 = zero rows, which also keeps the kernels inside
+        # the R-row weights); on_apply_end adds the missing experts streamed through the scratch pool (phase 2.5).
         S.ctx.layer = None
+        S.ctx.prefill = (li, topk_ids)
         if T not in S.noncompact_reported:
             S.noncompact_reported.add(T)
-            _log(f"WARNING: a {T}-token MoE call takes b12x's non-compact path: missing experts are NOT computed "
-                 f"there yet (phase 2.5); ids remapped through the slot table for memory safety")
+            _log(f"{T}-token MoE call: b12x's non-compact path; missing experts "
+                 f"{'streamed through the scratch pool' if SCRATCH_SLOTS else 'NOT computed (VLLM_MOET_CPU_TIER_SCRATCH=0)'}")
         table = S.pools[li].slot_table
         return torch.where(topk_ids >= 0, table[topk_ids.clamp(min=0).long()], topk_ids.new_full((), -1))
+    S.ctx.prefill = None
     return topk_ids
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# phase 2.5: the non-compact calls' missing experts, streamed from the pinned store through a scratch pool
+# ---------------------------------------------------------------------------------------------------------------
+class _Scratch:
+    """One scratch pool shared by all layers: SCRATCH_SLOTS experts prepared by b12x (zeros at startup), refilled per
+    layer and round by stage_records (pinned -> device staging) + repack_batch (into the prepared storages)."""
+
+    def __init__(self, experts_impl, layer, device: torch.device):
+        from b12x.moe.fused_moe import _impl as b12x_impl
+
+        n = SCRATCH_SLOTS
+        self.n = n
+        w1 = torch.zeros(n, 2 * N_R, HID // 2, dtype=torch.uint8, device=device)
+        w2 = torch.zeros(n, HID, N_R // 2, dtype=torch.uint8, device=device)
+        w1s = torch.zeros(n, 2 * N_R, HID // 32, dtype=torch.uint8, device=device)
+        w2s = torch.zeros(n, HID, N_R // 32, dtype=torch.uint8, device=device)
+        qc = experts_impl.quant_config
+        saved = (qc._w1.scale, qc._w2.scale)
+        try:
+            qc._w1.scale, qc._w2.scale = w1s, w2s
+            self.prepared = experts_impl._prepare_experts(w1=w1, w2=w2, activation=layer.activation,
+                                                          params_dtype=experts_impl.moe_config.in_dtype)
+        finally:
+            qc._w1.scale, qc._w2.scale = saved
+        payload = self.prepared.representation_for("w4a8_mx")
+        views = b12x_impl._w4a8_prepared_dict(payload)
+        self.pool = dict(w13=views["w13_rp"].view(n, -1), w13s=views["w13_sfb"].view(n, -1),
+                         w2=views["w2_rp"].view(n, -1), w2s=views["w2_sfb"].view(n, -1))
+        self.staging = torch.empty(n, RECORD_BYTES, dtype=torch.uint8, device=device)
+        self.table = torch.full((S.E,), -1, dtype=torch.int32, device=device)
+        self.plans: dict = {}
+        self.bufs: dict = {}
+        self.impl = experts_impl
+        self.activation = layer.activation
+        self.rounds = 0
+        self.experts_streamed = 0
+        self.calls = 0
+
+    def plan(self, T: int, K: int, nbytes_fn):
+        key = (T, K)
+        if key not in self.plans:
+            from vllm.model_executor.layers.fused_moe.b12x import _require_b12x_fused_moe
+            fused_moe = _require_b12x_fused_moe()
+            limit, alpha, beta = self.impl._swiglu_params(self.activation)
+            plan = fused_moe.plan(fused_moe.Caps(
+                max_tokens=max(T, 1), num_topk=K, device=self.prepared.w1_fp4.device, weight_plan=self.prepared.plan,
+                core_token_counts=(max(T, 1),), route_num_experts=0, quant_mode=self.impl._quant_mode,
+                apply_router_weight_on_input=False, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta, frozen=True))
+            self.plans[key] = plan
+            self.bufs[key] = (torch.empty(nbytes_fn(plan), dtype=torch.uint8, device=self.prepared.w1_fp4.device),
+                              torch.empty(T, HID, dtype=self.impl.moe_config.in_dtype, device=self.prepared.w1_fp4.device))
+        return self.plans[key], self.bufs[key]
+
+
+def _dump_call(experts_impl, hidden_states, topk_weights, output) -> None:
+    """Debug (eager runs: graph replays never reach here): the first DUMP_MAX target-layer MoE calls of this rank -
+    hidden states, the router's ids / weights, the layer's MoE output (the rank's partial) - to DUMP_DIR."""
+    li = getattr(experts_impl, "_moet_cpu_tier_layer", None)
+    if li is None:
+        return
+    n = S.kpi.get("dumped", 0)
+    if n >= DUMP_MAX:
+        return
+    S.kpi["dumped"] = n + 1
+    os.makedirs(DUMP_DIR, exist_ok=True)
+    ids = getattr(S.ctx, "last_ids", None)
+    torch.cuda.synchronize()
+    torch.save(dict(call=n, step=S.step, layer=li, T=int(hidden_states.shape[0]),
+                    x=hidden_states.detach().float().cpu(), ids=None if ids is None else ids.detach().cpu(),
+                    w=topk_weights.detach().float().cpu(), out=output.detach().float().cpu(),
+                    slots=S.pools[li].slot_table.detach().cpu()),
+               os.path.join(DUMP_DIR, f"rank{_rank()}_{n:04d}.pt"))
+
+
+def _stage_and_repack(sc, ptrs: list) -> None:
+    """Records ptrs[i] -> scratch slot i: pinned -> device staging, then the batched repack (<= 256 per launch)."""
+    ext = S.tier.ext
+    ext.stage_records(sc.staging, ptrs)
+    lay = S.manager.layout
+    for c0 in range(0, len(ptrs), 256):
+        slots = list(range(c0, min(len(ptrs), c0 + 256)))
+        ext.repack_batch(sc.staging[c0:c0 + len(slots)], lay["w13"], lay["w13s"], lay["w2"], lay["w2s"],
+                         sc.pool["w13"], sc.pool["w13s"], sc.pool["w2"], sc.pool["w2s"], slots)
+
+
+def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.Tensor, output: torch.Tensor,
+                 run_plan, scratch_nbytes) -> None:
+    """After the stock b12x run of a non-compact call: the missing experts of the call, in rounds of SCRATCH_SLOTS:
+    records staged from the pinned store, repacked into the scratch pool, one more b12x run on the ids remapped to
+    the scratch slots (resident pairs -1), the result added to the output. Eager path (prefill / T > 8): host syncs
+    allowed (rule R6)."""
+    if DUMP_DIR and S.created:
+        _dump_call(experts_impl, hidden_states, topk_weights, output)
+    pf = getattr(S.ctx, "prefill", None)
+    if pf is None or not SCRATCH_SLOTS or not S.created:
+        return
+    S.ctx.prefill = None
+    li, ids = pf
+    P = S.pools[li]
+    T, K = ids.shape
+    with S.lock:
+        if S.scratch is None:
+            S.scratch = _Scratch(experts_impl, S.layer_modules[li], hidden_states.device)
+            _log(f"scratch pool: {SCRATCH_SLOTS} slots ({SCRATCH_SLOTS * RECORD_BYTES / 2**20:.0f} MiB staging + pool)")
+    sc = S.scratch
+    valid = ids >= 0
+    missing_mask = valid & (P.slot_table[ids.clamp(min=0).long()] < 0)
+    missing = torch.unique(ids[missing_mask]).tolist()
+    sc.calls += 1
+    if not missing:
+        return
+    plan, (buf, tmp) = sc.plan(T, K, scratch_nbytes)
+    weights = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32)
+    weights = weights.contiguous()
+    for r0 in range(0, len(missing), sc.n):
+        rnd = missing[r0:r0 + sc.n]
+        ptrs = [_record_ptr(li, e) for e in rnd]
+        _stage_and_repack(sc, ptrs)
+        sc.table.fill_(-1)
+        rnd_t = torch.tensor(rnd, dtype=torch.long, device=ids.device)
+        sc.table[rnd_t] = torch.arange(len(rnd), dtype=torch.int32, device=ids.device)
+        rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+        run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights,
+                 topk_ids=rids, output=tmp, unit_scale_contract=False)
+        output.add_(tmp)
+        sc.rounds += 1
+        sc.experts_streamed += len(rnd)
+    if sc.calls <= 3 or sc.calls % 200 == 0:
+        _log(f"prefill call {sc.calls} (layer {li}, {T} tokens): {len(missing)} missing experts in "
+             f"{(len(missing) + sc.n - 1) // sc.n} rounds; totals {sc.experts_streamed} experts / {sc.rounds} rounds")
+    if DEBUG_PREFILL:
+        _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output, run_plan, plan, buf, T)
+
+
+def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output, run_plan, plan, buf, T) -> None:
+    """Debug (VLLM_MOET_CPU_TIER_DEBUG_PREFILL=1, needs SCRATCH >= the call's distinct experts): the same call with
+    EVERY routed expert in the scratch pool in one b12x run = the all-resident reference for this layer's output;
+    run twice to see the kernel's own run-to-run noise; the hybrid output (resident run + streamed rounds) against it."""
+    routed = torch.unique(ids[valid]).tolist()
+    if len(routed) > sc.n:
+        _log(f"DEBUG prefill layer {li}: {len(routed)} routed experts > {sc.n} scratch slots; reference skipped")
+        return
+    _stage_and_repack(sc, [_record_ptr(li, e) for e in routed])
+    sc.table.fill_(-1)
+    sc.table[torch.tensor(routed, dtype=torch.long, device=ids.device)] = torch.arange(len(routed), dtype=torch.int32, device=ids.device)
+    rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+    ref = torch.empty_like(output)
+    ref2 = torch.empty_like(output)
+    run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights, topk_ids=rids,
+             output=ref, unit_scale_contract=False)
+    run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights, topk_ids=rids,
+             output=ref2, unit_scale_contract=False)
+    torch.cuda.synchronize()
+    o, r, r2 = output.float(), ref.float(), ref2.float()
+    noise = (r - r2).abs().max().item()
+    d = (o - r).abs()
+    rel = (d.max() / r.abs().max().clamp(min=1e-20)).item()
+    _log(f"DEBUG prefill layer {li} T {T}: {len(routed)} routed experts; hybrid vs all-in-one-run reference: max |d| "
+         f"{d.max().item():.3e} (rel {rel:.2e}), elements differing {(d > 0).float().mean().item():.4f}, reference run-to-run "
+         f"max |d| {noise:.3e}; |ref| max {r.abs().max().item():.3e}")
 
 
 def on_apply_done() -> None:

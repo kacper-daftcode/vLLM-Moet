@@ -37,15 +37,18 @@ def main() -> int:
     ap.add_argument("--out", default="/mnt/nvme/models/mini-real576")
     ap.add_argument("--layers", default="0,1,2,3,20,21,24,23", help="real layer of every mini layer, in order")
     ap.add_argument("--experts", type=int, default=16)
+    ap.add_argument("--inter", type=int, default=576, help="moe_intermediate_size: 576 (TP1 = TP4 rank 0) or 1152 (TP2 = TP4 ranks 0+1)")
     args = ap.parse_args()
     real_layers = [int(x) for x in args.layers.split(",")]
     E = args.experts
+    INTER = args.inter
+    frac = 2304 // INTER   # the kept fraction of the full intermediate size
     os.makedirs(args.out, exist_ok=True)
 
     cfg = json.load(open(os.path.join(args.mini, "config.json")))
     t = cfg["text_config"]
     assert t["num_hidden_layers"] == len(real_layers), (t["num_hidden_layers"], real_layers)
-    assert t["moe_intermediate_size"] == INTER_R, t["moe_intermediate_size"]
+    t["moe_intermediate_size"] = INTER
     t["n_routed_experts"] = E
     t["engram_layer_ids"] = []
     t["engram_num_embeddings"] = []
@@ -80,13 +83,13 @@ def main() -> int:
             if e >= E:
                 return None
             if w in ("w1", "w3"):
-                return x[:INTER_R]                         # nibbles [2304, 2560] / e8m0 scales [2304, 160]
-            return x[:, : x.shape[1] // 4]                 # w2 nibbles [5120, 1152] -> 288; scales [5120, 72] -> 18
+                return x[:INTER]                           # nibbles [2304, 2560] / e8m0 scales [2304, 160]
+            return x[:, : x.shape[1] // frac]              # w2 nibbles [5120, 1152] -> 288; scales [5120, 72] -> 18
         if ".ffn.shared_experts." in name:
             w = name.rsplit(".", 2)[-2]
             if w in ("w1", "w3"):
-                return x[: x.shape[0] // 4]                 # fp8 [2304, 5120] -> 576; scales [72, 160] -> 18
-            return x[:, : x.shape[1] // 4]                 # w2 [5120, 2304] -> 576; scales [160, 72] -> 18
+                return x[: x.shape[0] // frac]              # fp8 [2304, 5120] -> 576; scales [72, 160] -> 18
+            return x[:, : x.shape[1] // frac]              # w2 [5120, 2304] -> 576; scales [160, 72] -> 18
         if ".ffn.gate." in name:
             return x[:E]                                   # router weight [384, 5120] / bias [384]
         if ".engram." in name:

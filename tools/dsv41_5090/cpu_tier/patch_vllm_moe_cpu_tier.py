@@ -74,6 +74,7 @@ B12X_APPLY_END_NEW = ("            output=output,\n"
                       "            unit_scale_contract=self._quant_mode == \"w4a16\",\n"
                       "        )\n"
                       f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}: the layer context ends here\n"
+                      "            _moet_cpu_tier.on_apply_end(self, hidden_states, topk_weights, output, _run_b12x_moe_plan, _b12x_scratch_nbytes)\n"
                       "            _moet_cpu_tier.on_apply_done()\n"
                       "\n"
                       "    def moe_sum(")

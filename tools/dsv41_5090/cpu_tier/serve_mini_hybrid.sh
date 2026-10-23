@@ -2,7 +2,7 @@
 # Serve a TP1 mini model (make_mini_config.py + moe_intermediate_size 576: dummy weights, or make_mini_real.py's real
 # layers) with the CPU expert tier inside the sm120 serving image, one GPU. The patcher runs first (idempotent).
 #   usage (container): serve_mini_hybrid.sh MODEL_DIR PORT [extra vllm serve args...]
-#   env: DSPARK=0 serves without the drafter; LOAD_FORMAT=dummy (default) | auto (a real checkpoint);
+#   env: DSPARK=0 serves without the drafter; LOAD_FORMAT=dummy (default) | auto (a real checkpoint); TP (1);
 #        VLLM_MOET_MOE_CPU_TIER=1 VLLM_MOET_CPU_TIER_RESIDENT=8 VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=1
 #        VLLM_MOET_CPU_TIER_TABLES=/parity VLLM_MOET_CPU_TIER_CPUS=9-15 VLLM_MOET_CPU_TIER_LOG=1
 #        VLLM_MOET_CPU_TIER_STORE=/store (the real-checkpoint path: records from build_store.py's files)
@@ -23,7 +23,7 @@ SPEC=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft
 LOAD=(--load-format "${LOAD_FORMAT:-dummy}")
 [ "${LOAD_FORMAT:-dummy}" = "auto" ] && LOAD=()
 exec vllm serve "$MODEL_DIR" "${LOAD[@]}" --served-model-name mini --seed 0 \
-  --tensor-parallel-size 1 --tokenizer-mode deepseek_v41 --reasoning-parser deepseek_v41 --kv-cache-dtype nvfp4_ds_mla \
+  --tensor-parallel-size "${TP:-1}" --tokenizer-mode deepseek_v41 --reasoning-parser deepseek_v41 --kv-cache-dtype nvfp4_ds_mla \
   --gpu-memory-utilization "${GPU_MEM_UTIL:-0.3}" --max-model-len 4096 --max-num-seqs 1 \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-512}" --max-cudagraph-capture-size 16 \
   --language-model-only --attention-config '{"indexer_kv_dtype":"mxfp4"}' --moe-backend b12x \

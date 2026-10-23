@@ -219,4 +219,7 @@ class PlacementManager:
             m = torch.cuda.Event()
             m.record(self.copy)
             self.map_events_last.append(m)
+            if os.environ.get("VLLM_MOET_CPU_TIER_PROMOTE_SYNC", "0") == "1":
+                # diagnostics: the next step waits for the maps too (no map lands while a step runs)
+                self.unmap_events.append(m)
         return n_sched

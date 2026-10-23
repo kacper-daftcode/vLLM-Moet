@@ -6,11 +6,14 @@
 #   env:   MODEL_DIR (/mnt/nvme/models/mini-hyb576: dummy weights; LOAD_FORMAT=dummy)
 #          STORE=/mnt/nvme/packs/dsv41-hybrid-mini576 + LOAD_FORMAT=auto + MODEL_DIR=/mnt/nvme/models/mini-real576:
 #                 the real-checkpoint path (store mode: R-row parameters, loader skip, records from the store files)
-#          SPARE (0) spare slots per layer; PROMOTIONS (4) per layer per step; DSPARK (1); DEBUG (0); CPUS (9-15)
+#          SPARE (0) spare slots per layer; PROMOTIONS (4) per layer per step; DSPARK (1); DEBUG (0); CPUS (unset = the
+#          runtime's per-rank layout; 9-15 pins one pool); GPU=1,2 serves TP2 (TP from the count; both locks taken)
 #          GPU_MEM_UTIL (0.3; the 384-expert mini-real needs ~0.85); R=placement uses the model dir's placement.json
 #   (holds the GPU's flock for each serve; logs /tmp/moet-mini-r<R>.log)
 set -u
-GPU="${1:?gpu index}"
+GPU="${1:?gpu index (or a list 1,2 for TP2)}"
+LOCKS=""; for g in ${GPU//,/ }; do LOCKS="$LOCKS flock -w 3600 /tmp/exl3diff-gpu$g.lock"; done
+TP="${TP:-$(echo $GPU | tr "," "\n" | wc -l)}"
 RS="${2:-16 8 1}"
 PORT="${3:-8031}"
 shift 3 2>/dev/null || shift $#
@@ -19,6 +22,7 @@ REPO=/mnt/nvme/vLLM-Moet-cpu
 IMG=vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1
 PY=/root/work/venv/bin/python
 CLIENT=$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py
+[ "${LONG:-0}" = "1" ] && CLIENT="$CLIENT --long"
 MODEL_DIR="${MODEL_DIR:-/mnt/nvme/models/mini-hyb576}"
 LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
 STORE="${STORE:-}"
@@ -35,11 +39,11 @@ for R in $RS; do
   # R=placement: the model dir's placement.json (make_mini_real.py) instead of the first R experts
   RES_ARGS=(-e VLLM_MOET_CPU_TIER_RESIDENT=$R)
   [ "$R" = "placement" ] && RES_ARGS=(-e VLLM_MOET_CPU_TIER_PLACEMENT=/model/placement.json)
-  ( flock -w 3600 /tmp/exl3diff-gpu$GPU.lock docker run --rm --gpus "\"device=$GPU\"" --name moet-mini-hyb --ulimit memlock=-1:-1 \
+  ( $LOCKS docker run --rm --gpus "\"device=$GPU\"" --name moet-mini-hyb --ulimit memlock=-1:-1 --ipc host --shm-size 16g -e TP=$TP ${EXTRA_DOCKER_ENV:-} \
       -e VLLM_MOET_MOE_CPU_TIER=1 "${RES_ARGS[@]}" -e VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=$DUMMY_W \
-      -e VLLM_MOET_CPU_TIER_TABLES=/parity -e VLLM_MOET_CPU_TIER_CPUS=${CPUS:-9-15} -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY=${LOG_EVERY:-50} \
+      -e VLLM_MOET_CPU_TIER_TABLES=/parity ${CPUS:+-e VLLM_MOET_CPU_TIER_CPUS=$CPUS} -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY=${LOG_EVERY:-50} \
       -e VLLM_MOET_DET_TOPK=1 -e DSPARK=${DSPARK:-1} -e LOAD_FORMAT=$LOAD_FORMAT -e GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.3} -e MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-512} -e VLLM_MOET_CPU_TIER_SPARE=${SPARE:-0} \
-      -e VLLM_MOET_CPU_TIER_MAX_PROMOTIONS=${PROMOTIONS:-4} -e VLLM_MOET_CPU_TIER_DEBUG=${DEBUG:-0} "${STORE_ARGS[@]}" \
+      -e VLLM_MOET_CPU_TIER_MAX_PROMOTIONS=${PROMOTIONS:-4} -e VLLM_MOET_CPU_TIER_DEBUG=${DEBUG:-0} -e VLLM_MOET_CPU_TIER_SCRATCH=${SCRATCH:-0} -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL=${DEBUG_PREFILL:-0} "${STORE_ARGS[@]}" \
       -v $MODEL_DIR:/model -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache \
       -v $REPO:/repo:ro -v $REPO/internal/dsv41-5090-cpu/parity:/parity:ro \
       -p 127.0.0.1:$PORT:$PORT --entrypoint bash $IMG \

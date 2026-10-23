@@ -192,6 +192,66 @@ void repack_record(torch::Tensor record, torch::Tensor idx_w13, torch::Tensor id
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
+// N records (a device staging [N, 4700160]) into N slots in one launch (blockIdx.y = the record): the prefill's
+// streamed experts (phase 2.5); the per-record repack above is launch/latency-bound at ~100 us
+struct RepackBatch { int n; int slot[256]; };
+
+__global__ void repack_batch_kernel(const uint8_t* staging, const int32_t* idx_w13, const int32_t* idx_w13s,
+                                    const int32_t* idx_w2, const int32_t* idx_w2s, uint8_t* pool_w13, uint8_t* pool_w13s,
+                                    uint8_t* pool_w2, uint8_t* pool_w2s, RepackBatch b) {
+    const int r = blockIdx.y;
+    if (r >= b.n) return;
+    const uint8_t* rec = staging + (int64_t)r * 4700160;
+    const int64_t s = b.slot[r];
+    const int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < W13_NIB / 2) {
+        pool_w13[s * (W13_NIB / 2) + j] = rec_nibble_w13(rec, idx_w13[2 * j]) | (rec_nibble_w13(rec, idx_w13[2 * j + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2) {
+        const int64_t k = j - W13_NIB / 2;
+        pool_w2[s * (W2_NIB / 2) + k] = rec_nibble_w2(rec, idx_w2[2 * k]) | (rec_nibble_w2(rec, idx_w2[2 * k + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2;
+        pool_w13s[s * W13S_B + k] = rec_scale_w13(rec, idx_w13s[k]);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2 - W13S_B;
+        pool_w2s[s * W2S_B + k] = rec[REC_W2S + idx_w2s[k]];
+    }
+}
+
+void repack_batch(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                  torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                  torch::Tensor pool_w2s, std::vector<int64_t> slots) {
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.is_cuda() && staging.dim() == 2 && staging.size(1) == 4700160);
+    TORCH_CHECK(slots.size() <= 256 && (int64_t)slots.size() <= staging.size(0));
+    TORCH_CHECK(pool_w13.size(1) * (int64_t)pool_w13.element_size() == W13_NIB / 2 && pool_w2.size(1) * (int64_t)pool_w2.element_size() == W2_NIB / 2);
+    TORCH_CHECK(pool_w13s.size(1) * (int64_t)pool_w13s.element_size() == W13S_B && pool_w2s.size(1) * (int64_t)pool_w2s.element_size() == W2S_B);
+    if (slots.empty()) return;
+    RepackBatch b;
+    b.n = (int)slots.size();
+    for (int i = 0; i < b.n; ++i) {
+        TORCH_CHECK(slots[i] >= 0 && slots[i] < pool_w13.size(0));
+        b.slot[i] = (int)slots[i];
+    }
+    const int64_t total = W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B;
+    const int threads = 256;
+    dim3 grid((unsigned)((total + threads - 1) / threads), (unsigned)b.n);
+    repack_batch_kernel<<<grid, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        staging.data_ptr<uint8_t>(), idx_w13.data_ptr<int32_t>(), idx_w13s.data_ptr<int32_t>(), idx_w2.data_ptr<int32_t>(),
+        idx_w2s.data_ptr<int32_t>(), reinterpret_cast<uint8_t*>(pool_w13.data_ptr()), reinterpret_cast<uint8_t*>(pool_w13s.data_ptr()),
+        reinterpret_cast<uint8_t*>(pool_w2.data_ptr()), reinterpret_cast<uint8_t*>(pool_w2s.data_ptr()), b);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// N pinned host records into a device staging [N, 4700160] (cudaMemcpyAsync each, current stream)
+void stage_records(torch::Tensor staging, std::vector<int64_t> host_ptrs) {
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.is_cuda() && staging.dim() == 2 && staging.size(1) == 4700160);
+    TORCH_CHECK((int64_t)host_ptrs.size() <= staging.size(0));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    for (size_t i = 0; i < host_ptrs.size(); ++i)
+        TORCH_CHECK(cudaMemcpyAsync(staging.data_ptr<uint8_t>() + i * 4700160, (const void*)(uintptr_t)host_ptrs[i], 4700160,
+                                    cudaMemcpyHostToDevice, stream) == cudaSuccess, "staging H2D failed");
+}
+
 // ---- batched promotions (phase 2.4: the host side of ~30 promotions per step was 20 ms of torch ops) ----------
 struct TableWrites { int n; int e[64]; int v[64]; };
 
@@ -333,6 +393,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("repack_record", &repack_record);
     m.def("table_write", &table_write);
     m.def("promote_batch", &promote_batch);
+    m.def("repack_batch", &repack_batch);
+    m.def("stage_records", &stage_records);
     m.def("request_bytes", &request_bytes);
     m.def("ack_bytes", &ack_bytes);
     m.def("staging_bytes", &staging_bytes);

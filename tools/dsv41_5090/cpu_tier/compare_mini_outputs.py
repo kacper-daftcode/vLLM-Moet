@@ -15,6 +15,13 @@ import urllib.request
 
 PROMPTS = ["The capital of France is", "1, 2, 3, 4,", "def fib(n):", "Once upon a time", "import numpy as np",
            "Hello", "The quick brown fox", "x = [1, 2, 3]", "Paris is", "Water boils at", "A list:", "The end"]
+# prefill-sized prompts (> 8 tokens: b12x's non-compact path, phase 2.5)
+PROMPTS_LONG = [
+    "def quicksort(arr):\n    if len(arr) <= 1:\n        return arr\n    pivot = arr[len(arr) // 2]\n    left = [x for x in arr if x < pivot]\n",
+    "The Industrial Revolution, which took place from the 18th to 19th centuries, was a period during which predominantly agrarian, rural societies in Europe and America became industrial and urban. Prior to the Industrial Revolution,",
+    "import torch\nimport torch.nn as nn\n\nclass MLP(nn.Module):\n    def __init__(self, d_in, d_hidden, d_out):\n        super().__init__()\n        self.fc1 = nn.Linear(d_in, d_hidden)\n",
+    "Q: A train travels 60 miles per hour for 2.5 hours. How far does it travel?\nA: Let's think step by step.",
+]
 
 
 def post(port: int, path: str, body: dict, timeout: float = 600.0) -> dict:
@@ -27,7 +34,7 @@ def post(port: int, path: str, body: dict, timeout: float = 600.0) -> dict:
 def wait_ready(port: int, timeout: float = 1800.0, container: str = "") -> None:
     import subprocess
     t0 = time.time()
-    gone = 0
+    gone, seen = 0, False
     while time.time() - t0 < timeout:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as r:
@@ -37,8 +44,9 @@ def wait_ready(port: int, timeout: float = 1800.0, container: str = "") -> None:
             pass
         if container:
             up = subprocess.run(["docker", "ps", "-q", "-f", f"name=^{container}$"], capture_output=True, text=True).stdout.strip()
-            gone = gone + 1 if not up else 0
-            if gone >= 6:   # 30 s without the container: it died
+            seen = seen or bool(up)
+            gone = gone + 1 if (seen and not up) else 0
+            if gone >= 6:   # 30 s without the container after it had been up: it died
                 raise SystemExit(f"server not ready: container {container} is gone")
         time.sleep(5)
     raise SystemExit("server not ready")
@@ -52,6 +60,7 @@ def main():
     ap.add_argument("--model", default="mini")
     ap.add_argument("--prompts", type=int, default=0, help="only the first N prompts (0 = all)")
     ap.add_argument("--container", default="", help="give up early when this docker container is gone")
+    ap.add_argument("--long", action="store_true", help="the prefill-sized prompts (PROMPTS_LONG) instead of the short ones")
     ap.add_argument("--compare", nargs=2, default=None)
     args = ap.parse_args()
     if args.compare:
@@ -69,7 +78,7 @@ def main():
         return 0 if bad == 0 else 1
     wait_ready(args.port, container=args.container)
     results = []
-    for p in PROMPTS[: args.prompts or None]:
+    for p in (PROMPTS_LONG if args.long else PROMPTS)[: args.prompts or None]:
         t0 = time.time()
         r = post(args.port, "/v1/completions", dict(model=args.model, prompt=p, max_tokens=args.max_tokens, temperature=0,
                                                      logprobs=1, seed=0))
