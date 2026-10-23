@@ -18,7 +18,10 @@
 #            SPEC_TOKENS (5)         DSpark draft tokens (0 = no drafter)
 #            GPU_MEM_UTIL (0.92)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (512)  CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
-#            NCCL_P2P_LEVEL (SYS)    EXTRA_ARGS / EXTRA_DOCKER_ARGS appended to `vllm serve` / `docker run`
+#            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
+#                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
+#                        outputs by ulps -> bit-identity across boots needs the pin)
+#            EXTRA_ARGS / EXTRA_DOCKER_ARGS appended to `vllm serve` / `docker run`
 # GPU protocol: this script does NOT take the locks - run it as
 #   flock -w 3600 /tmp/exl3diff-gpu0.lock flock -w 3600 /tmp/exl3diff-gpu1.lock flock -w 3600 /tmp/exl3diff-gpu2.lock \
 #     flock -w 3600 /tmp/exl3diff-gpu3.lock bash -c 'MODEL_DIR=... docker/sm120/run-dsv41-5090.sh && docker wait ds41-hyb'
@@ -44,6 +47,7 @@ TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
 TIER_DEBUG="${TIER_DEBUG:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
+NCCL_CHANNELS="${NCCL_CHANNELS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 TABLES="$REPO/internal/dsv41-5090-cpu/parity"
@@ -82,6 +86,7 @@ docker run -d --name "$NAME" --restart no \
   "${MOUNTS[@]}" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
+  ${NCCL_CHANNELS:+-e NCCL_MIN_NCHANNELS=$NCCL_CHANNELS -e NCCL_MAX_NCHANNELS=$NCCL_CHANNELS} \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-5}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
