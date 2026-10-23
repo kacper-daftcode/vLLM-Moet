@@ -7,13 +7,17 @@
    extension sources (cpu_tier_cuda.cu, cpu_tier_abi.h) and builds libcpu_tier.so (cpu_tier.cpp + the b12x-exact
    kernel cpu_moe_b12x.cpp) for this machine's compiler; a .pth file makes them importable.
 2. Patches, with markers:
+   - vllm/model_executor/layers/quantization/mxfp4.py: Mxfp4MoEMethod.create_weights asks the tier how many expert
+     rows a target layer gets (store mode: the resident slots only; the layer's loader maps experts to slots).
    - vllm/model_executor/layers/fused_moe/b12x.py: process_weights_after_loading hands the layer's experts to the
-     tier (records into pinned RAM, the resident subset back for prepare_weights); apply() announces the layer and
-     the step to the tier.
+     tier (records into pinned RAM or from the store, the resident rows back for prepare_weights); apply() announces
+     the layer to the tier and gets the ids the kernels run with.
    - flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py: after b12x's rows quant the tier
      publishes the step's missing pairs and remaps the ids (missing -> -1) for the compact kernel (and the grouped /
      fused FC2 of the sm120 image); before the route rows go to TopKSum the tier's rows are injected.
-   - vllm/v1/worker/gpu_model_runner.py: execute_model wrapped with the placement manager's before/after hooks.
+   - vllm/v1/worker/gpu/model_runner.py (the V2 runner; the V1 gpu_model_runner.py likewise when present):
+     execute_model wrapped with the placement manager's before/after-step hooks (promotions, the error word, KPIs)
+     for every live forward - graph replays included, dummy / profile runs excluded.
 Everything is inert unless VLLM_MOET_MOE_CPU_TIER=1 (see vllm_moet_cpu_tier.py for the environment).
 """
 from __future__ import annotations
@@ -58,9 +62,9 @@ B12X_PREP_NEW = ("        self._refresh_quant_config(layer)\n"
 B12X_APPLY_OLD = ("        prepared = self._prepared()\n"
                   "        topk_ids = _normalize_topk_ids(topk_ids)\n")
 B12X_APPLY_NEW = ("        prepared = self._prepared()\n"
+                  "        topk_ids = _normalize_topk_ids(topk_ids)\n"
                   f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}\n"
-                  "            _moet_cpu_tier.on_apply(self, hidden_states)\n"
-                  "        topk_ids = _normalize_topk_ids(topk_ids)\n")
+                  "            topk_ids = _moet_cpu_tier.on_apply(self, hidden_states, topk_ids)\n")
 B12X_APPLY_END_OLD = ("            output=output,\n"
                       "            unit_scale_contract=self._quant_mode == \"w4a16\",\n"
                       "        )\n"
@@ -114,8 +118,45 @@ CM_RET_NEW = ("            num_tokens * int(num_topk), cap * int(num_topk),\n"
               "        _moet_cpu_tier.after_compiled(route)\n"
               "    return route.narrow(0, 0, num_tokens * int(num_topk))\n")
 
-# ---- gpu_model_runner.py ------------------------------------------------------------------------------------------
-RUNNER_TAIL = ("\n\n# " + MARK + ": the placement manager's hooks around a step\n"
+# ---- mxfp4.py: Mxfp4MoEMethod.create_weights ------------------------------------------------------------------------
+MX_IMPORT_OLD = "from vllm.logger import init_logger\n"
+MX_IMPORT_NEW = ("from vllm.logger import init_logger\n"
+                 f"# {MARK}\n"
+                 "try:\n"
+                 "    import vllm_moet_cpu_tier as _moet_cpu_tier\n"
+                 "except ImportError:\n"
+                 "    _moet_cpu_tier = None\n")
+MX_CREATE_OLD = ("        return mxfp4_weight_loader\n"
+                 "\n"
+                 "    def create_weights(\n"
+                 "        self,\n"
+                 "        layer: RoutedExperts,\n"
+                 "        num_experts: int,\n"
+                 "        hidden_size: int,\n"
+                 "        intermediate_size_per_partition: int,\n"
+                 "        params_dtype: torch.dtype,\n"
+                 "        **extra_weight_attrs,\n"
+                 "    ):\n"
+                 "        self.num_experts = num_experts\n")
+MX_CREATE_NEW = ("        return mxfp4_weight_loader\n"
+                 "\n"
+                 "    def create_weights(\n"
+                 "        self,\n"
+                 "        layer: RoutedExperts,\n"
+                 "        num_experts: int,\n"
+                 "        hidden_size: int,\n"
+                 "        intermediate_size_per_partition: int,\n"
+                 "        params_dtype: torch.dtype,\n"
+                 "        **extra_weight_attrs,\n"
+                 "    ):\n"
+                 f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}: resident slots only\n"
+                 "            num_experts = _moet_cpu_tier.on_create_weights(layer, num_experts, hidden_size,\n"
+                 "                                                          intermediate_size_per_partition)\n"
+                 "        self.num_experts = num_experts\n")
+
+# ---- model_runner.py (V2: vllm/v1/worker/gpu/model_runner.py; V1: vllm/v1/worker/gpu_model_runner.py) -------------
+RUNNER_TAIL = ("\n\n# " + MARK + ": the placement manager's hooks around a live step (not dummy / profile runs; graph\n"
+               "# capture does not go through execute_model)\n"
                "try:\n"
                "    import vllm_moet_cpu_tier as _moet_cpu_tier\n"
                "except ImportError:\n"
@@ -124,9 +165,12 @@ RUNNER_TAIL = ("\n\n# " + MARK + ": the placement manager's hooks around a step\
                "    _moet_orig_execute_model = GPUModelRunner.execute_model\n"
                "\n"
                "    def _moet_execute_model(self, *args, **kwargs):\n"
-               "        _moet_cpu_tier.runner_before_step()\n"
+               "        live = not kwargs.get(\"dummy_run\", False) and not kwargs.get(\"is_profile\", False)\n"
+               "        if live:\n"
+               "            _moet_cpu_tier.runner_before_step()\n"
                "        out = _moet_orig_execute_model(self, *args, **kwargs)\n"
-               "        _moet_cpu_tier.runner_after_step()\n"
+               "        if live:\n"
+               "            _moet_cpu_tier.runner_after_step()\n"
                "        return out\n"
                "\n"
                "    GPUModelRunner.execute_model = _moet_execute_model\n")
@@ -153,26 +197,33 @@ def main() -> int:
     args = ap.parse_args()
     site = Path(args.site)
     targets = {
+        "mxfp4": (site / "vllm/model_executor/layers/quantization/mxfp4.py",
+                  [(MX_IMPORT_OLD, MX_IMPORT_NEW), (MX_CREATE_OLD, MX_CREATE_NEW)]),
         "b12x": (site / "vllm/model_executor/layers/fused_moe/b12x.py",
                  [(B12X_IMPORT_OLD, B12X_IMPORT_NEW), (B12X_PREP_OLD, B12X_PREP_NEW), (B12X_APPLY_OLD, B12X_APPLY_NEW),
                   (B12X_APPLY_END_OLD, B12X_APPLY_END_NEW)]),
         "compact_micro": (site / "flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py",
                           [(CM_IMPORT_OLD, CM_IMPORT_NEW), (CM_FUSED_OLD, CM_FUSED_NEW), (CM_IDS_OLD, CM_IDS_NEW), (CM_RET_OLD, CM_RET_NEW)]),
     }
-    runner = site / "vllm/v1/worker/gpu_model_runner.py"
+    runners = [site / "vllm/v1/worker/gpu/model_runner.py", site / "vllm/v1/worker/gpu_model_runner.py"]
     patched = {}
     for name, (path, pairs) in targets.items():
         src = path.read_text()
         out = patch_text(src, pairs, name)
         compile(out, str(path), "exec")
         patched[path] = out
-    rsrc = runner.read_text()
-    if MARK not in rsrc:
-        if "class GPUModelRunner(" not in rsrc:
-            raise SystemExit("gpu_model_runner.py: no GPUModelRunner class")
-        rsrc = rsrc + RUNNER_TAIL
-        compile(rsrc, str(runner), "exec")
-    patched[runner] = rsrc
+    if not runners[0].exists():
+        raise SystemExit(f"{runners[0]}: the V2 model runner is missing")
+    for runner in runners:
+        if not runner.exists():
+            continue
+        rsrc = runner.read_text()
+        if MARK not in rsrc:
+            if "class GPUModelRunner(" not in rsrc:
+                raise SystemExit(f"{runner}: no GPUModelRunner class")
+            rsrc = rsrc + RUNNER_TAIL
+            compile(rsrc, str(runner), "exec")
+        patched[runner] = rsrc
     if args.check:
         print("patches apply cleanly (not written); runtime install skipped")
         return 0

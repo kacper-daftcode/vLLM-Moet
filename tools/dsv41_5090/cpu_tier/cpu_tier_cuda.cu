@@ -8,6 +8,9 @@
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
 
 #include "cpu_tier_abi.h"
 
@@ -39,16 +42,21 @@ __global__ void publish_kernel(CpuTierRequest* req, int* seq_dev, const int* ids
                                const uint8_t* a_scales, int n_tokens) {
     __shared__ int s_n;
     const int tid = threadIdx.x;
+    // the slot table is read ONCE per pair: the copy stream may map an expert (slot[e]: -1 -> s) while this kernel
+    // runs (the step after a promotion may or may not see it), and a second read could disagree with the first -
+    // a pair remapped to -1 (the GPU writes a zero row) but absent from the mailbox (no CPU row) would stay zero.
+    // The compaction below therefore uses the remapped ids this CTA just wrote (visible after __syncthreads).
     for (int p = tid; p < n_pairs; p += blockDim.x) {
         const int e = ids[p];
         remapped[p] = e >= 0 ? slot[e] : -1;
         req->ids[p] = (int16_t)e;  // the use log for the placement manager (hits and misses)
     }
+    __syncthreads();
     if (tid == 0) {
         int n = 0;
         for (int p = 0; p < n_pairs; ++p) {
             const int e = ids[p];
-            if (e >= 0 && slot[e] < 0 && n < CPU_TIER_MAX_PAIRS) {
+            if (e >= 0 && remapped[p] < 0 && n < CPU_TIER_MAX_PAIRS) {
                 CpuTierPair pr;
                 pr.token = (uint16_t)(p / topk);
                 pr.expert = (uint16_t)e;
@@ -183,9 +191,32 @@ void repack_record(torch::Tensor record, torch::Tensor idx_w13, torch::Tensor id
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
-// pinned (page-locked, portable) host memory for the expert store: H2D promotions DMA from it; not zeroed
+// pinned (page-locked, portable) host memory for the expert store: H2D promotions DMA from it; not zeroed.
+// Default cudaHostAlloc (4 KB pages). MOET_CPU_TIER_STORE_THP=1: an anonymous mapping advised to transparent huge
+// pages, registered with the driver (2 MB TLB entries instead of 1,150 4 KB ones per 4.7 MB record) - measured
+// 2026-10-22 on the 498 GB box with the page cache full of the checkpoint: the THP faults stall in direct compaction
+// (~5 huge pages per second per rank, compact_fail 5x compact_success), so it is opt-in until the box reserves
+// huge pages (hugetlbfs) or drops caches before the boot.
 int64_t alloc_pinned(int64_t nbytes) {
     void* p = nullptr;
+    const char* thp = getenv("MOET_CPU_TIER_STORE_THP");
+    if (thp && thp[0] == '1') {
+        const size_t huge = 2u << 20;
+        const size_t len = ((size_t)nbytes + huge - 1) / huge * huge + huge;  // room to align the start
+        void* raw = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (raw != MAP_FAILED) {
+            uintptr_t a = ((uintptr_t)raw + huge - 1) / huge * huge;
+            p = (void*)a;
+            madvise(p, (size_t)nbytes, MADV_HUGEPAGE);
+            // touch one byte per huge page so that the faults happen under the THP advice (and in this thread's
+            // NUMA policy) before the driver pins the range
+            for (size_t off = 0; off < (size_t)nbytes; off += huge) ((volatile char*)p)[off] = 0;
+            if (cudaHostRegister(p, (size_t)nbytes, cudaHostRegisterPortable) == cudaSuccess) return (int64_t)a;
+            munmap(raw, len);
+            p = nullptr;
+            fprintf(stderr, "[cpu_tier_cuda] cudaHostRegister of the THP store failed; falling back to cudaHostAlloc\n");
+        }
+    }
     TORCH_CHECK(cudaHostAlloc(&p, (size_t)nbytes, cudaHostAllocPortable) == cudaSuccess, "cudaHostAlloc (pinned) failed");
     return (int64_t)(uintptr_t)p;
 }

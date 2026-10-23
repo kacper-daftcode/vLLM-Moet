@@ -26,9 +26,13 @@
 // the workers, barriers between FC1, the activation and FC2).
 
 #include <immintrin.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -327,6 +331,12 @@ struct Pool {
     std::atomic<uint64_t> gen{0};
     std::atomic<int> done{0};
     std::atomic<bool> stop{false};
+    // idle policy: a worker spins on `gen` for spin_ns after its last job (the gaps between a step's layers), then
+    // sleeps on the futex word `wake_seq` (bumped with every job and at destroy); n_sleeping saves the wake syscall
+    // when nobody sleeps. spin_ns < 0 = spin forever (the old behaviour; MOE_B12X_POOL_SPIN_US=-1).
+    int64_t spin_ns = 500000;
+    std::atomic<uint32_t> wake_seq{0};
+    std::atomic<int> n_sleeping{0};
     std::atomic<int> bar_count{0};
     std::atomic<int> bar_gen{0};
     std::atomic<int> error{0};
@@ -618,13 +628,48 @@ static void pin_to_cpu(int cpu) {
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
 }
 
+static inline int64_t mono_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static inline void futex_wait_u32(std::atomic<uint32_t>* word, uint32_t expected) {
+    syscall(SYS_futex, (uint32_t*)word, FUTEX_WAIT_PRIVATE, expected, nullptr, nullptr, 0);
+}
+static inline void futex_wake_all(std::atomic<uint32_t>* word) {
+    syscall(SYS_futex, (uint32_t*)word, FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+}
+
+// bump the job generation and wake the sleepers (the order gen -> wake_seq -> n_sleeping check pairs with the
+// worker's n_sleeping++ -> gen re-check -> futex_wait(wake_seq) so that no wake-up is lost)
+static inline void pool_kick(Pool& P) {
+    P.gen.fetch_add(1, std::memory_order_seq_cst);
+    P.wake_seq.fetch_add(1, std::memory_order_seq_cst);
+    if (P.n_sleeping.load(std::memory_order_seq_cst) > 0) futex_wake_all(&P.wake_seq);
+}
+
 static void worker_main(Pool* P, int tid) {
     pin_to_cpu(P->cpus[tid]);
     uint64_t seen = 0;
     while (!P->stop.load(std::memory_order_acquire)) {
         uint64_t g;
+        int64_t t_idle = -1;
         while ((g = P->gen.load(std::memory_order_acquire)) == seen) {
             if (P->stop.load(std::memory_order_acquire)) return;
+            if (P->spin_ns >= 0) {
+                const int64_t now = mono_ns();
+                if (t_idle < 0) t_idle = now;
+                else if (now - t_idle > P->spin_ns) {
+                    const uint32_t w = P->wake_seq.load(std::memory_order_seq_cst);
+                    P->n_sleeping.fetch_add(1, std::memory_order_seq_cst);
+                    if (P->gen.load(std::memory_order_seq_cst) == seen && !P->stop.load(std::memory_order_acquire))
+                        futex_wait_u32(&P->wake_seq, w);
+                    P->n_sleeping.fetch_sub(1, std::memory_order_seq_cst);
+                    t_idle = -1;
+                    continue;
+                }
+            }
             _mm_pause();
         }
         seen = g;
@@ -763,6 +808,7 @@ void* moe_b12x_pool_create(int nthreads, const int* cpu_ids) {
     P->nthreads = nthreads;
     P->cpus.assign(cpu_ids, cpu_ids + nthreads);
     P->C = make_consts();
+    if (const char* s = getenv("MOE_B12X_POOL_SPIN_US")) P->spin_ns = (int64_t)atoll(s) * 1000;
     P->x_cap = 256;
     P->X = (XPrep*)big_alloc((int64_t)P->x_cap * sizeof(XPrep));
     for (int b = 0; b < 2; ++b) {
@@ -776,7 +822,9 @@ void* moe_b12x_pool_create(int nthreads, const int* cpu_ids) {
 void moe_b12x_pool_destroy(void* pool) {
     Pool* P = (Pool*)pool;
     if (!P) return;
-    P->stop.store(true, std::memory_order_release);
+    P->stop.store(true, std::memory_order_seq_cst);
+    P->wake_seq.fetch_add(1, std::memory_order_seq_cst);
+    futex_wake_all(&P->wake_seq);
     for (auto& th : P->threads) th.join();
     big_free(P->X, (int64_t)P->x_cap * sizeof(XPrep));
     for (int b = 0; b < 2; ++b) {
@@ -826,7 +874,7 @@ int moe_b12x_experts_forward(void* pool, int n_experts, const uint8_t* const* re
     J.inter_q_out = inter_q_out;
     J.inter_s_out = inter_s_out;
     P->done.store(0, std::memory_order_release);
-    P->gen.fetch_add(1, std::memory_order_acq_rel);
+    pool_kick(*P);
     while (P->done.load(std::memory_order_acquire) < P->nthreads) _mm_pause();
     return 0;
 }

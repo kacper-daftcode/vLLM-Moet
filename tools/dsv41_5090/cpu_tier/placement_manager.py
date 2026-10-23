@@ -30,8 +30,11 @@ def load_layout(tables_dir: str, device: torch.device) -> dict:
 
 class ResidentPool:
     def __init__(self, layer: int, n_experts: int, R: int, device: torch.device, pool: dict | None = None,
-                 slot_table: torch.Tensor | None = None):
+                 slot_table: torch.Tensor | None = None, record_ok=None):
         self.layer, self.E, self.R, self.device = layer, n_experts, R, device
+        # record_ok(e) -> the CPU tier holds e's record (an expert without one can never be evicted: after the
+        # eviction the CPU would have to compute it). None = every expert has a record.
+        self.record_ok = record_ok
         # pool=None: own tensors; pool={}: attached later (vLLM's prepared storages, at the layer's first launch)
         self.pool = pool if pool is not None else {name: torch.zeros(R, w, dtype=torch.int32, device=device) for name, w in WORDS.items()}
         self.slot_table = slot_table if slot_table is not None else torch.full((n_experts,), -1, dtype=torch.int32, device=device)
@@ -53,14 +56,17 @@ class ResidentPool:
 
     def pick_victim(self, protect: set, candidate_key: tuple) -> int:
         """An empty slot, else the least recently used one (ties: the least used since it was filled) whose expert
-        is not protected AND whose key is older than the candidate's (a miss never evicts something hotter than
-        itself: with more misses per step than spare slots that would churn the hot set); -1 if none."""
+        is not protected, has a record in the tier's store AND whose key is older than the candidate's (a miss never
+        evicts something hotter than itself: with more misses per step than spare slots that would churn the hot
+        set); -1 if none."""
         best, best_key = -1, None
         for s in range(self.R):
             e = self.expert_of_slot[s]
             if e < 0:
                 return s
             if e in protect:
+                continue
+            if self.record_ok is not None and not self.record_ok(e):
                 continue
             key = (self.last_used[s], self.use_count[s])
             if best_key is None or key < best_key:

@@ -31,6 +31,7 @@ int moe_b12x_experts_forward(void* pool, int n_experts, const uint8_t* const* re
                              const int* token_idx, const float* pair_weight, const int* out_row, int n_tokens,
                              const uint8_t* aq, const uint8_t* as, uint16_t* out, int64_t out_stride, float vs1,
                              float vs2, uint16_t* proj_out, uint8_t* inter_q_out, uint8_t* inter_s_out);
+void moe_b12x_pool_stats(void* pool, int64_t* out, int reset);
 }
 
 namespace {
@@ -415,5 +416,13 @@ int64_t cpu_tier_request_bytes(void) { return (int64_t)sizeof(CpuTierRequest); }
 int64_t cpu_tier_ack_bytes(void) { return (int64_t)sizeof(CpuTierAck); }
 int64_t cpu_tier_staging_bytes(void) { return (int64_t)CPU_TIER_MAX_PAIRS * CPU_TIER_HID * 2; }
 int64_t cpu_tier_now_ns(void) { return now_ns(); }
+
+// the kernel pool's statistics (6 int64: FC2 blocks, FC2 blocks through the general path, worker 0's TSC cycles in
+// prepare / FC1 / activation / FC2 incl. barrier waits); reset != 0 clears them
+void cpu_tier_pool_stats(void* tier, int64_t* out, int reset) {
+    Tier* T = (Tier*)tier;
+    if (!T || !T->pool) return;
+    moe_b12x_pool_stats(T->pool, out, reset);
+}
 
 }  // extern "C"

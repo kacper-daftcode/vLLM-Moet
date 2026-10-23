@@ -24,8 +24,10 @@ def post(port: int, path: str, body: dict, timeout: float = 600.0) -> dict:
         return json.load(r)
 
 
-def wait_ready(port: int, timeout: float = 1800.0) -> None:
+def wait_ready(port: int, timeout: float = 1800.0, container: str = "") -> None:
+    import subprocess
     t0 = time.time()
+    gone = 0
     while time.time() - t0 < timeout:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as r:
@@ -33,6 +35,11 @@ def wait_ready(port: int, timeout: float = 1800.0) -> None:
                     return
         except Exception:
             pass
+        if container:
+            up = subprocess.run(["docker", "ps", "-q", "-f", f"name=^{container}$"], capture_output=True, text=True).stdout.strip()
+            gone = gone + 1 if not up else 0
+            if gone >= 6:   # 30 s without the container: it died
+                raise SystemExit(f"server not ready: container {container} is gone")
         time.sleep(5)
     raise SystemExit("server not ready")
 
@@ -42,6 +49,9 @@ def main():
     ap.add_argument("--port", type=int, default=8031)
     ap.add_argument("--out", default="")
     ap.add_argument("--max-tokens", type=int, default=48)
+    ap.add_argument("--model", default="mini")
+    ap.add_argument("--prompts", type=int, default=0, help="only the first N prompts (0 = all)")
+    ap.add_argument("--container", default="", help="give up early when this docker container is gone")
     ap.add_argument("--compare", nargs=2, default=None)
     args = ap.parse_args()
     if args.compare:
@@ -57,11 +67,11 @@ def main():
             bad += not (same_tok and same_lp)
         print(f"{bad} of {len(a['results'])} prompts differ -> {'PASS' if bad == 0 else 'FAIL'}")
         return 0 if bad == 0 else 1
-    wait_ready(args.port)
+    wait_ready(args.port, container=args.container)
     results = []
-    for p in PROMPTS:
+    for p in PROMPTS[: args.prompts or None]:
         t0 = time.time()
-        r = post(args.port, "/v1/completions", dict(model="mini", prompt=p, max_tokens=args.max_tokens, temperature=0,
+        r = post(args.port, "/v1/completions", dict(model=args.model, prompt=p, max_tokens=args.max_tokens, temperature=0,
                                                      logprobs=1, seed=0))
         ch = r["choices"][0]
         toks = ch["logprobs"]["tokens"]

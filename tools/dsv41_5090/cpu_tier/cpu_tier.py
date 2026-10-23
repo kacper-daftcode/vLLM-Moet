@@ -72,6 +72,7 @@ def host_lib(path: str | None = None):
     lib.cpu_tier_ack_bytes.restype = ctypes.c_int64
     lib.cpu_tier_staging_bytes.restype = ctypes.c_int64
     lib.cpu_tier_now_ns.restype = ctypes.c_int64
+    lib.cpu_tier_pool_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
     lib.moe_b12x_init_tables.restype = ctypes.c_int
     lib.moe_b12x_init_tables.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     return lib
@@ -99,19 +100,23 @@ class ExpertStore:
         self.n_records = int(m.sum())
         self.nbytes = self.n_records * RECORD_BYTES
         self.pinned = pinned
+        self.slot_of = np.full((n_layers, n_experts), -1, dtype=np.int32)
+        self.load_seconds = 0.0
+        if self.n_records == 0:   # nothing to pin (e.g. every expert resident): an empty store
+            self.base = 0
+            return
         if pinned:
             self.ext = ext or cuda_ext()
             self.base = int(self.ext.alloc_pinned(self.nbytes))
         else:
             self._buf = np.empty(self.nbytes, dtype=np.uint8)
             self.base = int(self._buf.ctypes.data)
-        self.slot_of = np.full((n_layers, n_experts), -1, dtype=np.int32)
         t0 = time.perf_counter()
         rc = self.lib.cpu_tier_store_load(store_dir.encode(), rank, n_layers, n_experts, m.ctypes.data, self.base,
                                           self.nbytes, self.slot_of.ctypes.data, nthreads)
         self.load_seconds = time.perf_counter() - t0
         if rc != self.n_records:
-            raise RuntimeError(f"store load failed: rc={rc}")
+            raise RuntimeError(f"store load failed: rc={rc} (dir {store_dir}, rank {rank}, {self.n_records} records)")
 
     def ptr(self, layer: int, expert: int) -> int:
         s = int(self.slot_of[layer, expert])
@@ -251,3 +256,10 @@ class CpuTier:
 
     def now_ns(self) -> int:
         return int(self.lib.cpu_tier_now_ns())
+
+    def pool_stats(self, reset: bool = True) -> dict:
+        """The kernel pool's counters: FC2 blocks (all / general path) and worker 0's TSC cycles per phase
+        (prepare, FC1, activation, FC2; barrier waits included)."""
+        buf = (ctypes.c_int64 * 6)()
+        self.lib.cpu_tier_pool_stats(self.handle, buf, 1 if reset else 0)
+        return dict(fc2_blocks=buf[0], fc2_general=buf[1], cyc_prepare=buf[2], cyc_fc1=buf[3], cyc_act=buf[4], cyc_fc2=buf[5])
