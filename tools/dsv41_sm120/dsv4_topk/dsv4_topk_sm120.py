@@ -55,11 +55,44 @@ def dsv4_topk_cuda(
     if pdl is None:
         pdl = os.environ.get("VLLM_MOET_DSV4_TOPK_PDL", "0") == "1"
     has_vl = bias_vl is not None and image_sentinel_lo > 0
+    # step 35: the router GEMM that produced these logits may be pending in the BF16 GEMM module - run both in one launch
+    rec = _pending_router_gemm(gating_output)
+    if rec is not None:
+        _BF16.run_pending_router_topk(
+            rec, gating_output, correction_bias, is_padding, w, ids, float(routed_scaling_factor),
+            input_ids if has_vl else None, bias_vl if has_vl else None, int(image_sentinel_lo) if has_vl else 0,
+        )
+        return w, ids
     _ext().dsv4_topk_out(
         gating_output, correction_bias, is_padding, w, ids, float(routed_scaling_factor),
         input_ids if has_vl else None, bias_vl if has_vl else None, int(image_sentinel_lo) if has_vl else 0, bool(pdl),
     )
     return w, ids
+
+
+_BF16 = None  # the BF16 GEMM module (bf16_replica_gemm_sm120), resolved once; False when unavailable
+
+
+def _pending_router_gemm(gating_output: torch.Tensor):
+    """The deferred router spread launch whose output is `gating_output` (step 35), or None."""
+    global _BF16
+    if _BF16 is None:
+        _BF16 = False
+        if os.environ.get("VLLM_MOET_ROUTER_TOPK_FUSED", "0") == "1":
+            import sys
+
+            d = os.environ.get("VLLM_MOET_BF16_GEMM_DIR", "/opt/vllm-moet/dsv41_sm120/bf16_gemm")
+            if d not in sys.path:
+                sys.path.insert(0, d)
+            try:
+                import bf16_replica_gemm_sm120 as _m
+
+                _BF16 = _m
+            except Exception:  # noqa: BLE001
+                _BF16 = False
+    if not _BF16:
+        return None
+    return _BF16.take_pending_router(gating_output)
 
 
 def supported(gating_output: torch.Tensor, indices_dtype: torch.dtype) -> bool:

@@ -297,6 +297,14 @@
 #      to the fused MoE after joining the side stream (same kernel, same input, same bytes; any mismatch quantizes as
 #      before). pb-deep C1 (r18, det switches): greedy outputs of six prompts identical with and without, the quant's
 #      27.6 us per step leave the critical path, period 9,885 -> 9,803 us. OFF by default: VLLM_MOET_MOE_PREQUANT=1.
+#  35. The router's spread GEMM and DeepSeek-V4's routing top-6 in one launch (bf16_gemm/bf16_replica_gemm_sm120.cu
+#      spread_topk_kernel + dsv4_topk_sm120.py): replica_mm keeps the router GEMM pending and the top-k takes it;
+#      the tile reducers compute the routing scores of their columns, the CTA finishing the last tile selects the
+#      top-6 (two rows per warp, interleaved) - GEMM and top-k arithmetic unchanged, 96 random cases bit-identical,
+#      pb-deep greedy outputs identical. Measured and NOT worth it: isolated 6.45 vs 6.56 us (PDL), in the served
+#      graph 10.7 us vs spread 6.6 + top-k 3.9 - the serial selection tail costs what the top-k launch cost; the
+#      critical path did not move (8,271 -> 8,260 us). OFF by default (VLLM_MOET_ROUTER_TOPK_FUSED=1); kept for the
+#      MoE-sublayer megakernel, where the routing phase runs on all CTAs.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC

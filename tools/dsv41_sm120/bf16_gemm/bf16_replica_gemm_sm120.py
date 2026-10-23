@@ -31,6 +31,11 @@ graph the router follows the PDL-launched mHC boundary kernel on the same branch
 gain nothing (weights_proj sits on its own graph branch, wk's predecessor releases nothing early). 1 / all = every
 site, 0 = plain launches. Neither switch changes a bit of the result.
 
+Step 35 (VLLM_MOET_ROUTER_TOPK_FUSED=1, default off): the router's spread GEMM is not launched by replica_mm but
+kept pending (router_logits are consumed by DeepSeek-V4's routing top-6 only); dsv4_topk_sm120.dsv4_topk_cuda takes
+the pending launch and runs spread + top-6 in one kernel (spread_topk_out) - the GEMM's and the top-k's arithmetic
+unchanged. A pending launch nobody took runs plainly at the next router call (and is reported once).
+
 The first import compiles the extension with torch.utils.cpp_extension.load (~60 s, cached under
 $TORCH_EXTENSIONS_DIR or ~/.cache/torch_extensions; the serving image compiles it at build time).
 """
@@ -140,8 +145,8 @@ class Shape:
         key = (slices, torch.cuda.current_stream(self.device).cuda_stream, _ext().capture_id())
         if key not in self.ws:
             self.ws[key] = (
-                torch.empty(self.n // 8 * slices * 128, device=self.device, dtype=torch.float32),
-                torch.zeros(self.n // 8, device=self.device, dtype=torch.int32),
+                torch.empty(self.n // 8 * slices * 128 + 2 * 16 * self.n, device=self.device, dtype=torch.float32),  # + the step-35 scores / keys
+                torch.zeros(self.n // 8 + 1, device=self.device, dtype=torch.int32),  # [N/8] tiles + the step-35 completion counter
             )
         return self.ws[key]
 
@@ -280,6 +285,46 @@ def _calibrate_pending(device: torch.device) -> None:
             _SHAPES[key] = calibrate(w, out_f32, ldx, site)
 
 
+# ---- step 35: the router GEMM deferred into the routing top-6 launch -------------------------------------------------
+_ROUTER_TOPK_FUSED: bool | None = None
+_PENDING_ROUTER: dict[int, tuple] = {}  # out.data_ptr() -> (x, w, out, case, slices, ws, cnt, pdl)
+_PENDING_LATE = [0]
+
+
+def router_topk_fused() -> bool:
+    global _ROUTER_TOPK_FUSED
+    if _ROUTER_TOPK_FUSED is None:
+        _ROUTER_TOPK_FUSED = os.environ.get("VLLM_MOET_ROUTER_TOPK_FUSED", "0") == "1"
+    return _ROUTER_TOPK_FUSED
+
+
+def _run_pending_late() -> None:
+    """A deferred router GEMM nobody took: run it plainly now (its reader, if any, saw stale logits - reported once)."""
+    while _PENDING_ROUTER:
+        _, rec = _PENDING_ROUTER.popitem()
+        x, w, out, case, slices, ws, cnt, pdl = rec
+        _ext().spread_out(x, w, out, case.step, case.pbf16, ws, cnt, SPREAD_WARPS, pdl)
+        _PENDING_LATE[0] += 1
+        if _PENDING_LATE[0] == 1:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "vllm-moet step 35: a deferred router GEMM was not consumed by the routing top-k; launched late"
+            )
+
+
+def take_pending_router(logits: torch.Tensor):
+    """The deferred spread launch whose output is `logits`, or None. Used by dsv4_topk_sm120.dsv4_topk_cuda."""
+    return _PENDING_ROUTER.pop(logits.data_ptr(), None)
+
+
+def run_pending_router_topk(rec, logits, bias, is_padding, out_w, out_ids, scale, input_ids, bias_vl, image_lo) -> None:
+    x, w, out, case, slices, ws, cnt, pdl = rec
+    assert out.data_ptr() == logits.data_ptr()
+    _ext().spread_topk_out(x, w, out, case.step, ws, cnt, SPREAD_WARPS, pdl, bias, is_padding, out_w, out_ids,
+                           float(scale), input_ids, bias_vl, int(image_lo))
+
+
 def replica_mm(x: torch.Tensor, w: torch.Tensor, out_f32: bool, site: str) -> torch.Tensor:
     """torch.mm(x, w.T, out_dtype=torch.float32) (out_f32) / F.linear(x, w) with cuBLAS's bits."""
     if (
@@ -306,6 +351,21 @@ def replica_mm(x: torch.Tensor, w: torch.Tensor, out_f32: bool, site: str) -> to
     if case is None or x.data_ptr() % 16 or w.data_ptr() % 16 or x.stride(0) % 8:
         return cublas_mm(x, w, out_f32)
     out = torch.empty(x.shape[0], n, device=x.device, dtype=torch.float32 if out_f32 else torch.bfloat16)
+    if site == "router":
+        if _PENDING_ROUTER:
+            _run_pending_late()
+        if (
+            router_topk_fused()
+            and case.kind == "spread"
+            and out_f32
+            and n == 384
+            and x.shape[0] <= 8
+            and not case.pbf16
+        ):
+            slices = -(-shape.k // case.step)
+            ws, cnt = shape.workspace(slices)
+            _PENDING_ROUTER[out.data_ptr()] = (x, w, out, case, slices, ws, cnt, pdl_for(site))
+            return out  # launched by the routing top-6 (dsv4_topk_sm120) together with it
     _run(shape, case, x, w, out, site)
     return out
 
