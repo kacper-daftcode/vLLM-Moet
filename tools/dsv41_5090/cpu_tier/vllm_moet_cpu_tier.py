@@ -305,7 +305,8 @@ def _create_tier_if_needed(device: torch.device):
     tables_layout = load_layout(tables, device)
     copy_stream = torch.cuda.Stream(device=device)
     S.manager = PlacementManager(S.tier.ext, tables_layout, S.pools, _record_view, copy_stream,
-                                 max_promotions_per_layer=int(os.environ.get("VLLM_MOET_CPU_TIER_MAX_PROMOTIONS", "4")))
+                                 max_promotions_per_layer=int(os.environ.get("VLLM_MOET_CPU_TIER_MAX_PROMOTIONS", "4")),
+                                 record_ptr=_record_ptr)
     S.tier.start(first_step=1)
     S.created = True
 

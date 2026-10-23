@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <vector>
 
 #include "cpu_tier_abi.h"
 
@@ -191,6 +192,47 @@ void repack_record(torch::Tensor record, torch::Tensor idx_w13, torch::Tensor id
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
+// ---- batched promotions (phase 2.4: the host side of ~30 promotions per step was 20 ms of torch ops) ----------
+struct TableWrites { int n; int e[64]; int v[64]; };
+
+__global__ void table_write_kernel(int* table, TableWrites w) {
+    const int i = threadIdx.x;
+    if (i < w.n) table[w.e[i]] = w.v[i];
+}
+
+// slot_table[experts[i]] = values[i] (<= 64 entries), one launch on the current stream
+void table_write(torch::Tensor slot_table, std::vector<int64_t> experts, std::vector<int64_t> values) {
+    TORCH_CHECK(slot_table.scalar_type() == torch::kInt32 && slot_table.is_cuda());
+    TORCH_CHECK(experts.size() == values.size() && experts.size() <= 64);
+    if (experts.empty()) return;
+    TableWrites w;
+    w.n = (int)experts.size();
+    for (int i = 0; i < w.n; ++i) {
+        TORCH_CHECK(experts[i] >= 0 && experts[i] < slot_table.numel());
+        w.e[i] = (int)experts[i];
+        w.v[i] = (int)values[i];
+    }
+    table_write_kernel<<<1, 64, 0, c10::cuda::getCurrentCUDAStream()>>>(slot_table.data_ptr<int>(), w);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// one layer's promotions on the current stream: for each (host record, expert, slot): H2D into the staging record,
+// repack into the slot, slot_table[expert] = slot (after the repack, in stream order)
+void promote_batch(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                   torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                   torch::Tensor pool_w2s, torch::Tensor slot_table, std::vector<int64_t> host_ptrs,
+                   std::vector<int64_t> experts, std::vector<int64_t> slots) {
+    TORCH_CHECK(host_ptrs.size() == experts.size() && experts.size() == slots.size());
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.numel() == 4700160 && staging.is_cuda());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    for (size_t i = 0; i < experts.size(); ++i) {
+        TORCH_CHECK(cudaMemcpyAsync(staging.data_ptr<uint8_t>(), (const void*)(uintptr_t)host_ptrs[i], 4700160,
+                                    cudaMemcpyHostToDevice, stream) == cudaSuccess, "promotion H2D failed");
+        repack_record(staging, idx_w13, idx_w13s, idx_w2, idx_w2s, pool_w13, pool_w13s, pool_w2, pool_w2s, slots[i]);
+        table_write(slot_table, {experts[i]}, {slots[i]});
+    }
+}
+
 // pinned (page-locked, portable) host memory for the expert store: H2D promotions DMA from it; not zeroed.
 // Default cudaHostAlloc (4 KB pages). MOET_CPU_TIER_STORE_THP=1: an anonymous mapping advised to transparent huge
 // pages, registered with the driver (2 MB TLB entries instead of 1,150 4 KB ones per 4.7 MB record) - measured
@@ -289,6 +331,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("publish", &publish);
     m.def("wait_inject", &wait_inject);
     m.def("repack_record", &repack_record);
+    m.def("table_write", &table_write);
+    m.def("promote_batch", &promote_batch);
     m.def("request_bytes", &request_bytes);
     m.def("ack_bytes", &ack_bytes);
     m.def("staging_bytes", &staging_bytes);

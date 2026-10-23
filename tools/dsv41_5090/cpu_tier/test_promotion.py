@@ -267,7 +267,7 @@ def main():
         step_no = first_step + it
         mgr.before_launch()
         pend = [set(mgr.last_promoted.get(l, set())) for l in range(L)]
-        resident_at_launch[step_no] = [set(pools[l].slot_of_expert.keys()) - pend[l] for l in range(L)]
+        resident_at_launch[step_no] = [pools[l].resident_experts() - pend[l] for l in range(L)]
         pending_at_launch[step_no] = pend
         q, s, i_np, w_np = new_inputs(it)
         routing_at[step_no] = i_np
