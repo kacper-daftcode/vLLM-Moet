@@ -18,6 +18,11 @@
 #            SPEC_TOKENS (5)         DSpark draft tokens (0 = no drafter)
 #            GPU_MEM_UTIL (0.92)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (512)  CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
+#            SCRATCH (0)             slots of the prefill scratch pool (phase 2.5; 128 = 1.2 GB per rank; 0 = the missing
+#                        experts of > 8-token calls are not computed: decode bring-up only)
+#            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
+#                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
+#            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
@@ -46,6 +51,9 @@ PROMOTIONS="${PROMOTIONS:-4}"
 TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
 TIER_DEBUG="${TIER_DEBUG:-0}"
+SCRATCH="${SCRATCH:-0}"
+DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
+DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
@@ -60,7 +68,9 @@ mkdir -p "$CACHE_DIR/dot-cache"
 TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM_MOET_CPU_TIER_STORE_MODE="$STORE_MODE"
           -e VLLM_MOET_CPU_TIER_TABLES=/parity -e VLLM_MOET_CPU_TIER_SPARE="$SPARE" -e VLLM_MOET_CPU_TIER_MAX_PROMOTIONS="$PROMOTIONS"
           -e VLLM_MOET_CPU_TIER_TIMEOUT_MS="$TIMEOUT_MS" -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY="$LOG_EVERY"
-          -e VLLM_MOET_CPU_TIER_DEBUG="$TIER_DEBUG" -e VLLM_MOET_DET_TOPK=1)
+          -e VLLM_MOET_CPU_TIER_DEBUG="$TIER_DEBUG" -e VLLM_MOET_DET_TOPK=1
+          -e VLLM_MOET_CPU_TIER_SCRATCH="$SCRATCH" -e VLLM_MOET_CPU_TIER_DEBUG_COMPACT="$DEBUG_COMPACT"
+          -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL="$DEBUG_PREFILL")
 MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$REPO:/repo:ro" -v "$TABLES:/parity:ro" -v "$STORE:/store:ro")
 # the store may be a directory of symlinks into another store (the mini-real test): mount the packs root too
 MOUNTS+=(-v /mnt/nvme/packs:/mnt/nvme/packs:ro)

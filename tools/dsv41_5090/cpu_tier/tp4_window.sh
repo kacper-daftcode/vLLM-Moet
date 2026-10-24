@@ -82,6 +82,8 @@ free -g | head -2 | tee -a "$SUMMARY"
 # 3. measurements: the identity client (10 short prompts x 48 tokens, saved), then decode tok/s on longer generations
 MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
 $PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --port "$PORT" --model "$MODEL" --out "/tmp/ds41-hyb-$TAG-outputs.json" 2>&1 | tee -a "$SUMMARY"
+# who runs on which CPU while the first decode runs (foreign threads on the pool cores / their SMT siblings slow the kernel)
+( sleep 2; bash "$REPO/tools/dsv41_5090/cpu_tier/cpu_placement_probe.sh" "${PLACEMENT_SAMPLES:-40}" 0.1 > "/tmp/ds41-hyb-$TAG-placement.txt" 2>&1 ) &
 for p in "Hello" "def fib(n):"; do
   $PY - "$PORT" "$MODEL" "$p" "$GEN_TOKENS" <<'EOF' 2>&1 | tee -a "$SUMMARY"
 import json, sys, time, urllib.request
@@ -97,7 +99,31 @@ EOF
 done
 docker logs "$NAME" > "$LOG" 2>&1
 grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -3 | cut -c1-300 | tee -a "$SUMMARY"
+grep -o "worker-0 in-kernel [0-9]* us per expert" "$LOG" | sort | uniq -c | sort -rn | head -3 | tee -a "$SUMMARY"
+wait  # the placement probe
+if [[ -s "/tmp/ds41-hyb-$TAG-placement.txt" ]]; then
+  note "CPU placement during decode (pool cores and their siblings; full list /tmp/ds41-hyb-$TAG-placement.txt):"
+  # pool cores 8r+2..8r+7 and their siblings 8r+34..8r+39 are exactly the CPUs with cpu % 8 >= 2
+  awk '/^  cpu/ {cpu = $2 + 0; if (cpu % 8 >= 2) print}' "/tmp/ds41-hyb-$TAG-placement.txt" | head -48 | tee -a "$SUMMARY"
+fi
+# optional (phase 2.5): TTFT / prefill rate on long prompts, e.g. TTFT_LENGTHS=2048,14336,30720 (needs SCRATCH > 0 for
+# correct outputs; MAX_NUM_BATCHED_TOKENS sets the chunk)
+if [[ -n "${TTFT_LENGTHS:-}" ]]; then
+  note "TTFT probe: lengths $TTFT_LENGTHS, gen ${TTFT_GEN:-64}, repeat ${TTFT_REPEAT:-2}"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/ttft_probe.py" --port "$PORT" --model "$MODEL" --lengths "$TTFT_LENGTHS" \
+    --gen "${TTFT_GEN:-64}" --repeat "${TTFT_REPEAT:-2}" --out "/tmp/ds41-hyb-$TAG-ttft.json" 2>&1 | tee -a "$SUMMARY"
+  docker logs "$NAME" > "$LOG" 2>&1
+  grep -E "moet-cpu-tier\] rank 0: (prefill call|scratch pool|DEBUG prefill|[0-9]+-token MoE call)" "$LOG" | tail -8 | cut -c1-300 | tee -a "$SUMMARY"
+  grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+fi
 grep -c "moet-cpu-tier\] rank 0: WARNING" "$LOG" | xargs -I{} note "tier warnings in the log: {}"
+if [[ "${DEBUG_COMPACT:-0}" == "1" ]]; then
+  # the within-boot identity check (every compact call vs all its experts in one b12x run): totals per rank, mismatches
+  for r in 0 1 2 3; do grep -o "rank $r: step [0-9]*:.*compact check: .*" "$LOG" | tail -1 | sed -E "s/(rank $r: step [0-9]+):.*compact check:/\1 compact check:/" | tee -a "$SUMMARY"; done
+  grep -c "DEBUG compact.*MISMATCH" "$LOG" | xargs -I{} note "compact check MISMATCH lines (all ranks): {}"
+  grep "DEBUG compact.*MISMATCH" "$LOG" | head -5 | cut -c1-300 | tee -a "$SUMMARY"
+  grep -c "DEBUG compact.*check skipped" "$LOG" | xargs -I{} note "compact check skipped lines: {}"
+fi
 grep -i "fail\|error word\|Traceback" "$LOG" | grep -v "errors 0" | head -5 | tee -a "$SUMMARY"
 
 # 4. stop, release

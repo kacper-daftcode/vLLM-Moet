@@ -27,8 +27,13 @@ Environment:
   VLLM_MOET_CPU_TIER_TIMEOUT_MS         bounded wait (default 500)
   VLLM_MOET_CPU_TIER_MAX_PROMOTIONS     per layer per step (default 4; 0 = static placement only)
   VLLM_MOET_CPU_TIER_LOG=1              KPI lines (every VLLM_MOET_CPU_TIER_LOG_EVERY steps, default 100)
-  VLLM_MOET_CPU_TIER_SCRATCH=<int>      slots of the prefill scratch pool (default 128; 0 = the missing experts of
-                                        non-compact calls are not computed - decode-only serving)
+  VLLM_MOET_CPU_TIER_SCRATCH=<int>      slots of the prefill scratch pool (default 0 = off: the missing experts of
+                                        non-compact calls are not computed - decode-only serving; 128 = 1.2 GB per rank)
+  VLLM_MOET_CPU_TIER_DEBUG_COMPACT=1    eager runs only (--enforce-eager; needs SCRATCH >= the routed experts of a
+                                        call, <= 64): every compact call is recomputed with all its routed experts in
+                                        the scratch pool in one b12x run = the all-resident reference of this boot;
+                                        the hybrid's route rows (GPU pairs / CPU pairs) and the layer output are
+                                        compared bit for bit (R5 within one boot, where TP4 boots are not reproducible)
 """
 from __future__ import annotations
 
@@ -49,6 +54,7 @@ if _HERE not in sys.path:
 ENABLED = os.environ.get("VLLM_MOET_MOE_CPU_TIER", "0") == "1"
 DEBUG = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG", "0") == "1"
 DEBUG_PREFILL = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG_PREFILL", "0") == "1"
+DEBUG_COMPACT = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG_COMPACT", "0") == "1"
 DUMP_DIR = os.environ.get("VLLM_MOET_CPU_TIER_DUMP_DIR", "")   # eager runs only: per-call MoE inputs/outputs
 DUMP_MAX = int(os.environ.get("VLLM_MOET_CPU_TIER_DUMP_MAX", "400"))
 STORE = os.environ.get("VLLM_MOET_CPU_TIER_STORE", "")
@@ -63,6 +69,7 @@ _PROMOTE_RANKS = ([int(x) for x in os.environ["VLLM_MOET_CPU_TIER_PROMOTE_RANKS"
 _PROMOTE_LAYERS = ([int(x) for x in os.environ["VLLM_MOET_CPU_TIER_PROMOTE_LAYERS"].split("-")]
                    if os.environ.get("VLLM_MOET_CPU_TIER_PROMOTE_LAYERS") else None)
 COMPACT_MAX_TOKENS = 8   # b12x's direct compact micro path "owns one through eight live tokens"
+_TSC_GHZ = float(os.environ.get("VLLM_MOET_CPU_TIER_TSC_GHZ", "3.9937"))   # the pool's rdtsc rate (rtxdev2: 3993.689 MHz)
 SCRATCH_SLOTS = int(os.environ.get("VLLM_MOET_CPU_TIER_SCRATCH", "0"))   # prefill scratch pool (0 = off; 2.5 under test)
 
 
@@ -329,7 +336,8 @@ def _create_tier_if_needed(device: torch.device):
             if LOG:
                 tot = S.tier.totals()
                 _log(f"exit: steps {S.step}, tier steps {tot['steps']} pairs {tot['pairs']} busy {tot['busy_ns'] / 1e9:.1f} s "
-                     f"errors {tot['errors']}; pairs all {S.kpi['pairs_all']} cpu {S.kpi['pairs_cpu']} promotions {S.kpi['promotions']}")
+                     f"errors {tot['errors']}; pairs all {S.kpi['pairs_all']} cpu {S.kpi['pairs_cpu']} promotions {S.kpi['promotions']}"
+                     f"{_debug_compact_summary()}")
             S.tier.stop()
             S.tier.close()  # frees the mapped mailboxes before the driver tears the process down
         except Exception:
@@ -549,6 +557,11 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
     allowed (rule R6)."""
     if DUMP_DIR and S.created:
         _dump_call(experts_impl, hidden_states, topk_weights, output)
+    if DEBUG_COMPACT and S.created and getattr(S.ctx, "compact_call", None) is not None \
+            and not torch.cuda.is_current_stream_capturing():
+        li = S.ctx.compact_call
+        S.ctx.compact_call = None
+        _debug_compact_reference(experts_impl, li, hidden_states, topk_weights, output, run_plan, scratch_nbytes)
     pf = getattr(S.ctx, "prefill", None)
     if pf is None or not SCRATCH_SLOTS or not S.created:
         return
@@ -618,6 +631,106 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
          f"max |d| {noise:.3e}; |ref| max {r.abs().max().item():.3e}")
 
 
+def _debug_compact_reference(experts_impl, li, hidden_states, topk_weights, output, run_plan, scratch_nbytes) -> None:
+    """Debug (VLLM_MOET_CPU_TIER_DEBUG_COMPACT=1, eager runs): the compact call just made, once more with EVERY routed
+    expert of the call in the scratch pool in one stock b12x run = the all-resident reference of this boot for this
+    layer and step (TP4 boots are not reproducible among themselves, so the reference has to live in the same boot).
+    Experts with a record are staged from the pinned store; the resident ones without a record (the nonresident
+    store) are copied from the layer's pool rows. Compared bit for bit: the route rows per pair (the GPU's rows for
+    the resident pairs, the host's injected rows for the missing ones) and the layer output after TopKSum."""
+    ids = getattr(S.ctx, "last_ids", None)
+    hyb = getattr(S.ctx, "hyb_rows", None)
+    S.ctx.hyb_rows = None
+    if ids is None or hyb is None or not SCRATCH_SLOTS:
+        if not S.kpi.get("dc_off_reported"):
+            S.kpi["dc_off_reported"] = True
+            _log("DEBUG compact: no scratch pool (VLLM_MOET_CPU_TIER_SCRATCH=0) or no rows captured; check skipped")
+        return
+    T, K = ids.shape
+    P = S.pools[li]
+    with S.lock:
+        if S.scratch is None:
+            S.scratch = _Scratch(experts_impl, S.layer_modules[li], hidden_states.device)
+            _log(f"scratch pool: {SCRATCH_SLOTS} slots ({SCRATCH_SLOTS * RECORD_BYTES / 2**20:.0f} MiB staging + pool)")
+    sc = S.scratch
+    S.manager.copy.synchronize()   # promotions in flight: the slot table and the pool rows consistent before reading
+    torch.cuda.synchronize()
+    ids_h = ids.cpu().numpy().reshape(-1)
+    gpu_ids = S.remapped[li][: T * K].cpu().numpy()   # what the compact kernel ran: the slot, or -1 = the host's pair
+    table = P.slot_table.cpu().numpy()
+    routed = sorted(set(int(e) for e in ids_h if e >= 0))
+    if len(routed) > sc.n:
+        _log(f"DEBUG compact layer {li}: {len(routed)} routed experts > {sc.n} scratch slots; check skipped")
+        return
+    from_store = [e for e in routed if _has_record(li, e)]
+    from_pool = [e for e in routed if not _has_record(li, e)]
+    order = from_store + from_pool
+    if from_store:
+        _stage_and_repack(sc, [_record_ptr(li, e) for e in from_store])
+    for j, e in enumerate(from_pool, start=len(from_store)):
+        s = int(table[e])
+        if s < 0:
+            _log(f"DEBUG compact layer {li}: expert {e} has neither a record nor a slot; check skipped")
+            return
+        for name in sc.pool:
+            sc.pool[name][j].copy_(P.pool[name][s])
+    sc.table.fill_(-1)
+    sc.table[torch.tensor(order, dtype=torch.long, device=ids.device)] = torch.arange(len(order), dtype=torch.int32, device=ids.device)
+    valid = ids >= 0
+    rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+    plan, (buf, tmp) = sc.plan(T, K, scratch_nbytes)
+    weights = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32)
+    ref = torch.empty_like(output)
+    S.ctx.ref_rows = None
+    S.ctx.want_ref_rows = True
+    try:
+        run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights.contiguous(),
+                 topk_ids=rids, output=ref, unit_scale_contract=False)
+    finally:
+        S.ctx.want_ref_rows = False
+    torch.cuda.synchronize()
+    ref_rows = getattr(S.ctx, "ref_rows", None)
+    S.ctx.ref_rows = None
+    n_pairs = T * K
+    valid_h = ids_h >= 0
+    is_gpu = valid_h & (gpu_ids >= 0)
+    is_cpu = valid_h & (gpu_ids < 0)
+    out_eq = bool(torch.equal(output.view(torch.int16), ref.view(torch.int16)))
+    d_out = (output.float() - ref.float()).abs()
+    bad_gpu = bad_cpu = 0
+    if ref_rows is None:
+        row_msg = "reference rows missing (the reference took a non-compact path)"
+    else:
+        diff = (hyb[:n_pairs].view(torch.int16) != ref_rows[:n_pairs].view(torch.int16)).any(dim=1).cpu().numpy()
+        bad_gpu, bad_cpu = int((diff & is_gpu).sum()), int((diff & is_cpu).sum())
+        row_msg = f"rows differing: gpu {bad_gpu} of {int(is_gpu.sum())}, cpu {bad_cpu} of {int(is_cpu.sum())}"
+    k = S.kpi
+    k["dc_calls"] = k.get("dc_calls", 0) + 1
+    k["dc_cpu_pairs"] = k.get("dc_cpu_pairs", 0) + int(is_cpu.sum())
+    k["dc_gpu_pairs"] = k.get("dc_gpu_pairs", 0) + int(is_gpu.sum())
+    k["dc_bad_out"] = k.get("dc_bad_out", 0) + (0 if out_eq else 1)
+    k["dc_bad_rows_gpu"] = k.get("dc_bad_rows_gpu", 0) + bad_gpu
+    k["dc_bad_rows_cpu"] = k.get("dc_bad_rows_cpu", 0) + bad_cpu
+    k["dc_no_rows"] = k.get("dc_no_rows", 0) + (1 if ref_rows is None else 0)
+    seen = k.setdefault("dc_seen", {})
+    first = seen.get(li, 0)
+    seen[li] = first + 1
+    bad = (not out_eq) or bad_gpu or bad_cpu
+    if bad or first < 2:
+        _log(f"DEBUG compact layer {li} step {S.step} T {T}: {int(valid_h.sum())} pairs, {len(routed)} experts "
+             f"({len(from_store)} from the store, {len(from_pool)} from the pool); {row_msg}; output == reference: {out_eq} "
+             f"(max |d| {d_out.max().item():.3e}, |ref| max {ref.float().abs().max().item():.3e})"
+             f"{'  <-- MISMATCH' if bad else ''}")
+
+
+def _debug_compact_summary() -> str:
+    k = S.kpi
+    if not DEBUG_COMPACT or not k.get("dc_calls"):
+        return ""
+    return (f"; compact check: {k['dc_calls']} calls, pairs gpu {k['dc_gpu_pairs']} cpu {k['dc_cpu_pairs']}; mismatches: "
+            f"outputs {k['dc_bad_out']}, rows gpu {k['dc_bad_rows_gpu']} cpu {k['dc_bad_rows_cpu']}, references without rows {k['dc_no_rows']}")
+
+
 def on_apply_done() -> None:
     S.ctx.layer = None
 
@@ -668,8 +781,13 @@ def after_compiled(route: torch.Tensor) -> None:
     li = current_layer()
     S.ctx.layer = None  # one compact launch per apply; warmup launches outside apply stay stock
     if li is None or not S.created:
+        if DEBUG_COMPACT and getattr(S.ctx, "want_ref_rows", False):
+            S.ctx.ref_rows = route.clone()   # the reference run's rows (the stock path: no publish, no inject)
         return
     S.tier.wait_inject(li, route)
+    if DEBUG_COMPACT and not torch.cuda.is_current_stream_capturing():
+        S.ctx.hyb_rows = route.clone()      # the hybrid's rows: the GPU's for resident pairs, the host's injected
+        S.ctx.compact_call = li
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -715,11 +833,13 @@ def runner_after_step() -> None:
         # the KPI ring since the last line: per (step, layer) request the pairs, distinct experts and the host's
         # compute time (t_done - t_seen)
         detail = ""
+        n_exp_interval = 0
         try:
             kp = S.tier.kpis(cap=4096)
             kp = kp[kp[:, 0] > S.kpi.get("last_kpi_step", -1)] if len(kp) else kp
             served = kp[kp[:, 2] > 0] if len(kp) else kp
             if len(served):
+                n_exp_interval = int(served[:, 3].sum())
                 comp = (served[:, 6] - served[:, 5]) / 1e3
                 pe = served[:, 3]
                 detail = (f"; per served layer: pairs {served[:, 2].mean():.1f} experts {pe.mean():.1f} compute "
@@ -734,12 +854,17 @@ def runner_after_step() -> None:
                 detail += (f"; worker-0 cycles: prepare {100 * cyc[0] / tot_c:.0f} % fc1 {100 * cyc[1] / tot_c:.0f} % act "
                            f"{100 * cyc[2] / tot_c:.0f} % fc2 {100 * cyc[3] / tot_c:.0f} % (barrier waits included), fc2 general "
                            f"path {ps['fc2_general']} of {ps['fc2_blocks']} blocks")
+                if n_exp_interval:
+                    # TSC cycles -> time: the in-kernel time of worker 0 per expert, against the request's compute time per
+                    # expert above (the difference = outside the kernel: wake-up, dispatch, the job barrier)
+                    detail += f"; worker-0 in-kernel {tot_c / _TSC_GHZ / 1e3 / n_exp_interval:.0f} us per expert"
         except Exception as ex:  # diagnostics only
             detail = f"; kpi detail failed: {ex!r}"
         _log(f"step {S.step}: tier steps {tot['steps']} pairs {tot['pairs']} errors {tot['errors']}; cpu busy "
              f"{d_busy / 1e6 / d_steps:.2f} ms per tier step; pair hit rate {hit:.3f} (all {S.kpi['pairs_all']}, cpu "
              f"{S.kpi['pairs_cpu']}); promotions {S.kpi['promotions']} ({S.manager.stats}); "
-             f"{LOG_EVERY / max(1e-6, now - S.kpi['last_log_t']):.1f} steps/s; host hook {S.kpi['hook_s'] * 1e3 / LOG_EVERY:.2f} ms per step{detail}")
+             f"{LOG_EVERY / max(1e-6, now - S.kpi['last_log_t']):.1f} steps/s; host hook {S.kpi['hook_s'] * 1e3 / LOG_EVERY:.2f} ms per step{detail}"
+             f"{_debug_compact_summary()}")
         S.kpi["busy_ns"], S.kpi["tier_steps"], S.kpi["last_log_t"], S.kpi["hook_s"] = tot["busy_ns"], tot["steps"], now, 0.0
 
 
