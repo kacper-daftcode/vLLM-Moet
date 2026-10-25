@@ -25,7 +25,7 @@
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
 #            PREFIX_CACHE (1)        0 = --no-enable-prefix-caching (measurements: repeated / shared-prefix prompts would hit
 #                        vLLM's prefix cache and skip the prefill)
-#            PROMOTE_WINDOW (0)      promotion admission: 0 = every miss; W > 0 = only an expert whose previous miss was <= W
+#            PROMOTE_WINDOW (12)     promotion admission: 0 = every miss; W > 0 = only an expert whose previous miss was <= W
 #                        steps ago (the traces: W = 8-16 keeps the hit rate within 0.6 pt at a quarter of the promotions / DMA)
 #            POOL_SPIN_HOT (1)       the kernel pool's spin does ALU work instead of `pause` (keeps the cores' clock up between a
 #                        step's jobs: +3 % decode on 10-25); 0 = pause
@@ -69,7 +69,7 @@ NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
 POOL_SPIN_US="${POOL_SPIN_US:-}"
 POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
-PROMOTE_WINDOW="${PROMOTE_WINDOW:-0}"
+PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
 HOST_EMPTY_CACHE="${HOST_EMPTY_CACHE:-0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"

@@ -123,6 +123,12 @@ grep -E "^(MemAvailable|Shmem|AnonPages|Mapped|Cached|Unevictable|Mlocked|Kernel
 for p in $(pgrep -f "VLLM::Worker_TP" | head -4); do
   awk -v p="$p" '/^(Rss|Pss|Shared_Clean|Shared_Dirty|Private_Dirty|Anonymous|Shmem.*Rss|Locked):/ {printf "%s %.1f GB  ", $1, $2/1048576} END {print "(pid " p ")"}' "/proc/$p/smaps_rollup" 2>/dev/null | tee -a "$SUMMARY"
 done
+# the RAM item: Shmem (458 GB) exceeds the pinned store + Engram (411) and the workers' RSS differ by rank - the biggest
+# mappings of the first and the third worker (size / rss / name) show what the rest is
+for p in $(pgrep -f "VLLM::Worker_TP" | sed -n '1p;3p'); do
+  echo "  pid $p largest mappings (size GB / rss GB / path):" | tee -a "$SUMMARY"
+  awk '/^[0-9a-f]+-[0-9a-f]+ / {path = (NF >= 6) ? $6 : "[anon]"} /^Size:/ {sz = $2} /^Rss:/ {if (sz > 1048576) printf "    %6.1f %6.1f %s\n", sz / 1048576, $2 / 1048576, path}' "/proc/$p/smaps" 2>/dev/null | sort -rn | head -8 | tee -a "$SUMMARY"
+done
 
 # 3. measurements: the identity client (10 short prompts x 48 tokens, saved), then decode tok/s on longer generations
 MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
