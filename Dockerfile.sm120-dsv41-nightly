@@ -305,6 +305,12 @@
 #      graph 10.7 us vs spread 6.6 + top-k 3.9 - the serial selection tail costs what the top-k launch cost; the
 #      critical path did not move (8,271 -> 8,260 us). OFF by default (VLLM_MOET_ROUTER_TOPK_FUSED=1); kept for the
 #      MoE-sublayer megakernel, where the routing phase runs on all CTAs.
+#  36. The DSpark drafter's non-causal SWA metadata update in one launch (patch_vllm_swa_draft_build_sm120.py):
+#      update_draft_decode_metadata() ran, per SWA builder of the drafter (three) inside the drafter's graph,
+#      torch.ge(slot_mapping, 0), the token -> request binary search and the non-causal indices kernel - nine launches
+#      of 0.9-1.6 us per step. One Triton launch per builder computes the token's validity and request index (the same
+#      comparison, the same binary search) and runs the non-causal kernel's row body unchanged; tail programs write the
+#      validity past the draft tokens. Bit-identical by construction and by test. OFF by default: VLLM_MOET_SWA_DRAFT_BUILD=1.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -320,7 +326,7 @@
 #  VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH (21), VLLM_MOET_B12X_FC2_GROUPED (22), VLLM_MOET_DET_TOPK_PATCH (26),
 #  VLLM_MOET_B12X_MOE_FUSED_PATCH (27), VLLM_MOET_SPARSE_MLA_LDG_PATCH (28), VLLM_MOET_DFLASH_PREP_GROUPS_PATCH (30),
 #  VLLM_MOET_CANDIDATE_DET_TOPK_PATCH (31), VLLM_MOET_SWA_DECODE_BUILD_PATCH (32), VLLM_MOET_MOE_TOPKSUM_ADD_PATCH (33),
-#  VLLM_MOET_MOE_PREQUANT_PATCH (34).
+#  VLLM_MOET_MOE_PREQUANT_PATCH (34), VLLM_MOET_SWA_DRAFT_BUILD_PATCH (36).
 #
 # Build (repo root):
 #   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> .
@@ -579,6 +585,13 @@ ARG VLLM_MOET_MOE_PREQUANT_PATCH=1
 RUN if [ "$VLLM_MOET_MOE_PREQUANT_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_prequant_sm120.py \
     && python3 -c "import vllm.model_executor.layers.fused_moe.runner.moe_runner as r, flashinfer.experimental.b12x.moe._shared.kernels.w4a8_compact_micro as m; assert hasattr(r, '_moet_prequant_begin') and hasattr(r, '_moet_prequant_take') and hasattr(m, '_moet_prequant_take'); print('MoE rows quantization off the critical path patched')"; fi
 
+# 36. The DSpark drafter's non-causal SWA metadata update (validity + token -> request map + indices) in one Triton
+#     launch instead of three, per SWA builder inside the drafter's graph (runtime switch VLLM_MOET_SWA_DRAFT_BUILD=1,
+#     default off). GPU test: tools/dsv41_sm120/swa_draft_build/test_swa_draft_build_sm120.py.
+ARG VLLM_MOET_SWA_DRAFT_BUILD_PATCH=1
+RUN if [ "$VLLM_MOET_SWA_DRAFT_BUILD_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_swa_draft_build_sm120.py \
+    && python3 -c "import vllm.v1.attention.backends.mla.sparse_swa as s; assert hasattr(s, '_moet_swa_draft_build_kernel') and hasattr(s, '_moet_swa_draft_build'); print('SWA draft build in one launch patched')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads, its softmax / XV section with four barriers per tile and its merge with hoisted loads (runtime switch) + the drafter's input preparation in one launch for all draft KV groups (runtime switch) + the DSA candidate-block selection on the deterministic top-k (runtime switch) + the SWA builders' decode build in one launch (runtime switch) + the shared-expert add fused into the MoE top-k sum (runtime switch) + the MoE rows quantization on a side stream before the router (runtime switch)" \
@@ -610,4 +623,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.swa-decode-build="${VLLM_MOET_SWA_DECODE_BUILD_PATCH}" \
       com.vllm-moet.moe-topksum-add="${VLLM_MOET_MOE_TOPKSUM_ADD_PATCH}" \
       com.vllm-moet.moe-prequant="${VLLM_MOET_MOE_PREQUANT_PATCH}" \
+      com.vllm-moet.swa-draft-build="${VLLM_MOET_SWA_DRAFT_BUILD_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
