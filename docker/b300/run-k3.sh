@@ -20,8 +20,12 @@
 #                        DCP8 shards it, ~8x the tokens per GPU for long agent sessions. 1 = off.
 #            SPEC_TOKENS (0)         DSpark draft tokens (the recipe uses 7); needs DRAFT_DIR
 #            DRAFT_DIR ("")          Inferact/Kimi-K3-DSpark checkpoint
-#            DRAFT_ATTENTION_BACKEND (FLASHINFER_MLA)  the Inferact draft is MLA-native; RedHatAI's speculator is a
-#                        Qwen3-style GQA draft that FLASHINFER_MLA rejects: "" lets vLLM pick
+#            DRAFT_ATTENTION_BACKEND (FLASHINFER_MLA)  the Inferact draft is MLA-native; RedHatAI's speculator
+#                        (RedHatAI/Kimi-K3-speculator.dspark: 5 Qwen3-style GQA layers, sliding window 2048, trained
+#                        for k=8) is a GQA draft that FLASHINFER_MLA rejects: set "" to let vLLM pick (FLASHINFER).
+#                        It needs the Dockerfile.b300-k3 -r2 image (tools/k3_b300/patch_vllm_swa_draft_dcp.py) next
+#                        to DCP; its window-bounded KV leaves ~13% more pool than the Inferact draft at the same k
+#                        (24.48M vs 21.61M tokens at k=4, 2026-10-25) at the cost of 20 KV cache groups.
 #            DRAFT_QUANTIZATION ("")  quantization of the draft's weights, e.g. fp8 (online, from the BF16 checkpoint)
 #            DRAFT_KV_CACHE_DTYPE ("")  "" = the target's --kv-cache-dtype (fp8). The draft's MLA layers are K3's own
 #                        (models/kimi_k3/nvidia/mla.py), so DCP shards the draft KV like the target's.

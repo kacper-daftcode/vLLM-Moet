@@ -125,10 +125,56 @@ The MLA KV and the block-aligned KDA states came back from the NVMe slab through
 the answer and a continuation that depends on the restored KDA state; nothing was recomputed (TTFT 0.14 s vs
 1.33 s cold).
 
+## 3b. The other draft: RedHatAI/Kimi-K3-speculator.dspark (2026-10-25)
+
+The Inferact draft's 5 MLA layers attend over the whole context, so their KV is per token (+21 % on every block).
+RedHat's speculator is a 5-layer Qwen3-style GQA draft (16 KV heads x head_dim 64, 2 per GPU at TP8) with a
+**2048-token sliding window**, trained for k = 8 on the aux hidden states of layers 24/48/72/88/92: its KV is a
+`SlidingWindowSpec`, a few blocks per request whatever the context. v0.32.0 cannot start it next to the DCP-sharded
+MLA target; `tools/k3_b300/patch_vllm_swa_draft_dcp.py` (image `-r2`) fixes the three stops, in order:
+
+1. `resolve_kv_cache_layout` sees a sharded target and a replicated draft with different page sizes and demands a
+   block-outer layout (BLHNC), which TOKENSPEED_MLA cannot split into its kernel blocks ("packed 1664-token KV cache
+   blocks cannot be split into"). The hybrid grouping pads the draft's page to the MLA page anyway, so the patch
+   decides the requirement on the unified page sizes: one page size, layer-compact LBHNC, the split as today.
+2. The target's CUDA graph support was computed over every attention group including the draft's; FlashInfer under
+   the target's config (DCP 8) answers UNIFORM_SINGLE_TOKEN_DECODE and the target's graphs collapse to NONE. The
+   patch asks the target's layers only (the draft has its own graph manager and a DCP 1 config).
+3. The sliding-window layer picked 64-token blocks because FlashInfer advertises its trtllm-gen pages (128..1024) from
+   the *current* model config's head ratio (the MLA target's: 1). Each 64-token block then padded to the 958 KB MLA
+   page cost ~290 admission blocks (1.4 GB) per request (`GPU KV cache size: 15,624,648`) and `--prefix-match-unit
+   128` rejected the 64-token group. The patch judges the trtllm-gen pages on the layer's own heads: 1024-token blocks,
+   13 admission blocks, 2-3 held in decode.
+
+Layer groups become 24 MLA / 69 KDA / 5 SWA -> group size 5: 5 MLA groups (1 padding layer), 14 KDA groups (1), one
+SWA group - **20 KV cache groups** of 5 pages (4.79 MB blocks), 1 + 1 padding layers instead of 18.
+
+Same host, same flags (RecoverSSM, fp8 KV, prefix caching, disk offload), one stream, greedy, two reps each; `code`
+is the Fraser prompt, `prose` a 1500-word essay, `math` a number-theory proof at `reasoning_effort: high`, `longctx`
+a 30K-token design document followed by a coding task (`tools/k3_b300/accept_suite.sh`):
+
+| draft, k | GPU KV tokens | code: tok/s (accepted) | prose | math | longctx 30K | steps/s (code) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Inferact k = 4 (served) | 21,614,964 | 205.2 (3.33); 219.6 (3.34) in §3 | 142.4 (2.16) | 215.0 (3.27) | 244.1 (3.74) | 61.7-65.8 |
+| **RedHat k = 4** | **24,482,869** | 230.3 (3.76) | 162.5 (2.48) | 213.6 (3.27) | 265.1 (4.08) | 61.4 |
+| Inferact k = 7 | 19,885,043 | 220.6 (3.96) | 130.5 (2.19) | 215.0 (3.62) | 265.2 (4.51) | 55.6 |
+| **RedHat k = 8** | 22,102,814 | 236.3 (4.42) | 145.2 (2.53) | 215.5 (3.79) | 299.5 (5.29) | 53.5 |
+
+Per-position acceptance, code: RedHat k = 4 0.89 / 0.75 / 0.61 / 0.50 vs Inferact k = 4 0.83 / 0.63 / 0.49 / 0.37;
+longctx: RedHat k = 4 0.93 / 0.82 / 0.72 / 0.62 vs Inferact 0.90 / 0.75 / 0.61 / 0.48; RedHat k = 8
+0.91 / 0.79 / 0.65 / 0.53 / 0.46 / 0.38 / 0.31 / 0.26. The 2048-token window did not hurt the 30K-context case; the
+RedHat draft accepts more at every position on every prompt type except `math`, where the two tie at k = 4, and its
+step is marginally slower at the same k (5 dense Qwen3 layers plus the 20 groups' bookkeeping). Net per stream at
+k = 4: code +12 %, prose +14 %, math 0 %, longctx +9 %, with 13 % more KV pool.
+
+Not yet done for RedHat: GSM8K / needle / offload round trip, the 128-session capacity probe (20 groups cost the
+scheduler per step), and `--mamba-ssm-cache-dtype`. Those gate a switch of the served draft; the KV and acceptance
+numbers above are the case for running them.
+
 ## 4. What is left, and why it is not patched here
 
-* **The 5 draft layers** (+21 % per block): the draft attends over the whole context, so its KV is per token. Only a
-  smaller draft KV format (FP4 latents) would shrink it; FLASHINFER_MLA has no such path on B300.
+* **The 5 draft layers** (+21 % per block) with the Inferact draft: it attends over the whole context, so its KV is
+  per token. The RedHat draft (§3b) is the way around it: window-bounded draft KV, +13 % pool at k = 4.
 * **18 padding layers**: with 29 MLA and 69 KDA layers every uniform group size pads somewhere, and the cheapest
   place is the KDA side (its blocks are per request, not per token). Removing it needs a second block pool with its
   own stride for the short group - a change across `BlockPool`, the coordinator and the worker's tensor layout for
