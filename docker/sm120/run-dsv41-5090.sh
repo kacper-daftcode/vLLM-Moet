@@ -23,6 +23,10 @@
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
+#            ENGRAM_THP (0)          1 = --engram-config {"use_thp":true}: vLLM backs the Engram tables with an exact-size mmap
+#                        (+ MADV_HUGEPAGE, prefaulted, cudaHostRegister) instead of torch's pinned allocator, which rounds
+#                        each 24.6 GB table up to 32 GiB (10-25: 2 tables x 4 ranks = ~80 GB of host RAM lost); needs free,
+#                        unfragmented memory at boot (DROP_CACHES=1 on the window script)
 #            PREFIX_CACHE (1)        0 = --no-enable-prefix-caching (measurements: repeated / shared-prefix prompts would hit
 #                        vLLM's prefix cache and skip the prefill)
 #            PROMOTE_WINDOW (12)     promotion admission: 0 = every miss; W > 0 = only an expert whose previous miss was <= W
@@ -72,7 +76,9 @@ POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
 PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
 HOST_EMPTY_CACHE="${HOST_EMPTY_CACHE:-0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
+ENGRAM_THP="${ENGRAM_THP:-0}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+[[ "$ENGRAM_THP" == "1" ]] && EXTRA_ARGS="--engram-config {\"use_thp\":true} $EXTRA_ARGS"
 [[ "$PREFIX_CACHE" == "1" ]] || EXTRA_ARGS="--no-enable-prefix-caching $EXTRA_ARGS"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 TABLES="$REPO/internal/dsv41-5090-cpu/parity"
