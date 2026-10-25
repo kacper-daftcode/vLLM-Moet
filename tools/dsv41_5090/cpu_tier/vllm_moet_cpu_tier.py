@@ -349,7 +349,39 @@ def _create_tier_if_needed(device: torch.device):
     atexit.register(_shutdown)
     _log(f"tier started: {n_layers} layers x {S.E} experts, slots {[c.R for c in S.layers][:3]}..., resident "
          f"{[len(c.residents) for c in S.layers][:3]}..., records {n_rec}, pool CPUs {cpus[0]}-{cpus[-1]} ({len(cpus)} threads), "
-         f"dispatcher {layout['dispatcher']}, {pin_msg}; layers {[c.name for c in S.layers]}")
+         f"dispatcher {layout['dispatcher']}, {pin_msg}; promotion window {S.manager.window} steps; layers {[c.name for c in S.layers]}")
+    _host_memory_report("after the weights")
+
+
+def _host_memory_report(when: str) -> None:
+    """The RAM item: torch's pinned caching host allocator keeps the loader's staging blocks (Shmem outside our
+    store + Engram); VLLM_MOET_CPU_TIER_HOST_EMPTY_CACHE=1 releases them (torch._C._host_emptyCache) and logs the
+    effect on MemAvailable."""
+    def avail_gb() -> float:
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 1048576
+        except OSError:
+            pass
+        return float("nan")
+    stats = ""
+    try:
+        hs = torch.cuda.host_memory_stats()
+        res = hs.get("reserved_bytes.all.current", 0)
+        alloc = hs.get("allocated_bytes.all.current", 0)
+        stats = f"torch pinned host allocator: reserved {res / 2**30:.1f} GiB, allocated {alloc / 2**30:.1f} GiB; "
+    except Exception as ex:  # older torch
+        stats = f"torch host_memory_stats unavailable ({type(ex).__name__}); "
+    msg = f"host memory {when}: {stats}MemAvailable {avail_gb():.1f} GB"
+    if os.environ.get("VLLM_MOET_CPU_TIER_HOST_EMPTY_CACHE", "0") == "1":
+        try:
+            torch.cuda.synchronize()
+            torch._C._host_emptyCache()
+            msg += f" -> after _host_emptyCache: MemAvailable {avail_gb():.1f} GB"
+        except Exception as ex:
+            msg += f" (_host_emptyCache failed: {ex!r})"
+    _log(msg)
 
 
 # ---------------------------------------------------------------------------------------------------------------

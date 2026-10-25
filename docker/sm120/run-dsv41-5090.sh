@@ -25,6 +25,12 @@
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
 #            PREFIX_CACHE (1)        0 = --no-enable-prefix-caching (measurements: repeated / shared-prefix prompts would hit
 #                        vLLM's prefix cache and skip the prefill)
+#            PROMOTE_WINDOW (0)      promotion admission: 0 = every miss; W > 0 = only an expert whose previous miss was <= W
+#                        steps ago (the traces: W = 8-16 keeps the hit rate within 0.6 pt at a quarter of the promotions / DMA)
+#            POOL_SPIN_HOT (1)       the kernel pool's spin does ALU work instead of `pause` (keeps the cores' clock up between a
+#                        step's jobs: +3 % decode on 10-25); 0 = pause
+#            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded (the RAM item: the loader's
+#                        pinned staging blocks), with MemAvailable logged before / after
 #            POOL_SPIN_US ("")       the kernel pool's spin before it sleeps on the futex (the pool's default 500; the cores
 #                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins through a
 #                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever)
@@ -62,6 +68,9 @@ DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
 POOL_SPIN_US="${POOL_SPIN_US:-}"
+POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
+PROMOTE_WINDOW="${PROMOTE_WINDOW:-0}"
+HOST_EMPTY_CACHE="${HOST_EMPTY_CACHE:-0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 [[ "$PREFIX_CACHE" == "1" ]] || EXTRA_ARGS="--no-enable-prefix-caching $EXTRA_ARGS"
@@ -78,7 +87,8 @@ TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM
           -e VLLM_MOET_CPU_TIER_TIMEOUT_MS="$TIMEOUT_MS" -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY="$LOG_EVERY"
           -e VLLM_MOET_CPU_TIER_DEBUG="$TIER_DEBUG" -e VLLM_MOET_DET_TOPK=1
           -e VLLM_MOET_CPU_TIER_SCRATCH="$SCRATCH" -e VLLM_MOET_CPU_TIER_DEBUG_COMPACT="$DEBUG_COMPACT"
-          -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL="$DEBUG_PREFILL")
+          -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL="$DEBUG_PREFILL" -e VLLM_MOET_CPU_TIER_PROMOTE_WINDOW="$PROMOTE_WINDOW"
+          -e VLLM_MOET_CPU_TIER_HOST_EMPTY_CACHE="$HOST_EMPTY_CACHE" -e MOE_B12X_POOL_SPIN_HOT="$POOL_SPIN_HOT")
 MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$REPO:/repo:ro" -v "$TABLES:/parity:ro" -v "$STORE:/store:ro")
 # the store may be a directory of symlinks into another store (the mini-real test): mount the packs root too
 MOUNTS+=(-v /mnt/nvme/packs:/mnt/nvme/packs:ro)

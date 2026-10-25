@@ -107,8 +107,11 @@ class PlacementManager:
         self.map_events_last: list[torch.cuda.Event] = []  # M of the last after_launch
         self.map_events_prev: list[torch.cuda.Event] = []  # M of the one before
         self.last_promoted: dict[int, set] = {}            # layer -> experts promoted by the last after_launch
-        self.stats = dict(promotions=0, skipped_no_victim=0, skipped_already=0)
+        self.stats = dict(promotions=0, skipped_no_victim=0, skipped_already=0, skipped_window=0)
         self.batched = hasattr(ext, "promote_batch")
+        # admission window (steps; 0 = promote on every miss): the previous miss step per (layer, expert)
+        self.window = int(os.environ.get("VLLM_MOET_CPU_TIER_PROMOTE_WINDOW", "0"))
+        self.last_miss = [np.full(P.E, -10 ** 9, dtype=np.int64) for P in pools] if self.window > 0 else None
 
     def _repack_into(self, P: ResidentPool, layer: int, e: int, s: int) -> None:
         P.staging.copy_(self.records_of(layer, e), non_blocking=True)
@@ -142,7 +145,11 @@ class PlacementManager:
             self.pools[layer].note_use(ids, int(step))
 
     def plan(self, misses: np.ndarray) -> dict[int, list[tuple[int, int, int, int]]]:
-        """Host side: per layer the promotions (expert, slot, victim, miss_step) this call makes, mirrors updated."""
+        """Host side: per layer the promotions (expert, slot, victim, miss_step) this call makes, mirrors updated.
+        Admission (self.window > 0): a missed expert is promoted only if its previous miss in this layer was at most
+        `window` steps ago - the second miss within the window. On the routing traces (routing/promo_sim.py, 10-25)
+        a window of 8-16 steps keeps the hit rate within 0.6 pt of promote-on-every-miss at a quarter of the
+        promotions (53 -> 12-15 per step), i.e. a quarter of the H2D DMA that slows the CPU kernel in situ."""
         plans: dict[int, list[tuple[int, int, int, int]]] = {}
         if len(misses) == 0:
             return plans
@@ -156,6 +163,14 @@ class PlacementManager:
             experts = experts[order]
             miss_step = {int(e): int(rows[rows[:, 2] == e, 0].max()) for e in experts}
             protect = set(int(e) for e in experts)
+            if self.window > 0:
+                lm = self.last_miss[int(layer)]
+                ex = experts.astype(np.int64)
+                steps = np.array([miss_step[int(e)] for e in experts], dtype=np.int64)
+                admitted = (steps - lm[ex]) <= self.window
+                lm[ex] = steps
+                self.stats["skipped_window"] += int((~admitted).sum())
+                experts = experts[admitted]
             out = []
             for e in experts:
                 e = int(e)
