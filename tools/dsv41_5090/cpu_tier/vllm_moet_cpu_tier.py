@@ -338,6 +338,9 @@ def _create_tier_if_needed(device: torch.device):
                 _log(f"exit: steps {S.step}, tier steps {tot['steps']} pairs {tot['pairs']} busy {tot['busy_ns'] / 1e9:.1f} s "
                      f"errors {tot['errors']}; pairs all {S.kpi['pairs_all']} cpu {S.kpi['pairs_cpu']} promotions {S.kpi['promotions']}"
                      f"{_debug_compact_summary()}")
+                if S.scratch is not None:
+                    _log(f"exit: scratch pool {S.scratch.calls} calls, {S.scratch.experts_streamed} experts streamed in "
+                         f"{S.scratch.rounds} rounds{S.scratch.timing_summary()}")
             S.tier.stop()
             S.tier.close()  # frees the mapped mailboxes before the driver tears the process down
         except Exception:
@@ -501,6 +504,28 @@ class _Scratch:
         self.rounds = 0
         self.experts_streamed = 0
         self.calls = 0
+        self.pending: list = []        # (ev0, ev1, T, missing) of calls whose events may not have completed yet
+        self.timed: dict = {}          # T -> [calls, ms, missing experts] of completed calls
+
+    def timing_summary(self) -> str:
+        """Folds the completed events into per-token-count totals; returns a summary (no host sync)."""
+        keep = []
+        for ev0, ev1, T, n_missing in self.pending:
+            if ev1.query():
+                acc = self.timed.setdefault(T, [0, 0.0, 0])
+                acc[0] += 1
+                acc[1] += ev0.elapsed_time(ev1)
+                acc[2] += n_missing
+            else:
+                keep.append((ev0, ev1, T, n_missing))
+        self.pending = keep[-64:]
+        if not self.timed:
+            return ""
+        parts = []
+        for T in sorted(self.timed):
+            calls, ms, n_missing = self.timed[T]
+            parts.append(f"T {T}: {calls} calls, {ms / calls:.1f} ms per call, {ms / max(1, n_missing):.2f} ms per missing expert")
+        return "; streaming (stage + repack + extra runs): " + " | ".join(parts)
 
     def plan(self, T: int, K: int, nbytes_fn):
         key = (T, K)
@@ -583,6 +608,10 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
     plan, (buf, tmp) = sc.plan(T, K, scratch_nbytes)
     weights = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32)
     weights = weights.contiguous()
+    # the streaming's cost per call, from CUDA events read later (no host sync here): stage + repack + the extra runs
+    ev0 = torch.cuda.Event(enable_timing=True)
+    ev1 = torch.cuda.Event(enable_timing=True)
+    ev0.record()
     for r0 in range(0, len(missing), sc.n):
         rnd = missing[r0:r0 + sc.n]
         ptrs = [_record_ptr(li, e) for e in rnd]
@@ -596,9 +625,12 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
         output.add_(tmp)
         sc.rounds += 1
         sc.experts_streamed += len(rnd)
+    ev1.record()
+    sc.pending.append((ev0, ev1, T, len(missing)))
     if sc.calls <= 3 or sc.calls % 200 == 0:
         _log(f"prefill call {sc.calls} (layer {li}, {T} tokens): {len(missing)} missing experts in "
-             f"{(len(missing) + sc.n - 1) // sc.n} rounds; totals {sc.experts_streamed} experts / {sc.rounds} rounds")
+             f"{(len(missing) + sc.n - 1) // sc.n} rounds; totals {sc.experts_streamed} experts / {sc.rounds} rounds"
+             f"{sc.timing_summary()}")
     if DEBUG_PREFILL:
         _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output, run_plan, plan, buf, T)
 

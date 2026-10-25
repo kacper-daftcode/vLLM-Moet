@@ -204,6 +204,8 @@ struct XPrep {
 // byte and the max field exponent of the nonzero codes (the alignment bound)
 struct YPrep {
     int32_t x32[K2];
+    int16_t hi[K2];     // the units split as FC1's operand (9-bit halves): the VNNI dot when no product is truncated
+    int16_t lo[K2];
     int16_t fexp[K2];   // field exponent per k (-1000 for zero codes)
     uint8_t sa[B2];
     int8_t ea_max[B2];
@@ -349,7 +351,7 @@ struct Pool {
     Consts C;
     // statistics (per worker, merged on request): FC2 blocks, FC2 blocks through the general path; tid 0's cycle
     // counts per phase (prepare, FC1, activation, FC2; barrier waits included)
-    struct alignas(64) Stats { int64_t fc2_blocks = 0, fc2_general = 0, cyc[4] = {0, 0, 0, 0}; } stats[MAX_THREADS];
+    struct alignas(64) Stats { int64_t fc2_blocks = 0, fc2_general = 0, cyc[4] = {0, 0, 0, 0}, fc2_q0 = 0; } stats[MAX_THREADS];
 };
 
 static inline int64_t rdtsc_now() { return (int64_t)__rdtsc(); }
@@ -434,6 +436,7 @@ static void act_group(const uint16_t* prow, int grp, YPrep& Y, uint8_t* q_out) {
         const uint8_t code = f32_to_e4m3_rne(inv * y[i]);
         if (q_out) q_out[j0 + i] = code;
         Y.x32[j0 + i] = g_e4m3_units[code];
+        split_units(Y.x32[j0 + i], Y.hi[j0 + i], Y.lo[j0 + i]);
         const int fe = g_e4m3_fexp[code];
         Y.fexp[j0 + i] = (int16_t)fe;
         ea_max = std::max(ea_max, fe);
@@ -449,14 +452,12 @@ static void act_group(const uint16_t* prow, int grp, YPrep& Y, uint8_t* q_out) {
 // rare, so that branch recomputes M exactly; the products' truncation is unconditional and branch-free, q = 0 being
 // the identity). The truncated addends are summed exactly in fp64 and truncated to fp32.
 struct Fc2Block {
-    __m512i wlo, whi;  // the block's 32 e2m1 units as int32 lanes
+    __m512i w16;       // the block's 32 e2m1 units as int16 lanes (the VNNI dot; the truncating path widens them)
 };
 
 static inline Fc2Block fc2_decode(const uint8_t* nib16, const Consts& C) {
-    const __m512i w16 = decode_block_units(nib16, C);
     Fc2Block B;
-    B.wlo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(w16));
-    B.whi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(w16, 1));
+    B.w16 = decode_block_units(nib16, C);
     return B;
 }
 
@@ -484,52 +485,88 @@ static inline __m128i reduce4_epi32(__m512i v0, __m512i v1, __m512i v2, __m512i 
     return _mm_add_epi32(_mm256_castsi256_si128(h), _mm256_extracti128_si256(h, 1));
 }
 
-// one block of the chains of four rows (acc4 = their accumulators) for one token
+// one block of the chains of four rows (acc4 = their accumulators) for one token.
+// The alignment prologue runs on the four lanes at once (the exponent from the bits, so MXCSR does not matter):
+// q = max(e_acc - sc - 15, 0) where e_acc >= bound = ea_max + 2 + sc, else 0; the rare lanes (acc below a quarter of
+// the largest possible product: bound > e_acc + 2) and denormal accumulators take the scalar path below, which is
+// the original code for all four lanes - the fast path is that code without its data-dependent branches (real
+// weights mispredict them in ~7 % of the row-blocks; the bench's uniform nibbles in 3.6 %).
 static inline __m128 fc2_step4(__m128 acc4, const Fc2Block* W, const uint8_t* const* nib16, const YPrep& Y, int b,
-                               const int32_t* sb4, const Consts& C, int64_t& n_rare) {
-    alignas(16) float accs[4], acc_t[4];
-    alignas(16) int32_t sc4[4];
-    int q[4];
-    _mm_store_ps(accs, acc4);
+                               const int32_t* sb4, const Consts& C, Pool::Stats& st) {
+    int64_t& n_rare = st.fc2_general;
     const int sa = Y.sa[b];
     const int ea = Y.ea_max[b];
-    for (int r = 0; r < 4; ++r) {
-        const int sc = sa + sb4[r] - 254;
-        sc4[r] = sc;
-        q[r] = 0;
-        acc_t[r] = accs[r];
-        if (accs[r] != 0.0f) {
-            const int e_acc = f32_exp(accs[r]);
-            const int bound = ea + 2 + sc;
-            if (e_acc >= bound) {
-                q[r] = std::max(e_acc - sc - 15, 0);
-            } else if (bound > e_acc + 2) {
-                ++n_rare;
-                const int M = fc2_block_max_fexp(nib16[r], Y, b, sc, C);
-                if (M > e_acc + 2) acc_t[r] = trunc_below(accs[r], M - (WINDOW - 1));
+    const __m128i sc4 = _mm_add_epi32(_mm_load_si128((const __m128i*)sb4), _mm_set1_epi32(sa - 254));
+    const __m128i bits = _mm_and_si128(_mm_castps_si128(acc4), _mm_set1_epi32(0x7FFFFFFF));
+    const __mmask8 nz = _mm_cmpneq_epi32_mask(bits, _mm_setzero_si128());
+    const __m128i efield = _mm_srli_epi32(bits, 23);
+    const __mmask8 denorm = _mm_mask_cmpeq_epi32_mask(nz, efield, _mm_setzero_si128());
+    const __m128i e_acc = _mm_sub_epi32(efield, _mm_set1_epi32(127));
+    const __m128i bound = _mm_add_epi32(sc4, _mm_set1_epi32(ea + 2));
+    const __mmask8 fast = _mm_mask_cmpge_epi32_mask(nz, e_acc, bound);
+    __m128i q4 = _mm_maskz_max_epi32(fast, _mm_sub_epi32(_mm_sub_epi32(e_acc, sc4), _mm_set1_epi32(15)), _mm_setzero_si128());
+    const __mmask8 rare = _mm_mask_cmpgt_epi32_mask((__mmask8)(nz & (__mmask8)~fast), bound, _mm_add_epi32(e_acc, _mm_set1_epi32(2)));
+    __m128 acc_t4 = acc4;
+    unsigned slow = (unsigned)(rare | denorm) & 0xFu;
+    if (__builtin_expect(slow != 0, 0)) {
+        // the original per-row logic, for the flagged lanes only (the vector results of the other lanes stand; those
+        // lanes' q is 0 already: a rare or denormal lane is never "fast"). Results go back by masked broadcasts -
+        // no scalar stores reloaded as a vector (a store-forwarding stall per slow step).
+        alignas(16) float accs[4];
+        alignas(16) int32_t sc_s[4];
+        _mm_store_ps(accs, acc4);
+        _mm_store_si128((__m128i*)sc_s, sc4);
+        do {
+            const int r = __builtin_ctz(slow);
+            slow &= slow - 1;
+            const int sc = sc_s[r];
+            const float a = accs[r];
+            if (a != 0.0f) {
+                const int e_acc_s = f32_exp(a);
+                const int bound_s = ea + 2 + sc;
+                if (e_acc_s >= bound_s) {
+                    const int q = std::max(e_acc_s - sc - 15, 0);
+                    if (q) q4 = _mm_mask_mov_epi32(q4, (__mmask8)(1u << r), _mm_set1_epi32(q));
+                } else if (bound_s > e_acc_s + 2) {
+                    ++n_rare;
+                    const int M = fc2_block_max_fexp(nib16[r], Y, b, sc, C);
+                    if (M > e_acc_s + 2)
+                        acc_t4 = _mm_mask_mov_ps(acc_t4, (__mmask8)(1u << r), _mm_set1_ps(trunc_below(a, M - (WINDOW - 1))));
+                }
             }
-        }
+        } while (slow);
     }
-    const __m512i xlo = _mm512_loadu_si512((const void*)(Y.x32 + b * 32));
-    const __m512i xhi = _mm512_loadu_si512((const void*)(Y.x32 + b * 32 + 16));
     __m512i t[4];
-    for (int r = 0; r < 4; ++r) {
-        const __m512i pa = _mm512_mullo_epi32(W[r].wlo, xlo);
-        const __m512i pb = _mm512_mullo_epi32(W[r].whi, xhi);
-        const __m512i cnt = _mm512_set1_epi32(std::min(q[r], 31));
-        const __mmask16 na = _mm512_cmplt_epi32_mask(pa, _mm512_setzero_si512());
-        const __mmask16 nb = _mm512_cmplt_epi32_mask(pb, _mm512_setzero_si512());
-        __m512i ta = _mm512_sllv_epi32(_mm512_srlv_epi32(_mm512_abs_epi32(pa), cnt), cnt);
-        __m512i tb = _mm512_sllv_epi32(_mm512_srlv_epi32(_mm512_abs_epi32(pb), cnt), cnt);
-        ta = _mm512_mask_sub_epi32(ta, na, _mm512_setzero_si512(), ta);
-        tb = _mm512_mask_sub_epi32(tb, nb, _mm512_setzero_si512(), tb);
-        t[r] = _mm512_add_epi32(ta, tb);
+    if (__builtin_expect(_mm_test_all_zeros(q4, q4), 1)) {
+        // no lane truncates a product (real weights: ~100 % of the steps; the bench's uniform nibbles: 23 %): the
+        // block dot is the plain integer sum of the products = FC1's exact VNNI dot on the 9-bit halves
+        // (sum_k w_k * (hi_k * 512 + lo_k), every partial inside int32), the same integer as the truncating path's
+        ++st.fc2_q0;
+        for (int r = 0; r < 4; ++r) t[r] = dot_lanes(W[r].w16, Y.hi + b * 32, Y.lo + b * 32);
+    } else {
+        alignas(16) int32_t cnt_s[4];
+        _mm_store_si128((__m128i*)cnt_s, _mm_min_epi32(q4, _mm_set1_epi32(31)));
+        const __m512i xlo = _mm512_loadu_si512((const void*)(Y.x32 + b * 32));
+        const __m512i xhi = _mm512_loadu_si512((const void*)(Y.x32 + b * 32 + 16));
+        for (int r = 0; r < 4; ++r) {
+            const __m512i wlo = _mm512_cvtepi16_epi32(_mm512_castsi512_si256(W[r].w16));
+            const __m512i whi = _mm512_cvtepi16_epi32(_mm512_extracti64x4_epi64(W[r].w16, 1));
+            const __m512i pa = _mm512_mullo_epi32(wlo, xlo);
+            const __m512i pb = _mm512_mullo_epi32(whi, xhi);
+            const __m512i cnt = _mm512_set1_epi32(cnt_s[r]);
+            const __mmask16 na = _mm512_cmplt_epi32_mask(pa, _mm512_setzero_si512());
+            const __mmask16 nb = _mm512_cmplt_epi32_mask(pb, _mm512_setzero_si512());
+            __m512i ta = _mm512_sllv_epi32(_mm512_srlv_epi32(_mm512_abs_epi32(pa), cnt), cnt);
+            __m512i tb = _mm512_sllv_epi32(_mm512_srlv_epi32(_mm512_abs_epi32(pb), cnt), cnt);
+            ta = _mm512_mask_sub_epi32(ta, na, _mm512_setzero_si512(), ta);
+            tb = _mm512_mask_sub_epi32(tb, nb, _mm512_setzero_si512(), tb);
+            t[r] = _mm512_add_epi32(ta, tb);
+        }
     }
     const __m128i dots = reduce4_epi32(t[0], t[1], t[2], t[3]);
     // 2^(sc - 10) per row as doubles: exponent field 1023 + sc - 10
-    const __m256i eb = _mm256_slli_epi64(_mm256_add_epi64(_mm256_cvtepi32_epi64(_mm_load_si128((const __m128i*)sc4)),
-                                                          _mm256_set1_epi64x(1013)), 52);
-    const __m256d total = _mm256_fmadd_pd(_mm256_cvtepi32_pd(dots), _mm256_castsi256_pd(eb), _mm256_cvtps_pd(_mm_load_ps(acc_t)));
+    const __m256i eb = _mm256_slli_epi64(_mm256_add_epi64(_mm256_cvtepi32_epi64(sc4), _mm256_set1_epi64x(1013)), 52);
+    const __m256d total = _mm256_fmadd_pd(_mm256_cvtepi32_pd(dots), _mm256_castsi256_pd(eb), _mm256_cvtps_pd(acc_t4));
     return _mm256_castps256_ps128(_mm512_cvt_roundpd_ps(_mm512_castpd256_pd512(total), _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC));
 }
 
@@ -557,8 +594,8 @@ static void fc2_rows(const uint8_t* rec, int r0, int r1, const YPrep* const* Y, 
             for (int b = 0; b < B2; ++b) {
                 const uint8_t* nb0[4] = {nib[0] + b * 16, nib[1] + b * 16, nib[2] + b * 16, nib[3] + b * 16};
                 const uint8_t* nb1[4] = {nib[4] + b * 16, nib[5] + b * 16, nib[6] + b * 16, nib[7] + b * 16};
-                a0 = fc2_step4(a0, W[b], nb0, Yt, b, sb[b], C, st.fc2_general);
-                a1 = fc2_step4(a1, W[b] + 4, nb1, Yt, b, sb[b] + 4, C, st.fc2_general);
+                a0 = fc2_step4(a0, W[b], nb0, Yt, b, sb[b], C, st);
+                a1 = fc2_step4(a1, W[b] + 4, nb1, Yt, b, sb[b] + 4, C, st);
             }
             alignas(32) float accs[RG];
             _mm_store_ps(accs, a0);
@@ -884,11 +921,12 @@ int moe_b12x_experts_forward(void* pool, int n_experts, const uint8_t* const* re
 void moe_b12x_pool_stats(void* pool, int64_t* out, int reset) {
     Pool* P = (Pool*)pool;
     if (!P) return;
-    int64_t blocks = 0, general = 0;
-    for (int t = 0; t < P->nthreads; ++t) { blocks += P->stats[t].fc2_blocks; general += P->stats[t].fc2_general; }
+    int64_t blocks = 0, general = 0, q0 = 0;
+    for (int t = 0; t < P->nthreads; ++t) { blocks += P->stats[t].fc2_blocks; general += P->stats[t].fc2_general; q0 += P->stats[t].fc2_q0; }
     out[0] = blocks;
     out[1] = general;
     for (int i = 0; i < 4; ++i) out[2 + i] = P->stats[0].cyc[i];
+    out[6] = q0 * 4;   // in row-blocks, like out[0] / out[1]
     if (reset)
         for (int t = 0; t < P->nthreads; ++t) P->stats[t] = Pool::Stats();
 }

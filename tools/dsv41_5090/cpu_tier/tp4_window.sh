@@ -78,6 +78,11 @@ grep -E "moet-cpu-tier\] rank 0: (store|tier started|layer language_model.model.
 nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader | tee -a "$SUMMARY"
 ps -eo pid,rss,comm,args | grep -E "VLLM|EngineCore|vllm" | grep -v grep | awk '{printf "  pid %s rss %.1f GB %s\n", $1, $2/1048576, $3}' | tee -a "$SUMMARY"
 free -g | head -2 | tee -a "$SUMMARY"
+# where the host RAM goes (the RAM budget is an open item): meminfo + the workers' smaps_rollup
+grep -E "^(MemAvailable|Shmem|AnonPages|Mapped|Cached|Unevictable|Mlocked|KernelStack|PageTables|VmallocUsed):" /proc/meminfo | awk '{printf "  %s %.1f GB\n", $1, $2/1048576}' | tr '\n' ' ' | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"
+for p in $(pgrep -f "VLLM::Worker_TP" | head -4); do
+  awk -v p="$p" '/^(Rss|Pss|Shared_Clean|Shared_Dirty|Private_Dirty|Anonymous|Shmem.*Rss|Locked):/ {printf "%s %.1f GB  ", $1, $2/1048576} END {print "(pid " p ")"}' "/proc/$p/smaps_rollup" 2>/dev/null | tee -a "$SUMMARY"
+done
 
 # 3. measurements: the identity client (10 short prompts x 48 tokens, saved), then decode tok/s on longer generations
 MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
@@ -113,7 +118,7 @@ if [[ -n "${TTFT_LENGTHS:-}" ]]; then
   $PY "$REPO/tools/dsv41_5090/cpu_tier/ttft_probe.py" --port "$PORT" --model "$MODEL" --lengths "$TTFT_LENGTHS" \
     --gen "${TTFT_GEN:-64}" --repeat "${TTFT_REPEAT:-2}" --out "/tmp/ds41-hyb-$TAG-ttft.json" 2>&1 | tee -a "$SUMMARY"
   docker logs "$NAME" > "$LOG" 2>&1
-  grep -E "moet-cpu-tier\] rank 0: (prefill call|scratch pool|DEBUG prefill|[0-9]+-token MoE call)" "$LOG" | tail -8 | cut -c1-300 | tee -a "$SUMMARY"
+  grep -E "moet-cpu-tier\] rank 0: (prefill call|scratch pool|DEBUG prefill|[0-9]+-token MoE call)" "$LOG" | tail -8 | cut -c1-600 | tee -a "$SUMMARY"
   grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
 fi
 grep -c "moet-cpu-tier\] rank 0: WARNING" "$LOG" | xargs -I{} note "tier warnings in the log: {}"

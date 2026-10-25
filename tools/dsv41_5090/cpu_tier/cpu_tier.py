@@ -260,6 +260,6 @@ class CpuTier:
     def pool_stats(self, reset: bool = True) -> dict:
         """The kernel pool's counters: FC2 blocks (all / general path) and worker 0's TSC cycles per phase
         (prepare, FC1, activation, FC2; barrier waits included)."""
-        buf = (ctypes.c_int64 * 6)()
+        buf = (ctypes.c_int64 * 7)()
         self.lib.cpu_tier_pool_stats(self.handle, buf, 1 if reset else 0)
-        return dict(fc2_blocks=buf[0], fc2_general=buf[1], cyc_prepare=buf[2], cyc_fc1=buf[3], cyc_act=buf[4], cyc_fc2=buf[5])
+        return dict(fc2_blocks=buf[0], fc2_general=buf[1], cyc_prepare=buf[2], cyc_fc1=buf[3], cyc_act=buf[4], cyc_fc2=buf[5], fc2_q0=buf[6])

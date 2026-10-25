@@ -23,6 +23,9 @@
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
+#            POOL_SPIN_US ("")       the kernel pool's spin before it sleeps on the futex (the pool's default 500; the cores
+#                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins through a
+#                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever)
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
@@ -56,6 +59,7 @@ DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
 DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
+POOL_SPIN_US="${POOL_SPIN_US:-}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 TABLES="$REPO/internal/dsv41-5090-cpu/parity"
@@ -97,6 +101,7 @@ docker run -d --name "$NAME" --restart no \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
   ${NCCL_CHANNELS:+-e NCCL_MIN_NCHANNELS=$NCCL_CHANNELS -e NCCL_MAX_NCHANNELS=$NCCL_CHANNELS} \
+  ${POOL_SPIN_US:+-e MOE_B12X_POOL_SPIN_US=$POOL_SPIN_US} \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-5}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
