@@ -231,6 +231,7 @@ Quality release **`v2026.07.30-quality`** — dataset evals vs the committed **n
 | `Dockerfile.sm120-dsv41-nightly`, `tools/dsv41_sm120/`, `docker/sm120/run-dsv41.sh` | DeepSeek-V4.1-Flash: the served image, its patchers, kernels and tests, the launcher (`docker/sm120/` also holds its cron scripts) |
 | `Dockerfile.sm120-dsv41` | the same on the recipe's `deepseekv41-flash-0909` image (served until 2026-09-23) |
 | `Dockerfile.sm120-qwen38`, `tools/qwen38_sm120/`, `docker/sm120/run-qwen38.sh` | Qwen3.8-Flash-Next-FP8 |
+| `Dockerfile.b300-k3`, `tools/k3_b300/`, `docker/b300/run-k3.sh` | Kimi-K3 + DSpark on 8x B300 (official v0.32.0 image + the K3 RecoverSSM patch that gives DSpark its KV cache back; `docs/k3-b300-dspark-kv.md`) |
 | `tools/sm120_perf/` | profiling and benchmark scripts |
 | `patch/`, `Dockerfile.sm120-v024`, `Dockerfile.recipes`, `docker/serve_recipe.py` | the 2-bit line: the generated v0.24.0 patch (never edited by hand, see [AGENTS.md](AGENTS.md)), its image, the recipes image |
 | `bench/` | recipes, the runner and committed results; the tables above are rendered from it and checked in CI |
