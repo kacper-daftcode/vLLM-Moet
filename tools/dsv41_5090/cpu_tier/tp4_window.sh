@@ -25,6 +25,16 @@ export MODEL_DIR="${MODEL_DIR:-/mnt/nvme/models/DeepSeek-V4.1-Flash}"
 
 note() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$SUMMARY"; }
 : > "$SUMMARY"
+# /tmp is tmpfs (three reboots on 10-25 took the day's logs): the window's artefacts are copied to NVMe at the end
+KEEP="${KEEP_DIR:-$REPO/internal/dsv41-5090-cpu/handoff/boots}"
+keep_artefacts() {
+  mkdir -p "$KEEP" 2>/dev/null || return 0
+  for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-placement.txt"; do
+    [[ -s "$f" ]] && cp -f "$f" "$KEEP/" 2>/dev/null
+  done
+  [[ -s "$LOG" ]] && gzip -c "$LOG" > "$KEEP/$(basename "$LOG").gz" 2>/dev/null
+  return 0
+}
 # whatever ends this script (a kill included) stops the container first: the GPU locks (inherited from the flock
 # chain, held through this process's fds) must outlive the container
 cleanup() {
@@ -34,6 +44,7 @@ cleanup() {
     docker rm -f "$NAME" > /dev/null 2>&1
     echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"
   fi
+  keep_artefacts
 }
 trap cleanup EXIT TERM INT
 
