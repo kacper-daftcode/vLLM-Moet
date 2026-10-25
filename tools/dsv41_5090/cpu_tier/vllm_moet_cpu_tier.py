@@ -843,6 +843,7 @@ def runner_after_step() -> None:
     uses = S.tier.uses()
     S.manager.note_uses(uses)
     misses = S.tier.misses()
+    t_rings = time.perf_counter()
     # diagnostics: promotions restricted to some ranks / hybrid layers (VLLM_MOET_CPU_TIER_PROMOTE_RANKS=0,1
     # VLLM_MOET_CPU_TIER_PROMOTE_LAYERS=a-b); a static placement elsewhere
     if _PROMOTE_RANKS is not None and _rank() not in _PROMOTE_RANKS:
@@ -850,11 +851,15 @@ def runner_after_step() -> None:
     if _PROMOTE_LAYERS is not None and len(misses):
         misses = misses[(misses[:, 1] >= _PROMOTE_LAYERS[0]) & (misses[:, 1] <= _PROMOTE_LAYERS[1])]
     n = S.manager.after_launch(misses, S.step)
+    t_promo = time.perf_counter()
     S.kpi["pairs_all"] += sum(int((ids >= 0).sum()) for _, _, ids in uses)
     S.kpi["pairs_cpu"] += int(misses[:, 3].sum()) if len(misses) else 0
     S.kpi["promotions"] += n
     if DEBUG and n:
         _debug_check_promotions()
+    # the hook's parts: the rings (uses / note_uses / misses), the promotion scheduling + its GPU enqueue, the rest
+    S.kpi["hook_rings_s"] = S.kpi.get("hook_rings_s", 0.0) + (t_rings - t_hook)
+    S.kpi["hook_promo_s"] = S.kpi.get("hook_promo_s", 0.0) + (t_promo - t_rings)
     S.kpi["hook_s"] = S.kpi.get("hook_s", 0.0) + (time.perf_counter() - t_hook)
     if LOG and (S.step % LOG_EVERY == 0 or S.step <= 3):
         tot = S.tier.totals()
@@ -895,9 +900,11 @@ def runner_after_step() -> None:
         _log(f"step {S.step}: tier steps {tot['steps']} pairs {tot['pairs']} errors {tot['errors']}; cpu busy "
              f"{d_busy / 1e6 / d_steps:.2f} ms per tier step; pair hit rate {hit:.3f} (all {S.kpi['pairs_all']}, cpu "
              f"{S.kpi['pairs_cpu']}); promotions {S.kpi['promotions']} ({S.manager.stats}); "
-             f"{LOG_EVERY / max(1e-6, now - S.kpi['last_log_t']):.1f} steps/s; host hook {S.kpi['hook_s'] * 1e3 / LOG_EVERY:.2f} ms per step{detail}"
+             f"{LOG_EVERY / max(1e-6, now - S.kpi['last_log_t']):.1f} steps/s; host hook {S.kpi['hook_s'] * 1e3 / LOG_EVERY:.2f} ms per step "
+             f"(rings {S.kpi.get('hook_rings_s', 0.0) * 1e3 / LOG_EVERY:.2f}, promotions {S.kpi.get('hook_promo_s', 0.0) * 1e3 / LOG_EVERY:.2f}){detail}"
              f"{_debug_compact_summary()}")
         S.kpi["busy_ns"], S.kpi["tier_steps"], S.kpi["last_log_t"], S.kpi["hook_s"] = tot["busy_ns"], tot["steps"], now, 0.0
+        S.kpi["hook_rings_s"] = S.kpi["hook_promo_s"] = 0.0
 
 
 _LAYOUT_NP = {}

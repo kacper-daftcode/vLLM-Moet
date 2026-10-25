@@ -23,6 +23,8 @@
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
+#            PREFIX_CACHE (1)        0 = --no-enable-prefix-caching (measurements: repeated / shared-prefix prompts would hit
+#                        vLLM's prefix cache and skip the prefill)
 #            POOL_SPIN_US ("")       the kernel pool's spin before it sleeps on the futex (the pool's default 500; the cores
 #                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins through a
 #                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever)
@@ -60,7 +62,9 @@ DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
 POOL_SPIN_US="${POOL_SPIN_US:-}"
+PREFIX_CACHE="${PREFIX_CACHE:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
+[[ "$PREFIX_CACHE" == "1" ]] || EXTRA_ARGS="--no-enable-prefix-caching $EXTRA_ARGS"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 TABLES="$REPO/internal/dsv41-5090-cpu/parity"
 

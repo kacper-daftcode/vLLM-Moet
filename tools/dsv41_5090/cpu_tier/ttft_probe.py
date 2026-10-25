@@ -5,8 +5,11 @@ rate behind the long context.
     python ttft_probe.py --port 8041 --model deepseek-ai/DeepSeek-V4.1-Flash --lengths 2048,14336,30720 --gen 64 --repeat 2 --out ttft.json
 
 The first request of a length pays b12x's plans / compiles for the chunk shapes it meets (the tail chunk of a chunked
-prefill is a new token count); --repeat 2 shows the steady state. Prefix caching must be off on the server (it is in
-the hybrid launcher's identity settings) or the repeats would skip the prefill.
+prefill is a new token count); --repeat 2 shows the steady state. Prefix caching must be off on the server
+(`PREFIX_CACHE=0` on the launcher) or the repeats would skip the prefill; the prompts of different lengths are cut
+from DISJOINT parts of the corpus (10-24: prefixes shared between the 2K / 14K / 30K prompts made the longer ones
+partial cache hits), and a repeat with --vary-repeats shifts the slice by one line so that even a server with the
+cache on has to prefill.
 """
 from __future__ import annotations
 
@@ -50,13 +53,15 @@ def corpus(source: str, min_chars: int) -> str:
     return "".join(parts)
 
 
-def prompt_of_length(port: int, model: str, text: str, target: int) -> tuple[str, int]:
-    """Trim `text` (chars) so that the server counts ~target tokens (within 0.5 %); a few /tokenize rounds."""
-    lo, hi = 0, len(text)
-    cut = min(len(text), target * 4)
+def prompt_of_length(port: int, model: str, text: str, target: int, start: int = 0) -> tuple[str, int, int]:
+    """Cut `text` from char `start` so that the server counts ~target tokens (within 0.5 %); a few /tokenize rounds.
+    Returns (prompt, tokens, end char)."""
+    body = text[start:]
+    lo, hi = 0, len(body)
+    cut = min(len(body), target * 4)
     best = None
     for _ in range(12):
-        n = count_tokens(port, model, text[:cut])
+        n = count_tokens(port, model, body[:cut])
         if best is None or abs(n - target) < abs(best[1] - target):
             best = (cut, n)
         if abs(n - target) <= max(4, target // 200):
@@ -72,7 +77,7 @@ def prompt_of_length(port: int, model: str, text: str, target: int) -> tuple[str
             cut = (lo + hi) // 2
         if hi - lo < 8:
             break
-    return text[: best[0]], best[1]
+    return body[: best[0]], best[1], start + best[0]
 
 
 def stream_once(port: int, model: str, prompt: str, gen: int) -> dict:
@@ -120,13 +125,20 @@ def main() -> int:
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--source", default=os.path.dirname(os.__file__))
     ap.add_argument("--out", default="")
+    ap.add_argument("--vary-repeats", action="store_true", help="shift each repeat's slice by one line (defeats a prefix cache)")
     args = ap.parse_args()
     lengths = [int(x) for x in args.lengths.split(",") if x]
-    text = corpus(args.source, max(lengths) * 6)
+    # disjoint slices: every (length, repeat) prompt starts where the previous one ended (plus a line when varying)
+    text = corpus(args.source, sum(lengths) * 6 * (args.repeat if args.vary_repeats else 1) + 4000)
     results = []
+    pos = 0
     for L in lengths:
-        prompt, n = prompt_of_length(args.port, args.model, text, L)
+        prompt, n, end = prompt_of_length(args.port, args.model, text, L, pos)
         for rep in range(args.repeat):
+            if rep and args.vary_repeats:
+                nl = text.find("\n", end)
+                pos = nl + 1 if nl > 0 else end
+                prompt, n, end = prompt_of_length(args.port, args.model, text, L, pos)
             r = stream_once(args.port, args.model, prompt, args.gen)
             r.update(target=L, rep=rep, tokenized=n)
             results.append(r)
@@ -134,6 +146,7 @@ def main() -> int:
             dec = f"{r['decode_tok_s']:.1f} tok/s" if r["decode_tok_s"] else "n/a"
             print(f"  prompt {pt} tokens (rep {rep}): TTFT {r['ttft_s']:.2f} s = {pt / r['ttft_s']:.0f} tok/s prefill; "
                   f"decode {dec} over {r['completion_tokens']} tokens; total {r['total_s']:.1f} s; text {r['text'][:40]!r}", flush=True)
+        pos = end
     if args.out:
         json.dump(results, open(args.out, "w"), indent=1)
     return 0

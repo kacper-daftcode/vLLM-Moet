@@ -44,8 +44,29 @@ fi
 if nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | grep -q .; then
   note "ABORT: compute processes on the GPUs: $(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' ')"; exit 2
 fi
+# host RAM: the hybrid pins ~396 GB (4 x 52 GB store + 4 x 47 GiB Engram) and needs ~480 of the 498 GB while up; a boot
+# into a box with less than RAM_MIN_GB available dies in the OOM killer at the JIT warmup (10-24) - fail fast instead
+avail_gb=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
+if (( avail_gb < ${RAM_MIN_GB:-465} )); then
+  note "ABORT: MemAvailable ${avail_gb} GB < ${RAM_MIN_GB:-465} GB needed for the boot; top RSS: $(ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<5 {printf "%s %.0f GB; ", $2, $1/1048576}')"; exit 2
+fi
 echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: **4-GPU window started** (TP4 boot \`$TAG\`: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"
-note "window start: boot $TAG ($*)"
+note "window start: boot $TAG ($*); MemAvailable ${avail_gb} GB"
+# the box's memory-management activity across the window (compaction / page migration -> TLB shootdowns on the workers'
+# cores; kcompactd / khugepaged CPU time): snapshots at start, ready, end
+memsnap() {
+  awk '/^(compact_stall|compact_fail|compact_success|compact_daemon_wake|pgmigrate_success|pgmigrate_fail|thp_fault_alloc|thp_collapse_alloc|pgscan_kswapd|pgsteal_kswapd|pgscan_direct|allocstall_normal) / {printf "%s=%s ", $1, $2}' /proc/vmstat
+  awk '/^ *TLB:/ {s = 0; for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+$/) s += $i; printf "tlb_shootdowns=%d ", s}' /proc/interrupts
+  for p in $(pgrep -x kcompactd0) $(pgrep -x khugepaged); do awk -v p="$p" '{printf "%s_cpu_s=%.0f ", $2, ($14 + $15) / 100}' "/proc/$p/stat" 2>/dev/null; done
+  echo
+}
+memdelta() {  # memdelta "<snap a>" "<snap b>" -> the differences of every counter
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n = split(a, A, " "); for (i = 1; i <= n; i++) { split(A[i], kv, "="); va[kv[1]] = kv[2] }
+    n = split(b, B, " "); for (i = 1; i <= n; i++) { split(B[i], kv, "="); if (kv[1] in va) printf "%s %+d  ", kv[1], kv[2] - va[kv[1]] }
+    print "" }'
+}
+SNAP0=$(memsnap)
 
 # 2. boot
 cd "$REPO" || exit 1
@@ -68,6 +89,8 @@ if (( ready == 0 )); then
   exit 1
 fi
 note "ready after $(( $(date +%s) - t0 )) s"
+SNAP1=$(memsnap)
+note "memory management during the boot: $(memdelta "$SNAP0" "$SNAP1")"
 if [[ "${PIN_ENGINE:-1}" == "1" ]]; then
   # the engine core and the API server off the kernel pools' cores (the workers pin their own threads)
   for p in $(pgrep -f "VLLM::EngineCore" ; docker inspect --format '{{.State.Pid}}' "$NAME"); do
@@ -103,8 +126,10 @@ print(f"  decode {prompt!r}: {u.get('completion_tokens')} tokens in {dt:.1f} s =
 EOF
 done
 docker logs "$NAME" > "$LOG" 2>&1
+SNAP2=$(memsnap)
+note "memory management during the measurements: $(memdelta "$SNAP1" "$SNAP2")"
 grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -3 | cut -c1-300 | tee -a "$SUMMARY"
-grep -o "worker-0 in-kernel [0-9]* us per expert" "$LOG" | sort | uniq -c | sort -rn | head -3 | tee -a "$SUMMARY"
+for r in 0 1 2 3; do printf "  rank $r in-kernel us per expert (KPI lines): " | tee -a "$SUMMARY"; grep -o "rank $r: step [0-9]*:.*in-kernel [0-9]* us" "$LOG" | grep -v "step [0-9]:" | sed -E 's/.*in-kernel ([0-9]+) us/\1/' | tr '\n' ' ' | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"; done
 wait  # the placement probe
 if [[ -s "/tmp/ds41-hyb-$TAG-placement.txt" ]]; then
   note "CPU placement during decode (pool cores and their siblings; full list /tmp/ds41-hyb-$TAG-placement.txt):"
@@ -116,7 +141,7 @@ fi
 if [[ -n "${TTFT_LENGTHS:-}" ]]; then
   note "TTFT probe: lengths $TTFT_LENGTHS, gen ${TTFT_GEN:-64}, repeat ${TTFT_REPEAT:-2}"
   $PY "$REPO/tools/dsv41_5090/cpu_tier/ttft_probe.py" --port "$PORT" --model "$MODEL" --lengths "$TTFT_LENGTHS" \
-    --gen "${TTFT_GEN:-64}" --repeat "${TTFT_REPEAT:-2}" --out "/tmp/ds41-hyb-$TAG-ttft.json" 2>&1 | tee -a "$SUMMARY"
+    --gen "${TTFT_GEN:-64}" --repeat "${TTFT_REPEAT:-2}" --vary-repeats --out "/tmp/ds41-hyb-$TAG-ttft.json" 2>&1 | tee -a "$SUMMARY"
   docker logs "$NAME" > "$LOG" 2>&1
   grep -E "moet-cpu-tier\] rank 0: (prefill call|scratch pool|DEBUG prefill|[0-9]+-token MoE call)" "$LOG" | tail -8 | cut -c1-600 | tee -a "$SUMMARY"
   grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
