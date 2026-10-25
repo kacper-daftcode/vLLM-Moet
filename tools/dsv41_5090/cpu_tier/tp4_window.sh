@@ -67,6 +67,12 @@ memdelta() {  # memdelta "<snap a>" "<snap b>" -> the differences of every count
     print "" }'
 }
 SNAP0=$(memsnap)
+# DROP_CACHES=1: the boot pins ~400 GB and evicts the page cache anyway; doing it first spares the loader the direct-reclaim
+# storm (10-25 boot: pgscan_direct +162 M pages, allocstall +100 K, compact_stall +68 K; the 48 safetensors shards
+# re-read from NVMe at 36-40 GB/s cost nothing against the loader's own pace)
+if [[ "${DROP_CACHES:-0}" == "1" ]]; then
+  sync; echo 3 > /proc/sys/vm/drop_caches; note "page cache dropped before the boot: $(free -g | awk '/^Mem:/ {print $6 " GB buff/cache, " $7 " GB available"}')"
+fi
 
 # 2. boot
 cd "$REPO" || exit 1
