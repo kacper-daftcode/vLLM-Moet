@@ -48,9 +48,20 @@ cleanup() {
 }
 trap cleanup EXIT TERM INT
 
-# 1. nothing foreign on the GPUs
-if docker ps --format '{{.Names}}' | grep -q .; then
-  note "ABORT: containers running: $(docker ps --format '{{.Names}}' | tr '\n' ' ')"; exit 2
+# 1. nothing foreign on the GPUs. Only containers that can touch a GPU count (a --gpus device request, the nvidia
+# runtime, or NVIDIA_VISIBLE_DEVICES in their environment): the other lines' CPU-only containers (SWE-bench task and
+# scoring containers, `minisweagent-*` / `sweb.eval.*`) run for hours and must not block a window (10-26 14:24: a
+# window aborted on eight scoring containers after waiting 2 h 45 for the locks)
+gpu_containers=""
+for c in $(docker ps --format '{{.Names}}'); do
+  info=$(docker inspect -f '{{len .HostConfig.DeviceRequests}} {{.HostConfig.Runtime}}{{range .Config.Env}} {{.}}{{end}}' "$c" 2>/dev/null) || continue
+  devreq=${info%% *}
+  if [[ "$devreq" != "0" || "$info" == *" nvidia"* || "$info" == *"NVIDIA_VISIBLE_DEVICES="* && "$info" != *"NVIDIA_VISIBLE_DEVICES=void"* ]]; then
+    gpu_containers+="$c "
+  fi
+done
+if [[ -n "$gpu_containers" ]]; then
+  note "ABORT: GPU containers running: $gpu_containers"; exit 2
 fi
 if nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | grep -q .; then
   note "ABORT: compute processes on the GPUs: $(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' ')"; exit 2
