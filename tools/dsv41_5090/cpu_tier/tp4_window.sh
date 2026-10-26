@@ -29,7 +29,7 @@ note() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$SUMMARY"; }
 KEEP="${KEEP_DIR:-$REPO/internal/dsv41-5090-cpu/handoff/boots}"
 keep_artefacts() {
   mkdir -p "$KEEP" 2>/dev/null || return 0
-  for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-placement.txt"; do
+  for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-needle.json" "/tmp/ds41-hyb-$TAG-soak.json" "/tmp/ds41-hyb-$TAG-placement.txt"; do
     [[ -s "$f" ]] && cp -f "$f" "$KEEP/" 2>/dev/null
   done
   [[ -s "$LOG" ]] && gzip -c "$LOG" > "$KEEP/$(basename "$LOG").gz" 2>/dev/null
@@ -183,6 +183,25 @@ if [[ -n "${HARD_PROBE:-}" ]]; then
     docker logs "$NAME" > "$LOG" 2>&1
     grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
   done
+fi
+# optional (phase 3): NEEDLE_LENGTHS=32768,65536 - a code word planted at NEEDLE_DEPTHS (0.1,0.5,0.9) of long fillers,
+# asked back (needle_probe.py); SOAK_MINUTES=120 SOAK_CONC=4 - concurrent mixed-prompt streams (soak_probe.py; the
+# server needs MAX_NUM_SEQS >= SOAK_CONC); the tier's error counter and hit rate from the KPI lines after each
+if [[ -n "${NEEDLE_LENGTHS:-}" ]]; then
+  note "needle probe: lengths $NEEDLE_LENGTHS, depths ${NEEDLE_DEPTHS:-0.1,0.5,0.9}"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/needle_probe.py" --port "$PORT" --model "$MODEL" --lengths "$NEEDLE_LENGTHS" \
+    --depths "${NEEDLE_DEPTHS:-0.1,0.5,0.9}" --out "/tmp/ds41-hyb-$TAG-needle.json" 2>&1 | tee -a "$SUMMARY"
+  docker logs "$NAME" > "$LOG" 2>&1
+  grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+fi
+if [[ -n "${SOAK_MINUTES:-}" ]]; then
+  note "soak: $SOAK_MINUTES min x ${SOAK_CONC:-4} streams, max_tokens ${SOAK_TOKENS:-256}"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/soak_probe.py" --port "$PORT" --model "$MODEL" --minutes "$SOAK_MINUTES" \
+    --conc "${SOAK_CONC:-4}" --max-tokens "${SOAK_TOKENS:-256}" --out "/tmp/ds41-hyb-$TAG-soak.json" 2>&1 | tail -8 | tee -a "$SUMMARY"
+  docker logs "$NAME" > "$LOG" 2>&1
+  grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+  grep -ciE "error word|fail.*closed|Traceback" "$LOG" | xargs -I{} note "server log: error / traceback lines after the soak: {}"
+  free -g | head -2 | tail -1 | tee -a "$SUMMARY"
 fi
 # optional (phase 2.5): TTFT / prefill rate on long prompts, e.g. TTFT_LENGTHS=2048,14336,30720 (needs SCRATCH > 0 for
 # correct outputs; MAX_NUM_BATCHED_TOKENS sets the chunk)
