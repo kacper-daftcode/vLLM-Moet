@@ -167,14 +167,49 @@ RedHat draft accepts more at every position on every prompt type except `math`, 
 step is marginally slower at the same k (5 dense Qwen3 layers plus the 20 groups' bookkeeping). Net per stream at
 k = 4: code +12 %, prose +14 %, math 0 %, longctx +9 %, with 13 % more KV pool.
 
-Not yet done for RedHat: GSM8K / needle / offload round trip, the 128-session capacity probe (20 groups cost the
-scheduler per step), and `--mamba-ssm-cache-dtype`. Those gate a switch of the served draft; the KV and acceptance
-numbers above are the case for running them.
+### k sweep and the gates (2026-10-25/26)
+
+Same suite plus the 8K matrix at C = 32 / 64 for each k (`matrix-sweep.log`); Inferact k = 4 rows from §3:
+
+| draft, k | pool M | code | prose | math | longctx | 8K C = 32: /session (total) | 8K C = 64: /session (total) |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Inferact k = 4 (served) | 21.61 | 205-220 (3.33) | 142 (2.16) | 215 (3.27) | 244 (3.74) | 57.6 (1869) | 40.7 (2604) |
+| RedHat k = 4 | 24.48 | 230 (3.76) | 162 (2.48) | 214 (3.27) | 265 (4.08) | 61.6 (1988) | **44.6 (2840)** |
+| RedHat k = 5 | 24.02 | 237 (4.02) | **170 (2.66)** | 225 (3.56) | 284 (4.50) | 60.2 (1939) | 42.5 (2721) |
+| RedHat k = 6 | 23.54 | 242 (4.23) | 156 (2.54) | 219 (3.58) | 305 (5.04) | 61.0 (1915) | 40.3 (2574) |
+| RedHat k = 7 | 22.53 | 245 (4.42) | 153 (2.55) | **227 (3.81)** | **311 (5.23)** | 58.5 (1851) | 37.4 (2413) |
+| RedHat k = 8 | 22.10 | 236 (4.42) | 145 (2.53) | 216 (3.79) | 300 (5.29) | - | - |
+
+Per session at C = 64 falls monotonically with k; k = 4 (pool, concurrency) or k = 5 (prose, math) would be the
+served choice. On RedHat k = 4: GSM8K-200 196/200, needle 4/4, 128 x 22K sessions all running at 33 % KV, 0
+preemptions, 1486 tok/s aggregate (Inferact: 36 %, 1418); 32K at C = 64: 45.3 tok/s per session.
+
+**Blocker: prefix caching.** With the draft's sliding-window group in prefix caching, `SlidingWindowManager`
+"requires block-aligned lookups" and the whole model loses fine-grained hits; measured on RedHat k = 4, a 30K prompt
+resent hit **0 of 20,348 tokens** (TTFT 1.10 s instead of 0.11 s), a second turn 0 as well. Three variants were
+tried (`patch_vllm_swa_draft_dcp.py` step 4 and its `VLLM_MOET_SWA_DRAFT_*` switches):
+
+| variant | pool | resend of a 30K prompt | agent turns 2-4 on a 16-20K context |
+| --- | --- | --- | --- |
+| window in prefix cache, 1024-token blocks (default of steps 1-3) | 24.48M | 0 hits | 0 hits |
+| window in prefix cache, 128-token blocks (`VLLM_MOET_SWA_DRAFT_BLOCK=128 VLLM_MOET_SWA_DRAFT_REPLAY=0`) | 19.18M | 0 hits | 0 / 15,872 / 15,872 of ~17K |
+| window as per-request scratch, hits capped 2048 tokens below the prompt end (step 4, default) | 24.48M | 0 hits | 0 / 11,648 / 15,872 of ~17K; accepted length 4.0-4.9 after a hit |
+
+The reason is K3-specific: the KDA groups retain their aligned state sparsely (at a finished request's prompt-end
+hash boundary and a few block boundaries), so a hit must land exactly there; the draft's window blocks (variants 1-2)
+or the 2048-token cap (variant 3) move the admissible position away from it. A `SlidingWindowManager` with
+fine-grained lookups and copy-on-write for the partial window block would fix variants 1-2 upstream; variant 3
+would need the KDA state retained at the cap position as well. Neither is attempted here.
+
+**Verdict:** the RedHat draft is faster and leaner in KV, but on this engine it costs prefix caching, which the
+agent workload needs more than 13 % of pool; the served draft stays Inferact (k = 4, RecoverSSM). The `-r2`
+image and the patch remain for single-session / no-prefix-cache serving and as the base for the upstream work.
 
 ## 4. What is left, and why it is not patched here
 
 * **The 5 draft layers** (+21 % per block) with the Inferact draft: it attends over the whole context, so its KV is
-  per token. The RedHat draft (§3b) is the way around it: window-bounded draft KV, +13 % pool at k = 4.
+  per token. The RedHat draft (§3b) would be the way around it (+13 % pool at k = 4) once its sliding-window group
+  can take fine-grained prefix hits.
 * **18 padding layers**: with 29 MLA and 69 KDA layers every uniform group size pads somewhere, and the cheapest
   place is the KDA side (its blocks are per request, not per token). Removing it needs a second block pool with its
   own stride for the short group - a change across `BlockPool`, the coordinator and the worker's tensor layout for
