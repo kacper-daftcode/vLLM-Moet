@@ -51,6 +51,9 @@
 #            BAKED (0)               1 = run the image's own copy of the hybrid (Dockerfile step 28: patched packages, runtime,
 #                        libcpu_tier.so) without mounting the worktree or re-running the patcher at start (IMAGE must have the
 #                        layer, e.g. vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2); 0 = the dev flow (worktree mounted, patched at start)
+#            POWER_CAP_W (CAP_W of /etc/default/gpu-power-cap, else 400)  the GPUs' power limit this launcher re-applies before
+#                        the boot when a card sits above it (the box's cap after GPU 0 fell off the bus twice under full
+#                        power, 2026-10-25; gpu-power-cap.service sets it at boot); POWER_CAP_W=0 skips the check
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS appended to `vllm serve` / `docker run`
 # GPU protocol: this script does NOT take the locks - run it as
 #   flock -w 3600 /tmp/exl3diff-gpu0.lock flock -w 3600 /tmp/exl3diff-gpu1.lock flock -w 3600 /tmp/exl3diff-gpu2.lock \
@@ -123,6 +126,18 @@ else
   [[ -f "$PLACEMENT" ]] || { echo "no placement file $PLACEMENT" >&2; exit 1; }
   MOUNTS+=(-v "$PLACEMENT:/placement.json:ro")
   TIER_ENV+=(-e VLLM_MOET_CPU_TIER_PLACEMENT=/placement.json)
+fi
+
+# the GPUs' power cap (see the header): re-applied here when a card is above it (the launcher runs as root on the host)
+if [[ -z "${POWER_CAP_W:-}" ]]; then
+  POWER_CAP_W=$( (. /etc/default/gpu-power-cap 2>/dev/null; echo "${CAP_W:-400}") )
+fi
+if [[ "$POWER_CAP_W" != "0" ]]; then
+  over=$(nvidia-smi --query-gpu=index,power.limit --format=csv,noheader,nounits 2>/dev/null | awk -F', ' -v cap="$POWER_CAP_W" '$2 > cap + 0.5 {printf "%s ", $1}')
+  if [[ -n "$over" ]]; then
+    echo "GPU(s) $over above the ${POWER_CAP_W} W cap - re-applying it (nvidia-smi -pl ${POWER_CAP_W})"
+    nvidia-smi -pl "$POWER_CAP_W" > /dev/null 2>&1 || echo "WARNING: nvidia-smi -pl ${POWER_CAP_W} failed (not root?)"
+  fi
 fi
 
 if docker ps -q -f name="^${NAME}$" -f status=running | grep -q .; then

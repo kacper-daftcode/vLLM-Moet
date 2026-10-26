@@ -62,7 +62,7 @@ if (( avail_gb < ${RAM_MIN_GB:-465} )); then
   note "ABORT: MemAvailable ${avail_gb} GB < ${RAM_MIN_GB:-465} GB needed for the boot; top RSS: $(ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<5 {printf "%s %.0f GB; ", $2, $1/1048576}')"; exit 2
 fi
 echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: **4-GPU window started** (TP4 boot \`$TAG\`: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"
-note "window start: boot $TAG ($*); MemAvailable ${avail_gb} GB"
+note "window start: boot $TAG ($*); MemAvailable ${avail_gb} GB; GPU power limits: $(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | awk '{printf "%d ", $1}')W (cap $( (. /etc/default/gpu-power-cap 2>/dev/null; echo "${CAP_W:-400}") ) W, re-applied by the launcher if above)"
 # the box's memory-management activity across the window (compaction / page migration -> TLB shootdowns on the workers'
 # cores; kcompactd / khugepaged CPU time): snapshots at start, ready, end
 memsnap() {

@@ -1,0 +1,16 @@
+[Unit]
+Description=Cap all NVIDIA GPUs at 400 W (rtxdev2: GPU 0 fell off the PCIe bus twice under 4-GPU full-power prefill, 2026-10-25; owner to check GPU 0 power path). Remove/disable to restore the 550 W default.
+# Ordered AFTER nvidia-powerlimit.service (the 2026-10-13 unit that sets persistence mode and the 550 W default): both are
+# WantedBy multi-user.target and without this line the boot order between them was a race (MoET line, 2026-10-26).
+After=nvidia-persistenced.service nvidia-powerlimit.service
+Wants=nvidia-persistenced.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do /usr/bin/nvidia-smi -L >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+EnvironmentFile=-/etc/default/gpu-power-cap
+ExecStart=/bin/sh -c 'exec /usr/bin/nvidia-smi -pl "${CAP_W:-400}"'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
