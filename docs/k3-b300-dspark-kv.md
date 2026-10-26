@@ -191,6 +191,7 @@ tried (`patch_vllm_swa_draft_dcp.py` step 4 and its `VLLM_MOET_SWA_DRAFT_*` swit
 
 | variant | pool | resend of a 30K prompt | agent turns 2-4 on a 16-20K context |
 | --- | --- | --- | --- |
+| Inferact k = 4 (served), for reference | 21.61M | 20,224 of 20,354 hits, TTFT 0.11 s | 15,872 / 16,512 / 17,152 of ~17K; accepted length 3.7-4.7 |
 | window in prefix cache, 1024-token blocks (default of steps 1-3) | 24.48M | 0 hits | 0 hits |
 | window in prefix cache, 128-token blocks (`VLLM_MOET_SWA_DRAFT_BLOCK=128 VLLM_MOET_SWA_DRAFT_REPLAY=0`) | 19.18M | 0 hits | 0 / 15,872 / 15,872 of ~17K |
 | window as per-request scratch, hits capped 2048 tokens below the prompt end (step 4, default) | 24.48M | 0 hits | 0 / 11,648 / 15,872 of ~17K; accepted length 4.0-4.9 after a hit |
