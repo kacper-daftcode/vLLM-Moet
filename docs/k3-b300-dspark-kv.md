@@ -223,7 +223,11 @@ boundary) stays referenced by its request until it finishes, instead of being nu
 window, so it ages out of the LRU together with the request's MLA/KDA blocks and not during a long decode; it fits
 the per-request admission cap (window + one in-flight chunk = 13 blocks, 2-3 held in decode). The fine-grained
 branch is entered only when the coordinator aligns hits below the block size, which needs a Mamba "align" group;
-block-aligned models and Gemma-style full+SWA hybrids keep the upstream code path.
+block-aligned models and Gemma-style full+SWA hybrids keep the upstream code path. Open on the offload tier:
+`SimpleCPUOffload` copies the prompt-end partial tail only for the full-attention group (`fa_gidx`), so after a GPU
+eviction the external hit with this draft lands on the prompt-end boundary only once the producer's decode has
+promoted the window's tail block to a full one (its secondary key travels with it); otherwise on the window's last
+full block below. GPU hits are unaffected.
 
 Emulated against the real `KVCacheManager` (the K3 group layout, chunked prefill through the scheduler's Mamba
 split, spec-decode steps with rejections, 220-block pools with overlapping prefixes): a 20,354-token prompt resent
