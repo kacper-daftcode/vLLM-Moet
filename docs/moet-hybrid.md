@@ -14,7 +14,7 @@ Measured (2026‑10‑26, the launcher's defaults, TP4, no DSpark):
 |---|---|
 | decode, single stream, short prompts | **143 / 120 tok/s** ('Hello' / 'def fib(n):'; the degenerate 'Hello' run has a hit rate → 1 and is the stack's GPU floor at 7.0 ms per step — the hybrid's miss handling costs ~1.3 ms per step on a real prompt) |
 | decode behind 2K / 14K / 30K of context | 50–64 / 43–46 / 47–48 tok/s (the attention side) |
-| prefill with the streamed experts (chunk 2048) | **2.0–2.3K tok/s** at 2K / 14K / 30K prompts (PCIe‑bound: 0.12 ms per missing expert per rank ≈ 39 GB/s per link) |
+| prefill with the streamed experts (chunk 4096, the default) | **2.1–2.4K tok/s at 2K, 3.9K tok/s at 14K** (TTFT 0.9 s / 3.7 s; PCIe‑bound: 0.12 ms per missing expert per rank ≈ 39 GB/s per link; the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token — chunk 2048 gave 2.0–2.3K at 2K / 14K / 30K) |
 | quality, paired against the native FP4 reference | **HumanEval 159/164 vs 160/164** (McNemar p = 1.0, 134 identical programs); **MATH‑500 level 5: 55/60 vs 55/60** (0 discordant items, 59 identical answers) |
 | identity | bit‑exact against the all‑resident b12x path within one boot: 21,040 compact calls per rank, 98,220 CPU‑computed rows, 0 differ (`DEBUG_COMPACT`); the CPU kernel bit‑exact against b12x's GPU kernels on four parity sets |
 | expert hit rate (pairs resident) | 0.83–0.85 on short prompts, **0.87 on HumanEval, 0.91 on MATH‑500** |
@@ -112,8 +112,8 @@ prefill TTFT on disjoint prompts), `cpu_tier/cpu_placement_probe.sh` (who runs o
 
 - DSpark (k = 5) does not pay for the hybrid: a verify step routes ~5× more distinct experts for 3.6× more tokens and
   the CPU kernel's cost per extra token (~73 µs) keeps it CPU‑bound; k = 0 is the serving mode.
-- Prefill is PCIe‑bound at ~2.1K tok/s with 2048‑token chunks; a 4096‑token chunk and a CPU tail for experts with
-  few tokens are the next levers.
+- Prefill is PCIe‑bound (0.12 ms per missing expert per rank): 2.1–2.4K tok/s on 2K prompts, 3.9K on 14K with the
+  4096‑token chunk; a CPU tail for experts with few tokens and double‑buffered staging are the next levers.
 - Phase 3's needle, concurrency and soak runs are pending; the GPU 0 of this box dropped off the PCIe bus twice under
   sustained full‑power four‑GPU prefill (hardware), so the cards run capped at 400 W.
 - The working notes with every measurement and its command: `internal/dsv41-5090-cpu/handoff/*.md` and

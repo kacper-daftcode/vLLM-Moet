@@ -4,8 +4,9 @@
 # other routed expert of a decode step computed on the CPU from the pinned expert store, bit-identical to the
 # all-resident b12x path (tools/dsv41_5090/cpu_tier/, /root/work/HANDOFF-moet-hybrid.md). Defaults = the serving
 # configuration measured 2026-10-25 (40 static + 80 LRU expert slots per layer per rank, promotion admission window
-# 12, exact-size Engram tables, the streamed prefill with a 128-slot scratch pool, no DSpark): decode 143 / 120 tok/s
-# on short prompts, prefill 2.0-2.3K tok/s, MemAvailable ~45 GB while up, boot ~7 min.
+# 12, exact-size Engram tables, the streamed prefill in 4096-token chunks through a 64-slot scratch pool, no DSpark):
+# decode 143 / 120 tok/s on short prompts, prefill 2.1-2.4K tok/s at 2K and 3.9K tok/s at 14K, MemAvailable ~45 GB while up,
+# boot ~6 min; HumanEval 159 vs native 160, MATH-500 L5 55 vs 55 (paired).
 #
 # Required:  MODEL_DIR   the official DeepSeek-V4.1-Flash checkpoint
 # Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1)  NAME (ds41-hyb)  GPUS (0,1,2,3)  TP (4)  PORT (8041)
@@ -19,9 +20,10 @@
 #                        PROMOTIONS (4) per layer per step
 #            TIMEOUT_MS (500)        the in-graph wait's bound (fail-closed)
 #            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
-#            GPU_MEM_UTIL (0.92)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (512)  CAPTURE_SIZE (8)
+#            GPU_MEM_UTIL (0.92)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts
+#                        prefill at 3.9K tok/s against 2.2K with 2048)  CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
-#            SCRATCH (128)           slots of the prefill scratch pool (phase 2.5; 128 = 1.2 GB per rank; 0 = the missing
+#            SCRATCH (64)            slots of the prefill scratch pool (phase 2.5; 64 = 0.6 GB per rank, 128 = 1.2; 0 = the missing
 #                        experts of > 8-token calls are not computed: decode-only diagnostics)
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
@@ -69,7 +71,7 @@ PROMOTIONS="${PROMOTIONS:-4}"
 TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
 TIER_DEBUG="${TIER_DEBUG:-0}"
-SCRATCH="${SCRATCH:-128}"
+SCRATCH="${SCRATCH:-64}"
 DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
 DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
@@ -126,7 +128,7 @@ docker run -d --name "$NAME" --restart no \
   ${NCCL_CHANNELS:+-e NCCL_MIN_NCHANNELS=$NCCL_CHANNELS -e NCCL_MAX_NCHANNELS=$NCCL_CHANNELS} \
   ${POOL_SPIN_US:+-e MOE_B12X_POOL_SPIN_US=$POOL_SPIN_US} \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
-  -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
+  -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
   --entrypoint bash "$IMAGE" \
