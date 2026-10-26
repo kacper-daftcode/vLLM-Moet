@@ -63,11 +63,19 @@ def main() -> int:
     results, passed, pos = [], 0, 0
     for L in lengths:
         for depth in depths:
-            # a filler of ~L tokens cut from a fresh part of the corpus; the needle sentence goes at `depth` of its chars
+            # a filler of ~L tokens cut from a fresh part of the corpus; the needle sentence goes at `depth` of its chars.
+            # The token density differs along the corpus (10-26: the third 64K filler came out > 65536 - 32 after one
+            # proportional cut from a 1000-token margin and the server answered 400), so the cut is re-measured on the
+            # actual filler and shrunk until it fits L - 1000 (the needle, the question and the chat template on top; L
+            # must stay under --max-model-len)
             body = text[pos:]
             cut = min(len(body), L * 4)
-            n = count_tokens(args.port, args.model, body[:cut])
-            cut = int(cut * (L - 1000) / max(1, n))   # the needle, the question and the chat template on top; L must stay under --max-model-len
+            target = L - 1000
+            for _ in range(4):
+                n = count_tokens(args.port, args.model, body[:cut])
+                if n <= target and n >= target * 0.98:
+                    break
+                cut = int(cut * target / max(1, n))
             filler = body[:cut]
             pos += cut
             word = rng.choice(WORDS) + str(rng.randint(100, 999))
@@ -75,15 +83,27 @@ def main() -> int:
             at = filler.rfind("\n", 0, int(len(filler) * depth)) + 1
             prompt = (filler[:at] + needle + filler[at:] +
                       "\n\nQuestion: what is the secret code word mentioned in the text above? Answer with the code word only.")
-            answer, ttft, ptok = chat(args.port, args.model, prompt)
-            ok = word in answer
+            try:
+                answer, ttft, ptok = chat(args.port, args.model, prompt)
+                err = ""
+            except Exception as ex:   # an HTTP 400 (prompt too long) or a stream failure counts as a failed item, not a crash
+                body_txt = ""
+                try:
+                    body_txt = ex.read().decode("utf-8", "ignore")[:200]   # urllib.error.HTTPError carries the server's message
+                except Exception:
+                    pass
+                answer, ttft, ptok, err = "", 0.0, n, f"{type(ex).__name__}: {str(ex)[:80]} {body_txt}".strip()
+            ok = bool(answer) and word in answer
             passed += ok
-            results.append(dict(length=L, depth=depth, prompt_tokens=ptok, ttft_s=ttft, ok=ok, word=word, answer=answer[:60]))
-            print(f"  {ptok:6d} tokens, needle at {depth:.1f}: {'PASS' if ok else 'FAIL'} ({word} -> {answer.strip()[:40]!r}); "
-                  f"TTFT {ttft:.2f} s = {ptok / max(ttft, 1e-6):.0f} tok/s", flush=True)
+            results.append(dict(length=L, depth=depth, prompt_tokens=ptok, ttft_s=ttft, ok=ok, word=word, answer=answer[:60], error=err))
+            if err:
+                print(f"  {ptok:6d} tokens (filler), needle at {depth:.1f}: ERROR {err}", flush=True)
+            else:
+                print(f"  {ptok:6d} tokens, needle at {depth:.1f}: {'PASS' if ok else 'FAIL'} ({word} -> {answer.strip()[:40]!r}); "
+                      f"TTFT {ttft:.2f} s = {ptok / max(ttft, 1e-6):.0f} tok/s", flush=True)
+            if args.out:
+                json.dump(results, open(args.out, "w"), indent=1)
     print(f"needle: {passed} of {len(results)} passed")
-    if args.out:
-        json.dump(results, open(args.out, "w"), indent=1)
     return 0 if passed == len(results) else 1
 
 
