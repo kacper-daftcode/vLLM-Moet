@@ -131,6 +131,23 @@ Build, serve, validate and every image tag: **[docs/sm120-deploy.md](docs/sm120-
 tests: [tools/dsv41_sm120/README.md](tools/dsv41_sm120/README.md). Head-to-head with an SGLang recipe on
 the same host (2026-09-19): [docs/dsv41-sm120-vs-0xsero.md](docs/dsv41-sm120-vs-0xsero.md).
 
+## GLM-5.3-Flash on 4× RTX PRO 6000
+
+Served next to DeepSeek on the host's other four cards (`:8002`): the official FP8 checkpoint
+([`zai-org/GLM-5.3-Flash`](https://huggingface.co/zai-org/GLM-5.3-Flash): 45 layers — 34 KDA linear
+attention + 11 DeepSeek sparse attention with the kpool indexer — 288 routed experts top-8, MTP) on the
+unmodified `vllm/vllm-openai:nightly-49cb2bbf` image, TP4, 512K context, MTP k = 3, FP8 KV, a 64 GiB
+host offload region plus a disk tier (launcher `glm53flash/run.sh` on the host). No vLLM-Moet kernels
+yet — this is the baseline the sm_120 work on this model starts from.
+
+| | measured on the served configuration (400 W), 2026-10-26 |
+|---|---|
+| decode, 1 stream | prose 175–190 tok/s, code 244–258 tok/s (71–75 steps/s; MTP accepts 1.4 / 2.6 of 3 drafts per step) |
+| decode, 8 streams | prose 545–557 tok/s, code 710–726 tok/s aggregate |
+| fresh prefill | 20K tokens in 2.0 s (10K tok/s), 169K in 17.8 s (9.4K), 406K in 47.6 s (8.5K) |
+| KV cache | 613K tokens on the GPUs at 0.92 (1.17× concurrency at 512K), 64 GiB host offload, disk tier |
+| quality | GSM8K-200 (reasoning effort low) 192/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass |
+
 ## Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000
 
 The official `vllm/vllm-openai` nightly ran this 177B-A6B model on sm_120 at 65 decode steps/s as first
