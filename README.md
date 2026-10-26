@@ -25,13 +25,13 @@ deterministic top-k, the shared-expert add fused into the MoE top-k sum — most
 switches; as served: the fused MoE, the sparse-MLA gather and steps 30–33 and 36 on, every one of them
 bit-identical to the path it replaces).
 
-| | measured on the served line (DSpark k = 7) |
+| | measured on the served image (`-r21`, DSpark k = 7, 400 W) |
 |---|---|
-| decode, 1 stream | prose **253–265 tok/s**, code **~740 tok/s median (waves 706–859)** (122–125 steps/s; the Fraser bench below is the stricter single-prompt code measure) |
-| decode, 8 streams | prose 737–746 tok/s, code 2,202–2,228 tok/s aggregate |
-| fresh prefill | 180K tokens in 10.1 s (~18K tok/s) |
-| KV cache | **9.63M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
-| quality | GSM8K-200 193–194/200 on the b12x line (steps 26–28 are bit-identical to the paths they replace), needle PASS at 100K, tool calls / JSON pass |
+| decode, 1 stream | prose **~277 tok/s median (waves 259–296)**, code **~796 tok/s median (waves 742–812)** (131–132 steps/s on short prompts; the Fraser bench below is the stricter single-prompt code measure) |
+| decode, 8 streams | prose ~717 tok/s median (702–734), code ~2,055 tok/s median (1,916–2,236) aggregate, 8 × 1,024 tokens |
+| fresh prefill | 163K tokens in 8.6 s (~19K tok/s) |
+| KV cache | **9.62M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
+| quality | GSM8K-200 193–194/200 on the b12x line (steps 26–36 are bit-identical to the paths they replace), needle PASS at 100K, tool calls / JSON pass |
 
 ### What we changed against official vLLM
 
