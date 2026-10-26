@@ -72,16 +72,20 @@ DSV41_MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash python tools/dsv41_5090/cpu
 # qmma_probe is built from qmma_probe.cu, the layout probe runs in the serving image)
 CUDA_VISIBLE_DEVICES=1 tools/dsv41_5090/cpu_moe/qmma_probe --tables internal/dsv41-5090-cpu/parity
 python tools/dsv41_5090/cpu_tier/b12x_layout_probe.py --out internal/dsv41-5090-cpu/parity
-# serve (the image = this repo's sm_120 line on the nightly base; the patcher is applied at container start)
+# serve: the dev flow (the worktree mounted, the patcher applied at container start, ~60 s)
 MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash docker/sm120/run-dsv41-5090.sh
+# serve: the baked image (Dockerfile.sm120-dsv41-nightly step 28 = the patched packages + runtime + libcpu_tier.so;
+# build: DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 .)
+MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 BAKED=1 docker/sm120/run-dsv41-5090.sh
 ```
 
 `docker/sm120/run-dsv41-5090.sh` boots the measured serving configuration by default; its header lists every knob
-(`PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `ENGRAM_THP`, `POOL_SPIN_HOT`, `SPEC_TOKENS`, `PREFIX_CACHE`,
-`GPU_MEM_UTIL`, …). The hybrid's own switches arrive in the container as `VLLM_MOET_CPU_TIER_*` (documented at the
+(`PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `MAX_NUM_BATCHED_TOKENS`, `ENGRAM_THP`, `POOL_SPIN_HOT`, `SPEC_TOKENS`,
+`PREFIX_CACHE`, `GPU_MEM_UTIL`, `BAKED`, …). The hybrid's own switches arrive in the container as `VLLM_MOET_CPU_TIER_*` (documented at the
 top of `tools/dsv41_5090/cpu_tier/vllm_moet_cpu_tier.py`); everything is inert unless `VLLM_MOET_MOE_CPU_TIER=1`.
 `tools/dsv41_5090/cpu_tier/tp4_window.sh TAG [KEY=VALUE …]` runs one boot with the measurements (identity prompts,
-decode, memory, optional `TTFT_LENGTHS=…` and `HARD_PROBE=humaneval,math500`) under the box's GPU locks and keeps
+decode, memory, optional `TTFT_LENGTHS=…`, `HARD_PROBE=humaneval,math500`, `NEEDLE_LENGTHS=…`, `SOAK_MINUTES=… SOAK_CONC=…`)
+under the box's GPU locks and keeps
 the artefacts under `internal/dsv41-5090-cpu/handoff/boots/`.
 
 Host‑side requirements: ~450 GB of RAM free at boot (the window script refuses below 465 GB available and drops the
