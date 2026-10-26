@@ -159,6 +159,21 @@ if [[ -s "/tmp/ds41-hyb-$TAG-placement.txt" ]]; then
   # pool cores 8r+2..8r+7 and their siblings 8r+34..8r+39 are exactly the CPUs with cpu % 8 >= 2
   awk '/^  cpu/ {cpu = $2 + 0; if (cpu % 8 >= 2) print}' "/tmp/ds41-hyb-$TAG-placement.txt" | head -48 | tee -a "$SUMMARY"
 fi
+# optional (phase 3, G3): HARD_PROBE=humaneval,math500 - the W2 line's hard_probe.py (copied to internal/…/probe/ with the
+# native fin01 references): greedy, thinking off; HumanEval executed (164 items), MATH-500 level 5 (60 items); paired
+# comparison against native (McNemar). ~8 + ~12 min at ~100 tok/s; decode-dominated (prompts of a few hundred tokens)
+if [[ -n "${HARD_PROBE:-}" ]]; then
+  PROBE=$REPO/internal/dsv41-5090-cpu/probe
+  for suite in ${HARD_PROBE//,/ }; do
+    lv=(); [[ "$suite" == "math500" ]] && lv=(--levels 5)
+    note "hard probe $suite (tag $TAG) ..."
+    ( cd "$PROBE" && $PY hard_probe.py run "http://127.0.0.1:$PORT" "$MODEL" "$suite" "$TAG" --conc "${PROBE_CONC:-1}" "${lv[@]}" 2>&1 | tail -4 | cut -c1-300 ) | tee -a "$SUMMARY"
+    note "hard probe $suite vs native fin01:"
+    ( cd "$PROBE" && $PY hard_probe.py compare "hard_${suite}_native_fin01.jsonl" "hard_${suite}_${TAG}.jsonl" 2>&1 | tail -12 | cut -c1-300 ) | tee -a "$SUMMARY"
+    docker logs "$NAME" > "$LOG" 2>&1
+    grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+  done
+fi
 # optional (phase 2.5): TTFT / prefill rate on long prompts, e.g. TTFT_LENGTHS=2048,14336,30720 (needs SCRATCH > 0 for
 # correct outputs; MAX_NUM_BATCHED_TOKENS sets the chunk)
 if [[ -n "${TTFT_LENGTHS:-}" ]]; then

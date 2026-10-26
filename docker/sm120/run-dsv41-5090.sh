@@ -2,28 +2,31 @@
 # DeepSeek-V4.1-Flash on 4x RTX 5090 (sm_120), TP4, as the MoET hybrid: the resident experts (a static placement
 # from routing frequencies, plus promote-on-miss into spare slots) in VRAM through b12x's compact W4A8 path, every
 # other routed expert of a decode step computed on the CPU from the pinned expert store, bit-identical to the
-# all-resident b12x path (tools/dsv41_5090/cpu_tier/, /root/work/HANDOFF-moet-hybrid.md). Phase 2.4 bring-up:
-# prompts <= 8 tokens take the hybrid path; longer prefills run b12x's non-compact kernels with the missing experts
-# as zero rows (phase 2.5 adds the streamed prefill) - this launcher is for the decode bring-up, not for serving yet.
+# all-resident b12x path (tools/dsv41_5090/cpu_tier/, /root/work/HANDOFF-moet-hybrid.md). Defaults = the serving
+# configuration measured 2026-10-25 (40 static + 80 LRU expert slots per layer per rank, promotion admission window
+# 12, exact-size Engram tables, the streamed prefill with a 128-slot scratch pool, no DSpark): decode 143 / 120 tok/s
+# on short prompts, prefill 2.0-2.3K tok/s, MemAvailable ~45 GB while up, boot ~7 min.
 #
 # Required:  MODEL_DIR   the official DeepSeek-V4.1-Flash checkpoint
 # Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1)  NAME (ds41-hyb)  GPUS (0,1,2,3)  TP (4)  PORT (8041)
 #            BIND (127.0.0.1:)       CACHE_DIR (/mnt/nvme/cache/ds41)  REPO (/mnt/nvme/vLLM-Moet-cpu: patcher + runtime)
 #            STORE (/mnt/nvme/packs/dsv41-hybrid)   cpu_moe/build_store.py's files (269 GB on NVMe)
 #            STORE_MODE (nonresident)  which records the tier pins: nonresident (52 GB per rank) or all (72 GB per rank)
-#            PLACEMENT ($REPO/internal/dsv41-5090-cpu/routes/placement-0.28-uniform.json)  routing/placement.py's file;
+#            PLACEMENT ($REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json = 40 static experts per layer;
+#                        0.28 = 107, 0.2526 = 97)  routing/placement.py's file;
 #                        RESIDENT=<int> instead = the first N experts of every layer (a test placement)
-#            SPARE (0)               empty slots per layer for promote-on-miss; PROMOTIONS (4) per layer per step
+#            SPARE (80)              LRU slots per layer for promote-on-miss (40 + 80 = the 120 slots of the 0.92 VRAM budget);
+#                        PROMOTIONS (4) per layer per step
 #            TIMEOUT_MS (500)        the in-graph wait's bound (fail-closed)
-#            SPEC_TOKENS (5)         DSpark draft tokens (0 = no drafter)
+#            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
 #            GPU_MEM_UTIL (0.92)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (512)  CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
-#            SCRATCH (0)             slots of the prefill scratch pool (phase 2.5; 128 = 1.2 GB per rank; 0 = the missing
-#                        experts of > 8-token calls are not computed: decode bring-up only)
+#            SCRATCH (128)           slots of the prefill scratch pool (phase 2.5; 128 = 1.2 GB per rank; 0 = the missing
+#                        experts of > 8-token calls are not computed: decode-only diagnostics)
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
-#            ENGRAM_THP (0)          1 = --engram-config {"use_thp":true}: vLLM backs the Engram tables with an exact-size mmap
+#            ENGRAM_THP (1)          1 = --engram-config {"use_thp":true}: vLLM backs the Engram tables with an exact-size mmap
 #                        (+ MADV_HUGEPAGE, prefaulted, cudaHostRegister) instead of torch's pinned allocator, which rounds
 #                        each 24.6 GB table up to 32 GiB (10-25: 2 tables x 4 ranks = ~80 GB of host RAM lost); needs free,
 #                        unfragmented memory at boot (DROP_CACHES=1 on the window script)
@@ -59,14 +62,14 @@ CACHE_DIR="${CACHE_DIR:-/mnt/nvme/cache/ds41}"
 REPO="${REPO:-/mnt/nvme/vLLM-Moet-cpu}"
 STORE="${STORE:-/mnt/nvme/packs/dsv41-hybrid}"
 STORE_MODE="${STORE_MODE:-nonresident}"
-PLACEMENT="${PLACEMENT:-$REPO/internal/dsv41-5090-cpu/routes/placement-0.28-uniform.json}"
+PLACEMENT="${PLACEMENT:-$REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json}"
 RESIDENT="${RESIDENT:-}"
-SPARE="${SPARE:-0}"
+SPARE="${SPARE:-80}"
 PROMOTIONS="${PROMOTIONS:-4}"
 TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
 TIER_DEBUG="${TIER_DEBUG:-0}"
-SCRATCH="${SCRATCH:-0}"
+SCRATCH="${SCRATCH:-128}"
 DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
 DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
@@ -76,7 +79,7 @@ POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
 PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
 HOST_EMPTY_CACHE="${HOST_EMPTY_CACHE:-0}"
 PREFIX_CACHE="${PREFIX_CACHE:-1}"
-ENGRAM_THP="${ENGRAM_THP:-0}"
+ENGRAM_THP="${ENGRAM_THP:-1}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 [[ "$ENGRAM_THP" == "1" ]] && EXTRA_ARGS="--engram-config {\"use_thp\":true} $EXTRA_ARGS"
 [[ "$PREFIX_CACHE" == "1" ]] || EXTRA_ARGS="--no-enable-prefix-caching $EXTRA_ARGS"
@@ -122,7 +125,7 @@ docker run -d --name "$NAME" --restart no \
   -e NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
   ${NCCL_CHANNELS:+-e NCCL_MIN_NCHANNELS=$NCCL_CHANNELS -e NCCL_MAX_NCHANNELS=$NCCL_CHANNELS} \
   ${POOL_SPIN_US:+-e MOE_B12X_POOL_SPIN_US=$POOL_SPIN_US} \
-  -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-5}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
+  -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-512}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
