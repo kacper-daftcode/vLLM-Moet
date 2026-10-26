@@ -9,7 +9,9 @@
 #
 # Required:  MODEL_DIR   directory with the moonshotai/Kimi-K3 checkpoint
 # Optional:  IMAGE (vllm/vllm-openai:v0.32.0)  NAME (vllm-k3)  PORT (8000)
-#            BIND (127.0.0.1: only local; "" = all interfaces)
+#            BIND (127.0.0.1: only local; "" = all interfaces; several space-separated "ADDR:" prefixes publish the
+#                        port on each of them, e.g. "10.100.0.12: 127.0.0.1:" = the LAN plus the loopback the
+#                        watchdog probes, nothing on Tailscale)
 #            API_KEY_FILE ("")       docker env file with VLLM_API_KEY=...; "" serves without a key
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm (FlashInfer JIT,
 #                        torch.compile, vLLM and DeepGEMM caches; later starts reuse them)
@@ -182,6 +184,11 @@ case "$KV_OFFLOAD" in
 esac
 ENV_ARGS=()
 [[ -n "$API_KEY_FILE" ]] && ENV_ARGS+=(--env-file "$API_KEY_FILE")
+# One -p per BIND prefix ("" = one unrestricted publish).
+PUBLISH=()
+if [[ -z "$BIND" ]]; then PUBLISH+=(-p "${PORT}:${PORT}"); else
+  for prefix in $BIND; do PUBLISH+=(-p "${prefix}${PORT}:${PORT}"); done
+fi
 
 if docker ps -q -f name="^${NAME}$" -f status=running | grep -q .; then
   echo "container $NAME already running - stop it first (docker stop -t 120 $NAME)"; exit 0
@@ -219,7 +226,7 @@ fi
 docker run -d --name "$NAME" --restart no \
   --gpus all \
   --ipc host \
-  -p "${BIND}${PORT}:${PORT}" \
+  "${PUBLISH[@]}" \
   --ulimit memlock=-1:-1 --ulimit stack=67108864 \
   "${MOUNTS[@]}" \
   "${ENV_ARGS[@]}" \
@@ -246,5 +253,5 @@ docker run -d --name "$NAME" --restart no \
   ${EXTRA_ARGS} \
   --host 0.0.0.0 --port "$PORT"
 
-echo "container $NAME started; logs: docker logs -f $NAME ; API: http://${BIND:-0.0.0.0:}${PORT}/v1"
+echo "container $NAME started; logs: docker logs -f $NAME ; API: $(for prefix in ${BIND:-0.0.0.0:}; do printf 'http://%s%s/v1 ' "$prefix" "$PORT"; done)"
 exit 0
