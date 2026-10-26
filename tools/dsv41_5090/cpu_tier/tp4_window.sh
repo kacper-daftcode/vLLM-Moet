@@ -90,11 +90,19 @@ cd "$REPO" || exit 1
 bash docker/sm120/run-dsv41-5090.sh || { note "launcher failed"; exit 1; }
 t0=$(date +%s)
 ready=0
+dropped2=0
 while (( $(date +%s) - t0 < READY_TIMEOUT )); do
   if ! docker ps -q -f name="^${NAME}$" | grep -q .; then
     note "container exited during startup after $(( $(date +%s) - t0 )) s"; break
   fi
   if curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null 2>&1; then ready=1; break; fi
+  # the second drop: the weight loading leaves ~290 GB of clean shard pages in the cache and the store pinning (260 GB
+  # of cudaHostAlloc) then reclaims them under pressure - 10-26: 16 min stuck in direct reclaim with another line's
+  # docker pulls dirtying the cache in parallel; dropping right after the weights are read frees the pages at once
+  if [[ "${DROP_CACHES:-0}" == "1" && $dropped2 == 0 ]] && docker logs "$NAME" 2>&1 | grep -q "Loading weights took"; then
+    sync; echo 3 > /proc/sys/vm/drop_caches; dropped2=1
+    note "page cache dropped again after the weights were read ($(( $(date +%s) - t0 )) s): $(free -g | awk '/^Mem:/ {print $7 " GB available"}')"
+  fi
   sleep 10
 done
 docker logs "$NAME" > "$LOG" 2>&1
