@@ -6,7 +6,7 @@ repository plus the model checkpoints; nothing is bind-mounted from a host-speci
 
 | model | image | Dockerfile | launcher | single-stream decode (TP4, greedy) |
 |---|---|---|---|---|
-| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-df3bd094-r13` (served since 2026-10-22: vLLM nightly df3bd094 + steps 17–28, fused decode MoE and sparse-MLA gather on, DSpark k=7; before it `-r11` (2026-10-21), then `dsv41-nightly-20260923-engram` (served since 2026-10-02 18:23Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-bf16` = the same without the Engram wkv split, served 2026-10-01..02; `-mhc` = also without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | **641 tok/s median, 686 best-of-10, 118 steps/s on the Fraser bench (DSpark k=7, `-r13`)**; earlier: 80.7–83.4 / 82.8–83.2 steps/s (prose / code), 169–195 / 420–433 tok/s (DSpark k=5; `-bf16`: 80.2–81.8 / 81.9–82.1), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
+| DeepSeek-V4.1-Flash (official MXFP4/MXFP8 checkpoint, vision on) | `vllm-moet-sm120:dsv41-nightly-df3bd094-r18` (served since 2026-10-23 at 400 W: vLLM nightly df3bd094 + steps 17–33, fused decode MoE, sparse-MLA gather and steps 30–33 on, DSpark k=7; before it `-r13` (2026-10-22, 325 W), `-r11` (2026-10-21), then `dsv41-nightly-20260923-engram` (served since 2026-10-02 18:23Z with `VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router`; `-bf16` = the same without the Engram wkv split, served 2026-10-01..02; `-mhc` = also without the small-M BF16 GEMMs, served 2026-09-25..10-01; `-moeqs` = also without the mHC boundary off the critical path and vllm#57679, `-ced` = also without the fused MoE quant+scatter, `-kvdedup` = also without the CED prefill, `dsv41-nightly-20260923` = also one offloaded KV copy per rank, `dsv41-0909` = rollback) | `Dockerfile.sm120-dsv41-nightly` (`Dockerfile.sm120-dsv41` for the 0909 image) | `docker/sm120/run-dsv41.sh` | **641 tok/s median, 686 best-of-10, 118 steps/s on the Fraser bench (DSpark k=7, `-r13`)**; earlier: 80.7–83.4 / 82.8–83.2 steps/s (prose / code), 169–195 / 420–433 tok/s (DSpark k=5; `-bf16`: 80.2–81.8 / 81.9–82.1), fresh prefill 18k tok/s (CED), 3.40M-token FP4 KV at 512K context + KV offload (64 GiB host RAM = 76.7M tokens, disk tier; since 2026-09-23) (0909 image: 67 steps/s, 152 / 360 tok/s, 3.06M tokens) |
 | Qwen3.8-Flash-Next-FP8 (official checkpoint) | `vllm-moet-sm120:qwen38-20073` | `Dockerfile.sm120-qwen38` | `docker/sm120/run-qwen38.sh` | 98.5 steps/s, prose 243 / code 346 tok/s (MTP k=3), 2.28M-token KV at 256K context |
 
 What the images change relative to the official ones, and the measurements behind each change:
@@ -98,15 +98,19 @@ DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm
 # (FlashInfer 0.7.2 taught the interleaved V4.1 records in step 5, DeepGEMM a7a92773 on the stable ABI); the image label
 # com.vllm-moet.v41-kv-records=interleaved sends the launcher's disk tier to $KV_OFFLOAD_FS_DIR/v41-interleaved
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-49cb2bbf-r1 .   # ~10 min
-# DeepSeek, served image since 2026-10-22 (-r13): the same line on vLLM nightly df3bd094 (FlashInfer 0.7.2 reading the
+# DeepSeek, served image since 2026-10-23 (-r18; -r13 served 2026-10-22): the same line on vLLM nightly df3bd094 (FlashInfer 0.7.2 reading the
 # interleaved V4.1 records in its DSv4.1 dual cache, DeepGEMM 727f8470), plus Dockerfile steps 17-28: b12x compact MoE
 # at TP4, the DSpark drafter's and the target's lm_head on the MXFP8 GEMV, the router's top-6 in one CUDA kernel, DSpark's
 # Markov sampling in one launch, b12x FC2 grouped by expert, the two-shot P2P all-reduce with its consumer fused into the
 # mHC boundary (in NCCL's summation order since -r12), the deterministic indexer top-k, the fused decode MoE (step 27)
-# and the sparse-MLA candidate rows by plain loads (step 28). As served: VLLM_MOET_B12X_MOE_FUSED=1,
+# and the sparse-MLA candidate rows by plain loads (step 28); -r18 adds steps 30-33 (the drafter's input prep and the
+# SWA builders' decode build in one launch each, the DSA candidate blocks on the deterministic top-k, the shared-expert
+# add fused into the MoE top-k sum - all bit-identical, all behind runtime switches). As served: VLLM_MOET_B12X_MOE_FUSED=1,
 # VLLM_MOET_SPARSE_MLA_LDG=1, VLLM_MOET_TARGET_LM_HEAD_MXFP8=1, VLLM_MOET_P2P_AR=1 (+ fused consumer to 16 rows),
-# DSpark k=7. Fraser bench on 4x RTX PRO 6000 (325 W, memory +5000): median 641 tok/s, best-of-10 686, 118 steps/s.
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r13 .   # ~10 min
+# VLLM_MOET_DFLASH_PREP_GROUPS=1, VLLM_MOET_CANDIDATE_DET_TOPK=1, VLLM_MOET_SWA_DECODE_BUILD=1, VLLM_MOET_MOE_TOPKSUM_ADD=1,
+# DSpark k=7. Fraser bench on 4x RTX PRO 6000 (400 W since 2026-10-23, memory +5000): median 650 tok/s, best-of-10 695,
+# 126.3 steps/s (-r13 at 325 W: 641 / 686 / 118.0; the same -r15 image 114.75 -> 122.85 steps/s from 325 to 400 W).
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r18 .   # ~10 min
 # DeepSeek, rollback image: the recipe's 0909 image + the same fixes on its own FlashInfer/DeepGEMM pins
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41  -t vllm-moet-sm120:dsv41-0909  .   # ~5 min after the base pull (DeepGEMM _C rebuild + FlashInfer JIT precompile)
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .   # ~4 min (MoE GEMV extension compile)
