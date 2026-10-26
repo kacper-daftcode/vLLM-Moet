@@ -1894,6 +1894,44 @@ hit 0.50 → 0.38 s. The first start of FlashInfer 0.7.2 autotunes (22.2 min to 
 images is `/mnt/k3x/kvcache/v41-interleaved`; the footer files above it age out under the TTL cron (or serve a
 rollback to -r2).
 
+## The df3bd094 line: steps 17–37 and the 400 W limit (2026‑10‑20..26)
+
+The image moved to vLLM nightly `df3bd094` (FlashInfer 0.7.2 with the DSv4.1 dual‑cache sparse MLA, DeepGEMM
+`727f8470`) and the MoE to b12x's compact W4A8 micro path (`--moe-backend b12x`, the drafter too): C1 decode
+~89 → ~105 steps/s on the first image (`-r1`, 2026‑10‑20) and the GPU KV cache 3.80M → 9.90M tokens. The twenty
+steps that followed are listed one by one — mechanism, bit test, in‑situ measurement, verdict — in the table of
+[`tools/dsv41_sm120/README.md`](../tools/dsv41_sm120/README.md); every one of them is bit‑identical to the path it
+replaces and sits behind a runtime switch, and every image was A/B'd against its predecessor with the real model in
+production's configuration (alternating cold starts, ten Fraser reps per arm) before a production window. The arc,
+in steps/s of the Fraser prompt on the served cards:
+
+| image (served) | what it added | steps/s |
+|---|---|---|
+| `-r1` (10‑20) | b12x W4A8 MoE for the target and the drafter | ~105 |
+| `-r6` (10‑21) | 18 drafter lm_head on the MXFP8 GEMV, 19 router top‑6 in one CUDA kernel, 20 fused Markov sampling, 21 target lm_head MXFP8, 22 FC2 grouped by expert | 117.8 → 123.6 (W4) |
+| `-r7`, `-r8`, `-r9` (10‑21) | 23 two‑shot P2P all‑reduce for 17–64 rows, 24 the C1 all‑reduce fused into `mhc_post_norm` after a P2P push, 25 the lm_head vocab all‑gather on the push | 122.0 → 125.2 (W6, k = 5) |
+| `-r11` (10‑21) | 26 deterministic indexer top‑k (off), 27 the decode MoE FC1 → activation → FC2 in one persistent kernel | 131.6 at k = 5 |
+| k = 7 (10‑22) | DSpark draft width 5 → 7: steps −12 %, tokens per step 4.54 → 5.38, tok/s +4 % | 117.2 |
+| `-r13`, `-r15` (10‑22) | P2P AR in NCCL's summation order, 28 sparse‑MLA candidate rows by plain loads + the softmax / XV section with 4 barriers per tile (8.83 → 8.19 µs) | 118.0 |
+| 400 W (10‑23) | power limit 325 → 400 W on all eight cards (the owner's decision after the measurement: `-r15` 114.75 → 122.85 on the development cards; 450 W tripped the breakers once) | 125.05 |
+| `-r18` (10‑23) | 30 drafter input prep in one launch, 31 DSA candidate blocks on the deterministic top‑k, 32 SWA builders' decode build in one launch, 33 shared‑expert add fused into the MoE top‑k sum | 126.25 |
+| `-r21` (10‑26) | the mHC boundary kernel as a cluster of five CTAs per token (8.3 → 7.1 µs), the sparse‑MLA XV loads on a transposed byte `ldmatrix` (7.9 → 7.1 µs), 36 the drafter's SWA update in one launch; `P2P_AR_FUSED_MAX_ROWS` 16 → 8 (C2 −1.3 %) | 127.0–128.0 |
+
+Measured and left off: step 29's per‑shape GEMV units (gained in isolation, lost in the served graph), step 34 (the MoE
+rows quantization on a side stream: pb‑deep promised −82 µs per step, the real model showed +0.08 %), step 35 (router
+GEMM + top‑6 in one launch: the serial selection tail of one CTA costs what the launch cost) and step 37 (the whole
+MoE sublayer's routing folded into the persistent MoE kernel: the phases are serial, the fusion loses the spread
+GEMM's PDL overlap with the boundary kernel and puts the side‑stream quantization back on the path — critical path
++227 µs per step; kept as an opt‑in build). Two methodological rules came out of those: gains under ~0.3 % are
+measured only on the real model with alternating arms (pb‑deep's dummy routing carries ±1 % of MoE noise and
+`crit_dag` attributes side‑stream joins to the wrong branch), and a launch removed buys nothing when a serial tail
+of one CTA replaces it.
+
+Where the C1 step (7.7 ms under the profiler on `-r21`) is now: the fused MoE 2.7 ms (the expert weight bytes at the
+DRAM floor), the dense MXFP8 GEMVs ~0.9 ms on the path, the mHC boundaries (P2P push 6.9 + post‑norm 7.1 µs × 80, the
+push on the PCIe egress floor) ~1.1 ms, the drafter graph 0.75 ms, the sparse attention + indexer ~0.5 ms; what is
+left bit‑for‑bit is ≈ 1–2 % (sparse‑MLA leftovers, the drafter's small‑expert MoE, the indexer's −1 fills).
+
 ## Apply / build / run
 
 ```bash
