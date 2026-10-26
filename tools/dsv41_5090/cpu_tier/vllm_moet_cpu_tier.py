@@ -530,7 +530,8 @@ class _Scratch:
         self.staging = torch.empty(n, RECORD_BYTES, dtype=torch.uint8, device=device)
         self.table = torch.full((S.E,), -1, dtype=torch.int32, device=device)
         self.plans: dict = {}
-        self.bufs: dict = {}
+        self.buf = None            # one b12x scratch for every token count (sized for the largest seen)
+        self.out = None            # one output buffer [T_max, HID]
         self.impl = experts_impl
         self.activation = layer.activation
         self.rounds = 0
@@ -560,6 +561,9 @@ class _Scratch:
         return "; streaming (stage + repack + extra runs): " + " | ".join(parts)
 
     def plan(self, T: int, K: int, nbytes_fn):
+        """b12x's plan for T tokens (cached per (T, K) like vLLM's own) and ONE scratch + output buffer shared by all
+        token counts, sized for the largest T seen so far (10-26: a buffer per distinct T leaked ~15 MB per prompt
+        length - HumanEval's 104 distinct lengths took the device to OOM at util 0.92)."""
         key = (T, K)
         if key not in self.plans:
             from vllm.model_executor.layers.fused_moe.b12x import _require_b12x_fused_moe
@@ -570,9 +574,16 @@ class _Scratch:
                 core_token_counts=(max(T, 1),), route_num_experts=0, quant_mode=self.impl._quant_mode,
                 apply_router_weight_on_input=False, swiglu_limit=limit, swiglu_alpha=alpha, swiglu_beta=beta, frozen=True))
             self.plans[key] = plan
-            self.bufs[key] = (torch.empty(nbytes_fn(plan), dtype=torch.uint8, device=self.prepared.w1_fp4.device),
-                              torch.empty(T, HID, dtype=self.impl.moe_config.in_dtype, device=self.prepared.w1_fp4.device))
-        return self.plans[key], self.bufs[key]
+        plan = self.plans[key]
+        need = int(nbytes_fn(plan))
+        dev = self.prepared.w1_fp4.device
+        if self.buf is None or self.buf.numel() < need:
+            self.buf = None
+            self.buf = torch.empty(need, dtype=torch.uint8, device=dev)
+        if self.out is None or self.out.shape[0] < T:
+            self.out = None
+            self.out = torch.empty(T, HID, dtype=self.impl.moe_config.in_dtype, device=dev)
+        return plan, (self.buf, self.out[:T])
 
 
 def _dump_call(experts_impl, hidden_states, topk_weights, output) -> None:
