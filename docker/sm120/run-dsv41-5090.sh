@@ -46,6 +46,9 @@
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
+#            BAKED (0)               1 = run the image's own copy of the hybrid (Dockerfile step 28: patched packages, runtime,
+#                        libcpu_tier.so) without mounting the worktree or re-running the patcher at start (IMAGE must have the
+#                        layer, e.g. vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2); 0 = the dev flow (worktree mounted, patched at start)
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS appended to `vllm serve` / `docker run`
 # GPU protocol: this script does NOT take the locks - run it as
 #   flock -w 3600 /tmp/exl3diff-gpu0.lock flock -w 3600 /tmp/exl3diff-gpu1.lock flock -w 3600 /tmp/exl3diff-gpu2.lock \
@@ -100,7 +103,15 @@ TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM
           -e VLLM_MOET_CPU_TIER_SCRATCH="$SCRATCH" -e VLLM_MOET_CPU_TIER_DEBUG_COMPACT="$DEBUG_COMPACT"
           -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL="$DEBUG_PREFILL" -e VLLM_MOET_CPU_TIER_PROMOTE_WINDOW="$PROMOTE_WINDOW"
           -e VLLM_MOET_CPU_TIER_HOST_EMPTY_CACHE="$HOST_EMPTY_CACHE" -e MOE_B12X_POOL_SPIN_HOT="$POOL_SPIN_HOT")
-MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$REPO:/repo:ro" -v "$TABLES:/parity:ro" -v "$STORE:/store:ro")
+BAKED="${BAKED:-0}"
+MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$TABLES:/parity:ro" -v "$STORE:/store:ro")
+if [[ "$BAKED" == "1" ]]; then
+  ENTRY=/opt/vllm-moet/dsv41_5090/cpu_tier/serve_hybrid.sh
+  TIER_ENV+=(-e HYBRID_PATCH_AT_START=0)
+else
+  MOUNTS+=(-v "$REPO:/repo:ro")
+  ENTRY=/repo/tools/dsv41_5090/cpu_tier/serve_hybrid.sh
+fi
 # the store may be a directory of symlinks into another store (the mini-real test): mount the packs root too
 MOUNTS+=(-v /mnt/nvme/packs:/mnt/nvme/packs:ro)
 if [[ -n "$RESIDENT" ]]; then
@@ -132,7 +143,7 @@ docker run -d --name "$NAME" --restart no \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
   --entrypoint bash "$IMAGE" \
-  /repo/tools/dsv41_5090/cpu_tier/serve_hybrid.sh /model "$PORT" ${EXTRA_ARGS}
+  "$ENTRY" /model "$PORT" ${EXTRA_ARGS}
 
 echo "container $NAME started; logs: docker logs -f $NAME ; API: http://${BIND:-0.0.0.0:}${PORT}/v1"
 echo "expect in the log: '[moet-cpu-tier] rank N: store /store (...) records = ... GB pinned', 'tier started: 40 layers x 384 experts',"

@@ -4,12 +4,18 @@
 # environment (see vllm_moet_cpu_tier.py).
 #   usage: serve_hybrid.sh MODEL_DIR PORT [extra vllm serve args...]
 #   env: TP (4) SERVED_NAME SPEC_TOKENS (5; 0 = no DSpark) GPU_MEM_UTIL (0.92) MAX_MODEL_LEN (65536) MAX_NUM_SEQS (1)
-#        MAX_NUM_BATCHED_TOKENS (512) CAPTURE_SIZE (8) LANGUAGE_ONLY (1) LOAD_FORMAT (auto)
+#        MAX_NUM_BATCHED_TOKENS (512) CAPTURE_SIZE (8) LANGUAGE_ONLY (1) LOAD_FORMAT (auto) HYBRID_PATCH_AT_START (1)
 set -u
 MODEL_DIR="${1:?model dir}"
 PORT="${2:?port}"
 shift 2
-python3 /repo/tools/dsv41_5090/cpu_tier/patch_vllm_moe_cpu_tier.py || exit 1
+# the patcher: from the mounted worktree at every start (the dev flow; idempotent, rebuilds libcpu_tier.so, ~60 s) unless
+# HYBRID_PATCH_AT_START=0 (the image has the layer of Dockerfile step 28: /opt/vllm-moet/cpu_tier + the patched packages)
+if [ "${HYBRID_PATCH_AT_START:-1}" = "1" ]; then
+  python3 "${HYBRID_SRC:-/repo/tools/dsv41_5090}/cpu_tier/patch_vllm_moe_cpu_tier.py" || exit 1
+else
+  python3 -c "import vllm_moet_cpu_tier" || { echo "the image has no baked cpu tier (Dockerfile step 28); set HYBRID_PATCH_AT_START=1 with the worktree mounted"; exit 1; }
+fi
 ARGS=()
 SPEC_TOKENS="${SPEC_TOKENS:-5}"
 if [ "$SPEC_TOKENS" != "0" ]; then

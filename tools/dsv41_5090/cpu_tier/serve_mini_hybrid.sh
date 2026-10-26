@@ -17,7 +17,11 @@ set -u
 MODEL_DIR="${1:?model dir}"
 PORT="${2:?port}"
 shift 2
-python3 /repo/tools/dsv41_5090/cpu_tier/patch_vllm_moe_cpu_tier.py || exit 1
+if [ "${HYBRID_PATCH_AT_START:-1}" = "1" ]; then
+  python3 "${HYBRID_SRC:-/repo/tools/dsv41_5090}/cpu_tier/patch_vllm_moe_cpu_tier.py" || exit 1
+else
+  python3 -c "import vllm_moet_cpu_tier" || { echo "no baked cpu tier in the image (Dockerfile step 28)"; exit 1; }
+fi
 SPEC=(--speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"moe_backend":"b12x"}')
 [ "${DSPARK:-1}" = "1" ] || SPEC=()
 LOAD=(--load-format "${LOAD_FORMAT:-dummy}")

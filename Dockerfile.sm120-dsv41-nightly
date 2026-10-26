@@ -464,6 +464,22 @@ RUN if [ "$VLLM_MOET_B12X_MOE_FUSED_PATCH" = "1" ]; then python3 /opt/vllm-moet/
     && grep -q "_moet_moe_fused_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_fused_sm120/*.so; fi
 
+# 28. The MoET hybrid: the CPU expert tier inside the b12x MoE path (tools/dsv41_5090/, docs/moet-hybrid.md). The patcher
+#     installs the runtime into /opt/vllm-moet/cpu_tier (+ a .pth), builds libcpu_tier.so (kernel v2, bit-identical to the
+#     compact W4A8 path; znver4 = the TR PRO 9975WX under GCC 13) and patches mxfp4.py / b12x.py / w4a8_compact_micro.py /
+#     the model runner with markers. Inert unless VLLM_MOET_MOE_CPU_TIER=1 (the launcher docker/sm120/run-dsv41-5090.sh sets
+#     it and mounts the expert store, the placement and the kernel tables). Dev flow: the launcher's default still mounts the
+#     worktree and re-runs the patcher at container start (idempotent); BAKED=1 uses this layer as is.
+COPY tools/dsv41_5090/ /opt/vllm-moet/dsv41_5090/
+ARG VLLM_MOET_CPU_TIER_PATCH=1
+ARG VLLM_MOET_CPU_TIER_ARCH=znver4
+RUN if [ "$VLLM_MOET_CPU_TIER_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_5090/cpu_tier/patch_vllm_moe_cpu_tier.py --arch "$VLLM_MOET_CPU_TIER_ARCH" \
+    && for f in vllm/model_executor/layers/quantization/mxfp4.py vllm/model_executor/layers/fused_moe/b12x.py \
+                flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py vllm/v1/worker/gpu/model_runner.py; do \
+         grep -q "\[vllm-moet\] cpu tier" /usr/local/lib/python3.12/dist-packages/$f || exit 1; done \
+    && ls /opt/vllm-moet/cpu_tier/libcpu_tier.so \
+    && python3 -c "import vllm_moet_cpu_tier, cpu_tier, placement_manager; print('cpu tier runtime importable')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch)" \
@@ -489,4 +505,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.b12x-fc2-grouped="${VLLM_MOET_B12X_FC2_GROUPED}" \
       com.vllm-moet.det-topk="${VLLM_MOET_DET_TOPK_PATCH}" \
       com.vllm-moet.b12x-moe-fused="${VLLM_MOET_B12X_MOE_FUSED_PATCH}" \
-      com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
+      com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}" \
+      com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}"
