@@ -2,7 +2,8 @@
 """A replicated sliding-window draft (RedHatAI/Kimi-K3-speculator.dspark) next to a DCP-sharded MLA target.
 
 The RedHat K3 speculator is a 5-layer Qwen3-style GQA draft with a 2048-token sliding window. Under a
-DCP-sharded MLA target (K3, TP8 + DCP8, TOKENSPEED_MLA) vLLM v0.32.0 cannot start it:
+DCP-sharded MLA target (K3, TP8 + DCP8, TOKENSPEED_MLA) vLLM v0.32.0 cannot start it, and once started it
+loses prefix caching:
 
 1. `resolve_kv_cache_layout` sees a sharded target cache and a replicated draft cache with different page
    sizes and requires a block-outer layout (BLHNC) "to pack those groups without equalizing pages". But
@@ -31,27 +32,31 @@ DCP-sharded MLA target (K3, TP8 + DCP8, TOKENSPEED_MLA) vLLM v0.32.0 cannot star
    patch lets a GQA FlashInfer layer on the SM100 family use the largest trtllm-gen page that fits the
    primary block, judged on the layer's own heads (1024 here: 13 admission blocks, 2-3 held in decode).
 
-4. With the draft's window in prefix caching, `SlidingWindowManager` ("requires block-aligned lookups")
-   switches the whole model to block-aligned hits, and the K3 target got **no prefix hit at all** (a 30K
-   prompt resent: 0 of 20,348 tokens; multi-turn TTFT = a full prefill). The draft's window is a few blocks of
-   per-request state, so the patch takes it out of prefix caching instead (`DraftSlidingWindowSpec`,
-   `prefix_cacheable = False`) and caps every prefix hit - local (`KVCacheManager.get_computed_blocks`, the
-   connector-path variant) and external (`SimpleCPUOffload` manager) - `sliding_window` tokens below the
-   prompt end (`draft_replay_window`). The target recomputes that tail (2048-2175 tokens, ~0.1 s of prefill)
-   and the DFlash precompute writes the draft's window from the recomputed hidden states; fine-grained
-   hits are back for the MLA / KDA groups. UNRESOLVED (2026-10-26): K3's KDA groups retain their aligned
-   state sparsely - at the prompt-end hash boundary of a finished request and at a few block boundaries -
-   so a hit capped 2048 tokens below the prompt end finds no KDA state: a 30K prompt resent hits 0 of
-   20,350 tokens, later agent turns hit 11,648-15,872 of ~17-20K (where an earlier turn's end state
-   happens to lie). The target stays correct and the pool stays at 24.48M tokens, but multi-turn TTFT
-   is a prefill. `VLLM_MOET_SWA_DRAFT_REPLAY=0` keeps the window in prefix caching instead: with the
-   default 1024-token blocks the window's and the KDA's hit positions never coincide (0 hits); with
-   `VLLM_MOET_SWA_DRAFT_BLOCK=128` (block = prefix-match unit) hits land where the retained window
-   still covers the KDA boundary - 0 on a resend, 15,872 of 17,307 on a third turn - and the pool drops
-   to 19.2M tokens (each 128-token block is padded to the 958 KB MLA page). A proper fix is a
-   `SlidingWindowManager` with fine-grained (hash-unit) lookups and copy-on-write for the partial
-   block, or the draft window rebuilt from a retained KDA state; neither is attempted here. Until then
-   this draft is for single-session / no-prefix-cache serving only.
+4. `SlidingWindowManager` only hits on whole blocks ("requires block-aligned lookups"), so with the
+   draft's window in prefix caching the hybrid coordinator gives up hash-unit (fine-grained) hits for the
+   whole model and every hit must land on a multiple of the scheduler block (LCM of 13,312-token MLA
+   blocks, 1,664-token KDA blocks and 1,024-token window blocks = 13,312): the K3 target got no prefix
+   hit at all (a 30K prompt resent: 0 of 20,348 tokens). K3's KDA groups retain their aligned state only
+   where the engine can commit it - the prompt-end hash boundary (`get_mamba_prefill_checkpoint_position`)
+   and the 1,664-token chunk ends - and the MLA groups retain the same prompt-end boundary as a partial
+   entry; a hit exists only where every group has state, i.e. at a finished request's prompt-end hash
+   boundary. So the window must be reachable exactly there. The patch gives `SlidingWindowManager`
+   fine-grained lookups (`supports_fine_grained_hash_lookup`): a hit may end at any hash boundary P whose
+   window blocks are cached - whole blocks under their full-block hash, the block P falls in under the
+   prefix hash at P, which `cache_blocks` registers at the prompt's final hash boundary the way
+   `FullAttentionManager._cache_partial_tail_block` does (and re-registers after the block is promoted to
+   a full one). The partial tail block is shared copy-on-write through the base class's
+   `_partial_hit_reqs` path (one reserved block, one block copy on the worker), exactly like the MLA
+   groups' partial tails. The window that a replaying request needs (the blocks before the prompt-end
+   boundary) is kept referenced by its request for the request's lifetime instead of being nulled once it
+   leaves the attention window, so it ages out of the LRU with the request's MLA/KDA blocks and not during
+   a long decode; it fits inside the per-request admission cap (`SlidingWindowSpec.
+   max_admission_blocks_per_request`: window + one in-flight chunk, 13 blocks here, 2-3 held in decode).
+   Everything else (block-aligned models, the dense-attention path, Gemma-style full+SWA hybrids without a
+   Mamba "align" group) keeps the upstream block-aligned code path: the fine-grained branch is entered only
+   when the coordinator aligns hits below the block size, which needs a Mamba "align" group.
+   Supersedes the 2026-10-25/26 variant (the window as per-request scratch with every hit capped
+   `sliding_window` tokens below the prompt end), which found no KDA state at the capped position.
 
 Idempotent, anchor-based. Usage:
     python3 patch_vllm_swa_draft_dcp.py [--root PATH] [--check]
@@ -156,7 +161,7 @@ ATTN_NEW = (
     "\n"
     "                    max_block = page_budget // sw_per_token\n"
     "                    # VLLM_MOET_SWA_DRAFT_BLOCK caps the choice (e.g. 128 = the\n"
-    "                    # prefix-match unit, so the window's blocks hit fine-grained).\n"
+    "                    # prefix-match unit; the default 1024 is the largest page).\n"
     "                    cap = int(os.environ.get(\"VLLM_MOET_SWA_DRAFT_BLOCK\", \"1024\"))\n"
     "                    for candidate in (1024, 512, 256, 128):\n"
     "                        if candidate <= cap and sw_block_size < candidate <= max_block:\n"
@@ -166,149 +171,264 @@ ATTN_NEW = (
     "                block_size=sw_block_size,\n"
 )
 
-# 4. The draft's window as per-request scratch, replayed after a prefix hit.
-IFACE_FILE = "v1/kv_cache_interface.py"
-IFACE_OLD = (
-    "@dataclass(frozen=True, kw_only=True)\n"
-    "class SlidingWindowMLASpec(SlidingWindowSpec):\n"
+# 4. SlidingWindowManager with hash-unit (fine-grained) hits and a copy-on-write partial tail.
+SWA_FILE = "v1/core/single_type_kv_cache_manager.py"
+SWA_CLASS_OLD = (
+    "class SlidingWindowManager(SingleTypeKVCacheManager):\n"
+    "    def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:\n"
+    "        super().__init__(kv_cache_spec, **kwargs)\n"
+    "        self.sliding_window = kv_cache_spec.sliding_window\n"
 )
-IFACE_NEW = (
-    f"{MARKER}\n"
-    "@dataclass(frozen=True, kw_only=True)\n"
-    "class DraftSlidingWindowSpec(SlidingWindowSpec):\n"
-    '    """A speculative draft\'s sliding-window cache, kept out of prefix caching.\n'
+SWA_CLASS_NEW = (
+    "class SlidingWindowManager(SingleTypeKVCacheManager):\n"
+    f"    {MARKER}:\n"
+    "    # Hash-unit (fine-grained) lookups. Next to a Mamba \"align\" group the\n"
+    "    # hybrid coordinator aligns hits to the hash unit; a manager that only\n"
+    "    # hits on whole blocks would force every group back to scheduler-block\n"
+    "    # aligned hits (the LCM of the group block sizes), which for Kimi-K3 with\n"
+    "    # a sliding-window draft meant no hit at all. A hit may end inside a\n"
+    "    # block; its partial tail is shared copy-on-write, as for full attention\n"
+    "    # (_find_longest_fine_grained_hit, cache_blocks, remove_skipped_blocks).\n"
+    "    supports_fine_grained_hash_lookup: ClassVar[bool] = True\n"
     "\n"
-    "    A SlidingWindowManager only hits on whole blocks, which disables the\n"
-    "    fine-grained (hash-unit) hits a hybrid target relies on, and in practice\n"
-    "    left the K3 target without any prefix hit. The draft's window is instead\n"
-    "    per-request scratch: every prefix hit is capped ``sliding_window`` tokens\n"
-    "    below the prompt end (``draft_replay_window``), the target recomputes that\n"
-    "    tail and the draft writes its window from the recomputed hidden states.\n"
-    '    """\n'
+    "    def __init__(self, kv_cache_spec: SlidingWindowSpec, **kwargs) -> None:\n"
+    "        super().__init__(kv_cache_spec, **kwargs)\n"
+    "        self.sliding_window = kv_cache_spec.sliding_window\n"
+)
+
+SWA_FIND_OLD = (
+    "        # The number of contiguous blocks needed for a prefix cache hit.\n"
+    "        sliding_window_contiguous_blocks = cls._contiguous_blocks_for_hit(\n"
+    "            kv_cache_spec.sliding_window, kv_cache_spec.block_size, drop_eagle_block\n"
+    "        )\n"
+)
+SWA_FIND_NEW = (
+    f"        {MARKER}:\n"
+    "        # fine-grained mode (hash unit below the block): resolve_block_hashes\n"
+    "        # kept the raw hash-unit list, and a hit may end at any hash boundary.\n"
+    "        if (\n"
+    "            alignment_tokens < kv_cache_spec.block_size\n"
+    "            and kv_cache_spec.block_size % alignment_tokens == 0\n"
+    "        ):\n"
+    "            # list or lazy BlobBlockHashes view\n"
+    "            assert isinstance(block_hashes, Sequence)\n"
+    "            return cls._find_longest_fine_grained_hit(\n"
+    "                block_hashes,\n"
+    "                max_length,\n"
+    "                kv_cache_group_ids,\n"
+    "                block_pool,\n"
+    "                kv_cache_spec,\n"
+    "                drop_eagle_block,\n"
+    "                alignment_tokens,\n"
+    "            )\n" + SWA_FIND_OLD
+)
+
+SWA_METHODS_OLD = (
+    "    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:\n"
+    '        """Get the number of tokens that will be skipped for attention computation.\n'
+    "\n"
+    "        For sliding window, this corresponds to the tokens that are prior to\n"
+    "        the current sliding window.\n"
+)
+SWA_METHODS_NEW = (
+    f"    {MARKER}\n"
+    "    @classmethod\n"
+    "    def _find_longest_fine_grained_hit(\n"
+    "        cls,\n"
+    "        block_hashes: Sequence,\n"
+    "        max_length: int,\n"
+    "        kv_cache_group_ids: list[int],\n"
+    "        block_pool: BlockPool,\n"
+    "        kv_cache_spec: SlidingWindowSpec,\n"
+    "        drop_eagle_block: bool,\n"
+    "        alignment_tokens: int,\n"
+    "    ) -> tuple[tuple[list[KVCacheBlock], ...], int]:\n"
+    '        """Longest hit ending at a hash boundary, not only at a block boundary.\n'
+    "\n"
+    "        A hit of ``hit_length`` tokens needs the blocks holding the window\n"
+    "        ``[hit_length - sliding_window + 1, hit_length)`` cached: whole blocks\n"
+    "        under their full-block hash, and the block the hit ends in under a\n"
+    "        prefix hash at or past ``hit_length`` (its full-block hash, or a\n"
+    "        partial entry ``cache_blocks`` registered at a prompt-end boundary);\n"
+    "        any such key proves the block holds the prefix below it. With the\n"
+    "        EAGLE drop the proof must reach one unit past the hit (the key at\n"
+    "        ``hit_length + unit``, or the next block when the hit is block\n"
+    "        aligned); the coordinator re-queries an already verified eagle group\n"
+    "        without the drop, which the same keys satisfy. Candidates are probed\n"
+    "        from the longest down, each block's keys once (``scale`` lookups per\n"
+    "        block, i.e. one per hash unit), then one per window block on a hit.\n"
+    '        """\n'
+    "        block_size = kv_cache_spec.block_size\n"
+    "        unit = alignment_tokens\n"
+    "        scale = block_size // unit\n"
+    "        drop = unit if drop_eagle_block else 0\n"
+    "        window = kv_cache_spec.sliding_window\n"
+    "        num_groups = len(kv_cache_group_ids)\n"
+    "        num_units = len(block_hashes)\n"
+    "        empty: tuple[list[KVCacheBlock], ...] = tuple([] for _ in range(num_groups))\n"
+    "        max_hit = min(max_length - drop, num_units * unit) // unit * unit\n"
+    "        if max_hit <= 0:\n"
+    "            return empty, 0\n"
+    "\n"
+    "        # Highest registered prefix hash on a block, (tokens, blocks per group),\n"
+    "        # None when the block is not cached; probed once per block.\n"
+    "        block_keys: dict[int, tuple[int, list[KVCacheBlock]] | None] = {}\n"
+    "\n"
+    "        def block_key(idx: int) -> tuple[int, list[KVCacheBlock]] | None:\n"
+    "            if idx in block_keys:\n"
+    "                return block_keys[idx]\n"
+    "            found = None\n"
+    "            for u in range(min((idx + 1) * scale, num_units), idx * scale, -1):\n"
+    "                cached = block_pool.get_cached_block(\n"
+    "                    block_hashes[u - 1], kv_cache_group_ids\n"
+    "                )\n"
+    "                if cached is not None:\n"
+    "                    found = (u * unit, cached)\n"
+    "                    break\n"
+    "            block_keys[idx] = found\n"
+    "            return found\n"
+    "\n"
+    "        for hit_length in range(max_hit, 0, -unit):\n"
+    "            last_block = (hit_length - 1) // block_size\n"
+    "            key = block_key(last_block)\n"
+    "            if key is None or key[0] < hit_length:\n"
+    "                continue\n"
+    "            if drop and key[0] < hit_length + unit:\n"
+    "                # A block-aligned hit is proven by any key on the next block.\n"
+    "                if (\n"
+    "                    hit_length != (last_block + 1) * block_size\n"
+    "                    or block_key(last_block + 1) is None\n"
+    "                ):\n"
+    "                    continue\n"
+    "            first_block = max(0, hit_length - window + 1) // block_size\n"
+    "            window_blocks: list[list[KVCacheBlock]] = []\n"
+    "            for idx in range(first_block, last_block):\n"
+    "                full = block_key(idx)\n"
+    "                if full is None or full[0] < (idx + 1) * block_size:\n"
+    "                    break\n"
+    "                window_blocks.append(full[1])\n"
+    "            else:\n"
+    "                window_blocks.append(key[1])\n"
+    "                computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(\n"
+    "                    [block_pool.null_block] * first_block for _ in range(num_groups)\n"
+    "                )\n"
+    "                for cached in window_blocks:\n"
+    "                    for computed, block in zip(computed_blocks, cached):\n"
+    "                        computed.append(block)\n"
+    "                return computed_blocks, hit_length\n"
+    "        return empty, 0\n"
     "\n"
     "    @property\n"
-    "    def prefix_cacheable(self) -> bool:\n"
-    "        return False\n"
-    "\n"
-    "\n"
-    'def draft_replay_window(kv_cache_config: "KVCacheConfig") -> int:\n'
-    '    """Tokens a prefix hit must leave for recomputation so a non-cacheable\n'
-    '    sliding-window draft rebuilds its window (0 without such a draft)."""\n'
-    "    return max(\n"
-    "        (\n"
-    "            spec.sliding_window\n"
-    "            for group in kv_cache_config.kv_cache_groups\n"
-    "            for spec in iter_layer_specs(group.kv_cache_spec)\n"
-    "            if isinstance(spec, DraftSlidingWindowSpec)\n"
-    "        ),\n"
-    "        default=0,\n"
-    "    )\n"
-    "\n"
-    "\n"
-    "@dataclass(frozen=True, kw_only=True)\n"
-    "class SlidingWindowMLASpec(SlidingWindowSpec):\n"
-)
-
-RUNNER_SPEC_OLD = (
-    "            for name in self.speculator.draft_attn_layer_names & kv_cache_spec.keys():\n"
-    "                kv_cache_spec[name] = replace(kv_cache_spec[name], dcp_sharded=False)\n"
-)
-RUNNER_SPEC_NEW = (
-    "            for name in self.speculator.draft_attn_layer_names & kv_cache_spec.keys():\n"
-    "                kv_cache_spec[name] = replace(kv_cache_spec[name], dcp_sharded=False)\n"
-    f"                {MARKER}:\n"
-    "                # a sliding-window draft cache is per-request scratch, replayed\n"
-    "                # after a prefix hit (see DraftSlidingWindowSpec).\n"
-    "                import os\n"
-    "                from dataclasses import fields\n"
-    "\n"
-    "                from vllm.v1.kv_cache_interface import (\n"
-    "                    DraftSlidingWindowSpec,\n"
-    "                    SlidingWindowSpec,\n"
-    "                )\n"
-    "\n"
-    "                spec = kv_cache_spec[name]\n"
-    "                # VLLM_MOET_SWA_DRAFT_REPLAY=0 keeps the draft's window in prefix\n"
-    "                # caching (needs a block of one prefix-match unit to hit fine-grained).\n"
-    "                if (\n"
-    "                    type(spec) is SlidingWindowSpec\n"
-    "                    and os.environ.get(\"VLLM_MOET_SWA_DRAFT_REPLAY\", \"1\") == \"1\"\n"
-    "                ):\n"
-    "                    kv_cache_spec[name] = DraftSlidingWindowSpec(\n"
-    "                        **{f.name: getattr(spec, f.name) for f in fields(spec) if f.init}\n"
-    "                    )\n"
-)
-
-MANAGER_FILE = "v1/core/kv_cache_manager.py"
-MANAGER_OLD_A = (
-    "        max_cache_hit_length = request.num_tokens - 1\n"
-    "        computed_blocks, num_new_computed_tokens, num_uncached = (\n"
-)
-MANAGER_NEW_A = (
-    "        max_cache_hit_length = request.num_tokens - 1\n"
-    f"        {MARKER}:\n"
-    "        # leave the draft's window to be recomputed (DraftSlidingWindowSpec).\n"
-    "        max_cache_hit_length -= self._draft_replay_window()\n"
-    "        if max_cache_hit_length <= 0:\n"
-    "            return self.empty_kv_cache_blocks, 0, 0\n"
-    "        computed_blocks, num_new_computed_tokens, num_uncached = (\n"
-)
-MANAGER_OLD_B = (
-    "        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(\n"
-    "            request.block_hashes, request.num_tokens - 1\n"
+    "    def _fine_grained_hits(self) -> bool:\n"
+    '        """Whether the coordinator serves hash-unit hits inside this group\'s blocks."""\n'
+    "        return (\n"
+    "            self.enable_caching\n"
+    "            and self.cache_hit_alignment_tokens < self.block_size\n"
+    "            and self.block_size % self.cache_hit_alignment_tokens == 0\n"
     "        )\n"
-)
-MANAGER_NEW_B = (
-    f"        {MARKER}\n"
-    "        max_cache_hit_length = request.num_tokens - 1 - self._draft_replay_window()\n"
-    "        if max_cache_hit_length <= 0:\n"
-    "            return self.empty_kv_cache_blocks, 0, 0, False\n"
-    "        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(\n"
-    "            request.block_hashes, max_cache_hit_length\n"
+    "\n"
+    "    def _replay_window(self, num_prompt_tokens: int) -> tuple[int, int] | None:\n"
+    '        """(proof boundary, first window block) of a prompt\'s replayable tail.\n'
+    "\n"
+    "        The proof boundary is the prompt's final hash boundary (the one a\n"
+    "        resend or a longer sibling matches; under the EAGLE drop the hit then\n"
+    "        ends one unit below it), the first window block the lowest block that\n"
+    "        hit needs. None when the prompt has no such boundary.\n"
+    '        """\n'
+    "        hash_block_size = self.block_pool.hash_block_size\n"
+    "        token_limit = num_prompt_tokens if self.use_eagle else num_prompt_tokens - 1\n"
+    "        boundary = token_limit // hash_block_size * hash_block_size\n"
+    "        hit_end = boundary - (hash_block_size if self.use_eagle else 0)\n"
+    "        if hit_end <= 0:\n"
+    "            return None\n"
+    "        first_block = max(0, hit_end - self.sliding_window + 1) // self.block_size\n"
+    "        return boundary, first_block\n"
+    "\n"
+    "    def cache_blocks(\n"
+    "        self,\n"
+    "        request: Request,\n"
+    "        num_tokens: int,\n"
+    "        retention_interval: int | None = None,\n"
+    "        *,\n"
+    "        replay_boundaries: Sequence[int],\n"
+    "    ) -> None:\n"
+    "        super().cache_blocks(\n"
+    "            request,\n"
+    "            num_tokens,\n"
+    "            retention_interval=retention_interval,\n"
+    "            replay_boundaries=replay_boundaries,\n"
     "        )\n"
-)
-MANAGER_OLD_C = "    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:\n"
-MANAGER_NEW_C = (
-    f"    {MARKER}\n"
-    "    def _draft_replay_window(self) -> int:\n"
-    "        window = getattr(self, \"_draft_replay_window_tokens\", None)\n"
-    "        if window is None:\n"
-    "            from vllm.v1.kv_cache_interface import draft_replay_window\n"
+    "        if self.kv_cache_spec.prefix_cacheable and self._fine_grained_hits:\n"
+    "            self._cache_partial_tail_block(request, num_tokens)\n"
     "\n"
-    "            window = draft_replay_window(self.kv_cache_config)\n"
-    "            self._draft_replay_window_tokens = window\n"
-    "        return window\n"
+    "    def _cache_partial_tail_block(self, request: Request, num_tokens: int) -> None:\n"
+    '        """Register the prompt\'s final hash boundary as a partial entry of the\n'
+    "        block it falls in, so a resend or a longer sibling hits there (as\n"
+    "        ``FullAttentionManager._cache_partial_tail_block`` does). Re-registered\n"
+    "        on every call: promotion to a full block drops the entry.\n"
+    '        """\n'
+    "        replay = self._replay_window(request.num_prompt_tokens)\n"
+    "        if replay is None:\n"
+    "            return\n"
+    "        boundary, _ = replay\n"
+    "        if boundary > num_tokens or boundary % self.block_size == 0:\n"
+    "            return\n"
+    "        blocks = self.req_to_blocks[request.request_id]\n"
+    "        block_idx = boundary // self.block_size\n"
+    "        if block_idx >= len(blocks) or blocks[block_idx].is_null:\n"
+    "            return\n"
+    "        self.block_pool.cache_partial_block(\n"
+    "            request=request,\n"
+    "            block=blocks[block_idx],\n"
+    "            num_tokens=boundary,\n"
+    "            kv_cache_group_id=self.kv_cache_group_id,\n"
+    "            block_size=self.block_size,\n"
+    "        )\n"
     "\n"
-    "    def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:\n"
-)
-
-OFFLOAD_FILE = "v1/simple_kv_offload/manager.py"
-OFFLOAD_OLD = (
-    "        max_hit_len = request.num_tokens - 1 - num_computed_tokens\n"
-    "        if max_hit_len <= 0:\n"
-    "            return 0, False\n"
-)
-OFFLOAD_NEW = (
-    "        max_hit_len = request.num_tokens - 1 - num_computed_tokens\n"
-    f"        {MARKER}:\n"
-    "        # the external hit observes the same replay window as the local one.\n"
-    "        from vllm.v1.kv_cache_interface import draft_replay_window\n"
-    "\n"
-    "        max_hit_len -= draft_replay_window(self.cpu_kv_cache_config)\n"
-    "        if max_hit_len <= 0:\n"
-    "            return 0, False\n"
+    "    def remove_skipped_blocks(\n"
+    "        self,\n"
+    "        request_id: str,\n"
+    "        processed_computed_tokens: int,\n"
+    "        num_prompt_tokens: int | None = None,\n"
+    "    ) -> None:\n"
+    "        replay = (\n"
+    "            self._replay_window(num_prompt_tokens)\n"
+    "            if num_prompt_tokens is not None and self._fine_grained_hits\n"
+    "            else None\n"
+    "        )\n"
+    "        if replay is None:\n"
+    "            super().remove_skipped_blocks(\n"
+    "                request_id, processed_computed_tokens, num_prompt_tokens\n"
+    "            )\n"
+    "            return\n"
+    "        # Keep the window a replaying request needs (the blocks before the\n"
+    "        # prompt-end boundary) referenced for the request's lifetime: it then\n"
+    "        # enters the eviction queue with the request's other groups' blocks\n"
+    "        # instead of ageing out during a long decode. Within the admission\n"
+    "        # cap: the window plus one in-flight chunk, of which decode holds 2-3.\n"
+    "        num_skipped_tokens = self.get_num_skipped_tokens(processed_computed_tokens)\n"
+    "        if num_skipped_tokens <= 0 or request_id not in self.req_to_blocks:\n"
+    "            return\n"
+    "        boundary, keep_start = replay\n"
+    "        keep_end = cdiv(boundary, self.block_size)\n"
+    "        num_skipped_blocks = min(\n"
+    "            num_skipped_tokens // self.block_size,\n"
+    "            len(self.req_to_blocks[request_id]),\n"
+    "        )\n"
+    "        self._remove_blocks_in_range(request_id, keep_end, num_skipped_blocks)\n"
+    "        self._remove_blocks_in_range(\n"
+    "            request_id, 0, min(keep_start, num_skipped_blocks)\n"
+    "        )\n"
+    "\n" + SWA_METHODS_OLD
 )
 
 PATCHES = (
     (LAYOUT_FILE, LAYOUT_OLD, LAYOUT_NEW, "layout decided on unified page sizes"),
     (RUNNER_FILE, RUNNER_OLD, RUNNER_NEW, "target graph support over target layers"),
     (ATTN_FILE, ATTN_OLD, ATTN_NEW, "GQA sliding-window draft on trtllm-gen pages"),
-    (IFACE_FILE, IFACE_OLD, IFACE_NEW, "DraftSlidingWindowSpec + draft_replay_window"),
-    (RUNNER_FILE, RUNNER_SPEC_OLD, RUNNER_SPEC_NEW, "draft sliding-window specs as scratch"),
-    (MANAGER_FILE, MANAGER_OLD_C, MANAGER_NEW_C, "replay window helper"),
-    (MANAGER_FILE, MANAGER_OLD_A, MANAGER_NEW_A, "local prefix hit capped below the draft window"),
-    (MANAGER_FILE, MANAGER_OLD_B, MANAGER_NEW_B, "connector-path local hit capped below the draft window"),
-    (OFFLOAD_FILE, OFFLOAD_OLD, OFFLOAD_NEW, "external prefix hit capped below the draft window"),
+    (SWA_FILE, SWA_CLASS_OLD, SWA_CLASS_NEW, "SlidingWindowManager: fine-grained lookups"),
+    (SWA_FILE, SWA_FIND_OLD, SWA_FIND_NEW, "SlidingWindowManager: fine-grained hit branch"),
+    (SWA_FILE, SWA_METHODS_OLD, SWA_METHODS_NEW, "SlidingWindowManager: partial tail, CoW, retention"),
 )
 
 

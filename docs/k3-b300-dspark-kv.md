@@ -131,7 +131,8 @@ The Inferact draft's 5 MLA layers attend over the whole context, so their KV is 
 RedHat's speculator is a 5-layer Qwen3-style GQA draft (16 KV heads x head_dim 64, 2 per GPU at TP8) with a
 **2048-token sliding window**, trained for k = 8 on the aux hidden states of layers 24/48/72/88/92: its KV is a
 `SlidingWindowSpec`, a few blocks per request whatever the context. v0.32.0 cannot start it next to the DCP-sharded
-MLA target; `tools/k3_b300/patch_vllm_swa_draft_dcp.py` (image `-r2`) fixes the three stops, in order:
+MLA target; `tools/k3_b300/patch_vllm_swa_draft_dcp.py` (image `-r2`; `-r3` adds step 4 below) fixes the three
+stops, in order:
 
 1. `resolve_kv_cache_layout` sees a sharded target and a replicated draft with different page sizes and demands a
    block-outer layout (BLHNC), which TOKENSPEED_MLA cannot split into its kernel blocks ("packed 1664-token KV cache
@@ -198,19 +199,49 @@ tried (`patch_vllm_swa_draft_dcp.py` step 4 and its `VLLM_MOET_SWA_DRAFT_*` swit
 
 The reason is K3-specific: the KDA groups retain their aligned state sparsely (at a finished request's prompt-end
 hash boundary and a few block boundaries), so a hit must land exactly there; the draft's window blocks (variants 1-2)
-or the 2048-token cap (variant 3) move the admissible position away from it. A `SlidingWindowManager` with
-fine-grained lookups and copy-on-write for the partial window block would fix variants 1-2 upstream; variant 3
-would need the KDA state retained at the cap position as well. Neither is attempted here.
+or the 2048-token cap (variant 3) move the admissible position away from it.
 
-**Verdict:** the RedHat draft is faster and leaner in KV, but on this engine it costs prefix caching, which the
-agent workload needs more than 13 % of pool; the served draft stays Inferact (k = 4, RecoverSSM). The `-r2`
-image and the patch remain for single-session / no-prefix-cache serving and as the base for the upstream work.
+**Where the groups keep state** (read off the managers with a CPU-side emulation of the scheduler loop, 2026-10-26;
+MLA block 13,312 tokens = 1,664 x DCP 8, KDA block 1,664, window block 1,024, hash unit 128, EAGLE-style drop on
+every group - with a draft whose spec carries no eagle marker the coordinator flags all of them). After a 10,000-token
+prompt decoded to 14,000 tokens: MLA `9984` (the prompt-end partial entry, kept as a secondary key after the block
+is promoted) and `13312` (a full block); KDA `6656` (a chunk end), `9984` (the prefill checkpoint), `13312` (a block
+boundary crossed in decode); so a hit exists only at a prompt-end boundary (the EAGLE drop then lands it one unit
+below: `9856`) or at a scheduler-block multiple crossed in decode (and only without the drop). Every group retains
+the prompt-end boundary; the window must be reachable exactly there.
+
+**Step 4 (image `-r3`, 2026-10-26): `SlidingWindowManager` with fine-grained lookups.** The manager declares
+`supports_fine_grained_hash_lookup`, so the coordinator keeps the hash-unit alignment, and its lookup accepts a hit
+ending at any hash boundary P whose window blocks are cached: whole blocks under their full-block hash, the block P
+falls in under any prefix hash at or past P (its full-block hash, or the partial entry that `cache_blocks` now
+registers at the prompt's final hash boundary, the way `FullAttentionManager._cache_partial_tail_block` does, and
+re-registers after the block is promoted). Under the EAGLE drop the proof must reach one unit past the hit (the
+coordinator re-queries a verified eagle group without the drop; the same keys satisfy it). The partial tail block is
+shared copy-on-write through the base class's `_partial_hit_reqs` path - one reserved block, one block copy on the
+worker, as for the MLA and KDA partial tails. The window a replaying request needs (the blocks before the prompt-end
+boundary) stays referenced by its request until it finishes, instead of being nulled when it leaves the attention
+window, so it ages out of the LRU together with the request's MLA/KDA blocks and not during a long decode; it fits
+the per-request admission cap (window + one in-flight chunk = 13 blocks, 2-3 held in decode). The fine-grained
+branch is entered only when the coordinator aligns hits below the block size, which needs a Mamba "align" group;
+block-aligned models and Gemma-style full+SWA hybrids keep the upstream code path.
+
+Emulated against the real `KVCacheManager` (the K3 group layout, chunked prefill through the scheduler's Mamba
+split, spec-decode steps with rejections, 220-block pools with overlapping prefixes): a 20,354-token prompt resent
+while its producer still decodes hits 20,224 (= prod's position) with CoW copies in the MLA, KDA and window groups;
+a second turn hits the same boundary; its resend hits its own boundary (21,120); pool accounting balances after
+every request is freed. Measured on the GPUs: the 2026-10-26/27 night window (`/root/work/k3-test/night-rh5.sh`,
+results in `night-rh5-<date>-summary.txt`).
+
+**Verdict (2026-10-26, before the night measurement):** the RedHat draft is faster and leaner in KV; with step 4 its
+window takes the same prefix hits as the MLA/KDA groups. The served draft stays Inferact (k = 4, RecoverSSM) until
+the `-r3` battery (prefix hits before and after load, acceptance, 8K/32K matrices, 128 x 22K capacity, GSM8K,
+needle) confirms it; the planned successor is RedHat k = 5 (prose/math best in the sweep, C = 64 within 5 % of k = 4).
 
 ## 4. What is left, and why it is not patched here
 
 * **The 5 draft layers** (+21 % per block) with the Inferact draft: it attends over the whole context, so its KV is
-  per token. The RedHat draft (§3b) would be the way around it (+13 % pool at k = 4) once its sliding-window group
-  can take fine-grained prefix hits.
+  per token. The RedHat draft (§3b) is the way around it (+13 % pool at k = 4); with step 4 (`-r3`) its
+  sliding-window group takes fine-grained prefix hits, pending the night measurement.
 * **18 padding layers**: with 29 MLA and 69 KDA layers every uniform group size pads somewhere, and the cheapest
   place is the KDA side (its blocks are per request, not per token). Removing it needs a second block pool with its
   own stride for the short group - a change across `BlockPool`, the coordinator and the worker's tensor layout for
@@ -224,7 +255,10 @@ image and the patch remain for single-session / no-prefix-cache serving and as t
 ## 5. Files
 
 * `tools/k3_b300/patch_vllm_recoverssm_offload.py` - the patch (idempotent, `--check`).
-* `Dockerfile.b300-k3` - `vllm/vllm-openai:v0.32.0` + the patch (`vllm-moet-b300:k3-v0.32.0-r1`).
+* `tools/k3_b300/patch_vllm_swa_draft_dcp.py` - the RedHat draft under DCP (§3b steps 1-3) and the fine-grained
+  `SlidingWindowManager` (step 4); idempotent, `--check`.
+* `Dockerfile.b300-k3` - `vllm/vllm-openai:v0.32.0` + the patches (`vllm-moet-b300:k3-v0.32.0-r1` = RecoverSSM
+  only, served; `-r3` = both, the RedHat draft candidate).
 * `docker/b300/run-k3.sh` - the launcher with `USE_RECOVERSSM` and `MAMBA_SSM_CACHE_DTYPE`.
 * `tools/k3_b300/kv_model.py` - the budget model (`--kv-gib 46.98` reproduces every row above).
 * `tools/k3_b300/k3_code_bench.py`, `k3_matrix.py`, `capacity_probe.py`, `gsm8k_probe.py`, `ref_outputs.py` - the
