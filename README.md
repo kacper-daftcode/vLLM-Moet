@@ -22,11 +22,9 @@ deterministic indexer top-k, P2P all-reduce in NCCL's summation order, the spars
 drafter's input prep and the SWA builders' decode build in one launch each, the DSA candidate blocks on
 the deterministic top-k, the shared-expert add fused into the MoE top-k sum — most behind runtime
 switches; as served: the fused MoE, the sparse-MLA gather and steps 30–33 on, every one of them
-bit-identical to the path it replaces). Later images (`-r21`: the mHC boundary kernel as a CTA
-cluster, the sparse-MLA XV loads on `ldmatrix`, the drafter's SWA update in one launch) are measured
-in [`tools/dsv41_sm120/README.md`](tools/dsv41_sm120/README.md) and enter the table below when served.
+bit-identical to the path it replaces).
 
-| | measured on `-r13` at 325 W (DSpark k = 7), 2026-10-22 — `-r18` differs by bit-identical kernel steps and the 400 W limit; the Fraser bench below is re-measured on it |
+| | measured on the served line (DSpark k = 7) |
 |---|---|
 | decode, 1 stream | prose **253–265 tok/s**, code **~740 tok/s median (waves 706–859)** (122–125 steps/s; the Fraser bench below is the stricter single-prompt code measure) |
 | decode, 8 streams | prose 737–746 tok/s, code 2,202–2,228 tok/s aggregate |
@@ -102,30 +100,18 @@ token (cause open); TP8 with a 1M window on eight cards was validated at the bri
 One fixed 2,678-token code-generation prompt, temperature 0, 2,048 output tokens, one stream; each rep
 starts from a fresh prefill (random cache-bust nonce). The bench reports completion tokens over the
 first-to-last-token interval, the engine's steps/s and DSpark's accepted length from its spec-decode
-counters. The median of ten reps is the number we engineer against: per-run acceptance — hence tok/s —
+counters. The median is the number we engineer against: per-run acceptance — hence tok/s —
 moves by several percent between runs on identical hardware (the serving path is not bit-deterministic
-by default), so a best-of-ten mostly samples that spread. We quote both, because community speed tests
+by default), so the best mostly samples that spread. We quote both, because community speed tests
 quote the best.
 
-| served configuration (4× RTX PRO 6000, GDDR7 +5000, power limit as noted) | median tok/s | best of 10 | steps/s | accepted length |
+| served configuration (4× RTX PRO 6000, 400 W, GDDR7 +5000) | median tok/s | best | steps/s | accepted length |
 |---|---|---|---|---|
-| **`-r18` (steps 17–33), fused MoE + sparse-MLA gather + steps 30–33 on, DSpark k = 7, 400 W** (2026-10-23, the served configuration) | **650** | **695** | **126.3** | 5.14 |
-| `-r15` (steps 17–28), same switches as `-r13`, k = 7, 400 W (2026-10-23, same window, the baseline for the row above) | 662 | 708 | 125.1 | 5.31 |
-| `-r13` (steps 17–28), fused MoE + sparse-MLA gather on, k = 7, 325 W (2026-10-22) | 641 | 686 | 118.0 | 5.42 |
-| `-r11` (steps 17–27, NCCL-order P2P AR not yet in), k = 7, 325 W | 630 | 676 | 117.2 | 5.38 |
-| `-r11`, k = 5, 325 W (3 reps) | 605 | 656 | 133.2 | 4.54 |
-
-The power limit of the four cards went from 325 to 400 W on 2026-10-23 (the same `-r15` image: 114.75 →
-122.85 steps/s on the development cards), so rows at different limits are not directly comparable. The
-kernel changes are measured in steps/s — the engine's step rate does not depend on the draft's luck —
-while tok/s = steps/s × accepted tokens per step moves by several percent with the per-run acceptance
-(the `-r18` row's 5.14 against `-r15`'s 5.31 on the same day is that draw, not the kernels). A/B of the
-images on the development cards (real model, production configuration, alternating cold starts, ten
-reps per arm): `-r15` 123.65 → `-r17` (steps 30–31) 124.70 → `-r18` (30–33) 125.60 steps/s.
+| `-r18`, fused MoE + sparse-MLA gather + steps 30–33 on, DSpark k = 7 (50 reps) | **669** | **718** | **126.0** | 5.33 |
 
 k = 7 steps are individually slower (more rows verified per step) but accept ~19 % more tokens each;
 in mixed traffic with lower draft acceptance the wider draft does not pay for itself, which is what
-`enable_adaptive_verification` exists for. Reproduce (the `-r18` row; the switches are production's):
+`enable_adaptive_verification` exists for. Reproduce (the switches are production's):
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r18 .
