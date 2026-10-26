@@ -67,7 +67,7 @@ def main() -> int:
             body = text[pos:]
             cut = min(len(body), L * 4)
             n = count_tokens(args.port, args.model, body[:cut])
-            cut = int(cut * (L - 200) / max(1, n))
+            cut = int(cut * (L - 1000) / max(1, n))   # the needle, the question and the chat template on top; L must stay under --max-model-len
             filler = body[:cut]
             pos += cut
             word = rng.choice(WORDS) + str(rng.randint(100, 999))
