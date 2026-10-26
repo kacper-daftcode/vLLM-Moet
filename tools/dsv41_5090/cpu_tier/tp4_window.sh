@@ -173,7 +173,9 @@ fi
 if [[ -n "${HARD_PROBE:-}" ]]; then
   PROBE=$REPO/internal/dsv41-5090-cpu/probe
   for suite in ${HARD_PROBE//,/ }; do
-    lv=(); [[ "$suite" == "math500" ]] && lv=(--levels 5)
+    # math500: the native fin01 reference = the first 60 level-5 items at --max-tokens 2500 (the probe's default 1200
+    # truncates a third of them: 10-26); humaneval: all 164 at the default 768
+    lv=(); [[ "$suite" == "math500" ]] && lv=(--levels 5 --n "${PROBE_MATH_N:-60}" --max-tokens "${PROBE_MATH_TOKENS:-2500}")
     note "hard probe $suite (tag $TAG) ..."
     ( cd "$PROBE" && $PY hard_probe.py run "http://127.0.0.1:$PORT" "$MODEL" "$suite" "$TAG" --conc "${PROBE_CONC:-1}" "${lv[@]}" 2>&1 | tail -4 | cut -c1-300 ) | tee -a "$SUMMARY"
     note "hard probe $suite vs native fin01:"
