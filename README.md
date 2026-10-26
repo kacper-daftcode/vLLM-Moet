@@ -15,13 +15,14 @@ official vLLM images do not run them or the official checkpoints do not fit. Two
 The official checkpoint ([`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
 552B plus a 196B Engram table, MXFP8 dense, MXFP4 experts, 510 GB) on four RTX PRO 6000 (96 GB, PCIe):
 TP4, 512K context, DSpark speculative decoding (k = 7), vision, thinking, tool calling, KV offload to
-host RAM and disk. Served image: `vllm-moet-sm120:dsv41-nightly-df3bd094-r18` (since 2026-10-23, the
-cards at 400 W), i.e. vLLM nightly df3bd094 (FlashInfer 0.7.2, DeepGEMM 727f8470) plus Dockerfile
-steps 17–33 in [`tools/dsv41_sm120/`](tools/dsv41_sm120/) (b12x MoE at TP4, the fused decode MoE, the
-deterministic indexer top-k, P2P all-reduce in NCCL's summation order, the sparse-MLA gather, the
-drafter's input prep and the SWA builders' decode build in one launch each, the DSA candidate blocks on
-the deterministic top-k, the shared-expert add fused into the MoE top-k sum — most behind runtime
-switches; as served: the fused MoE, the sparse-MLA gather and steps 30–33 on, every one of them
+host RAM and disk. Served image: `vllm-moet-sm120:dsv41-nightly-df3bd094-r21` (the cards at 400 W),
+i.e. vLLM nightly df3bd094 (FlashInfer 0.7.2, DeepGEMM 727f8470) plus Dockerfile steps 17–36 in
+[`tools/dsv41_sm120/`](tools/dsv41_sm120/) (b12x MoE at TP4, the fused decode MoE, the deterministic
+indexer top-k, P2P all-reduce in NCCL's summation order, the sparse-MLA gather with its XV loads on
+`ldmatrix`, the mHC boundary kernel as a CTA cluster, the drafter's input prep, the SWA builders'
+decode build and the drafter's SWA update in one launch each, the DSA candidate blocks on the
+deterministic top-k, the shared-expert add fused into the MoE top-k sum — most behind runtime
+switches; as served: the fused MoE, the sparse-MLA gather and steps 30–33 and 36 on, every one of them
 bit-identical to the path it replaces).
 
 | | measured on the served line (DSpark k = 7) |
@@ -70,7 +71,7 @@ plus the 64 GiB offload region), so one server per host.
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /srv/models/DeepSeek-V4.1-Flash-1017
-export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r18 \
+export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r21 \
   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .   # ~10 min
 
@@ -107,17 +108,17 @@ quote the best.
 
 | served configuration (4× RTX PRO 6000, 400 W, GDDR7 +5000) | median tok/s | best | steps/s | accepted length |
 |---|---|---|---|---|
-| `-r18`, fused MoE + sparse-MLA gather + steps 30–33 on, DSpark k = 7 (50 reps) | **669** | **718** | **126.0** | 5.33 |
+| `-r21`, fused MoE + sparse-MLA gather + steps 30–33 + 36 on, `P2P_AR_FUSED_MAX_ROWS=8`, DSpark k = 7 (40 reps) | **680** | **741** | **127.8** | 5.34 |
 
 k = 7 steps are individually slower (more rows verified per step) but accept ~19 % more tokens each;
 in mixed traffic with lower draft acceptance the wider draft does not pay for itself, which is what
 `enable_adaptive_verification` exists for. Reproduce (the switches are production's):
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r18 .
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r21 .
 MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 GPU_MEM_UTIL=0.94 KV_OFFLOAD_GIB=64 \
   KV_OFFLOAD_FS_DIR=/srv/kvcache KV_OFFLOAD_PROMPT_ONLY=0 INDEXER_TP_SHARD_MIN_ROWS=2048 \
-  EXTRA_DOCKER_ARGS="-e VLLM_MOET_B12X_MOE_FUSED=1 -e VLLM_MOET_SPARSE_MLA_LDG=1 -e VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 -e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16 -e VLLM_MOET_P2P_AG=0 -e VLLM_MOET_DFLASH_PREP_GROUPS=1 -e VLLM_MOET_CANDIDATE_DET_TOPK=1 -e VLLM_MOET_SWA_DECODE_BUILD=1 -e VLLM_MOET_MOE_TOPKSUM_ADD=1" \
+  EXTRA_DOCKER_ARGS="-e VLLM_MOET_B12X_MOE_FUSED=1 -e VLLM_MOET_SPARSE_MLA_LDG=1 -e VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 -e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8 -e VLLM_MOET_P2P_AG=0 -e VLLM_MOET_DFLASH_PREP_GROUPS=1 -e VLLM_MOET_CANDIDATE_DET_TOPK=1 -e VLLM_MOET_SWA_DECODE_BUILD=1 -e VLLM_MOET_MOE_TOPKSUM_ADD=1 -e VLLM_MOET_SWA_DRAFT_BUILD=1" \
   EXTRA_ARGS='--moe-backend b12x --speculative-config {"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"moe_backend":"b12x"}' \
   docker/sm120/run-dsv41.sh
 python3 tools/sm120_perf/fraser_bench.py --base http://127.0.0.1:8001 \
