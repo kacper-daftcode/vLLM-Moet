@@ -12,7 +12,9 @@
 # Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1)  NAME (ds41-hyb)  GPUS (0,1,2,3)  TP (4)  PORT (8041)
 #            BIND (127.0.0.1:)       CACHE_DIR (/mnt/nvme/cache/ds41)  REPO (/mnt/nvme/vLLM-Moet-cpu: patcher + runtime)
 #            STORE (/mnt/nvme/packs/dsv41-hybrid)   cpu_moe/build_store.py's files (269 GB on NVMe)
-#            STORE_MODE (nonresident)  which records the tier pins: nonresident (52 GB per rank) or all (72 GB per rank)
+#            STORE_MODE (nonresident)  which records the tier pins: nonresident (65 GB per rank with 40 static) or all (72 GB per rank)
+#            STORE_EARLY (0)         1 = pin the records before the weights are loaded (no reclaim storm against the loader's
+#                        page cache; needs PLACEMENT) - to be verified in a TP4 boot, then the default
 #            PLACEMENT ($REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json = 40 static experts per layer;
 #                        0.28 = 107, 0.2526 = 97)  routing/placement.py's file;
 #                        RESIDENT=<int> instead = the first N experts of every layer (a test placement)
@@ -67,6 +69,7 @@ CACHE_DIR="${CACHE_DIR:-/mnt/nvme/cache/ds41}"
 REPO="${REPO:-/mnt/nvme/vLLM-Moet-cpu}"
 STORE="${STORE:-/mnt/nvme/packs/dsv41-hybrid}"
 STORE_MODE="${STORE_MODE:-nonresident}"
+STORE_EARLY="${STORE_EARLY:-0}"
 PLACEMENT="${PLACEMENT:-$REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json}"
 RESIDENT="${RESIDENT:-}"
 SPARE="${SPARE:-80}"
@@ -96,7 +99,7 @@ TABLES="$REPO/internal/dsv41-5090-cpu/parity"
 [[ -f "$TABLES/b12x_act_m_limit10.f32" && -f "$TABLES/b12x_layout_w13.npy" ]] || { echo "kernel tables missing in $TABLES" >&2; exit 1; }
 mkdir -p "$CACHE_DIR/dot-cache"
 
-TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM_MOET_CPU_TIER_STORE_MODE="$STORE_MODE"
+TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM_MOET_CPU_TIER_STORE_MODE="$STORE_MODE" -e VLLM_MOET_CPU_TIER_STORE_EARLY="$STORE_EARLY"
           -e VLLM_MOET_CPU_TIER_TABLES=/parity -e VLLM_MOET_CPU_TIER_SPARE="$SPARE" -e VLLM_MOET_CPU_TIER_MAX_PROMOTIONS="$PROMOTIONS"
           -e VLLM_MOET_CPU_TIER_TIMEOUT_MS="$TIMEOUT_MS" -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY="$LOG_EVERY"
           -e VLLM_MOET_CPU_TIER_DEBUG="$TIER_DEBUG" -e VLLM_MOET_DET_TOPK=1

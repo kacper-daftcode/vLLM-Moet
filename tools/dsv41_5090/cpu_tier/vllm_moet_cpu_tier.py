@@ -22,6 +22,9 @@ Environment:
                                         left to vLLM's own threads); dispatcher = first pool CPU + 32 (its SMT sibling)
   VLLM_MOET_CPU_TIER_STORE=<dir>        build_store.py's files for the real checkpoint (see above)
   VLLM_MOET_CPU_TIER_STORE_MODE         nonresident (default) | all: which records to pin
+  VLLM_MOET_CPU_TIER_STORE_EARLY=1      pin the records at the first create_weights (before the weights are loaded; needs
+                                        a PLACEMENT file) instead of after loading - no reclaim storm against the loader's
+                                        page cache (10-26)
   VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=1    (dummy mode) overwrite the dummy expert weights with seeded sane random MXFP4
                                         bytes (scales 118..126), so that a stock run and a hybrid run see the same experts
   VLLM_MOET_CPU_TIER_TIMEOUT_MS         bounded wait (default 500)
@@ -59,6 +62,7 @@ DUMP_DIR = os.environ.get("VLLM_MOET_CPU_TIER_DUMP_DIR", "")   # eager runs only
 DUMP_MAX = int(os.environ.get("VLLM_MOET_CPU_TIER_DUMP_MAX", "400"))
 STORE = os.environ.get("VLLM_MOET_CPU_TIER_STORE", "")
 STORE_MODE = os.environ.get("VLLM_MOET_CPU_TIER_STORE_MODE", "nonresident")
+STORE_EARLY = os.environ.get("VLLM_MOET_CPU_TIER_STORE_EARLY", "0") == "1"   # pin the records before the weights load
 SPARE = int(os.environ.get("VLLM_MOET_CPU_TIER_SPARE", "0"))
 LOG = os.environ.get("VLLM_MOET_CPU_TIER_LOG", "0") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_MOET_CPU_TIER_LOG_EVERY", "100"))
@@ -251,6 +255,10 @@ def on_create_weights(layer, num_experts: int, hidden_size: int, intermediate_si
     layer._map_global_expert_id_to_local_expert_id = _slot_mapper(cfg)
     _log(f"layer {cfg.name} -> hybrid layer {cfg.li}: parameters for {cfg.R} slots ({len(cfg.residents)} resident "
          f"experts of {num_experts} + {SPARE} spare); the loader skips the rest")
+    if STORE_EARLY and S.store is None and os.environ.get("VLLM_MOET_CPU_TIER_PLACEMENT") \
+            and not int(os.environ.get("VLLM_MOET_CPU_TIER_RESIDENT_SHIFT", "0")):
+        with S.lock:
+            _ensure_store(early=True)
     return cfg.R
 
 
@@ -266,24 +274,42 @@ def _seed_dummy_weights(layer_idx: int, w13: torch.Tensor, w13s: torch.Tensor, w
 
 
 # ---- the records ----------------------------------------------------------------------------------------------
-def _ensure_store() -> None:
+def _ensure_store(early: bool = False) -> None:
+    """Pins the records (ExpertStore). Normally at the first process_weights_after_loading (every target layer
+    registered by then); with VLLM_MOET_CPU_TIER_STORE_EARLY=1 already at the first create_weights, i.e. BEFORE the
+    weights are loaded: the placement file gives every layer's residents up front, so the masks are known, and the
+    260 GB of cudaHostAlloc then happen while the page cache is still empty instead of evicting the loader's shard
+    pages under pressure afterwards (10-26: 16 min of direct reclaim in one boot)."""
     if S.store is not None:
         return
     from cpu_tier import ExpertStore
 
-    n_layers = max(c.model_layer for c in S.layers) + 1
-    mask = np.zeros((n_layers, S.E), dtype=np.uint8)
-    for c in S.layers:
-        if STORE_MODE == "all":
-            mask[c.model_layer, :] = 1
-        else:
-            mask[c.model_layer, :] = 1
-            mask[c.model_layer, c.residents] = 0
+    if early:
+        n_layers = _num_hidden_layers()
+        if n_layers >= 10 ** 9:
+            return   # no model config at hand: the normal path pins later
+        E = S.E
+        mask = np.zeros((n_layers, E), dtype=np.uint8)
+        for ml in range(n_layers):
+            if STORE_MODE == "all":
+                mask[ml, :] = 1
+            else:
+                mask[ml, :] = 1
+                mask[ml, _residents_of(ml, E)] = 0
+    else:
+        n_layers = max(c.model_layer for c in S.layers) + 1
+        mask = np.zeros((n_layers, S.E), dtype=np.uint8)
+        for c in S.layers:
+            if STORE_MODE == "all":
+                mask[c.model_layer, :] = 1
+            else:
+                mask[c.model_layer, :] = 1
+                mask[c.model_layer, c.residents] = 0
     t0 = time.perf_counter()
     S.store = ExpertStore(STORE, _rank(), n_layers, S.E, mask=mask, pinned=True, nthreads=16)
     S.store_layers = n_layers
-    _log(f"store {STORE} ({STORE_MODE}): {S.store.n_records} records = {S.store.nbytes / 1e9:.1f} GB pinned, read "
-         f"{S.store.load_seconds:.1f} s, alloc+read {time.perf_counter() - t0:.1f} s")
+    _log(f"store {STORE} ({STORE_MODE}{', before the weights' if early else ''}): {S.store.n_records} records = "
+         f"{S.store.nbytes / 1e9:.1f} GB pinned, read {S.store.load_seconds:.1f} s, alloc+read {time.perf_counter() - t0:.1f} s")
 
 
 def _has_record(li: int, e: int) -> bool:
