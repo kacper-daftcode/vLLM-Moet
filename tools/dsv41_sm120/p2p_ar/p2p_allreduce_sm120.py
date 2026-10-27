@@ -9,7 +9,9 @@ on random data - an M that does not reproduce NCCL bit for bit stays on NCCL. La
 to the TP group's all-reduce.
 
 Switches: VLLM_MOET_P2P_AR=1 enables it (default off), VLLM_MOET_P2P_AR_MAX_ROWS (16), VLLM_MOET_P2P_AR_DIR (this
-directory; the CUDA source p2p_allreduce_v3.cu lives next to this file), TORCH_EXTENSIONS_DIR for the build cache.
+directory; the CUDA source p2p_allreduce_v3.cu lives next to this file), TORCH_EXTENSIONS_DIR for the build cache,
+VLLM_MOET_P2P_AR_H (row width the kernels are compiled for: 5120 = DeepSeek-V4.1-Flash, the default and the extension
+name the shipped images cache; 4096 = GLM-5.3-Flash, built as p2p_allreduce_sm120_h4096 with -DP2P_AR_H=4096).
 
 The first call is collective (IPC handle exchange over the TP group's CPU group) and must happen at the same point on
 every rank - it does, because every rank reaches the first boundary all-reduce of the first forward together, and the
@@ -24,7 +26,9 @@ import torch
 
 logger = logging.getLogger("vllm.moet.p2p_allreduce_sm120")  # under vLLM's logger: its handler shows INFO
 
-H = 5120
+H = int(os.environ.get("VLLM_MOET_P2P_AR_H", "5120"))
+if H % 128 != 0 or H <= 0:
+    raise ValueError(f"VLLM_MOET_P2P_AR_H={H}: the kernels need a multiple of 128 (H/16 threads per row, H/32 per slice)")
 NSLOTS = 4
 M_MAX = 64
 _state: dict | None = None
@@ -49,10 +53,14 @@ def _build():
     from torch.utils.cpp_extension import load
 
     here = os.path.dirname(os.path.abspath(__file__))
+    # H = 5120 keeps the name and flags the shipped DeepSeek images have cached; other widths get their own extension
+    name, flags = "p2p_allreduce_sm120", ["-O3", "-gencode=arch=compute_120a,code=sm_120a"]
+    if H != 5120:
+        name, flags = f"p2p_allreduce_sm120_h{H}", flags + [f"-DP2P_AR_H={H}"]
     return load(
-        name="p2p_allreduce_sm120",
+        name=name,
         sources=[os.path.join(here, "p2p_allreduce_sm120.cu")],
-        extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a"],
+        extra_cuda_cflags=flags,
         verbose=False,
     )
 

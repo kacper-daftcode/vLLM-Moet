@@ -20,7 +20,14 @@
 #include <cstdint>
 #include <vector>
 
+// hidden size of the message rows: 5120 (DeepSeek-V4.1-Flash) unless the build passes -DP2P_AR_H=<width> (4096 for
+// GLM-5.3-Flash; p2p_allreduce_sm120.py: VLLM_MOET_P2P_AR_H). A plain -DH=... on the command line would clobber the
+// template parameter `H` of torch's headers, hence the indirection; H itself is defined after the includes.
+#ifdef P2P_AR_H
+#define H P2P_AR_H
+#else
 #define H 5120
+#endif
 #define NSRC 4
 #define NPEER 3
 #define NSLOTS 4
