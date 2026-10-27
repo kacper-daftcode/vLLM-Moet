@@ -31,7 +31,7 @@ bit-identical to the path it replaces).
 | decode, 8 streams | prose ~717 tok/s median (702–734), code ~2,055 tok/s median (1,916–2,236) aggregate, 8 × 1,024 tokens |
 | fresh prefill | 163K tokens in 8.6 s (~19K tok/s) |
 | KV cache | **9.62M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
-| quality | GSM8K-200 193–194/200 on the b12x line (steps 26–36 are bit-identical to the paths they replace), needle PASS at 100K, tool calls / JSON pass |
+| quality | GSM8K-200 (no-think, 4 streams) **193/200** on the served `-r21` vs 194/200 on the `-r8` baseline (one flip, exact McNemar p = 1); needle PASS at 29K / 106K / 400K; tool calls / JSON / vision pass (2026-10-26) |
 
 ### What we changed against official vLLM
 
