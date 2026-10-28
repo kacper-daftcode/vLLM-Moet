@@ -15,14 +15,14 @@ Measured (2026‑10‑26, the launcher's defaults, TP4, no DSpark):
 | decode, single stream, short prompts | **143 / 120 tok/s** ('Hello' / 'def fib(n):'; the degenerate 'Hello' run has a hit rate → 1 and is the stack's GPU floor at 7.0 ms per step — the hybrid's miss handling costs ~1.3 ms per step on a real prompt) |
 | decode behind 2K / 14K / 30K of context | 56–81 / 64 / 47 tok/s (the attention side) |
 | prefill with the streamed experts (chunk 4096, the default) | **2.1–2.4K tok/s at 2K, 3.9K tok/s at 14K, 3.0K at 30K, 3.7–3.85K at 32K / 64K** (TTFT 0.9 s / 3.7 s / 10.4 s / 8.5 s / 16.7 s; PCIe‑bound: 0.12 ms per missing expert per rank ≈ 39 GB/s per link; the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token — chunk 2048 gave 2.0–2.3K at 2K / 14K / 30K) |
-| long context | needle‑in‑a‑haystack **32K: 3/3, 64K: 2/2** measured (depths 0.1 / 0.5 / 0.9; the 64K / 0.9 item is pending a probe fix) |
+| long context | needle‑in‑a‑haystack **32K: 3/3, 64K: 3/3** (depths 0.1 / 0.5 / 0.9; TTFT 8.5 s / 16.5–16.8 s) |
 | concurrency (4 streams, 60‑min soak) | **1,888 requests, 0 errors, no leak**; aggregate **98 tok/s** (24.5 per stream) — every stream brings its own expert misses (~136 CPU experts per 4‑token step, 22–25 ms of CPU per step), so the hybrid serves one stream fast and several streams correctly but slowly; `--max-num-seqs 1` is the serving default |
 | quality, paired against the native FP4 reference | **HumanEval 159/164 vs 160/164** (McNemar p = 1.0, 134 identical programs); **MATH‑500 level 5: 55/60 vs 55/60** (0 discordant items, 59 identical answers) |
 | identity | bit‑exact against the all‑resident b12x path within one boot: 21,040 compact calls per rank, 98,220 CPU‑computed rows, 0 differ (`DEBUG_COMPACT`); the CPU kernel bit‑exact against b12x's GPU kernels on four parity sets |
 | expert hit rate (pairs resident) | 0.83–0.85 on short prompts, **0.87 on HumanEval, 0.91 on MATH‑500** |
 | host RAM while up | ~450 GB used (the expert store 64.7 GB per rank + the Engram tables 2 × 23.6 GiB per rank, pinned), MemAvailable ~45 GB |
 | VRAM | 29.9 GB per card at util 0.92; KV cache 0.8–1.1 GiB (nvfp4 MLA: 300K+ tokens) |
-| boot | ~6 min (weights 160–250 s + 65 GB of records pinned per rank in ~90 s + warmup) |
+| boot | ~6 min (weights 160–250 s + 65 GB of records pinned per rank in ~60 s + warmup; the page cache dropped before the boot and after the weights — pinning the records *before* the weights instead was measured slower: the loader then streams 290 GB through ~45 GB of cache, 527 s) |
 
 ## How it works
 
@@ -74,11 +74,14 @@ DSV41_MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash python tools/dsv41_5090/cpu
 # qmma_probe is built from qmma_probe.cu, the layout probe runs in the serving image)
 CUDA_VISIBLE_DEVICES=1 tools/dsv41_5090/cpu_moe/qmma_probe --tables internal/dsv41-5090-cpu/parity
 python tools/dsv41_5090/cpu_tier/b12x_layout_probe.py --out internal/dsv41-5090-cpu/parity
-# serve: the dev flow (the worktree mounted, the patcher applied at container start, ~60 s)
+# serve (the default since 2026-10-28): the baked image vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 — Dockerfile.sm120-dsv41-nightly
+# step 28 = the patched packages + the runtime + libcpu_tier.so; nothing mounted from the worktree, no patcher at start
 MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash docker/sm120/run-dsv41-5090.sh
-# serve: the baked image (Dockerfile.sm120-dsv41-nightly step 28 = the patched packages + runtime + libcpu_tier.so;
-# build: DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 .)
-MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 BAKED=1 docker/sm120/run-dsv41-5090.sh
+# after a change under tools/dsv41_5090/: rebuild the image (layer cache, seconds; tp4_window.sh warns when the image is stale)
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly --label com.vllm-moet.cpu-tier-commit=$(git rev-parse --short HEAD) \
+  -t vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 .
+# the dev flow instead: the worktree mounted at /repo, the patcher applied at container start (~60 s), the hyb1 image
+MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash BAKED=0 docker/sm120/run-dsv41-5090.sh
 ```
 
 `docker/sm120/run-dsv41-5090.sh` boots the measured serving configuration by default; its header lists every knob

@@ -9,12 +9,14 @@
 # boot ~6 min; HumanEval 159 vs native 160, MATH-500 L5 55 vs 55 (paired).
 #
 # Required:  MODEL_DIR   the official DeepSeek-V4.1-Flash checkpoint
-# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1)  NAME (ds41-hyb)  GPUS (0,1,2,3)  TP (4)  PORT (8041)
+# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2: the hybrid baked in, see BAKED)  NAME (ds41-hyb)  GPUS (0,1,2,3)  TP (4)  PORT (8041)
 #            BIND (127.0.0.1:)       CACHE_DIR (/mnt/nvme/cache/ds41)  REPO (/mnt/nvme/vLLM-Moet-cpu: patcher + runtime)
 #            STORE (/mnt/nvme/packs/dsv41-hybrid)   cpu_moe/build_store.py's files (269 GB on NVMe)
 #            STORE_MODE (nonresident)  which records the tier pins: nonresident (65 GB per rank with 40 static) or all (72 GB per rank)
-#            STORE_EARLY (0)         1 = pin the records before the weights are loaded (no reclaim storm against the loader's
-#                        page cache; needs PLACEMENT) - to be verified in a TP4 boot, then the default
+#            STORE_EARLY (0)         1 = pin the records at the last MoE layer's create_weights, i.e. before the weights are
+#                        loaded (needs PLACEMENT). Measured 10-28 (k0-baked-early2): it boots, but the loader then streams
+#                        290 GB of shards through the ~45 GB of page cache the pinned memory leaves - boot 527 s against
+#                        348-394 with the late pin + the window script's two cache drops; more compaction afterwards. Off.
 #            PLACEMENT ($REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json = 40 static experts per layer;
 #                        0.28 = 107, 0.2526 = 97)  routing/placement.py's file;
 #                        RESIDENT=<int> instead = the first N experts of every layer (a test placement)
@@ -48,9 +50,13 @@
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
-#            BAKED (0)               1 = run the image's own copy of the hybrid (Dockerfile step 28: patched packages, runtime,
+#            BAKED (1)               1 = run the image's own copy of the hybrid (Dockerfile step 28: patched packages, runtime,
 #                        libcpu_tier.so) without mounting the worktree or re-running the patcher at start (IMAGE must have the
-#                        layer, e.g. vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2); 0 = the dev flow (worktree mounted, patched at start)
+#                        layer: vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2; verified in the TP4 boot k0-baked-early2, 10-28).
+#                        After a change under tools/dsv41_5090/ rebuild the image (layer cache, seconds):
+#                          DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly \
+#                            --label com.vllm-moet.cpu-tier-commit=$(git rev-parse --short HEAD) -t vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 .
+#                        0 = the dev flow (IMAGE …-hyb1 or the base, the worktree mounted at /repo, the patcher at start, ~60 s)
 #            POWER_CAP_W (CAP_W of /etc/default/gpu-power-cap, else 400)  the GPUs' power limit this launcher re-applies before
 #                        the boot when a card sits above it (the box's cap after GPU 0 fell off the bus twice under full
 #                        power, 2026-10-25; gpu-power-cap.service sets it at boot); POWER_CAP_W=0 skips the check
@@ -62,7 +68,13 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1}"
+BAKED="${BAKED:-1}"
+# the baked image by default; the dev flow (BAKED=0) defaults to the image without step 28 (the patcher runs at start)
+if [[ "$BAKED" == "1" ]]; then
+  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2}"
+else
+  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1}"
+fi
 NAME="${NAME:-ds41-hyb}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -109,7 +121,6 @@ TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM
           -e VLLM_MOET_CPU_TIER_SCRATCH="$SCRATCH" -e VLLM_MOET_CPU_TIER_DEBUG_COMPACT="$DEBUG_COMPACT"
           -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL="$DEBUG_PREFILL" -e VLLM_MOET_CPU_TIER_PROMOTE_WINDOW="$PROMOTE_WINDOW"
           -e VLLM_MOET_CPU_TIER_HOST_EMPTY_CACHE="$HOST_EMPTY_CACHE" -e MOE_B12X_POOL_SPIN_HOT="$POOL_SPIN_HOT")
-BAKED="${BAKED:-0}"
 MOUNTS=(-v "$MODEL_DIR:/model:ro" -v "$CACHE_DIR/dot-cache:/root/.cache" -v "$TABLES:/parity:ro" -v "$STORE:/store:ro")
 if [[ "$BAKED" == "1" ]]; then
   ENTRY=/opt/vllm-moet/dsv41_5090/cpu_tier/serve_hybrid.sh

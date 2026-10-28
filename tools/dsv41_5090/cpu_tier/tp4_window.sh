@@ -96,8 +96,22 @@ if [[ "${DROP_CACHES:-0}" == "1" ]]; then
   sync; echo 3 > /proc/sys/vm/drop_caches; note "page cache dropped before the boot: $(free -g | awk '/^Mem:/ {print $6 " GB buff/cache, " $7 " GB available"}')"
 fi
 
-# 2. boot
+# 1b. BAKED=1 (the launcher's default since 10-28) runs the image's copy of tools/dsv41_5090: warn when it is not the worktree's
+# (a change committed or not, without `docker build` of the hyb2 image) - the window would measure stale code
 cd "$REPO" || exit 1
+if [[ "${BAKED:-1}" == "1" ]]; then
+  img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2}"
+  files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py'
+  stale=$(diff <(docker run --rm --entrypoint bash "$img" -c "cd /opt/vllm-moet/dsv41_5090 && md5sum $files 2>/dev/null" 2>/dev/null) \
+               <(cd tools/dsv41_5090 && eval md5sum $files 2>/dev/null) | grep '^>' | awk '{print $3}' | tr '\n' ' ')
+  if [[ -n "$stale" ]]; then
+    note "WARNING: the baked image $img differs from the worktree in: $stale(rebuild it, or run BAKED=0)"
+  else
+    note "baked image $img = the worktree's tools/dsv41_5090 (commit label: $(docker image inspect "$img" --format '{{index .Config.Labels "com.vllm-moet.cpu-tier-commit"}}' 2>/dev/null), HEAD $(git rev-parse --short HEAD))"
+  fi
+fi
+
+# 2. boot
 bash docker/sm120/run-dsv41-5090.sh || { note "launcher failed"; exit 1; }
 t0=$(date +%s)
 ready=0
