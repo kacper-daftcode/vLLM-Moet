@@ -280,7 +280,8 @@ preemptions; GSM8K-200 196/200; needle 4/4; no error in the engine log.
 **Verdict (2026-10-28):** with steps 4-5 the RedHat draft's window takes the same prefix hits as the MLA/KDA groups,
 the KDA keeps its checkpoints, and every gate passes; `-r5` with RedHat k = 5 is ready to serve (`IMAGE`,
 `SPEC_TOKENS=5`, `DRAFT_DIR`, `DRAFT_ATTENTION_BACKEND=""`, `MAX_CUDAGRAPH_CAPTURE_SIZE=768` in the launcher
-wrapper). `-r3` and `-r4` must not be served (`-r3`: a KDA state hashed under the wrong key; `-r4`: no checkpoints).
+wrapper) - **served on hgx-02 since 2026-10-28, 08:23 UTC** (first probes on the served endpoint: resend 20,224 of
+20,352 hits at 0.11 s, agent turns 15,872 / 16,512 / 17,152 with accepted length 5.8 / 5.4 / 4.6). `-r3` and `-r4` must not be served (`-r3`: a KDA state hashed under the wrong key; `-r4`: no checkpoints).
 
 ## 4. What is left, and why it is not patched here
 
@@ -303,7 +304,7 @@ wrapper). `-r3` and `-r4` must not be served (`-r3`: a KDA state hashed under th
 * `tools/k3_b300/patch_vllm_swa_draft_dcp.py` - the RedHat draft under DCP (§3b steps 1-3), the fine-grained
   `SlidingWindowManager` (step 4) and the scheduler's Mamba chunking on the Mamba block (step 5); idempotent, `--check`.
 * `Dockerfile.b300-k3` - `vllm/vllm-openai:v0.32.0` + the patches (`vllm-moet-b300:k3-v0.32.0-r1` = RecoverSSM
-  only, served; `-r5` = both, the RedHat draft candidate; `-r3`/`-r4` have a broken step 5 and must not be served).
+  only, served 2026-10-25..28; `-r5` = both, served since 2026-10-28 with RedHat k = 5; `-r3`/`-r4` have a broken step 5 and must not be served).
 * `docker/b300/run-k3.sh` - the launcher with `USE_RECOVERSSM` and `MAMBA_SSM_CACHE_DTYPE`.
 * `tools/k3_b300/kv_model.py` - the budget model (`--kv-gib 46.98` reproduces every row above).
 * `tools/k3_b300/k3_code_bench.py`, `k3_matrix.py`, `capacity_probe.py`, `gsm8k_probe.py`, `ref_outputs.py` - the

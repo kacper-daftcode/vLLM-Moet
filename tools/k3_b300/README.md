@@ -1,7 +1,8 @@
 # Kimi-K3 + DSpark on 8x B300 (HGX, sm_103)
 
-The official `vllm/vllm-openai:v0.32.0` serves K3 on B300 as is; this directory holds the one patch the served
-configuration needs and the tools behind `docs/k3-b300-dspark-kv.md` (why DSpark cost 35 % of the GPU KV pool and
+The official `vllm/vllm-openai:v0.32.0` serves K3 on B300 as is; this directory holds the two patches the served
+configuration needs (RecoverSSM next to the KV connector; the RedHat sliding-window draft with prefix caching, served at
+k = 5 since 2026-10-28) and the tools behind `docs/k3-b300-dspark-kv.md` (why DSpark cost 35 % of the GPU KV pool and
 how the KDA speculative state slots are removed). Image: `Dockerfile.b300-k3`; launcher: `docker/b300/run-k3.sh`.
 
 | file | role |
@@ -22,9 +23,9 @@ how the KDA speculative state slots are removed). Image: `Dockerfile.b300-k3`; l
 Build and serve (hgx-02 paths; every knob is documented in the launcher header):
 
 ```bash
-DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k3 -t vllm-moet-b300:k3-v0.32.0-r1 .
-IMAGE=vllm-moet-b300:k3-v0.32.0-r1 MODEL_DIR=/data/models/Kimi-K3 CACHE_DIR=/data/cache/vllm-k3 \
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k3 -t vllm-moet-b300:k3-v0.32.0-r5 .
+IMAGE=vllm-moet-b300:k3-v0.32.0-r5 MODEL_DIR=/data/models/Kimi-K3 CACHE_DIR=/data/cache/vllm-k3 \
   GPU_MEM_UTIL=0.95 KV_OFFLOAD=disk KV_OFFLOAD_GIB=12288 KV_OFFLOAD_DIR=/data/kvcache \
-  SPEC_TOKENS=4 DRAFT_DIR=/data/models/Kimi-K3-DSpark MAX_CUDAGRAPH_CAPTURE_SIZE=640 \
-  USE_RECOVERSSM=1 docker/b300/run-k3.sh
+  SPEC_TOKENS=5 DRAFT_DIR=/data/models/Kimi-K3-speculator-redhat DRAFT_ATTENTION_BACKEND="" \
+  MAX_CUDAGRAPH_CAPTURE_SIZE=768 USE_RECOVERSSM=1 docker/b300/run-k3.sh
 ```
