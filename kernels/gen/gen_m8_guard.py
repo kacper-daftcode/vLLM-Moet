@@ -43,7 +43,7 @@ GUARD_SHIFT7 = """\
     [B------:R-:W1:-:S01] LDC.64 R20, c[0x0][0x398] ;  // d_rmap
     [B0-----:R-:W-:-:S06] SHF.R.U32.HI R2, RZ, 0x7, R2 ;  // slot = expert
     [B------:R-:W-:-:S06] SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B
-    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, R2, 0x1, R20 ;
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, PT, R2, 0x1, R20 ;
     [B----4-:R-:W2:-:S01] LDG.E.64 R24, desc[UR4][R20.64] ;  // row_map[e][0:2]
     [B--2---:R-:W-:-:S06] IADD3 R24, PT, PT, R24, 0x1, RZ ;  // -1 -> 0
     [B------:R-:W-:-:S08] ISETP.EQ.AND P0, PT, R24, RZ, PT ;
@@ -63,7 +63,7 @@ GUARD_DIV192 = """\
     [B------:R-:W-:-:S06] IMAD R2, R2, 0xaaab, RZ ;  // magic //3 (GROUPS=192)
     [B------:R-:W-:-:S06] SHF.R.U32.HI R2, RZ, 0x11, R2 ;  // slot = expert
     [B------:R-:W-:-:S06] SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B
-    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, R2, 0x1, R20 ;
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, PT, R2, 0x1, R20 ;
     [B----4-:R-:W2:-:S01] LDG.E.64 R24, desc[UR4][R20.64] ;  // row_map[e][0:2]
     [B--2---:R-:W-:-:S06] IADD3 R24, PT, PT, R24, 0x1, RZ ;  // -1 -> 0
     [B------:R-:W-:-:S08] ISETP.EQ.AND P0, PT, R24, RZ, PT ;
@@ -85,7 +85,7 @@ GUARD_SHIFT6 = """\
     [B------:R-:W-:-:S06] MOV R24, RZ ;
     [B------:R-:W-:-:S06] @P0 IADD3 R2, PT, PT, R2, -0x6, RZ ;  // mod 6
     [B------:R-:W-:-:S06] SHF.L.U32 R2, R2, 0x5, RZ ;  // *32 B
-    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, R2, 0x1, R20 ;
+    [B-1----:R-:W-:-:S06] IMAD.WIDE.U32 R20, PT, R2, 0x1, R20 ;
     [B----4-:R-:W2:-:S01] LDG.E.64 R24, desc[UR4][R20.64] ;  // row_map[e][0:2]
     [B--2---:R-:W-:-:S06] IADD3 R24, PT, PT, R24, 0x1, RZ ;
     [B------:R-:W-:-:S08] ISETP.EQ.AND P0, PT, R24, RZ, PT ;

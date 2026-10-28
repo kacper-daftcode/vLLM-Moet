@@ -1,7 +1,18 @@
 # Kernel manifest (SM120 / sm_120, RTX PRO 6000 Blackwell + RTX 5090)
 
-Hand‑written SASS assembled by `cubit` (pinned @ `5912400`). Cubins are **SM120‑only**.
+Hand‑written SASS assembled by `cubit` (shipped cubins: pinned @ `5912400`). Cubins are **SM120‑only**.
 Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sass/qmma_e4m3.merc.stub`.
+
+**Sources re‑canonicalized for today's cubit (`main` ≥ `f8605f6`, strict encoder; 2026‑10‑28):** the
+`.ROW/.COL` operand suffixes on `QMMA.SF` (no such bit exists in the SM120 encoding — the `5912400`
+encoder silently dropped them, the current one refuses, BUG‑272) are gone from every `sass/*.sass`
+and every generator in `gen/`, and the 4‑operand `IMAD.WIDE.U32 Rd, Ra, b, Rc` (silicon reads `c` as
+the 64‑bit pair `Rc:Rc+1` — nvcc's address idiom, cubit BUG‑008 warning) is spelled in the explicit
+5‑operand form `IMAD.WIDE.U32 Rd, PT, Ra, b, Rc`. Both spellings encode to the same 128‑bit word
+(`cubit encode`, checked), the generators still reproduce their `.sass` byte for byte, all 90 sources
+assemble with 0 errors / 0 warnings, and the result differs from the shipped cubins only in the NOP
+tail (instruction‑level diff of all 86 matched kernels). The shipped `cubins-sm120/*.cubin` are
+unchanged: a regenerated cubin ships only after its GPU validation is repeated with the new assembler.
 
 ## Activation format rev `_a32` (group‑size‑flexible A scales) — the LIVE set
 
