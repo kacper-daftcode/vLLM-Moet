@@ -240,6 +240,9 @@
 #      decode step; 36 distinct experts 95.4 vs 99.5 us. Slower with few distinct experts (6 / 12: +4 / +3 us), so the
 #      kernel asks for >= 32 pairs per launch (the drafter's MoE stays on b12x). Built in but OFF by default:
 #      VLLM_MOET_B12X_MOE_FUSED=1 at runtime turns it on.
+#  27a. B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 set in the image (ENV): above the fused kernel's 8 tokens b12x's dynamic MoE
+#      backend sums the experts' outputs with atomics by default and identical requests returned different logits; the
+#      deterministic plan costs nothing measurable (details at the ENV line in step 27a below).
 #  28. The DeepSeek-V4.1 sparse MLA decode with its candidate rows gathered by plain loads, the fp4 -> fp8 conversion
 #      shared by the two producer groups, the first tile's index words loaded before the candidate lengths, the softmax /
 #      P-quantization / XV section with 4 barriers per tile instead of 20, and a merge whose loads are issued up front
@@ -558,6 +561,15 @@ RUN if [ "$VLLM_MOET_B12X_MOE_FUSED_PATCH" = "1" ]; then python3 /opt/vllm-moet/
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_fused'); import b12x_moe_fused_sm120 as f; e = f._ext(); assert hasattr(e, 'moe_fused'); print('sm120 b12x fused MoE extension built')" \
     && grep -q "_moet_moe_fused_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_fused_sm120/*.so; fi
+# 27a. Deterministic MoE output above the fused kernel's 8 tokens: b12x's `dynamic` backend (11+ tokens in the decode graphs,
+#      every prefill) sums the experts' FC2 contributions into the [M, K] output with atomics by default ("Atomic scatter
+#      writes directly into the caller-owned output" in its _impl.py), so identical requests of 9+ rows returned different
+#      logits (top-20 jitter ~2 nats, top-1 flips at high-entropy positions; measured 2026-10-26..28, GLM on upstream vLLM
+#      bit-identical). B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 selects b12x's plan with one bf16 row per (token, expert) pair
+#      and a fixed-order top-k reduction: bit-identical repeats at 9 / 12 / 128 rows, step period unchanged at one and two
+#      users and 3 % shorter at four (RTX PRO 6000, TP4, r21). Below 9 tokens the fused kernel (step 27) is deterministic by
+#      construction. -e B12X_DYNAMIC_DETERMINISTIC_OUTPUT=0 restores the atomic path.
+ENV B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
 
 # 28. The sparse MLA decode's rows gathered by plain loads, shared conversion, speculative index loads, the softmax / XV
 #     section with 4 barriers per tile + the merge with its loads issued up front (runtime switch VLLM_MOET_SPARSE_MLA_LDG=1,
