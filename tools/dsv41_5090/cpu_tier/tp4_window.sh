@@ -9,6 +9,13 @@
 # Outputs: /tmp/ds41-hyb-<TAG>.log (container log), /tmp/ds41-hyb-<TAG>-outputs.json (the identity client's run),
 # /tmp/ds41-hyb-<TAG>-summary.txt. Appends start / end lines to /root/work/GPU-BOARD.md.
 set -u
+# bash reads a script lazily: an edit of this file while a window runs kills the window mid-measurement (10-26 08:3x,
+# 10-28 19:12 - both ours). The window therefore runs from a private copy; the source may change under it.
+if [[ -z "${TP4_WINDOW_COPY:-}" ]]; then
+  _copy="/tmp/tp4_window.$$.sh"
+  cp "${BASH_SOURCE[0]}" "$_copy" || exit 1
+  TP4_WINDOW_COPY="$_copy" exec bash "$_copy" "$@"
+fi
 TAG="${1:?tag}"
 shift
 for kv in "$@"; do export "$kv"; done
@@ -45,6 +52,7 @@ cleanup() {
     echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"
   fi
   keep_artefacts
+  rm -f "${TP4_WINDOW_COPY:-/nonexistent}"
 }
 trap cleanup EXIT TERM INT
 
