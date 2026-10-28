@@ -211,7 +211,7 @@ if [[ -n "${SOAK_MINUTES:-}" ]]; then
     --conc "${SOAK_CONC:-4}" --max-tokens "${SOAK_TOKENS:-256}" --out "/tmp/ds41-hyb-$TAG-soak.json" 2>&1 | tail -8 | tee -a "$SUMMARY"
   docker logs "$NAME" > "$LOG" 2>&1
   grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
-  grep -ciE "error word|fail.*closed|Traceback" "$LOG" | xargs -I{} note "server log: error / traceback lines after the soak: {}"
+  note "server log: error / traceback lines after the soak: $(grep -ciE "error word|fail.*closed|Traceback" "$LOG")"
   free -g | head -2 | tail -1 | tee -a "$SUMMARY"
 fi
 # optional (phase 2.5): TTFT / prefill rate on long prompts, e.g. TTFT_LENGTHS=2048,14336,30720 (needs SCRATCH > 0 for
@@ -224,13 +224,13 @@ if [[ -n "${TTFT_LENGTHS:-}" ]]; then
   grep -E "moet-cpu-tier\] rank 0: (prefill call|scratch pool|DEBUG prefill|[0-9]+-token MoE call)" "$LOG" | tail -8 | cut -c1-600 | tee -a "$SUMMARY"
   grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
 fi
-grep -c "moet-cpu-tier\] rank 0: WARNING" "$LOG" | xargs -I{} note "tier warnings in the log: {}"
+note "tier warnings in the log: $(grep -c "moet-cpu-tier\] rank 0: WARNING" "$LOG")"
 if [[ "${DEBUG_COMPACT:-0}" == "1" ]]; then
   # the within-boot identity check (every compact call vs all its experts in one b12x run): totals per rank, mismatches
   for r in 0 1 2 3; do grep -o "rank $r: step [0-9]*:.*compact check: .*" "$LOG" | tail -1 | sed -E "s/(rank $r: step [0-9]+):.*compact check:/\1 compact check:/" | tee -a "$SUMMARY"; done
-  grep -c "DEBUG compact.*MISMATCH" "$LOG" | xargs -I{} note "compact check MISMATCH lines (all ranks): {}"
+  note "compact check MISMATCH lines (all ranks): $(grep -c "DEBUG compact.*MISMATCH" "$LOG")"
   grep "DEBUG compact.*MISMATCH" "$LOG" | head -5 | cut -c1-300 | tee -a "$SUMMARY"
-  grep -c "DEBUG compact.*check skipped" "$LOG" | xargs -I{} note "compact check skipped lines: {}"
+  note "compact check skipped lines: $(grep -c "DEBUG compact.*check skipped" "$LOG")"
 fi
 grep -i "fail\|error word\|Traceback" "$LOG" | grep -v "errors 0" | head -5 | tee -a "$SUMMARY"
 

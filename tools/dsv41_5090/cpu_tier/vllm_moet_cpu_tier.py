@@ -22,9 +22,11 @@ Environment:
                                         left to vLLM's own threads); dispatcher = first pool CPU + 32 (its SMT sibling)
   VLLM_MOET_CPU_TIER_STORE=<dir>        build_store.py's files for the real checkpoint (see above)
   VLLM_MOET_CPU_TIER_STORE_MODE         nonresident (default) | all: which records to pin
-  VLLM_MOET_CPU_TIER_STORE_EARLY=1      pin the records at the first create_weights (before the weights are loaded; needs
-                                        a PLACEMENT file) instead of after loading - no reclaim storm against the loader's
-                                        page cache (10-26)
+  VLLM_MOET_CPU_TIER_STORE_EARLY=1      pin the records at the LAST target layer's create_weights (the model constructed,
+                                        the Engram tables allocated, the weights not yet loaded; needs a PLACEMENT file)
+                                        instead of after loading - no reclaim storm against the loader's page cache (10-26;
+                                        not at the first create_weights: the Engram tables' huge-page prefault then stalls
+                                        in compaction behind 260 GB of pinned pages)
   VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=1    (dummy mode) overwrite the dummy expert weights with seeded sane random MXFP4
                                         bytes (scales 118..126), so that a stock run and a hybrid run see the same experts
   VLLM_MOET_CPU_TIER_TIMEOUT_MS         bounded wait (default 500)
@@ -255,8 +257,15 @@ def on_create_weights(layer, num_experts: int, hidden_size: int, intermediate_si
     layer._map_global_expert_id_to_local_expert_id = _slot_mapper(cfg)
     _log(f"layer {cfg.name} -> hybrid layer {cfg.li}: parameters for {cfg.R} slots ({len(cfg.residents)} resident "
          f"experts of {num_experts} + {SPARE} spare); the loader skips the rest")
+    # STORE_EARLY: pin the records at the LAST target layer's create_weights - the model is then constructed (vLLM's
+    # loader runs after the construction), so the 260 GB of cudaHostAlloc happen before the weights and still AFTER the
+    # Engram tables (engram_layer_ids 1 and 14 of V4.1-Flash: exact-size THP mmap + prefault + cudaHostRegister, 2 x 23.6
+    # GiB per rank, allocated as those layers are built). Pinning at the FIRST create_weights (10-26 17:53, boot
+    # k0-baked-early) fragmented the free memory with 260 GB of unmovable pages before the tables' huge-page prefault,
+    # which then sat in direct compaction: 48 min of silence after the store line, the window timed out.
     if STORE_EARLY and S.store is None and os.environ.get("VLLM_MOET_CPU_TIER_PLACEMENT") \
-            and not int(os.environ.get("VLLM_MOET_CPU_TIER_RESIDENT_SHIFT", "0")):
+            and not int(os.environ.get("VLLM_MOET_CPU_TIER_RESIDENT_SHIFT", "0")) \
+            and cfg.model_layer == _num_hidden_layers() - 1:
         with S.lock:
             _ensure_store(early=True)
     return cfg.R
@@ -276,10 +285,11 @@ def _seed_dummy_weights(layer_idx: int, w13: torch.Tensor, w13s: torch.Tensor, w
 # ---- the records ----------------------------------------------------------------------------------------------
 def _ensure_store(early: bool = False) -> None:
     """Pins the records (ExpertStore). Normally at the first process_weights_after_loading (every target layer
-    registered by then); with VLLM_MOET_CPU_TIER_STORE_EARLY=1 already at the first create_weights, i.e. BEFORE the
-    weights are loaded: the placement file gives every layer's residents up front, so the masks are known, and the
-    260 GB of cudaHostAlloc then happen while the page cache is still empty instead of evicting the loader's shard
-    pages under pressure afterwards (10-26: 16 min of direct reclaim in one boot)."""
+    registered by then); with VLLM_MOET_CPU_TIER_STORE_EARLY=1 already at the last target layer's create_weights, i.e.
+    BEFORE the weights are loaded (and after the Engram tables, see on_create_weights): the placement file gives every
+    layer's residents up front, so the masks are known, and the 260 GB of cudaHostAlloc then happen while the page
+    cache is still empty instead of evicting the loader's shard pages under pressure afterwards (10-26: 16 min of
+    direct reclaim in one boot)."""
     if S.store is not None:
         return
     from cpu_tier import ExpertStore

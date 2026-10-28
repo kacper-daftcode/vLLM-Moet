@@ -9,10 +9,15 @@
 #          SPARE (0) spare slots per layer; PROMOTIONS (4) per layer per step; DSPARK (1); DEBUG (0); CPUS (unset = the
 #          runtime's per-rank layout; 9-15 pins one pool); GPU=1,2 serves TP2 (TP from the count; both locks taken)
 #          GPU_MEM_UTIL (0.3; the 384-expert mini-real needs ~0.85); R=placement uses the model dir's placement.json
+#          EXTRA_DOCKER_ENV ("-e K=V ...") extra container environment, e.g. -e VLLM_MOET_CPU_TIER_STORE_EARLY=1
+#          NO_LOCK (0) 1 = do not take the GPU's flock (the caller holds it)
 #   (holds the GPU's flock for each serve; logs /tmp/moet-mini-r<R>.log)
 set -u
 GPU="${1:?gpu index (or a list 1,2 for TP2)}"
 LOCKS=""; for g in ${GPU//,/ }; do LOCKS="$LOCKS flock -w 3600 /tmp/exl3diff-gpu$g.lock"; done
+# NO_LOCK=1: the caller already holds the GPU's lock (e.g. a TP4 chain that runs this test under its four locks before
+# the full-model boot) - a second flock on the same file would block against it
+[ "${NO_LOCK:-0}" = "1" ] && LOCKS=""
 TP="${TP:-$(echo $GPU | tr "," "\n" | wc -l)}"
 RS="${2:-16 8 1}"
 PORT="${3:-8031}"
