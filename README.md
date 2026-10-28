@@ -25,13 +25,13 @@ deterministic top-k, the shared-expert add fused into the MoE top-k sum — most
 switches; as served: the fused MoE, the sparse-MLA gather and steps 30–33 and 36 on, every one of them
 bit-identical to the path it replaces).
 
-| | measured on the served image (`-r21`, DSpark k = 7, 400 W) |
+| | measured on the served image (`-r21-mxfp8` = `-r21` + steps 38–39 + the deterministic MoE sum of step 27a, DSpark k = 7, 400 W) |
 |---|---|
-| decode, 1 stream | prose **~277 tok/s median (waves 259–296)**, code **~796 tok/s median (waves 742–812)** (131–132 steps/s on short prompts; the Fraser bench below is the stricter single-prompt code measure) |
-| decode, 8 streams | prose ~717 tok/s median (702–734), code ~2,055 tok/s median (1,916–2,236) aggregate, 8 × 1,024 tokens |
-| fresh prefill | 163K tokens in 8.6 s (~19K tok/s) |
+| decode, 1 stream | prose **~293 tok/s median (waves 277–301)**, code **~802 tok/s median (waves 786–813)** (128–130 steps/s on short prompts; the Fraser bench below is the stricter single-prompt code measure) |
+| decode, 8 streams | prose ~721 tok/s median (716–759), code ~2,258 tok/s median (2,227–2,289) aggregate, 8 × 1,024 tokens |
+| fresh prefill | 163K tokens in 9.5 s (~17K tok/s), 391K in 23 s |
 | KV cache | **9.62M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
-| quality | GSM8K-200 (no-think, 4 streams) **193/200** on the served `-r21` vs 194/200 on the `-r8` baseline (one flip, exact McNemar p = 1); needle PASS at 29K / 106K / 400K; tool calls / JSON / vision pass (2026-10-26) |
+| quality | GSM8K-200 (no-think, 4 streams) **193/200** on the served image vs 194/200 on the `-r8` baseline (one flip, exact McNemar p = 1); needle PASS at 29K / 106K / 400K; tool calls / JSON / vision pass; identical requests return identical logits at any batch size (three identical teacher-forced calls at 12 and 128 rows: 0 differences) (2026-10-28) |
 
 ### What we changed against official vLLM
 
@@ -108,23 +108,47 @@ quote the best.
 
 | served configuration (4× RTX PRO 6000, 400 W, GDDR7 +5000) | median tok/s | best | steps/s | accepted length |
 |---|---|---|---|---|
-| `-r21`, fused MoE + sparse-MLA gather + steps 30–33 + 36 on, `P2P_AR_FUSED_MAX_ROWS=8`, DSpark k = 7 (40 reps) | **680** | **741** | **127.8** | 5.34 |
+| `-r21-mxfp8`, fused MoE + sparse-MLA gather + steps 30–33, 36, 38–39 on, `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, `P2P_AR_FUSED_MAX_ROWS=8`, DSpark k = 7 (20 reps, 2026-10-28) | **668** | **717** | **127.8** | 5.23 |
 
 k = 7 steps are individually slower (more rows verified per step) but accept ~19 % more tokens each;
 in mixed traffic with lower draft acceptance the wider draft does not pay for itself, which is what
 `enable_adaptive_verification` exists for. Reproduce (the switches are production's):
 
 ```bash
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r21 .
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r22 .
 MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 GPU_MEM_UTIL=0.94 KV_OFFLOAD_GIB=64 \
   KV_OFFLOAD_FS_DIR=/srv/kvcache KV_OFFLOAD_PROMPT_ONLY=0 INDEXER_TP_SHARD_MIN_ROWS=2048 \
-  EXTRA_DOCKER_ARGS="-e VLLM_MOET_B12X_MOE_FUSED=1 -e VLLM_MOET_SPARSE_MLA_LDG=1 -e VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 -e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8 -e VLLM_MOET_P2P_AG=0 -e VLLM_MOET_DFLASH_PREP_GROUPS=1 -e VLLM_MOET_CANDIDATE_DET_TOPK=1 -e VLLM_MOET_SWA_DECODE_BUILD=1 -e VLLM_MOET_MOE_TOPKSUM_ADD=1 -e VLLM_MOET_SWA_DRAFT_BUILD=1" \
+  EXTRA_DOCKER_ARGS="-e VLLM_MOET_B12X_MOE_FUSED=1 -e VLLM_MOET_SPARSE_MLA_LDG=1 -e VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 -e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8 -e VLLM_MOET_P2P_AG=0 -e VLLM_MOET_DFLASH_PREP_GROUPS=1 -e VLLM_MOET_CANDIDATE_DET_TOPK=1 -e VLLM_MOET_SWA_DECODE_BUILD=1 -e VLLM_MOET_MOE_TOPKSUM_ADD=1 -e VLLM_MOET_SWA_DRAFT_BUILD=1" \ -e VLLM_MOET_MHC_MXFP8=1 -e VLLM_MOET_MHC_SIDE_DEFER=1
   EXTRA_ARGS='--moe-backend b12x --speculative-config {"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"moe_backend":"b12x"}' \
   docker/sm120/run-dsv41.sh
 python3 tools/sm120_perf/fraser_bench.py --base http://127.0.0.1:8001 \
   --model deepseek-ai/DeepSeek-V4.1-Flash-1017 \
   --prompt-file tools/sm120_perf/fraser_prompt.txt --reps 10
 ```
+
+#### Fraser Price's BRRR bench on the served configuration
+
+[`fraserprice/DeepSeek-4.1-Flash-1017-BRRR`](https://huggingface.co/fraserprice/DeepSeek-4.1-Flash-1017-BRRR) ships
+`src/brrr/bench.py`, the script behind his published table: a calibrated code prompt of 2K / 16K / 65K tokens at 1, 4, 8
+(and 16) concurrent streams, five rounds per cell, **temperature 1.0, thinking off**, generation to natural EOS (≤ 2,048
+tokens), the GPUs cooled to 70 °C before every round; PP from a `max_tokens=1` pass, TG from a prefix-cached second pass
+timed while every stream decodes. Run unmodified against the served `:8001` on 2026-10-28 (the server needs
+`--enable-prompt-tokens-details`; production serves `--max-num-seqs 8`, so the 16-stream column is not run):
+
+| prompt | conc | TTFT p50 | PP p50 tok/s | PP total | TG p50 tok/s (per stream) | TG total | accepted / step |
+|---|---|---|---|---|---|---|---|
+| 2,148 | 1 | 221 ms | 9,731 | 9,145 | 766 | 764 | 6.03 (72 %) |
+| 2,148 | 4 | 399 ms | 5,389 | 13,066 | 352 | 1,403 | 5.97 (71 %) |
+| 2,147 | 8 | 751 ms | 2,861 | 14,167 | 244 | 1,960 | 5.97 (71 %) |
+| 16,483 | 1 | 1,034 ms | 15,947 | 15,960 | 750 | 755 | 6.02 (72 %) |
+| 16,484 | 4 | 2,395 ms | 7,181 | 17,978 | 341 | 1,363 | 5.99 (71 %) |
+| 16,484 | 8 | 4,551 ms | 3,622 | 17,862 | 242 | 1,937 | 5.98 (71 %) |
+| 65,635 | 1 | 3,742 ms | 17,542 | 17,478 | 744 | 739 | 6.00 (71 %) |
+| 65,635 | 4 | 10,492 ms | 6,328 | 16,018 | 331 | 1,325 | 5.99 (71 %) |
+| 65,629 | 8 | 17,244 ms | 3,812 | 16,702 | 234 | 1,866 | 6.03 (72 %) |
+
+(`accepted / step` is the script's `1 + accepted / drafts` with the draft-token acceptance rate; sampling at temperature 1.0
+with block verification accepts more of DSpark's seven drafts than greedy decoding does.)
 
 The port with every gap and measurement: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
 Build, serve, validate and every image tag: **[docs/sm120-deploy.md](docs/sm120-deploy.md)**. Op-level
