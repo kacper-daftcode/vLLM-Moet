@@ -25,7 +25,7 @@
 #            DRAFT_ATTENTION_BACKEND (FLASHINFER_MLA)  the Inferact draft is MLA-native; RedHatAI's speculator
 #                        (RedHatAI/Kimi-K3-speculator.dspark: 5 Qwen3-style GQA layers, sliding window 2048, trained
 #                        for k=8) is a GQA draft that FLASHINFER_MLA rejects: set "" to let vLLM pick (FLASHINFER).
-#                        It needs the Dockerfile.b300-k3 -r3 image (tools/k3_b300/patch_vllm_swa_draft_dcp.py: the
+#                        It needs the Dockerfile.b300-k3 -r4 image (tools/k3_b300/patch_vllm_swa_draft_dcp.py: the
 #                        draft next to DCP, and a SlidingWindowManager whose prefix hits land where K3's KDA state
 #                        is - the -r2 image lost prefix caching with it); its window-bounded KV leaves ~13% more
 #                        pool than the Inferact draft at the same k (24.48M vs 21.61M tokens at k=4, 2026-10-25) at

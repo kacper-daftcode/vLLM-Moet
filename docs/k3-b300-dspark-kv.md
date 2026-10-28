@@ -233,13 +233,44 @@ Emulated against the real `KVCacheManager` (the K3 group layout, chunked prefill
 split, spec-decode steps with rejections, 220-block pools with overlapping prefixes): a 20,354-token prompt resent
 while its producer still decodes hits 20,224 (= prod's position) with CoW copies in the MLA, KDA and window groups;
 a second turn hits the same boundary; its resend hits its own boundary (21,120); pool accounting balances after
-every request is freed. Measured on the GPUs: the 2026-10-26/27 night window (`/root/work/k3-test/night-rh5.sh`,
-results in `night-rh5-<date>-summary.txt`).
+every request is freed.
 
-**Verdict (2026-10-26, before the night measurement):** the RedHat draft is faster and leaner in KV; with step 4 its
-window takes the same prefix hits as the MLA/KDA groups. The served draft stays Inferact (k = 4, RecoverSSM) until
-the `-r3` battery (prefix hits before and after load, acceptance, 8K/32K matrices, 128 x 22K capacity, GSM8K,
-needle) confirms it; the planned successor is RedHat k = 5 (prose/math best in the sweep, C = 64 within 5 % of k = 4).
+**Measured 2026-10-26/27 (`-r3`, `/root/work/k3-test/night-rh5.sh`, k = 5 then k = 4; prod = Inferact k = 4):**
+
+| | prod Inferact k = 4 | RedHat k = 5 `-r3` | RedHat k = 4 `-r3` |
+| --- | --- | --- | --- |
+| GPU KV pool (graphs 640 / 768 / 640) | 21.61M | 24.02M | 24.48M |
+| 30K resend: hits, warm TTFT | 20,096 / 20,347, 0.09 s | 20,096 / 20,350, 0.12 s | 20,096 / 20,350, 0.12 s |
+| turn 2 after a 120-token answer | 20,096, 0.15 s | 20,096, 0.44 s | 20,096, 0.39 s |
+| agent turns 2 / 3 / 4 on 16K (600-token answers) | 15,872 / 16,512 / 17,152 | **0 / 14,976 / 17,152** | **0 / 14,976 / 17,152** |
+| accepted length after a hit (turns 2-4) | 4.81 / 4.29 / 3.79 | 5.82 / 5.50 / 3.95 | 4.90 / 4.74 / 3.94 |
+| code / prose / math / 30K+code (tok/s, accepted) | 205-220 (3.3) / 142 / 215 / 244 | 263 (4.13) / 162 / 226 / 292 (4.62) | 243 (3.67) / 165 / 222 / 269 |
+| 8K C = 32 / 64 per session | 57.6 / 40.7 | 61.7 / 42.6 | 62.7 / 43.8 |
+| 32K C = 64 end-to-end (64 x 1,024 tokens) | - | 535 tok/s (122 s) | 540 tok/s (121 s) |
+| 128 x 15K, 3,000 output tokens | (22K: 1,418 tok/s, 36 % KV) | 1,654 tok/s, 35 % KV, 0 preemptions | 1,775 tok/s, 35 % KV, 0 |
+| GSM8K-200 / needle | 196 / 4/4 | 195 / 4/4 | 196 / 4/4 |
+
+The window's own hits worked (resend, turn 2 after a short answer, turn 4), but the agent session lost turns 2-3.
+The instrumented run of 2026-10-27 (per-group cached positions at every lookup, `/root/work/k3-test/dbg-r3/`)
+showed the window group complete at every position (`11264P .. 15360P, 16000S, 16384P`: full keys plus the
+secondary partial key after promotion) and the **KDA groups empty**: no prompt-end checkpoint for the 16,006-token
+turn 1, no chunk-end states, and for turn 2 one state keyed at 14,976 that held the state after 14,336 tokens.
+Cause (step 5): with the window group prefix-cacheable, `cache_config.block_size` becomes the minimum over the
+cacheable groups - the window's 1,024 instead of the 1,664-token Mamba/attention block - and the scheduler's Mamba
+"align" chunking reads it: chunks ended at 7,168 / 14,336 / 15,360 instead of 6,656 / 13,312, so chunk-end states
+no longer sat on Mamba block boundaries (and one was hashed under the next boundary's key), and the scheduler's
+checkpoint-validity check (on 1,024) disagreed with the manager's (on 1,664) for that chunk geometry, so the
+prompt-end checkpoint was not taken. A resend of a 20,350-token prompt happened to have a valid geometry, which is
+why the resend probes passed. The worker's `mamba_hybrid` state already reads `cache_config.mamba_block_size` for
+exactly this reason; `-r4` makes the scheduler do the same (one hunk). In the emulation, the engine's chunk budget
+(8,187 = 8,192 - 5 draft slots) with a 1,024-token split reproduces the loss (turn 2: KDA 14,976, not 15,872); with
+the Mamba block it does not. This is an upstream bug for any Mamba "align" model with a prefix-cacheable draft
+group below the Mamba block (the DFlash case the worker comment names).
+
+**Verdict (2026-10-28):** the RedHat draft is faster and leaner in KV; with steps 4-5 its window takes the same
+prefix hits as the MLA/KDA groups and the KDA keeps its checkpoints. The served draft stays Inferact (k = 4,
+RecoverSSM) until the `-r4` battery (2026-10-28/29 night window) confirms the agent-turn hits on the GPUs; the
+planned successor is RedHat k = 5 (code / math / long-context best, C = 64 within 3 % of k = 4).
 
 ## 4. What is left, and why it is not patched here
 
@@ -259,10 +290,10 @@ needle) confirms it; the planned successor is RedHat k = 5 (prose/math best in t
 ## 5. Files
 
 * `tools/k3_b300/patch_vllm_recoverssm_offload.py` - the patch (idempotent, `--check`).
-* `tools/k3_b300/patch_vllm_swa_draft_dcp.py` - the RedHat draft under DCP (§3b steps 1-3) and the fine-grained
-  `SlidingWindowManager` (step 4); idempotent, `--check`.
+* `tools/k3_b300/patch_vllm_swa_draft_dcp.py` - the RedHat draft under DCP (§3b steps 1-3), the fine-grained
+  `SlidingWindowManager` (step 4) and the scheduler's Mamba chunking on the Mamba block (step 5); idempotent, `--check`.
 * `Dockerfile.b300-k3` - `vllm/vllm-openai:v0.32.0` + the patches (`vllm-moet-b300:k3-v0.32.0-r1` = RecoverSSM
-  only, served; `-r3` = both, the RedHat draft candidate).
+  only, served; `-r4` = both, the RedHat draft candidate; `-r3` lacks step 5).
 * `docker/b300/run-k3.sh` - the launcher with `USE_RECOVERSSM` and `MAMBA_SSM_CACHE_DTYPE`.
 * `tools/k3_b300/kv_model.py` - the budget model (`--kv-gib 46.98` reproduces every row above).
 * `tools/k3_b300/k3_code_bench.py`, `k3_matrix.py`, `capacity_probe.py`, `gsm8k_probe.py`, `ref_outputs.py` - the

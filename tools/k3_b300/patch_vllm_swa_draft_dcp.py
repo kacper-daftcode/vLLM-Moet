@@ -58,6 +58,18 @@ loses prefix caching:
    Supersedes the 2026-10-25/26 variant (the window as per-request scratch with every hit capped
    `sliding_window` tokens below the prompt end), which found no KDA state at the capped position.
 
+5. With the window's group prefix-cacheable, the engine core sets `cache_config.block_size` to the minimum over
+   the prefix-cacheable groups: 1024 (the window block) instead of the 1664-token Mamba/attention block. The
+   scheduler's Mamba "align" chunking (`Scheduler._mamba_block_aligned_split`) reads that value, so prefill
+   chunks ended on multiples of 1024: chunk-end KDA states no longer sat on Mamba block boundaries (and one
+   got hashed under the next boundary's key - a state 640 tokens behind its key), and the scheduler judged
+   the prompt-end checkpoint valid where the manager (on the real Mamba block) did not, so no checkpoint was
+   taken. Measured 2026-10-26/27: a resend still hit (the checkpoint happened to be valid for that chunk
+   geometry), but turn 2 of an agent session hit 0 and turn 3 resumed from the mis-keyed state. The worker's
+   `mamba_hybrid` state already reads `cache_config.mamba_block_size` for exactly this reason; the patch makes
+   the scheduler do the same. Without a draft group below the Mamba block both values agree and nothing
+   changes (prod with the Inferact draft: 1664 both).
+
 Idempotent, anchor-based. Usage:
     python3 patch_vllm_swa_draft_dcp.py [--root PATH] [--check]
 """
@@ -422,6 +434,31 @@ SWA_METHODS_NEW = (
     "\n" + SWA_METHODS_OLD
 )
 
+# 5. The scheduler's Mamba "align" chunking on the Mamba block, not on cache_config.block_size.
+SCHED_FILE = "v1/core/sched/scheduler.py"
+SCHED_OLD = (
+    "        block_size = self.cache_config.block_size\n"
+    "        # The last block-aligned position whose state can be cached. With\n"
+)
+SCHED_NEW = (
+    f"        {MARKER}:\n"
+    "        # cache_config.block_size is the min over the prefix-cacheable groups,\n"
+    "        # which a draft group with its own smaller block (the 1024-token\n"
+    "        # sliding window next to the 1664-token Mamba block here) pulls below\n"
+    "        # the Mamba block - the worker's mamba_hybrid state already reads\n"
+    "        # mamba_block_size for that reason. Split on the wrong block and chunk\n"
+    "        # ends stop landing on Mamba block boundaries: the aligned-state\n"
+    "        # invariant breaks (a chunk-end state hashed as the next boundary's),\n"
+    "        # and this check-point validity disagrees with the manager's, so the\n"
+    "        # prompt-end checkpoint is silently not taken (measured 2026-10-27:\n"
+    "        # turn 2 of an agent session hit 0, turn 3 resumed from a state 640\n"
+    "        # tokens behind its key).\n"
+    "        block_size = (\n"
+    "            self.cache_config.mamba_block_size or self.cache_config.block_size\n"
+    "        )\n"
+    "        # The last block-aligned position whose state can be cached. With\n"
+)
+
 PATCHES = (
     (LAYOUT_FILE, LAYOUT_OLD, LAYOUT_NEW, "layout decided on unified page sizes"),
     (RUNNER_FILE, RUNNER_OLD, RUNNER_NEW, "target graph support over target layers"),
@@ -429,6 +466,7 @@ PATCHES = (
     (SWA_FILE, SWA_CLASS_OLD, SWA_CLASS_NEW, "SlidingWindowManager: fine-grained lookups"),
     (SWA_FILE, SWA_FIND_OLD, SWA_FIND_NEW, "SlidingWindowManager: fine-grained hit branch"),
     (SWA_FILE, SWA_METHODS_OLD, SWA_METHODS_NEW, "SlidingWindowManager: partial tail, CoW, retention"),
+    (SCHED_FILE, SCHED_OLD, SCHED_NEW, "scheduler: Mamba chunk alignment on the Mamba block"),
 )
 
 

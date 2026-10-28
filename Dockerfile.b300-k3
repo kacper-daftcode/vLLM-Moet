@@ -18,15 +18,18 @@
 #      CUDA graph support judged on the target's layers only, and the draft's sliding-window block on
 #      trtllm-gen's 1024-token pages instead of 64-token blocks padded to the MLA page. Only reached when such a
 #      draft is configured; the Inferact MLA draft takes none of these paths.
-#   3. (-r3) Prefix caching with that draft: `SlidingWindowManager` with hash-unit (fine-grained) lookups and a
+#   3. (-r3, -r4) Prefix caching with that draft: `SlidingWindowManager` with hash-unit (fine-grained) lookups and a
 #      copy-on-write partial tail, so the window's hits land on the prompt-end hash boundary where K3's KDA
 #      groups keep their state (the -r2 image lost every prefix hit with the draft's window in prefix caching,
 #      and found no KDA state with the window as per-request scratch). Entered only when the coordinator aligns
 #      hits below the block size, i.e. next to a Mamba "align" group; other models keep the upstream path.
+#   4. (-r4) The scheduler's Mamba "align" chunking on cache_config.mamba_block_size: with the window group
+#      prefix-cacheable, cache_config.block_size became the window's 1024 and the KDA checkpoints were lost
+#      (turn 2 of an agent session hit 0 on -r3) - the worker already reads mamba_block_size for this.
 #
-# Build:  docker build -f Dockerfile.b300-k3 -t vllm-moet-b300:k3-v0.32.0-r3 .   (~2 min; hgx-02 has no buildx:
+# Build:  docker build -f Dockerfile.b300-k3 -t vllm-moet-b300:k3-v0.32.0-r4 .   (~2 min; hgx-02 has no buildx:
 #         DOCKER_BUILDKIT=0)
-# Serve:  IMAGE=vllm-moet-b300:k3-v0.32.0-r3 USE_RECOVERSSM=1 ... docker/b300/run-k3.sh
+# Serve:  IMAGE=vllm-moet-b300:k3-v0.32.0-r4 USE_RECOVERSSM=1 ... docker/b300/run-k3.sh
 ARG BASE_IMAGE=vllm/vllm-openai:v0.32.0
 FROM ${BASE_IMAGE}
 

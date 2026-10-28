@@ -56,13 +56,15 @@ def main():
     ap.add_argument("--prompt-tokens", type=int, default=30000)
     ap.add_argument("--api-key", default=os.environ.get("API_KEY", ""))
     ap.add_argument("--label", default="")
+    ap.add_argument("--max-tokens", type=int, default=120,
+                    help="output length of the cold request (a long answer promotes the draft window's tail block)")
     a = ap.parse_args()
     doc = uuid.uuid4().hex + "\n" + FILLER * int(a.prompt_tokens * 4.3 / len(FILLER))
     q1 = doc + "\nIn two sentences, what do the notes above describe?"
     c0 = counters(a.base)
-    cold = chat(a.base, a.api_key, a.model, [{"role": "user", "content": q1}], 120)
+    cold = chat(a.base, a.api_key, a.model, [{"role": "user", "content": q1}], a.max_tokens)
     c1 = counters(a.base)
-    warm = chat(a.base, a.api_key, a.model, [{"role": "user", "content": q1}], 120)
+    warm = chat(a.base, a.api_key, a.model, [{"role": "user", "content": q1}], a.max_tokens)
     c2 = counters(a.base)
     same = (cold["content"] == warm["content"]) and (cold["reasoning"] == warm["reasoning"])
     print(f"{a.label} cold: prompt={cold['usage'].get('prompt_tokens')} ttft={cold['ttft']:.2f}s | "
