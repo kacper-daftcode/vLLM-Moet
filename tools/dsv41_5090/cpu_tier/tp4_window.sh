@@ -166,6 +166,13 @@ done
 # 3. measurements: the identity client (10 short prompts x 48 tokens, saved), then decode tok/s on longer generations
 MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
 $PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --port "$PORT" --model "$MODEL" --out "/tmp/ds41-hyb-$TAG-outputs.json" 2>&1 | tee -a "$SUMMARY"
+# IDENTITY_REPEAT=2: the same 12 prompts again and the two runs compared (run-to-run determinism of THIS boot: the compact
+# path is deterministic, the > 8-token prompts only with B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 - 10-28)
+if [[ "${IDENTITY_REPEAT:-1}" == "2" ]]; then
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --port "$PORT" --model "$MODEL" --out "/tmp/ds41-hyb-$TAG-outputs2.json" > /dev/null 2>&1
+  note "identity prompts, run 1 vs run 2 of this boot:"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --compare "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-outputs2.json" 2>&1 | grep -E "DIFFER|prompts differ" | tee -a "$SUMMARY"
+fi
 # who runs on which CPU while the first decode runs (foreign threads on the pool cores / their SMT siblings slow the kernel)
 ( sleep 2; bash "$REPO/tools/dsv41_5090/cpu_tier/cpu_placement_probe.sh" "${PLACEMENT_SAMPLES:-40}" 0.1 > "/tmp/ds41-hyb-$TAG-placement.txt" 2>&1 ) &
 for p in "Hello" "def fib(n):"; do
