@@ -341,6 +341,12 @@ struct Pool {
     // governor reads a pause loop as a nearly idle core and lowers its clock between a decode step's jobs (3.8 GHz
     // in the gaps against 4.9 when busy; the next job starts on the low clock), a hot loop keeps it up
     bool spin_hot = false;
+    // MOE_B12X_POOL_SPIN_HOT=2: the hot spin also reads one cache line per poll from a private 32 MB buffer (stride
+    // 4 KB, beyond the prefetchers) - the decode pattern's 250 us gaps between jobs cost the kernel itself ~20 %
+    // (bench_pattern 10-28: in-kernel 120 us back to back, 146 after a gap, with the clock held up by the ALU spin),
+    // the suspects being the data fabric / memory controller's idle states and the untrained prefetchers; a trickle
+    // of DRAM traffic in the gaps keeps the memory path awake
+    int spin_hot_mode = 0;
     std::atomic<uint32_t> wake_seq{0};
     std::atomic<int> n_sleeping{0};
     std::atomic<int> bar_count{0};
@@ -694,11 +700,14 @@ static void worker_main(Pool* P, int tid) {
     pin_to_cpu(P->cpus[tid]);
     uint64_t seen = 0;
     volatile uint64_t sink = 0;
+    const int64_t touch_bytes = 32ll << 20;
+    uint8_t* touch = P->spin_hot_mode >= 2 ? (uint8_t*)big_alloc(touch_bytes) : nullptr;   // zeroed = faulted in
+    int64_t touch_off = 0;
     while (!P->stop.load(std::memory_order_acquire)) {
         uint64_t g;
         int64_t t_idle = -1;
         while ((g = P->gen.load(std::memory_order_acquire)) == seen) {
-            if (P->stop.load(std::memory_order_acquire)) return;
+            if (P->stop.load(std::memory_order_acquire)) { if (touch) big_free(touch, touch_bytes); return; }
             if (P->spin_ns >= 0) {
                 const int64_t now = mono_ns();
                 if (t_idle < 0) t_idle = now;
@@ -714,6 +723,10 @@ static void worker_main(Pool* P, int tid) {
             }
             if (P->spin_hot) {
                 uint64_t h = sink + 0x9E3779B97F4A7C15ull;   // ~100 cycles of dependent integer work per poll
+                if (touch) {                                  // mode 2: plus one DRAM line per poll (~2.5 GB/s per thread)
+                    h += *(volatile uint64_t*)(touch + touch_off);
+                    touch_off = (touch_off + 4096 + 64) & (touch_bytes - 1);
+                }
                 for (int i = 0; i < 24; ++i) h = (h ^ (h >> 29)) * 0xBF58476D1CE4E5B9ull;
                 sink = h;
             } else {
@@ -724,6 +737,7 @@ static void worker_main(Pool* P, int tid) {
         run_job(*P, tid);
         P->done.fetch_add(1, std::memory_order_acq_rel);
     }
+    if (touch) big_free(touch, touch_bytes);
 }
 
 // ------------------------------------------------------------------------------------------------------------
@@ -857,7 +871,7 @@ void* moe_b12x_pool_create(int nthreads, const int* cpu_ids) {
     P->cpus.assign(cpu_ids, cpu_ids + nthreads);
     P->C = make_consts();
     if (const char* s = getenv("MOE_B12X_POOL_SPIN_US")) P->spin_ns = (int64_t)atoll(s) * 1000;
-    if (const char* s = getenv("MOE_B12X_POOL_SPIN_HOT")) P->spin_hot = atoi(s) != 0;
+    if (const char* s = getenv("MOE_B12X_POOL_SPIN_HOT")) { P->spin_hot_mode = atoi(s); P->spin_hot = P->spin_hot_mode != 0; }
     P->x_cap = 256;
     P->X = (XPrep*)big_alloc((int64_t)P->x_cap * sizeof(XPrep));
     for (int b = 0; b < 2; ++b) {

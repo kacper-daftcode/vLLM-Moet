@@ -769,10 +769,16 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
     from_store = [e for e in routed if _has_record(li, e)]
     from_pool = [e for e in routed if not _has_record(li, e)]
     routed = from_store + from_pool
+    P = S.pools[li]
+    if from_pool and not P.pool:
+        # the layer's prepared storages are attached at its first COMPACT launch (publish); the profile run's 4096-token
+        # prefill comes before any (10-28: KeyError 'w13' killed a boot) - the check waits for a later call
+        _log(f"DEBUG prefill layer {li}: {len(from_pool)} routed experts without a record and the layer's pool not "
+             f"attached yet (no compact launch so far); reference skipped")
+        return
     if from_store:
         _stage_and_repack(sc, [_record_ptr(li, e) for e in from_store])
     if from_pool:
-        P = S.pools[li]
         S.manager.copy.synchronize()
         torch.cuda.synchronize()
         table = P.slot_table.cpu().numpy()
