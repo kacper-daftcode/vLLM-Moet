@@ -112,6 +112,13 @@ if [[ "${BAKED:-1}" == "1" ]]; then
 fi
 
 # 2. boot
+# PROFILE_STEPS=N: vLLM's torch profiler in the serve (traces under $CACHE_DIR/dot-cache/prof = /root/.cache/prof in the
+# container), used after the decode measurements: N steps of one 'def fib(n):' request, analysed by profile_anatomy.py
+PROF_DIR="${CACHE_DIR:-/mnt/nvme/cache/ds41}/dot-cache/prof"
+if [[ -n "${PROFILE_STEPS:-}" ]]; then
+  mkdir -p "$PROF_DIR"
+  export EXTRA_ARGS="${EXTRA_ARGS:-} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/root/.cache/prof"
+fi
 bash docker/sm120/run-dsv41-5090.sh || { note "launcher failed"; exit 1; }
 t0=$(date +%s)
 ready=0
@@ -198,6 +205,37 @@ if [[ -s "/tmp/ds41-hyb-$TAG-placement.txt" ]]; then
   note "CPU placement during decode (pool cores and their siblings; full list /tmp/ds41-hyb-$TAG-placement.txt):"
   # pool cores 8r+2..8r+7 and their siblings 8r+34..8r+39 are exactly the CPUs with cpu % 8 >= 2
   awk '/^  cpu/ {cpu = $2 + 0; if (cpu % 8 >= 2) print}' "/tmp/ds41-hyb-$TAG-placement.txt" | head -48 | tee -a "$SUMMARY"
+fi
+# optional: PROFILE_STEPS=N - a torch-profiler trace of the first N engine iterations of one 'def fib(n):' request (the
+# prefill step + N-1 decode steps; /start_profile with max_iterations stops the profiler by itself, /stop_profile flushes),
+# one trace per TP rank under $PROF_DIR; rank 0's analysed into the summary (GPU busy vs idle per step, the hybrid's
+# publish / wait-inject kernels, b12x, NCCL, attention), all traces copied to boots/
+if [[ -n "${PROFILE_STEPS:-}" ]]; then
+  rm -f "$PROF_DIR"/*"$TAG"* 2>/dev/null
+  note "profile: $PROFILE_STEPS engine iterations of a 'def fib(n):' request (torch profiler, prefix $TAG)"
+  curl -sf -m 60 -X POST "http://127.0.0.1:$PORT/start_profile" -H 'Content-Type: application/json' \
+    -d "{\"profile_prefix\": \"$TAG\", \"max_iterations\": $PROFILE_STEPS}" > /dev/null || note "start_profile failed"
+  $PY - "$PORT" "$MODEL" "def fib(n):" $((PROFILE_STEPS + 16)) <<'EOF' 2>&1 | tee -a "$SUMMARY"
+import json, sys, time, urllib.request
+port, model, prompt, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+body = dict(model=model, prompt=prompt, max_tokens=n, temperature=0, seed=0, ignore_eos=True)
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+t0 = time.time()
+r = json.load(urllib.request.urlopen(req, timeout=1800))
+dt = time.time() - t0
+u = r.get("usage", {})
+print(f"  profiled decode {prompt!r}: {u.get('completion_tokens')} tokens in {dt:.1f} s = {u.get('completion_tokens', 0) / dt:.1f} tok/s (profiler on)")
+EOF
+  curl -sf -m 900 -X POST "http://127.0.0.1:$PORT/stop_profile" > /dev/null 2>&1 || note "stop_profile returned an error (already stopped by max_iterations?)"
+  for i in $(seq 1 60); do (( $(ls "$PROF_DIR"/*"$TAG"*tp0*.json* 2>/dev/null | wc -l) >= 1 )) && break; sleep 5; done
+  sleep 5
+  ls -la "$PROF_DIR"/ 2>/dev/null | grep -- "$TAG" | awk '{printf "  %s %s\n", $5, $9}' | tee -a "$SUMMARY"
+  for f in "$PROF_DIR"/*"$TAG"*tp0*.json*; do
+    [[ -s "$f" ]] || continue
+    note "profile anatomy of $(basename "$f") (rank 0):"
+    $PY "$REPO/tools/dsv41_5090/cpu_tier/profile_anatomy.py" "$f" --steps "$PROFILE_STEPS" --top 30 2>&1 | tee -a "$SUMMARY"
+  done
+  mkdir -p "$KEEP" 2>/dev/null && cp -f "$PROF_DIR"/*"$TAG"* "$KEEP/" 2>/dev/null
 fi
 # optional (phase 3, G3): HARD_PROBE=humaneval,math500 - the W2 line's hard_probe.py (copied to internal/…/probe/ with the
 # native fin01 references): greedy, thinking off; HumanEval executed (164 items), MATH-500 level 5 (60 items); paired
