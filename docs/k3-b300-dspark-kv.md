@@ -261,16 +261,26 @@ cacheable groups - the window's 1,024 instead of the 1,664-token Mamba/attention
 no longer sat on Mamba block boundaries (and one was hashed under the next boundary's key), and the scheduler's
 checkpoint-validity check (on 1,024) disagreed with the manager's (on 1,664) for that chunk geometry, so the
 prompt-end checkpoint was not taken. A resend of a 20,350-token prompt happened to have a valid geometry, which is
-why the resend probes passed. The worker's `mamba_hybrid` state already reads `cache_config.mamba_block_size` for
-exactly this reason; `-r4` makes the scheduler do the same (one hunk). In the emulation, the engine's chunk budget
-(8,187 = 8,192 - 5 draft slots) with a 1,024-token split reproduces the loss (turn 2: KDA 14,976, not 15,872); with
-the Mamba block it does not. This is an upstream bug for any Mamba "align" model with a prefix-cacheable draft
-group below the Mamba block (the DFlash case the worker comment names).
+why the resend probes passed. `cache_config.mamba_block_size` (which the worker's `mamba_hybrid` reads for the
+same reason) is no better in the engine-core process: the model hook copied the pre-resolution block size into it
+(16) and only the workers' platform hook re-syncs it - an image that read it (`-r4`, 2026-10-28) split chunks every
+16 tokens (8,176 / 16,352 / 20,320), so chunk starts were not hash-aligned and no checkpoint was ever valid (every
+probe 0 hits). `-r5` reads the Mamba group's resolved block off the KV cache config. In the emulation, the engine's
+chunk budget (8,187 = 8,192 - 5 draft slots) with a 1,024-token split reproduces the loss (turn 2: KDA 14,976, not
+15,872); with the Mamba block it does not. This is an upstream bug for any Mamba "align" model with a
+prefix-cacheable draft group below the Mamba block (the DFlash case the worker comment names).
 
-**Verdict (2026-10-28):** the RedHat draft is faster and leaner in KV; with steps 4-5 its window takes the same
-prefix hits as the MLA/KDA groups and the KDA keeps its checkpoints. The served draft stays Inferact (k = 4,
-RecoverSSM) until the `-r4` battery (2026-10-28/29 night window) confirms the agent-turn hits on the GPUs; the
-planned successor is RedHat k = 5 (code / math / long-context best, C = 64 within 3 % of k = 4).
+**Measured 2026-10-28, 08:48-08:58 UTC (`-r5`, RedHat k = 5, same battery):** pool 24.02M; 30K resend 20,096
+(after the load phases 20,224) of 20,35x, warm TTFT 0.13-0.15 s; turn 2 after a short answer 20,096; **agent turns
+2 / 3 / 4 = 15,872 / 16,512 / 17,152 before and after load (= prod)**, TTFT 0.50 / 0.34 / 0.19 s (after load 0.28 /
+0.25 / 0.19), accepted length after a hit 5.67 / 5.33 / 4.26; code 260 tok/s (4.06), prose 162 (2.52), math 226
+(3.53), 30K+code 287 (4.52); 8K C = 32 / 64: 60.6 / 41.9 per session; 128 x 15K: 1,695 tok/s at 35 % KV, 0
+preemptions; GSM8K-200 196/200; needle 4/4; no error in the engine log.
+
+**Verdict (2026-10-28):** with steps 4-5 the RedHat draft's window takes the same prefix hits as the MLA/KDA groups,
+the KDA keeps its checkpoints, and every gate passes; `-r5` with RedHat k = 5 is ready to serve (`IMAGE`,
+`SPEC_TOKENS=5`, `DRAFT_DIR`, `DRAFT_ATTENTION_BACKEND=""`, `MAX_CUDAGRAPH_CAPTURE_SIZE=768` in the launcher
+wrapper). `-r3` and `-r4` must not be served (`-r3`: a KDA state hashed under the wrong key; `-r4`: no checkpoints).
 
 ## 4. What is left, and why it is not patched here
 
@@ -293,7 +303,7 @@ planned successor is RedHat k = 5 (code / math / long-context best, C = 64 withi
 * `tools/k3_b300/patch_vllm_swa_draft_dcp.py` - the RedHat draft under DCP (§3b steps 1-3), the fine-grained
   `SlidingWindowManager` (step 4) and the scheduler's Mamba chunking on the Mamba block (step 5); idempotent, `--check`.
 * `Dockerfile.b300-k3` - `vllm/vllm-openai:v0.32.0` + the patches (`vllm-moet-b300:k3-v0.32.0-r1` = RecoverSSM
-  only, served; `-r4` = both, the RedHat draft candidate; `-r3` lacks step 5).
+  only, served; `-r5` = both, the RedHat draft candidate; `-r3`/`-r4` have a broken step 5 and must not be served).
 * `docker/b300/run-k3.sh` - the launcher with `USE_RECOVERSSM` and `MAMBA_SSM_CACHE_DTYPE`.
 * `tools/k3_b300/kv_model.py` - the budget model (`--kv-gib 46.98` reproduces every row above).
 * `tools/k3_b300/k3_code_bench.py`, `k3_matrix.py`, `capacity_probe.py`, `gsm8k_probe.py`, `ref_outputs.py` - the

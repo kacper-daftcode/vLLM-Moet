@@ -66,9 +66,12 @@ loses prefix caching:
    the prompt-end checkpoint valid where the manager (on the real Mamba block) did not, so no checkpoint was
    taken. Measured 2026-10-26/27: a resend still hit (the checkpoint happened to be valid for that chunk
    geometry), but turn 2 of an agent session hit 0 and turn 3 resumed from the mis-keyed state. The worker's
-   `mamba_hybrid` state already reads `cache_config.mamba_block_size` for exactly this reason; the patch makes
-   the scheduler do the same. Without a draft group below the Mamba block both values agree and nothing
-   changes (prod with the Inferact draft: 1664 both).
+   `mamba_hybrid` state reads `cache_config.mamba_block_size` for exactly this reason, but in the engine-core
+   process that field still holds the pre-resolution block size the model hook copied (16 here; only the
+   workers' platform hook re-syncs it) - an image that read it split chunks every 16 tokens, so chunk starts
+   were not even hash-aligned and no checkpoint was ever valid (2026-10-28). The patch reads the Mamba group's
+   resolved block off the KV cache config instead. Without a draft group below the Mamba block
+   cache_config.block_size equals it and nothing changes (prod with the Inferact draft: 1664).
 
 Idempotent, anchor-based. Usage:
     python3 patch_vllm_swa_draft_dcp.py [--root PATH] [--check]
@@ -442,20 +445,31 @@ SCHED_OLD = (
 )
 SCHED_NEW = (
     f"        {MARKER}:\n"
+    "        # The Mamba group's resolved block, read off the KV cache config.\n"
     "        # cache_config.block_size is the min over the prefix-cacheable groups,\n"
     "        # which a draft group with its own smaller block (the 1024-token\n"
     "        # sliding window next to the 1664-token Mamba block here) pulls below\n"
-    "        # the Mamba block - the worker's mamba_hybrid state already reads\n"
-    "        # mamba_block_size for that reason. Split on the wrong block and chunk\n"
-    "        # ends stop landing on Mamba block boundaries: the aligned-state\n"
+    "        # the Mamba block; cache_config.mamba_block_size is no better in this\n"
+    "        # process - the model hook copied the pre-resolution block_size (16)\n"
+    "        # into it and only the workers' platform hook re-syncs it (measured\n"
+    "        # 2026-10-28: chunks of 8176 tokens). Split on the wrong block and\n"
+    "        # chunk ends stop landing on Mamba block boundaries: the aligned-state\n"
     "        # invariant breaks (a chunk-end state hashed as the next boundary's),\n"
-    "        # and this check-point validity disagrees with the manager's, so the\n"
-    "        # prompt-end checkpoint is silently not taken (measured 2026-10-27:\n"
-    "        # turn 2 of an agent session hit 0, turn 3 resumed from a state 640\n"
-    "        # tokens behind its key).\n"
-    "        block_size = (\n"
-    "            self.cache_config.mamba_block_size or self.cache_config.block_size\n"
-    "        )\n"
+    "        # chunk starts stop being hash-aligned, and this checkpoint validity\n"
+    "        # disagrees with the manager's, so the prompt-end checkpoint is\n"
+    "        # silently not taken (2026-10-27: turn 2 of an agent session hit 0,\n"
+    "        # turn 3 resumed from a state 640 tokens behind its key).\n"
+    "        block_size = getattr(self, \"_mamba_align_block_size\", None)\n"
+    "        if block_size is None:\n"
+    "            block_size = next(\n"
+    "                (\n"
+    "                    group.kv_cache_spec.block_size\n"
+    "                    for group in self.kv_cache_manager.kv_cache_config.kv_cache_groups\n"
+    "                    if isinstance(group.kv_cache_spec, MambaSpec)\n"
+    "                ),\n"
+    "                self.cache_config.block_size,\n"
+    "            )\n"
+    "            self._mamba_align_block_size = block_size\n"
     "        # The last block-aligned position whose state can be cached. With\n"
 )
 
