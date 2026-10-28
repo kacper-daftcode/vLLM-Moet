@@ -11,9 +11,13 @@ top-8) that is most of the work at any batch: profile run1 (26.10, rank 0): `_si
 for 256 live rows), 3.6 us x 43 = 0.16 ms at C1.
 
 The patch passes the ends in the standard layout, where they are exactly what the kernel expects (an expert starts at
-the previous end rounded up to the alignment - the padded start): expert_ends[e] = expert_start_loc[e] + expert_num_tokens[e],
-one int32 add over the experts inside deepgemm_moe_permute (an optional output), handed to _act_mul_quant together with
-the alignment the permute used. Per live row the kernel computes the same values as before (the ends only mask rows), so
+the previous end rounded up to the alignment - the padded start): after ep_scatter, expert_start_loc[e] IS the end of
+expert e's live rows, because _fwd_kernel_ep_scatter_2 uses that array as the placement cursor (tl.atomic_add); the
+permute copies it into an optional int32 output, handed to _act_mul_quant together with the alignment the permute used.
+(The first version added expert_num_tokens on top - counting the tokens twice; the end then overran the next expert's
+padded start whenever 2 * n_e exceeded the per-call alignment, and that expert's live rows stayed unwritten: on
+GLM-5.3-Flash the C8 decode collapsed (MTP acceptance 1.4 -> 0.08 per step, the target's routing degenerated), while C1,
+where every expert holds a token or two, stayed bit-identical. Found in the A/B of 2026-10-28/29.) Per live row the kernel computes the same values as before (the ends only mask rows), so
 the bits are unchanged; the padded rows of the FP8 activation stay unwritten, which the second GEMM computes and the
 unpermute discards, as it already does for the padding of the first GEMM's output. Rows: sm_120, FP8 block scales with
 UE8M0 (the only sm_120 route to the fused kernel), SiLU / swiglu-oai activation, not MXFP8, not the psum layout.
@@ -56,8 +60,10 @@ UTILS_RET_NEW = (
     "        use_psum_layout=use_psum_layout,\n"
     "    )\n"
     f"    if expert_ends_out is not None and not use_psum_layout:  # {MARKER}\n"
-    "        # the exclusive end of each expert's live rows in the padded layout: its padded start + its token count\n"
-    "        torch.add(expert_start_loc, expert_num_tokens.to(torch.int32), out=expert_ends_out)\n"
+    "        # _fwd_kernel_ep_scatter_2 advances expert_start_loc with atomics as it places the tokens: after the scatter the\n"
+    "        # entry of every expert is its padded start + its token count = the exclusive end of its live rows (an empty\n"
+    "        # expert's entry is its start, which is also the previous end rounded up - what the act-quant kernel expects)\n"
+    "        expert_ends_out.copy_(expert_start_loc)\n"
     "\n"
     "    return aq_out, aq_scale_out, grouped_layout, inv_perm, align_used\n"
 )
