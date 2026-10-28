@@ -331,6 +331,27 @@
 #      and the in-kernel hand-offs (selection wake-up, expert tables after the routing) cost more than the two launch
 #      gaps they replace. Kept as opt-in: build-arg VLLM_MOET_MOE_MEGA_PATCH=1 (default 0: not in the image), then
 #      VLLM_MOET_MOE_MEGA=1 at runtime (the deferral refuses to run without the launch-site patch).
+#  38. The mHC boundary kernel's MXFP8 copy of layer_input (patch_vllm_mhc_mxfp8_consumer_sm120.py + mhc_overlap/,
+#      template kQuant): the sublayer's first linear (fused_wqa_wkv; the shared experts' / dense MLPs' w13) quantized the
+#      bf16 layer input to MXFP8 right after the boundary kernel - FlashInfer's MXFP8QuantizeSwizzledKernel, two per layer,
+#      3.0-3.5 us each in the served graph with PDL, 0.7-1.2 us of it on the critical path per site (the GEMV waits for
+#      it; the GEMV with the quantization inside was measured slower: sm120_gemv/ variant AQ). The lanes of the boundary
+#      kernel that hold the eight rounded bf16 values write the e4m3 bytes and the F8_128x4 swizzled scales too (the same
+#      recipe, the same bytes; two xor-shuffles, one 8-byte store, one scale byte per lane) and the wrapper hangs the pair
+#      on the bf16 tensor; the MXFP8 linear kernel takes it like a QuantizedActivation. The bf16 tensor is unchanged (the
+#      router, the indexer's weights_proj, wk and the routed experts read it); the kernel without the pair is unchanged
+#      (SASS identical). Runtime switch VLLM_MOET_MHC_MXFP8=1 (default off).
+#  39. The attention sublayer's first GEMV as the first child of the mHC boundary kernel node
+#      (patch_vllm_mhc_side_defer_sm120.py): a kernel that follows its producer on the same hardware stream starts
+#      ~0.1 us after it or overlaps it with PDL; a child the graph executor sends to another hardware stream starts
+#      ~1.9 us after the producer's end. The boundary node had the mHC side stream, the attention's two aux-stream GEMMs
+#      and - last in capture order - the model stream's quantization + GEMV as children, and in the production r21
+#      profile the quantization behind 90 % of the attention boundaries started +1.9 us late although PDL-launched
+#      (behind wo_a the same kernel starts 2.2 us before its producer ends). With VLLM_MOET_MHC_SIDE_DEFER=1 the glue
+#      records an event after the boundary kernel and launches the side stream after the fused_wqa_wkv GEMV, and the
+#      attention enqueues its default chain first (execute_in_parallel(default_first=True)); the dependencies are the
+#      same, only the capture order changes (bit-exact by construction). FFN boundaries, the drafter and write_kv are
+#      untouched; pending side work is launched at the latest at the layer's join. Runtime switch, default off.
 #  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
 #  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
 #  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
@@ -633,6 +654,20 @@ RUN if [ "$VLLM_MOET_MOE_MEGA_PATCH" = "1" ] && [ "$VLLM_MOET_B12X_MOE_FUSED_PAT
     && grep -q "_moet_mega_take" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_mega_sm120/*.so; fi
 
+# 38. The MXFP8 linear kernel takes the mHC boundary kernel's MXFP8 copy of its input (runtime switch
+#     VLLM_MOET_MHC_MXFP8=1, default off; the kernel side is step 10's extension). GPU test:
+#     tools/dsv41_sm120/mhc_overlap/test_mhc_post_norm_mxfp8_sm120.py.
+ARG VLLM_MOET_MHC_MXFP8_PATCH=1
+RUN if [ "$VLLM_MOET_MHC_MXFP8_PATCH" = "1" ] && [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_mxfp8_consumer_sm120.py \
+    && grep -q "_moet_mxfp8" /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert 'q_data' in e.mhc_post_norm.__doc__; print('mHC boundary MXFP8 consumer patched')"; fi
+
+# 39. The attention boundary's model-stream chain first in capture order (runtime switch VLLM_MOET_MHC_SIDE_DEFER=1,
+#     default off). Depends on steps 10 and 23 (anchors in the installed ops/mhc.py).
+ARG VLLM_MOET_MHC_SIDE_DEFER_PATCH=1
+RUN if [ "$VLLM_MOET_MHC_SIDE_DEFER_PATCH" = "1" ] && [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_side_defer_sm120.py \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h, vllm.models.deepseek_v41.attention as a; assert hasattr(h, '_moet_mhc_run_deferred') and hasattr(a, '_moet_mhc_run_deferred_side'); print('mHC side-stream deferral patched')"; fi
+
 # Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads, its softmax / XV section with four barriers per tile and its merge with hoisted loads (runtime switch) + the drafter's input preparation in one launch for all draft KV groups (runtime switch) + the DSA candidate-block selection on the deterministic top-k (runtime switch) + the SWA builders' decode build in one launch (runtime switch) + the shared-expert add fused into the MoE top-k sum (runtime switch) + the MoE rows quantization on a side stream before the router (runtime switch) + the DSpark drafter's SWA metadata update in one launch per builder (runtime switch)" \
@@ -666,4 +701,6 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.moe-prequant="${VLLM_MOET_MOE_PREQUANT_PATCH}" \
       com.vllm-moet.swa-draft-build="${VLLM_MOET_SWA_DRAFT_BUILD_PATCH}" \
       com.vllm-moet.moe-mega="${VLLM_MOET_MOE_MEGA_PATCH}" \
+      com.vllm-moet.mhc-mxfp8="${VLLM_MOET_MHC_MXFP8_PATCH}" \
+      com.vllm-moet.mhc-side-defer="${VLLM_MOET_MHC_SIDE_DEFER_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"

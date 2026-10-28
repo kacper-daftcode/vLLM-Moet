@@ -46,6 +46,15 @@
 // In the served graph the kernel is the only child of the sublayer's NCCL all-reduce (the side
 // stream joins onto the all-reduce node, see the patcher) and starts 0.2 us after it, like the
 // TileLang kernel it replaced; with a second parent, 2.2 us.
+//
+// Optional (`q_data`, `q_scale`; template kQuant - the kernel without them is unchanged): the MXFP8
+// copy of layer_input the sublayer's first linear consumes (fused_wqa_wkv, the shared experts' w13,
+// the dense MLPs' w13: the vLLM-Moet GEMV / FlashInfer's mm_mxfp8 take a pre-quantized activation
+// through QuantizedActivation). The same bytes as the standalone MXFP8 quantization kernel that
+// otherwise runs between this kernel and the GEMV (two per layer, 3.0-3.5 us each in the served graph
+// with PDL; the GEMV waits for it), produced here by the lanes that already hold the eight rounded
+// bf16 values: two xor-shuffles and one 8-byte store per lane. The bf16 layer_input is still written
+// - the router, the indexer's weights_proj, wk and the routed experts read it.
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -128,11 +137,42 @@ __device__ __forceinline__ void load_coefficients(const float* __restrict__ pm_p
   }
 }
 
+// The MXFP8 copy of layer_input (kQuant): FlashInfer's quantization recipe, the one the standalone
+// MXFP8QuantizeSwizzledKernel in front of the sublayer's first GEMV applies to this very tensor (vLLM's
+// query_quant.py reproduces it bit for bit, tools/dsv41_sm120/sm120_gemv/ carries the same helpers): the amax of the
+// 32-block, normalized = amax * fp32(1/448), the ue8m0 scale is its exponent rounded up unless the mantissa is zero or
+// the value is a small subnormal, capped at 254, 0 for an all-zero block; the values are multiplied by 2^(127 - sf)
+// and rounded to e4m3 with saturation. The scale bytes go to FlashInfer's F8_128x4 swizzled layout (rows padded to 128,
+// 32-blocks to 4; only the real (token, block) bytes are written, as the consumers read only those).
+__device__ __forceinline__ uint32_t mxfp8_block_sf(float amax) {
+  const float normalized = amax * __uint_as_float(0x3b124925u);  // fp32(1.0 / 448.0)
+  const uint32_t bits = __float_as_uint(normalized);
+  const uint32_t exponent = (bits >> 23) & 255u, mantissa = bits & 0x7FFFFFu;
+  const bool bump = (mantissa != 0u) && !((exponent == 0u) && (mantissa <= 0x400000u));
+  const uint32_t sf = min(exponent + (bump ? 1u : 0u), 254u);
+  return normalized <= 0.0f ? 0u : sf;
+}
+__device__ __forceinline__ float mxfp8_inv_scale(uint32_t sf) {
+  return sf == 0u ? 0.0f : __uint_as_float((254u - sf) << 23);
+}
+// two floats -> two e4m3 (round to nearest, saturate to +-448); lo lands in the low byte
+__device__ __forceinline__ uint32_t cvt_e4m3x2(float lo, float hi) {
+  uint16_t r;
+  asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(r) : "f"(hi), "f"(lo));
+  return r;
+}
+// F8_128x4: byte offset of (row, 32-block kc) with num_k_tiles = ceil(K / 128)
+__device__ __forceinline__ int mxfp8_sf_offset(int row, int kc, int num_k_tiles) {
+  const int mt = row >> 7, r = row & 127, a = r >> 5, b = r & 31;
+  const int kt = kc >> 2, c = kc & 3;
+  return (((mt * num_k_tiles + kt) * 32 + b) * 4 + a) * 4 + c;
+}
+
 // One token per cluster of H/1024 CTAs x 128 threads (one TileLang block each); the blocks exchange their collapsed
 // values through the [T, H] workspace in L2 and one cluster barrier - see the header.
 constexpr int kBlockThreads = kTLBlock / kVec;  // 128
 
-template <int kMode, bool kPDL, bool kAR>
+template <int kMode, bool kPDL, bool kAR, bool kQuant>
 __global__ void __launch_bounds__(kBlockThreads) mhc_post_norm_kernel(
     const __nv_bfloat16* __restrict__ x,            // [T, H] (kAR: this rank's partial)
     const __nv_bfloat16* __restrict__ residual_in,  // [T, kHC, H]
@@ -150,7 +190,10 @@ __global__ void __launch_bounds__(kBlockThreads) mhc_post_norm_kernel(
     const int ar_rank, const int ar_mmax,
     const uint8_t* __restrict__ ar_order,           // kAR: [T * H / 8] NCCL's summation order
     __nv_bfloat16* __restrict__ ar_x_out,           // kAR: [T, H] the reduced x (the side stream's projection reads it)
-    __nv_bfloat16* __restrict__ scratch) {          // [T, H] bf16 workspace: every block's collapsed values
+    __nv_bfloat16* __restrict__ scratch,            // [T, H] bf16 workspace: every block's collapsed values
+    uint8_t* __restrict__ q_data,                   // kQuant: [T, H] e4m3 of layer_input
+    uint8_t* __restrict__ q_scale,                  // kQuant: F8_128x4 ue8m0 scales (ceil(T/128)*128 x H/32 bytes)
+    const int q_ktiles) {                           // kQuant: H / 128
   __shared__ float s_red[kTLThreads + 4];
   cg::cluster_group cluster = cg::this_cluster();
   const int nb = H / kTLBlock;                            // CTAs per token = cluster size
@@ -329,6 +372,28 @@ __global__ void __launch_bounds__(kBlockThreads) mhc_post_norm_kernel(
       l2[p] = __floats2bfloat162_rn((cf.x * rsqrt_norm) * wf.x, (cf.y * rsqrt_norm) * wf.y);
     }
     *reinterpret_cast<uint4*>(layer_input + static_cast<int64_t>(i) * H + h0) = lv;
+    if constexpr (kQuant) {
+      // the MXFP8 copy from the rounded bf16 values: a 32-block is this lane's eight and its three neighbours' (h0 = b *
+      // 1024 + ct * 8, so lanes 4m..4m+3 share a block) - two xor-shuffles for the amax, one 8-byte store, one scale byte
+      float f[kVec];
+      float amax = 0.f;
+#pragma unroll
+      for (int p = 0; p < kVec / 2; ++p) {
+        const float2 v = __bfloat1622float2(l2[p]);
+        f[2 * p] = v.x;
+        f[2 * p + 1] = v.y;
+        amax = fmaxf(amax, fmaxf(fabsf(v.x), fabsf(v.y)));
+      }
+      amax = fmaxf(amax, __shfl_xor_sync(full, amax, 1));
+      amax = fmaxf(amax, __shfl_xor_sync(full, amax, 2));
+      const uint32_t sf = mxfp8_block_sf(amax);
+      const float inv = mxfp8_inv_scale(sf);
+      uint2 q;
+      q.x = cvt_e4m3x2(f[0] * inv, f[1] * inv) | (cvt_e4m3x2(f[2] * inv, f[3] * inv) << 16);
+      q.y = cvt_e4m3x2(f[4] * inv, f[5] * inv) | (cvt_e4m3x2(f[6] * inv, f[7] * inv) << 16);
+      *reinterpret_cast<uint2*>(q_data + static_cast<int64_t>(i) * H + h0) = q;
+      if ((ct & 3) == 0) q_scale[mxfp8_sf_offset(i, h0 >> 5, q_ktiles)] = static_cast<uint8_t>(sf);
+    }
   }
   if constexpr (kAR) {
     // every CTA has read ar_ctrl[0] and its slot: the last one to finish advances the sequence
@@ -521,8 +586,10 @@ void mhc_post_norm(const at::Tensor& x, const at::Tensor& residual_in, const at:
                    at::Tensor residual_out, at::Tensor layer_input, const c10::optional<at::Tensor>& aux, double norm_eps,
                    int64_t mode, bool pdl, const c10::optional<at::Tensor>& ar_buf, const c10::optional<at::Tensor>& ar_flags,
                    const c10::optional<at::Tensor>& ar_ctrl, int64_t ar_rank, int64_t ar_mmax,
-                   const c10::optional<at::Tensor>& ar_x_out, const c10::optional<at::Tensor>& ar_order) {
+                   const c10::optional<at::Tensor>& ar_x_out, const c10::optional<at::Tensor>& ar_order,
+                   const c10::optional<at::Tensor>& q_data, const c10::optional<at::Tensor>& q_scale) {
   const bool ar = ar_buf.has_value();
+  const bool quant = q_data.has_value();
   if (ar) {
     TORCH_CHECK(ar_flags.has_value() && ar_ctrl.has_value() && ar_x_out.has_value() && 0 <= ar_rank && ar_rank < kARSrc &&
                     residual_in.size(0) <= ar_mmax && ar_x_out->is_contiguous() && ar_x_out->sizes() == x.sizes(),
@@ -563,6 +630,15 @@ void mhc_post_norm(const at::Tensor& x, const at::Tensor& residual_in, const at:
   if (aux.has_value()) {
     TORCH_CHECK(aux->is_contiguous() && aux->numel() == T * H && aux->scalar_type() == at::kBFloat16, "aux: bf16 [T, H]");
   }
+  const int64_t q_ktiles = H / 128;  // H % 1024 == 0
+  if (quant) {
+    TORCH_CHECK(q_scale.has_value() && q_data->is_cuda() && q_data->is_contiguous() && q_data->numel() == T * H &&
+                    q_data->scalar_type() == at::kFloat8_e4m3fn,
+                "q_data: float8_e4m3fn [T, H]");
+    TORCH_CHECK(q_scale->is_cuda() && q_scale->is_contiguous() && q_scale->scalar_type() == at::kByte &&
+                    q_scale->numel() >= ((T + 127) / 128) * 128 * (H / 32),
+                "q_scale: uint8 [ceil(T/128)*128 * H/32] (FlashInfer's F8_128x4 swizzled layout)");
+  }
   if (T == 0) return;
   const c10::cuda::OptionalCUDAGuard guard(residual_in.device());
   cudaStream_t stream = c10::cuda::getCurrentCUDAStream(residual_in.get_device()).stream();
@@ -601,26 +677,24 @@ void mhc_post_norm(const at::Tensor& x, const at::Tensor& residual_in, const at:
         ar ? reinterpret_cast<unsigned*>(ar_ctrl->data_ptr()) : nullptr, static_cast<int>(ar_rank), static_cast<int>(ar_mmax),
         ar ? ar_order->data_ptr<uint8_t>() : nullptr,
         ar ? reinterpret_cast<__nv_bfloat16*>(ar_x_out->data_ptr()) : nullptr,
-        reinterpret_cast<__nv_bfloat16*>(scratch.data_ptr())));
+        reinterpret_cast<__nv_bfloat16*>(scratch.data_ptr()),
+        quant ? reinterpret_cast<uint8_t*>(q_data->data_ptr()) : nullptr,
+        quant ? reinterpret_cast<uint8_t*>(q_scale->data_ptr()) : nullptr, static_cast<int>(q_ktiles)));
   };
+  auto by_mode = [&](auto pdl_c, auto ar_c, auto quant_c) {
+    constexpr bool P = decltype(pdl_c)::value, A = decltype(ar_c)::value, Q = decltype(quant_c)::value;
+    if (mode == 0) launch(mhc_post_norm_kernel<0, P, A, Q>);
+    else if (mode == 1) launch(mhc_post_norm_kernel<1, P, A, Q>);
+    else launch(mhc_post_norm_kernel<2, P, A, Q>);
+  };
+  using Y = std::true_type;
+  using N = std::false_type;
   if (ar) {
-    if (pdl) {
-      if (mode == 0) launch(mhc_post_norm_kernel<0, true, true>);
-      else if (mode == 1) launch(mhc_post_norm_kernel<1, true, true>);
-      else launch(mhc_post_norm_kernel<2, true, true>);
-    } else {
-      if (mode == 0) launch(mhc_post_norm_kernel<0, false, true>);
-      else if (mode == 1) launch(mhc_post_norm_kernel<1, false, true>);
-      else launch(mhc_post_norm_kernel<2, false, true>);
-    }
-  } else if (pdl) {
-    if (mode == 0) launch(mhc_post_norm_kernel<0, true, false>);
-    else if (mode == 1) launch(mhc_post_norm_kernel<1, true, false>);
-    else launch(mhc_post_norm_kernel<2, true, false>);
+    if (pdl) quant ? by_mode(Y{}, Y{}, Y{}) : by_mode(Y{}, Y{}, N{});
+    else quant ? by_mode(N{}, Y{}, Y{}) : by_mode(N{}, Y{}, N{});
   } else {
-    if (mode == 0) launch(mhc_post_norm_kernel<0, false, false>);
-    else if (mode == 1) launch(mhc_post_norm_kernel<1, false, false>);
-    else launch(mhc_post_norm_kernel<2, false, false>);
+    if (pdl) quant ? by_mode(Y{}, N{}, Y{}) : by_mode(Y{}, N{}, N{});
+    else quant ? by_mode(N{}, N{}, Y{}) : by_mode(N{}, N{}, N{});
   }
 }
 
@@ -631,7 +705,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::arg("norm_w"), py::arg("residual_out"), py::arg("layer_input"), py::arg("aux"), py::arg("norm_eps"),
         py::arg("mode") = 1, py::arg("pdl") = true, py::arg("ar_buf") = py::none(), py::arg("ar_flags") = py::none(),
         py::arg("ar_ctrl") = py::none(), py::arg("ar_rank") = 0, py::arg("ar_mmax") = 64, py::arg("ar_x_out") = py::none(),
-        py::arg("ar_order") = py::none());
+        py::arg("ar_order") = py::none(), py::arg("q_data") = py::none(), py::arg("q_scale") = py::none());
   m.def("mhc_proj", &mhc_proj,
         "DeepSeek-V4.1 mHC fn projection of the fp32 post-mix, split partials (mhc_fused_tilelang's outputs, one CTA per token x split)",
         py::arg("x"), py::arg("residual_in"), py::arg("post_layer_mix"), py::arg("comb_res_mix"), py::arg("fn"), py::arg("mixes"),
