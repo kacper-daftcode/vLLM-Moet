@@ -20,6 +20,10 @@ Environment:
   VLLM_MOET_CPU_TIER_TABLES=<dir>       b12x_act_m_limit10.f32, b12x_ue8m0_inv.f32, b12x_layout_*.npy
   VLLM_MOET_CPU_TIER_CPUS=<a-b>         the rank's CPUs (default: 8*rank+1 .. 8*rank+7 = one CCD minus its first core,
                                         left to vLLM's own threads); dispatcher = first pool CPU + 32 (its SMT sibling)
+  VLLM_MOET_CPU_TIER_POOL_THREADS=N     how much of the rank's CCD the kernel pool takes (default 6 = cores 8r+2..8r+7;
+                                        12 = those cores AND their SMT siblings - the bench: -17 % per expert at m = 1,
+                                        -24 % at m = 2; 7 / 14 = 7 cores (x 2) with the dispatcher on 8r+32; 8 = the
+                                        whole CCD, main + dispatcher on siblings) - see _cpu_layout (10-28)
   VLLM_MOET_CPU_TIER_STORE=<dir>        build_store.py's files for the real checkpoint (see above)
   VLLM_MOET_CPU_TIER_STORE_MODE         nonresident (default) | all: which records to pin
   VLLM_MOET_CPU_TIER_STORE_EARLY=1      pin the records at the LAST target layer's create_weights (the model constructed,
@@ -130,6 +134,18 @@ def _rank() -> int:
         return 0
 
 
+def _ranges(cpus: list) -> str:
+    """[2,3,4,34,35] -> '2-4,34-35' (the tier-started log line)."""
+    out, i = [], 0
+    while i < len(cpus):
+        j = i
+        while j + 1 < len(cpus) and cpus[j + 1] == cpus[j] + 1:
+            j += 1
+        out.append(f"{cpus[i]}-{cpus[j]}" if j > i else str(cpus[i]))
+        i = j + 1
+    return ",".join(out)
+
+
 def _cpu_layout() -> dict:
     """The rank's CPUs. Default on the 32-core / 4-CCD TR PRO (SMT siblings = core + 32): per rank r its CCD
     8r..8r+7: core 8r = this process's main thread (vLLM's launch loop), 8r+1 = the tier's dispatcher (spins), 8r+2..8r+7
@@ -138,17 +154,42 @@ def _cpu_layout() -> dict:
     VLLM_MOET_CPU_TIER_DISPATCHER_CPU, VLLM_MOET_CPU_TIER_MAIN_CPU, VLLM_MOET_CPU_TIER_OTHER_CPUS=a,b,.."""
     r = _rank()
     spec = os.environ.get("VLLM_MOET_CPU_TIER_CPUS")
+    # VLLM_MOET_CPU_TIER_POOL_THREADS (6): how much of the rank's CCD the kernel pool takes (10-28; the profile of a decode
+    # step shows the GPU waiting 2.6 ms per step for the tier, and the bench runs the kernel 14-17 % faster on 8 threads
+    # than on 6): 6 = cores 8r+2..8r+7, main 8r, dispatcher 8r+1 (the default layout above); 7 = cores 8r+1..8r+7, main
+    # 8r, the dispatcher on main's SMT sibling 8r+32; 8 = the whole CCD 8r..8r+7, main and dispatcher on the siblings
+    # 8r+32 / 8r+33, the process's other threads on 8r+34 / 8r+35 (they then share pool cores when busy)
+    # 12 = the 6 pool cores AND their SMT siblings 8r+34..8r+39 (main / dispatcher / other threads as with 6): the
+    # DRAM-bound kernel gains memory-level parallelism - bench on real records 10-28: 121 -> 100 us per expert at m = 1,
+    # 214 -> 163 at m = 2; 14 = 7 cores x 2 (8r+1..8r+7 + 8r+33..8r+39), the dispatcher and the other threads on 8r+32
+    nthreads = int(os.environ.get("VLLM_MOET_CPU_TIER_POOL_THREADS", "6"))
+    d_main, d_disp, d_other = 8 * r, 8 * r + 1, [8 * r + 32, 8 * r + 33]
     if spec:
-        a, b = spec.split("-")
-        pool = list(range(int(a), int(b) + 1))
+        parts = []
+        for part in spec.split(","):
+            a, _, b = part.partition("-")
+            parts.extend(range(int(a), int(b or a) + 1))
+        pool = parts
         disp = int(os.environ.get("VLLM_MOET_CPU_TIER_DISPATCHER_CPU", pool[0] + 32))
     else:
-        pool = list(range(8 * r + 2, 8 * r + 8))
-        disp = int(os.environ.get("VLLM_MOET_CPU_TIER_DISPATCHER_CPU", 8 * r + 1))
+        if nthreads >= 14:
+            pool = list(range(8 * r + 1, 8 * r + 8)) + list(range(8 * r + 33, 8 * r + 40))
+            d_disp, d_other = 8 * r + 32, [8 * r + 32]
+        elif nthreads >= 12:
+            pool = list(range(8 * r + 2, 8 * r + 8)) + list(range(8 * r + 34, 8 * r + 40))
+        elif nthreads >= 8:
+            pool = list(range(8 * r, 8 * r + 8))
+            d_main, d_disp, d_other = 8 * r + 32, 8 * r + 33, [8 * r + 34, 8 * r + 35]
+        elif nthreads == 7:
+            pool = list(range(8 * r + 1, 8 * r + 8))
+            d_disp, d_other = 8 * r + 32, [8 * r + 33]
+        else:
+            pool = list(range(8 * r + 2, 8 * r + 8))
+        disp = int(os.environ.get("VLLM_MOET_CPU_TIER_DISPATCHER_CPU", d_disp))
     main = os.environ.get("VLLM_MOET_CPU_TIER_MAIN_CPU")
-    main = int(main) if main else (8 * r if not spec else None)
+    main = int(main) if main else (d_main if not spec else None)
     other = os.environ.get("VLLM_MOET_CPU_TIER_OTHER_CPUS")
-    other = [int(x) for x in other.split(",")] if other else ([8 * r + 32, 8 * r + 33] if not spec else None)
+    other = [int(x) for x in other.split(",")] if other else (d_other if not spec else None)
     return dict(pool=pool, dispatcher=disp, main=main, other=other)
 
 
@@ -384,7 +425,7 @@ def _create_tier_if_needed(device: torch.device):
 
     atexit.register(_shutdown)
     _log(f"tier started: {n_layers} layers x {S.E} experts, slots {[c.R for c in S.layers][:3]}..., resident "
-         f"{[len(c.residents) for c in S.layers][:3]}..., records {n_rec}, pool CPUs {cpus[0]}-{cpus[-1]} ({len(cpus)} threads), "
+         f"{[len(c.residents) for c in S.layers][:3]}..., records {n_rec}, pool CPUs {_ranges(cpus)} ({len(cpus)} threads), "
          f"dispatcher {layout['dispatcher']}, {pin_msg}; promotion window {S.manager.window} steps; layers {[c.name for c in S.layers]}")
     _host_memory_report("after the weights")
 
@@ -718,11 +759,30 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
     """Debug (VLLM_MOET_CPU_TIER_DEBUG_PREFILL=1, needs SCRATCH >= the call's distinct experts): the same call with
     EVERY routed expert in the scratch pool in one b12x run = the all-resident reference for this layer's output;
     run twice to see the kernel's own run-to-run noise; the hybrid output (resident run + streamed rounds) against it."""
-    routed = torch.unique(ids[valid]).tolist()
+    routed = [int(e) for e in torch.unique(ids[valid]).tolist()]
     if len(routed) > sc.n:
         _log(f"DEBUG prefill layer {li}: {len(routed)} routed experts > {sc.n} scratch slots; reference skipped")
         return
-    _stage_and_repack(sc, [_record_ptr(li, e) for e in routed])
+    # experts with a record are staged from the pinned store; the static residents have none in the nonresident store
+    # (10-28: KeyError (0, 317) killed a boot in the profile run) - their prepared rows are copied from the layer's pool,
+    # as _debug_compact_reference does; the promotions in flight are drained first so the slot table is consistent
+    from_store = [e for e in routed if _has_record(li, e)]
+    from_pool = [e for e in routed if not _has_record(li, e)]
+    routed = from_store + from_pool
+    if from_store:
+        _stage_and_repack(sc, [_record_ptr(li, e) for e in from_store])
+    if from_pool:
+        P = S.pools[li]
+        S.manager.copy.synchronize()
+        torch.cuda.synchronize()
+        table = P.slot_table.cpu().numpy()
+        for j, e in enumerate(from_pool, start=len(from_store)):
+            s = int(table[e])
+            if s < 0:
+                _log(f"DEBUG prefill layer {li}: expert {e} has neither a record nor a slot; reference skipped")
+                return
+            for name in sc.pool:
+                sc.pool[name][j].copy_(P.pool[name][s])
     sc.table.fill_(-1)
     sc.table[torch.tensor(routed, dtype=torch.long, device=ids.device)] = torch.arange(len(routed), dtype=torch.int32, device=ids.device)
     rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()

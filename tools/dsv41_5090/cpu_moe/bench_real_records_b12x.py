@@ -77,8 +77,10 @@ def main() -> int:
     ap.add_argument("--secs", type=float, default=3.0)
     ap.add_argument("--no-synthetic", action="store_true")
     args = ap.parse_args()
-    a, b = args.cpus.split("-")
-    cpus = list(range(int(a), int(b) + 1))
+    cpus = []
+    for part in args.cpus.split(","):          # "10-15" or "10-15,42-47" (SMT siblings = core + 32 on this box)
+        a, _, b = part.partition("-")
+        cpus.extend(range(int(a), int(b or a) + 1))
     os.sched_setaffinity(0, {(cpus[0] // 8) * 8})   # the main thread on the CCD's first core, as in situ
     B.load_lib()
     g = torch.Generator().manual_seed(3)
