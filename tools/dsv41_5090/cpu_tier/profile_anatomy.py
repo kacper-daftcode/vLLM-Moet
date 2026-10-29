@@ -22,8 +22,12 @@ GROUPS = [
     ("hybrid repack/promote", re.compile(r"repack|promote|table_write", re.I)),
     ("MoE b12x", re.compile(r"b12x|w4a8|moe|TopKSum|topk_sum|route|expert", re.I)),
     ("NCCL", re.compile(r"nccl", re.I)),
-    # vLLM's other all-reduce backends (FlashInfer PCIe IPC, custom / symm-mem one-shot): their kernels are not NCCL's
-    ("all-reduce (non-NCCL)", re.compile(r"all_?reduce|pcie_?ipc|one_?shot|two_?shot|cross_device_reduce", re.I)),
+    # vLLM's other all-reduce backends: FlashInfer PCIe IPC (ipc_rsag_* / ipc_topo_* / ipc_tp2_* / push_oneshot_* /
+    # ce_add / ce_publish_flag / ce_wait_flag / kernel_pcie_ipc_ce_*), the image's sm_120 P2P push (push_phased_* /
+    # wait_reduce / push_twoshot / reduce_slice / assemble / wait_gather), vLLM's custom one-shot (cross_device_reduce)
+    ("all-reduce (non-NCCL)", re.compile(r"all_?reduce|pcie_?ipc|one_?shot|two_?shot|cross_device_reduce|ipc_rsag|ipc_topo|"
+                                         r"ipc_tp2|ce_add_kernel|ce_publish_flag|ce_wait_flag|push_phased|wait_reduce|"
+                                         r"reduce_slice_kernel|assemble_kernel|wait_gather", re.I)),
     ("attention / MLA / indexer", re.compile(r"mla|attn|attention|indexer|sparse|flash|paged|fmha|topk|dsa", re.I)),
     ("Engram", re.compile(r"engram|ngram|hash", re.I)),
     ("GEMV / GEMM", re.compile(r"gemv|gemm|cutlass|cublas|Kernel.*sm120|matmul", re.I)),
