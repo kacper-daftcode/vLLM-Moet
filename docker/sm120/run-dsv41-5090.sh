@@ -53,6 +53,10 @@
 #            PREFETCH ("")           MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (10-29: the
 #                        expert from DRAM costs 119 us in-kernel against 69 from L3; D = 1 takes 11 % off back to back and 7 %
 #                        under the decode's gaps on the bench; bits untouched by construction); PREFETCH_HINT (1 = L2)
+#            PREFILL_OVERLAP (0)     1 = a second prefill scratch set + a side stream: a non-compact call's round 0 is staged
+#                        during the stock b12x run and round r + 1 during round r's extra run (bit-identical to the
+#                        serial path - mini-real A/B 10-29; costs SCRATCH x 4.7 MB x 2 more VRAM: use GPU_MEM_UTIL=0.94);
+#                        DEBUG_OVERLAP=1 re-runs every call serially and compares bit for bit
 #            SPIN_TOUCH_STRIDE ("")  MOE_B12X_POOL_SPIN_TOUCH_STRIDE for POOL_SPIN_HOT=2: 64 = every worker streams its 32 MB
 #                        buffer sequentially instead of a line per page (10-29 bench: the whole after-a-gap penalty of FC1,
 #                        -13 % per expert, at ~3 GB/s per core of idle DRAM traffic; the page stride gave -4 % and lost in situ)
@@ -110,6 +114,8 @@ POOL_SPIN_US="${POOL_SPIN_US:-}"
 PREFETCH="${PREFETCH:-}"
 PREFETCH_HINT="${PREFETCH_HINT:-1}"
 SPIN_TOUCH_STRIDE="${SPIN_TOUCH_STRIDE:-}"
+PREFILL_OVERLAP="${PREFILL_OVERLAP:-0}"
+DEBUG_OVERLAP="${DEBUG_OVERLAP:-0}"
 POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
 POOL_THREADS="${POOL_THREADS:-6}"
 PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
@@ -183,6 +189,7 @@ docker run -d --name "$NAME" --restart no \
   ${POOL_SPIN_US:+-e MOE_B12X_POOL_SPIN_US=$POOL_SPIN_US} \
   ${PREFETCH:+-e MOE_B12X_PREFETCH=$PREFETCH -e MOE_B12X_PREFETCH_HINT=$PREFETCH_HINT} \
   ${SPIN_TOUCH_STRIDE:+-e MOE_B12X_POOL_SPIN_TOUCH_STRIDE=$SPIN_TOUCH_STRIDE} \
+  -e VLLM_MOET_CPU_TIER_PREFILL_OVERLAP="$PREFILL_OVERLAP" -e VLLM_MOET_CPU_TIER_DEBUG_OVERLAP="$DEBUG_OVERLAP" \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \

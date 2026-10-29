@@ -38,6 +38,10 @@ Environment:
   VLLM_MOET_CPU_TIER_LOG=1              KPI lines (every VLLM_MOET_CPU_TIER_LOG_EVERY steps, default 100)
   VLLM_MOET_CPU_TIER_SCRATCH=<int>      slots of the prefill scratch pool (default 0 = off: the missing experts of
                                         non-compact calls are not computed - decode-only serving; 128 = 1.2 GB per rank)
+  VLLM_MOET_CPU_TIER_PREFILL_OVERLAP=1  a second scratch set + a side stream: a call's round 0 is staged during the stock
+                                        run, round r + 1 during round r's extra run (bit-identical to the serial path;
+                                        + SCRATCH x 4.7 MB x 2 of VRAM); DEBUG_OVERLAP=1 re-runs every call serially
+                                        and compares bit for bit (mini-real 10-29: 0 mismatches under the deterministic plan)
   VLLM_MOET_CPU_TIER_DEBUG_COMPACT=1    eager runs only (--enforce-eager; needs SCRATCH >= the routed experts of a
                                         call, <= 64): every compact call is recomputed with all its routed experts in
                                         the scratch pool in one b12x run = the all-resident reference of this boot;
@@ -81,6 +85,15 @@ _PROMOTE_LAYERS = ([int(x) for x in os.environ["VLLM_MOET_CPU_TIER_PROMOTE_LAYER
 COMPACT_MAX_TOKENS = 8   # b12x's direct compact micro path "owns one through eight live tokens"
 _TSC_GHZ = float(os.environ.get("VLLM_MOET_CPU_TIER_TSC_GHZ", "3.9937"))   # the pool's rdtsc rate (rtxdev2: 3993.689 MHz)
 SCRATCH_SLOTS = int(os.environ.get("VLLM_MOET_CPU_TIER_SCRATCH", "0"))   # prefill scratch pool (0 = off; 2.5 under test)
+# VLLM_MOET_CPU_TIER_PREFILL_OVERLAP=1 (10-29): two scratch sets and a side stream - a non-compact call's round 0 is
+# staged + repacked while the stock (resident) b12x run executes, and round r + 1 while round r's extra run executes;
+# the extra runs and their `add_` keep their order on the main stream, so the output is bit-identical to the serial
+# path (the streaming cost is 0.12-0.13 ms per missing expert of PCIe bytes, note §20.1; this hides the GPU compute
+# that today sits between the transfers). Costs a second staging + pool (SCRATCH slots x 2 x 4.7 MB).
+# VLLM_MOET_CPU_TIER_DEBUG_OVERLAP=1: after every overlapped call, the same call again on the serial path into a scratch
+# output, compared bit for bit (the in-boot A/B of the overlap; eager prefill only, host syncs allowed).
+PREFILL_OVERLAP = os.environ.get("VLLM_MOET_CPU_TIER_PREFILL_OVERLAP", "0") == "1"
+DEBUG_OVERLAP = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG_OVERLAP", "0") == "1"
 
 
 def _log(msg: str) -> None:
@@ -111,6 +124,9 @@ class _State:
         self.arena: dict[int, int] = {}            # dummy mode: li -> pinned arena base (E records)
         self.store = None                          # store mode: cpu_tier.ExpertStore
         self.scratch = None                        # phase 2.5: the prefill scratch pool (_Scratch)
+        self.scratch2 = None                       # PREFILL_OVERLAP: the second set (rounds alternate between the two)
+        self.prefill_stream = None                 # PREFILL_OVERLAP: the side stream the staging + repack run on
+        self.overlap_stats = [0, 0, 0]             # calls overlapped, rounds prefetched, DEBUG_OVERLAP mismatches
         self.layer_modules: dict[int, object] = {}  # li -> the RoutedExperts module
         self.store_layers = 0
         self.step = 0
@@ -425,7 +441,10 @@ def _create_tier_if_needed(device: torch.device):
                      f"{_debug_compact_summary()}")
                 if S.scratch is not None:
                     _log(f"exit: scratch pool {S.scratch.calls} calls, {S.scratch.experts_streamed} experts streamed in "
-                         f"{S.scratch.rounds} rounds{S.scratch.timing_summary()}")
+                         f"{S.scratch.rounds} rounds{S.scratch.timing_summary()}"
+                         + (f"; prefill overlap: {S.overlap_stats[0]} calls overlapped, {S.overlap_stats[1]} rounds prefetched"
+                            f"{f', DEBUG_OVERLAP mismatching calls {S.overlap_stats[2]}' if DEBUG_OVERLAP else ''}"
+                            if PREFILL_OVERLAP else ""))
             S.tier.stop()
             S.tier.close()  # frees the mapped mailboxes before the driver tears the process down
         except Exception:
@@ -574,12 +593,16 @@ def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor) 
         # the R-row weights); on_apply_end adds the missing experts streamed through the scratch pool (phase 2.5).
         S.ctx.layer = None
         S.ctx.prefill = (li, topk_ids)
+        S.ctx.prefill_missing = None
         if T not in S.noncompact_reported:
             S.noncompact_reported.add(T)
             _log(f"{T}-token MoE call: b12x's non-compact path; missing experts "
                  f"{'streamed through the scratch pool' if SCRATCH_SLOTS else 'NOT computed (VLLM_MOET_CPU_TIER_SCRATCH=0)'}")
         table = S.pools[li].slot_table
-        return torch.where(topk_ids >= 0, table[topk_ids.clamp(min=0).long()], topk_ids.new_full((), -1))
+        remapped = torch.where(topk_ids >= 0, table[topk_ids.clamp(min=0).long()], topk_ids.new_full((), -1))
+        if PREFILL_OVERLAP and SCRATCH_SLOTS and S.scratch is not None and not torch.cuda.is_current_stream_capturing():
+            _prefill_prefetch_round0(li, topk_ids)
+        return remapped
     S.ctx.prefill = None
     return topk_ids
 
@@ -624,6 +647,12 @@ class _Scratch:
         self.calls = 0
         self.pending: list = []        # (ev0, ev1, T, missing) of calls whose events may not have completed yet
         self.timed: dict = {}          # T -> [calls, ms, missing experts] of completed calls
+        # PREFILL_OVERLAP: `free` is recorded on the main stream after the last extra run that read this set's pool
+        # (the side stream waits for it before restaging the set), `ready` on the side stream after the repack (the
+        # main stream waits for it before the extra run); an event never recorded is a no-op to wait on
+        self.free_event = torch.cuda.Event()
+        self.ready_event = torch.cuda.Event()
+        self.staged: list = []         # the experts currently staged in this set, in slot order (host-side bookkeeping)
 
     def timing_summary(self) -> str:
         """Folds the completed events into per-token-count totals; returns a summary (no host sync)."""
@@ -702,6 +731,83 @@ def _stage_and_repack(sc, ptrs: list) -> None:
                          sc.pool["w13"], sc.pool["w13s"], sc.pool["w2"], sc.pool["w2s"], slots)
 
 
+def _missing_experts(li: int, ids: torch.Tensor):
+    """The call's missing experts (host list, sorted by torch.unique) and the valid mask - one host sync."""
+    P = S.pools[li]
+    valid = ids >= 0
+    missing_mask = valid & (P.slot_table[ids.clamp(min=0).long()] < 0)
+    return valid, torch.unique(ids[missing_mask]).tolist()
+
+
+def _overlap_sets():
+    """The two scratch sets of PREFILL_OVERLAP (the second one created on first use) and the side stream."""
+    if S.scratch2 is None:
+        with S.lock:
+            if S.scratch2 is None:
+                li0 = next(iter(S.layer_modules))
+                S.scratch2 = _Scratch(S.scratch.impl, S.layer_modules[li0], S.scratch.staging.device)
+                S.prefill_stream = torch.cuda.Stream(device=S.scratch.staging.device)
+                _log(f"prefill overlap: a second scratch set of {SCRATCH_SLOTS} slots and a side stream "
+                     f"(VLLM_MOET_CPU_TIER_PREFILL_OVERLAP=1{', DEBUG_OVERLAP: every call re-run serially and compared' if DEBUG_OVERLAP else ''})")
+    return (S.scratch, S.scratch2), S.prefill_stream
+
+
+def _stage_round_async(sc, li: int, rnd: list) -> None:
+    """Stage + repack one round into set `sc` on the side stream: after the set's last reader (free_event, main
+    stream), then ready_event for the main stream's extra run."""
+    side = S.prefill_stream
+    side.wait_event(sc.free_event)
+    with torch.cuda.stream(side):
+        _stage_and_repack(sc, [_record_ptr(li, e) for e in rnd])
+        sc.ready_event.record(side)
+    sc.staged = list(rnd)
+
+
+def _prefill_prefetch_round0(li: int, topk_ids: torch.Tensor) -> None:
+    """on_apply of a non-compact call (PREFILL_OVERLAP): the missing set now (one host sync, instead of the one
+    on_apply_end would do), round 0 staged + repacked on the side stream while the stock run executes on the main
+    stream. on_apply_end picks the list up and skips round 0's staging."""
+    valid, missing = _missing_experts(li, topk_ids)
+    S.ctx.prefill_missing = (valid, missing)
+    if not missing:
+        return
+    sets, _ = _overlap_sets()
+    _stage_round_async(sets[0], li, missing[:sets[0].n])
+    S.overlap_stats[1] += 1
+
+
+def _run_rounds(sc_of_round, li, ids, valid, missing, weights, hidden_states, output, run_plan, plan, buf, tmp,
+                prefetched_round0: bool, prefetch_next: bool) -> int:
+    """The streamed rounds of one call: for round r, the set sc_of_round(r) is staged (synchronously on the main
+    stream, or already / asynchronously on the side stream), its table written, the extra b12x run added to output.
+    Returns the number of rounds. The run and the add_ order are the same on every path."""
+    n = sc_of_round(0).n
+    rounds = [missing[r0:r0 + n] for r0 in range(0, len(missing), n)]
+    main = torch.cuda.current_stream()
+    for r, rnd in enumerate(rounds):
+        sc = sc_of_round(r)
+        if r == 0 and prefetched_round0:
+            main.wait_event(sc.ready_event)
+        elif prefetch_next and r > 0:
+            main.wait_event(sc.ready_event)          # staged while round r - 1 ran
+        else:
+            _stage_and_repack(sc, [_record_ptr(li, e) for e in rnd])
+            sc.staged = list(rnd)
+        assert sc.staged == list(rnd), f"prefill round {r} of layer {li}: set holds {len(sc.staged)} experts, round wants {len(rnd)}"
+        if prefetch_next and r + 1 < len(rounds):
+            _stage_round_async(sc_of_round(r + 1), li, rounds[r + 1])
+            S.overlap_stats[1] += 1
+        sc.table.fill_(-1)
+        rnd_t = torch.tensor(rnd, dtype=torch.long, device=ids.device)
+        sc.table[rnd_t] = torch.arange(len(rnd), dtype=torch.int32, device=ids.device)
+        rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+        run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights,
+                 topk_ids=rids, output=tmp, unit_scale_contract=False)
+        output.add_(tmp)
+        sc.free_event.record(main)                   # this set's pool may be restaged once the run is done
+    return len(rounds)
+
+
 def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.Tensor, output: torch.Tensor,
                  run_plan, scratch_nbytes) -> None:
     """After the stock b12x run of a non-compact call: the missing experts of the call, in rounds of SCRATCH_SLOTS:
@@ -720,16 +826,18 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
         return
     S.ctx.prefill = None
     li, ids = pf
-    P = S.pools[li]
     T, K = ids.shape
     with S.lock:
         if S.scratch is None:
             S.scratch = _Scratch(experts_impl, S.layer_modules[li], hidden_states.device)
             _log(f"scratch pool: {SCRATCH_SLOTS} slots ({SCRATCH_SLOTS * RECORD_BYTES / 2**20:.0f} MiB staging + pool)")
     sc = S.scratch
-    valid = ids >= 0
-    missing_mask = valid & (P.slot_table[ids.clamp(min=0).long()] < 0)
-    missing = torch.unique(ids[missing_mask]).tolist()
+    pre = getattr(S.ctx, "prefill_missing", None)
+    S.ctx.prefill_missing = None
+    if pre is not None:                 # PREFILL_OVERLAP: on_apply did the host sync and staged round 0 on the side stream
+        valid, missing = pre
+    else:
+        valid, missing = _missing_experts(li, ids)
     sc.calls += 1
     if not missing:
         return
@@ -740,19 +848,20 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
     ev0 = torch.cuda.Event(enable_timing=True)
     ev1 = torch.cuda.Event(enable_timing=True)
     ev0.record()
-    for r0 in range(0, len(missing), sc.n):
-        rnd = missing[r0:r0 + sc.n]
-        ptrs = [_record_ptr(li, e) for e in rnd]
-        _stage_and_repack(sc, ptrs)
-        sc.table.fill_(-1)
-        rnd_t = torch.tensor(rnd, dtype=torch.long, device=ids.device)
-        sc.table[rnd_t] = torch.arange(len(rnd), dtype=torch.int32, device=ids.device)
-        rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
-        run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights,
-                 topk_ids=rids, output=tmp, unit_scale_contract=False)
-        output.add_(tmp)
-        sc.rounds += 1
-        sc.experts_streamed += len(rnd)
+    overlapped = pre is not None and S.scratch2 is not None
+    if overlapped:
+        sets, _ = _overlap_sets()
+        before = output.clone() if DEBUG_OVERLAP else None
+        n_rounds = _run_rounds(lambda r: sets[r % 2], li, ids, valid, missing, weights, hidden_states, output,
+                               run_plan, plan, buf, tmp, prefetched_round0=True, prefetch_next=True)
+        S.overlap_stats[0] += 1
+        if DEBUG_OVERLAP:
+            _debug_overlap_check(li, T, ids, valid, missing, weights, hidden_states, output, before, run_plan, plan, buf, tmp)
+    else:
+        n_rounds = _run_rounds(lambda r: sc, li, ids, valid, missing, weights, hidden_states, output,
+                               run_plan, plan, buf, tmp, prefetched_round0=False, prefetch_next=False)
+    sc.rounds += n_rounds
+    sc.experts_streamed += len(missing)
     ev1.record()
     sc.pending.append((ev0, ev1, T, len(missing)))
     if sc.calls <= 3 or sc.calls % 200 == 0:
@@ -761,6 +870,28 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
              f"{sc.timing_summary()}")
     if DEBUG_PREFILL:
         _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output, run_plan, plan, buf, T)
+
+
+def _debug_overlap_check(li, T, ids, valid, missing, weights, hidden_states, output, before, run_plan, plan, buf, tmp) -> None:
+    """DEBUG_OVERLAP: the same call once more on the serial path (set 0 only, staged on the main stream) into a
+    scratch copy of the pre-streaming output, compared bit for bit with the overlapped result. Host syncs."""
+    torch.cuda.synchronize()
+    ref = before
+    sets, _ = _overlap_sets()
+    sc0 = sets[0]
+    _run_rounds(lambda r: sc0, li, ids, valid, missing, weights, hidden_states, ref, run_plan, plan, buf, tmp,
+                prefetched_round0=False, prefetch_next=False)
+    torch.cuda.synchronize()
+    nd = int((ref != output).sum().item())
+    if nd:
+        S.overlap_stats[2] += 1
+        d = (ref.float() - output.float()).abs()
+        _log(f"DEBUG overlap layer {li} T {T}: {len(missing)} missing experts in {(len(missing) + sc0.n - 1) // sc0.n} rounds: "
+             f"{nd} of {output.numel()} elements differ between the overlapped and the serial path, max |d| {d.max().item():.3e}")
+    elif S.overlap_stats[0] <= 3 or S.overlap_stats[0] % 200 == 0:
+        _log(f"DEBUG overlap layer {li} T {T}: {len(missing)} missing experts in {(len(missing) + sc0.n - 1) // sc0.n} rounds: "
+             f"overlapped == serial (0 of {output.numel()} differ); calls overlapped {S.overlap_stats[0]}, rounds prefetched "
+             f"{S.overlap_stats[1]}, mismatching calls so far {S.overlap_stats[2]}")
 
 
 def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output, run_plan, plan, buf, T) -> None:
