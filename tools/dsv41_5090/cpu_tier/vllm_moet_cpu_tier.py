@@ -181,6 +181,14 @@ def _cpu_layout() -> dict:
             pool = list(range(8 * r, 8 * r + 8))
             d_main, d_disp, d_other = 8 * r + 32, 8 * r + 33, [8 * r + 34, 8 * r + 35]
         elif nthreads == 7:
+            # 10-29 (k0-t7, note §19.5) - DO NOT USE without changing `other`: pool = cores 8r+1..8r+7, main on core 8r,
+            # the dispatcher on 8r+32 (core 8r's SMT sibling, next to main) and `other` - the ~100 auxiliary threads of
+            # the vLLM worker (NCCL watchdog, Gloo, the executor) - lands on 8r+33, which is the SMT SIBLING OF POOL CORE
+            # 8r+1. A foreign busy thread on a pool core's sibling halves that core and the job's barrier waits for it
+            # (rule in §9): measured 172 us per expert against 154 with 6 threads, NCCL 2.70 ms/step against 1.18-1.80,
+            # the AllReduce p90 52.8 us against 36.7, decode 124.8 / 106.5 against 143 / 120. 6 is the default; 8 is the
+            # variant that has a clean layout (pool 8r..8r+7, main + dispatcher on 8r+32/8r+33, other on 8r+34/8r+35)
+            # and has not been measured in situ yet.
             pool = list(range(8 * r + 1, 8 * r + 8))
             d_disp, d_other = 8 * r + 32, [8 * r + 33]
         else:
