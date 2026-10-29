@@ -29,7 +29,7 @@ bit-identical to the path it replaces).
 |---|---|
 | decode, 1 stream | prose **~293 tok/s median (waves 277–301)**, code **~802 tok/s median (waves 786–813)** (128–130 steps/s on short prompts; the Fraser bench below is the stricter single-prompt code measure) |
 | decode, 8 streams | prose ~721 tok/s median (716–759), code ~2,258 tok/s median (2,227–2,289) aggregate, 8 × 1,024 tokens |
-| fresh prefill | 163K tokens in 9.5 s (~17K tok/s), 391K in 23 s |
+| fresh prefill | 163K tokens in 9.0 s (~18K tok/s), 391K in 22.6 s |
 | KV cache | **9.62M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
 | quality | GSM8K-200 (no-think, 4 streams) **193/200** on the served image vs 194/200 on the `-r8` baseline (one flip, exact McNemar p = 1); needle PASS at 29K / 106K / 400K; tool calls / JSON / vision pass; identical requests return identical logits at any batch size (three identical teacher-forced calls at 12 and 128 rows: 0 differences) (2026-10-28) |
 
@@ -108,7 +108,7 @@ quote the best.
 
 | served configuration (4× RTX PRO 6000, 400 W, GDDR7 +5000) | median tok/s | best | steps/s | accepted length |
 |---|---|---|---|---|
-| `-r21-mxfp8`, fused MoE + sparse-MLA gather + steps 30–33, 36, 38–39 on, `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, `P2P_AR_FUSED_MAX_ROWS=8`, DSpark k = 7 (20 reps, 2026-10-28) | **668** | **717** | **127.8** | 5.23 |
+| `-r21-mxfp8`, fused MoE + sparse-MLA gather + steps 30–33, 36, 38–39 on, `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, `P2P_AR_FUSED_MAX_ROWS=8`, DSpark k = 7 (40 reps, 2026-10-29) | **679** | **740** | **128.4** | 5.29 |
 
 k = 7 steps are individually slower (more rows verified per step) but accept ~19 % more tokens each;
 in mixed traffic with lower draft acceptance the wider draft does not pay for itself, which is what
@@ -133,7 +133,8 @@ python3 tools/sm120_perf/fraser_bench.py --base http://127.0.0.1:8001 \
 (and 16) concurrent streams, five rounds per cell, **temperature 1.0, thinking off**, generation to natural EOS (≤ 2,048
 tokens), the GPUs cooled to 70 °C before every round; PP from a `max_tokens=1` pass, TG from a prefix-cached second pass
 timed while every stream decodes. Run unmodified against the served `:8001` on 2026-10-28 (the server needs
-`--enable-prompt-tokens-details`; production serves `--max-num-seqs 8`, so the 16-stream column is not run):
+`--enable-prompt-tokens-details`; production serves `--max-num-seqs 8`, so the 16-stream column is not run); the raw
+output, the server configuration and the run record: [docs/benchmarks/brrr-dsv41-2026-10-28.md](docs/benchmarks/brrr-dsv41-2026-10-28.md):
 
 | prompt | conc | TTFT p50 | PP p50 tok/s | PP total | TG p50 tok/s (per stream) | TG total | accepted / step |
 |---|---|---|---|---|---|---|---|
