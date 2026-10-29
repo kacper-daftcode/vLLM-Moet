@@ -22,6 +22,8 @@ GROUPS = [
     ("hybrid repack/promote", re.compile(r"repack|promote|table_write", re.I)),
     ("MoE b12x", re.compile(r"b12x|w4a8|moe|TopKSum|topk_sum|route|expert", re.I)),
     ("NCCL", re.compile(r"nccl", re.I)),
+    # vLLM's other all-reduce backends (FlashInfer PCIe IPC, custom / symm-mem one-shot): their kernels are not NCCL's
+    ("all-reduce (non-NCCL)", re.compile(r"all_?reduce|pcie_?ipc|one_?shot|two_?shot|cross_device_reduce", re.I)),
     ("attention / MLA / indexer", re.compile(r"mla|attn|attention|indexer|sparse|flash|paged|fmha|topk|dsa", re.I)),
     ("Engram", re.compile(r"engram|ngram|hash", re.I)),
     ("GEMV / GEMM", re.compile(r"gemv|gemm|cutlass|cublas|Kernel.*sm120|matmul", re.I)),
