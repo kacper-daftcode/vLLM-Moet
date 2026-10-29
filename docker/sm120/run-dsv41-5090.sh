@@ -50,6 +50,12 @@
 #            POOL_SPIN_US ("")       the kernel pool's spin before it sleeps on the futex (the pool's default 500; the cores
 #                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins through a
 #                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever)
+#            PREFETCH ("")           MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (10-29: the
+#                        expert from DRAM costs 119 us in-kernel against 69 from L3; D = 1 takes 11 % off back to back and 7 %
+#                        under the decode's gaps on the bench; bits untouched by construction); PREFETCH_HINT (1 = L2)
+#            SPIN_TOUCH_STRIDE ("")  MOE_B12X_POOL_SPIN_TOUCH_STRIDE for POOL_SPIN_HOT=2: 64 = every worker streams its 32 MB
+#                        buffer sequentially instead of a line per page (10-29 bench: the whole after-a-gap penalty of FC1,
+#                        -13 % per expert, at ~3 GB/s per core of idle DRAM traffic; the page stride gave -4 % and lost in situ)
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
@@ -101,6 +107,9 @@ DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
 POOL_SPIN_US="${POOL_SPIN_US:-}"
+PREFETCH="${PREFETCH:-}"
+PREFETCH_HINT="${PREFETCH_HINT:-1}"
+SPIN_TOUCH_STRIDE="${SPIN_TOUCH_STRIDE:-}"
 POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
 POOL_THREADS="${POOL_THREADS:-6}"
 PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
@@ -172,6 +181,8 @@ docker run -d --name "$NAME" --restart no \
   -e NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
   ${NCCL_CHANNELS:+-e NCCL_MIN_NCHANNELS=$NCCL_CHANNELS -e NCCL_MAX_NCHANNELS=$NCCL_CHANNELS} \
   ${POOL_SPIN_US:+-e MOE_B12X_POOL_SPIN_US=$POOL_SPIN_US} \
+  ${PREFETCH:+-e MOE_B12X_PREFETCH=$PREFETCH -e MOE_B12X_PREFETCH_HINT=$PREFETCH_HINT} \
+  ${SPIN_TOUCH_STRIDE:+-e MOE_B12X_POOL_SPIN_TOUCH_STRIDE=$SPIN_TOUCH_STRIDE} \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \

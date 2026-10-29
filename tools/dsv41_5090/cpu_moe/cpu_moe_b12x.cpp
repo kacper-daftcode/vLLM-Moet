@@ -392,6 +392,28 @@ static inline void split_rows(int total, int nthreads, int tid, int& r0, int& r1
 }
 
 // ---- FC1: rows [r0, r1) of the 1152 (gate rows 0..575 = w1, up rows 576..1151 = w3) for m tokens ---------------
+// MOE_B12X_PREFETCH=D (default 0 = off): software prefetch of the record bytes D rows (FC1) / D row-groups (FC2) ahead
+// of the one being computed. Measured 10-29 on CCD 1 (bench_l3_vs_dram, real records, 6 threads, b2b): the same expert
+// costs 119 us in-kernel from DRAM and 69 us when it sits in L3 (FC1 58 -> 36, FC2 58 -> 30), while one CCD streams
+// 55-57 GB/s (= 82 us per 4.7 MB record) - the kernel is ~40 % memory stalls at 6 threads, not bandwidth. The loads
+// are issued where the decode needs them, FC1 rows are 2,560-byte streams and FC2 row-groups 2,304-byte bursts, so
+// the hardware prefetchers never get ahead; an explicit prefetch of the next row / group overlaps them with the
+// compute. Prefetch does not touch the arithmetic: the bits cannot move (test_cpu_moe_b12x + the G1b parity sets gate
+// every build anyway).
+static int g_prefetch = 0;        // rows / row-groups ahead (0 = off)
+static int g_prefetch_hint = 0;   // MOE_B12X_PREFETCH_HINT: 0 = T0 (L1), 1 = T1 (L2), 2 = NTA
+
+static inline void prefetch_line(const uint8_t* p) {
+    switch (g_prefetch_hint) {
+        case 1: _mm_prefetch((const char*)p, _MM_HINT_T1); break;
+        case 2: _mm_prefetch((const char*)p, _MM_HINT_NTA); break;
+        default: _mm_prefetch((const char*)p, _MM_HINT_T0); break;
+    }
+}
+static inline void prefetch_lines(const uint8_t* p, int bytes) {
+    for (int o = 0; o < bytes; o += 64) prefetch_line(p + o);
+}
+
 static void fc1_rows(const uint8_t* rec, int r0, int r1, const XPrep* const* X, int m, uint16_t* proj, float vs1,
                      const Consts& C) {
     for (int r = r0; r < r1; ++r) {
@@ -399,9 +421,26 @@ static void fc1_rows(const uint8_t* rec, int r0, int r1, const XPrep* const* X, 
         const int n = up ? r - INTER_R : r;
         const uint8_t* nib = rec + (up ? OFF_W3N : OFF_W1N) + (int64_t)n * (K1 / 2);
         const uint8_t* sc = rec + (up ? OFF_W3S : OFF_W1S) + (int64_t)n * B1;
+        // the prefetch target: row r + D's nibbles, issued 256 B per group below (4 lines per ~150 cycles of compute,
+        // never a burst that overflows the L1 miss buffers), its scales (3 lines) with the first group
+        const uint8_t* pf_nib = nullptr;
+        const uint8_t* pf_sc = nullptr;
+        if (g_prefetch > 0) {
+            const int rp = r + g_prefetch;
+            if (rp < N13) {   // the next rows of this thread's range (or of the next thread's: harmless)
+                const bool upp = rp >= INTER_R;
+                const int np = upp ? rp - INTER_R : rp;
+                pf_nib = rec + (upp ? OFF_W3N : OFF_W1N) + (int64_t)np * (K1 / 2);
+                pf_sc = rec + (upp ? OFF_W3S : OFF_W1S) + (int64_t)np * B1;
+            }
+        }
         float acc[MAX_M];
         for (int t = 0; t < m; ++t) acc[t] = 0.0f;
         for (int g = 0; g < B1 / 16; ++g) {  // 16 blocks = 512 k per group
+            if (pf_nib) {
+                prefetch_lines(pf_nib + g * 256, 256);
+                if (g == 0) prefetch_lines(pf_sc, B1);
+            }
             __m512i w16[16];
             for (int i = 0; i < 16; ++i) w16[i] = decode_block_units(nib + (g * 16 + i) * 16, C);
             for (int t = 0; t < m; ++t) {
@@ -587,6 +626,16 @@ static void fc2_rows(const uint8_t* rec, int r0, int r1, const YPrep* const* Y, 
     st.fc2_blocks += (int64_t)(r1 - r0) * m * B2;
     for (int n0 = r0; n0 < r1; n0 += RG) {
         const int R = std::min(RG, r1 - n0);
+        // the prefetch target: the row-group D groups ahead (8 rows x 288 B of nibbles = 36 lines, 8 x 18 B of
+        // scales = 3 lines), issued 2 lines per block b below (18 blocks) + the scales up front
+        const uint8_t* pf_nib = nullptr;
+        if (g_prefetch > 0) {
+            const int np = n0 + RG * g_prefetch;
+            if (np + RG <= N2) {
+                pf_nib = rec + OFF_W2N + (int64_t)np * (K2 / 2);
+                prefetch_lines(rec + OFF_W2S + (int64_t)np * B2, RG * B2);
+            }
+        }
         const uint8_t* nib[RG];
         alignas(16) int32_t sb[B2][RG];
         for (int r = 0; r < RG; ++r) {
@@ -602,6 +651,10 @@ static void fc2_rows(const uint8_t* rec, int r0, int r1, const YPrep* const* Y, 
             const YPrep& Yt = *Y[t];
             __m128 a0 = _mm_setzero_ps(), a1 = _mm_setzero_ps();
             for (int b = 0; b < B2; ++b) {
+                if (pf_nib && t == 0) {   // 2 of the next group's 36 lines per block
+                    prefetch_line(pf_nib + b * 128);
+                    prefetch_line(pf_nib + b * 128 + 64);
+                }
                 const uint8_t* nb0[4] = {nib[0] + b * 16, nib[1] + b * 16, nib[2] + b * 16, nib[3] + b * 16};
                 const uint8_t* nb1[4] = {nib[4] + b * 16, nib[5] + b * 16, nib[6] + b * 16, nib[7] + b * 16};
                 a0 = fc2_step4(a0, W[b], nb0, Yt, b, sb[b], C, st);
@@ -700,7 +753,15 @@ static void worker_main(Pool* P, int tid) {
     pin_to_cpu(P->cpus[tid]);
     uint64_t seen = 0;
     volatile uint64_t sink = 0;
-    const int64_t touch_bytes = 32ll << 20;
+    // mode 2's traffic shape (10-29 bisection on CCD 1, real records, 250 us gaps, bench_l3_vs_dram): the after-a-gap
+    // penalty is per CORE and sits entirely in FC1 (54 -> 75 us; FC2 and an L3-resident expert unchanged; a 55 GB/s stream
+    // on another CCD does not help), it appears after 20 us of idleness and needs every worker to keep issuing
+    // DRAM-missing loads on EVERY poll to stay away: MOE_B12X_POOL_SPIN_TOUCH_STRIDE=64 (a sequential stream per worker,
+    // ~3 GB/s each) removes it completely (FC1 57, the back-to-back figure), the default page stride 4096 + 64 only
+    // partly (67); one line every 2nd poll, 1-3 touching workers, an AVX-512 spin, or a buffer that fits L2 / L3
+    // (MOE_B12X_POOL_SPIN_TOUCH_KB < 32768) do nothing. Mode 2 with the page stride lost in situ (note §19.1).
+    static const int64_t touch_stride = getenv("MOE_B12X_POOL_SPIN_TOUCH_STRIDE") ? atoll(getenv("MOE_B12X_POOL_SPIN_TOUCH_STRIDE")) : 4096 + 64;
+    static const int64_t touch_bytes = getenv("MOE_B12X_POOL_SPIN_TOUCH_KB") ? (int64_t)atoll(getenv("MOE_B12X_POOL_SPIN_TOUCH_KB")) << 10 : 32ll << 20;   // a power of two
     uint8_t* touch = P->spin_hot_mode >= 2 ? (uint8_t*)big_alloc(touch_bytes) : nullptr;   // zeroed = faulted in
     int64_t touch_off = 0;
     while (!P->stop.load(std::memory_order_acquire)) {
@@ -723,9 +784,9 @@ static void worker_main(Pool* P, int tid) {
             }
             if (P->spin_hot) {
                 uint64_t h = sink + 0x9E3779B97F4A7C15ull;   // ~100 cycles of dependent integer work per poll
-                if (touch) {                                  // mode 2: plus one DRAM line per poll (~2.5 GB/s per thread)
+                if (touch) {                                  // mode 2: plus one DRAM line per poll (~2.5-3 GB/s per thread)
                     h += *(volatile uint64_t*)(touch + touch_off);
-                    touch_off = (touch_off + 4096 + 64) & (touch_bytes - 1);
+                    touch_off = (touch_off + touch_stride) & (touch_bytes - 1);
                 }
                 for (int i = 0; i < 24; ++i) h = (h ^ (h >> 29)) * 0xBF58476D1CE4E5B9ull;
                 sink = h;
@@ -872,6 +933,8 @@ void* moe_b12x_pool_create(int nthreads, const int* cpu_ids) {
     P->C = make_consts();
     if (const char* s = getenv("MOE_B12X_POOL_SPIN_US")) P->spin_ns = (int64_t)atoll(s) * 1000;
     if (const char* s = getenv("MOE_B12X_POOL_SPIN_HOT")) { P->spin_hot_mode = atoi(s); P->spin_hot = P->spin_hot_mode != 0; }
+    if (const char* s = getenv("MOE_B12X_PREFETCH")) g_prefetch = std::max(0, std::min(8, atoi(s)));
+    if (const char* s = getenv("MOE_B12X_PREFETCH_HINT")) g_prefetch_hint = std::max(0, std::min(2, atoi(s)));
     P->x_cap = 256;
     P->X = (XPrep*)big_alloc((int64_t)P->x_cap * sizeof(XPrep));
     for (int b = 0; b < 2; ++b) {
