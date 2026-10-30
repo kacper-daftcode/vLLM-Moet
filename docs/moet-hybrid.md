@@ -12,16 +12,16 @@ Measured (2026‑10‑26, the launcher's defaults, TP4, no DSpark):
 
 | | |
 |---|---|
-| decode, single stream, short prompts | **143 / 120 tok/s** ('Hello' / 'def fib(n):'; the degenerate 'Hello' run has a hit rate → 1 and is the stack's GPU floor at 7.0 ms per step — the hybrid's miss handling costs ~1.3 ms per step on a real prompt) |
+| decode, single stream, short prompts | **148 / 129 tok/s** ('Hello' / 'def fib(n):', the 10-29 defaults: the CPU kernel's software prefetch and a 5 ms pool spin; 143 / 120 before). The step is 7.6 ms, of which ~2.1 ms is the GPU waiting for the CPU tier on the ~10 layers per step that miss (one expert's full CPU latency each, ~130 µs in situ); the degenerate 'Hello' run has a hit rate → 1 |
 | decode behind 2K / 14K / 30K of context | 56–81 / 64 / 47 tok/s (the attention side) |
-| prefill with the streamed experts (chunk 4096, the default) | **2.1–2.4K tok/s at 2K, 3.9K tok/s at 14K, 3.0K at 30K, 3.7–3.85K at 32K / 64K** (TTFT 0.9 s / 3.7 s / 10.4 s / 8.5 s / 16.7 s; PCIe‑bound: 0.12 ms per missing expert per rank ≈ 39 GB/s per link; the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token — chunk 2048 gave 2.0–2.3K at 2K / 14K / 30K) |
+| prefill with the streamed experts (chunk 4096, the default) | **2.4–2.7K tok/s at 2K, 4.4K at 14K, 4.7–4.8K at 30K** with the 10-29 default `PREFILL_OVERLAP=1` (the records' staging on a side stream, during the resident run and the previous round's run — bit-identical to the serial path; TTFT 0.77–0.84 s / 3.25 s / 6.3–6.5 s against 0.94 / 3.8 / 7.7 s before, −15 %). PCIe‑bound: 0.09–0.10 ms per missing expert per rank ≈ 50 GB/s per link (0.12 before); the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token — chunk 2048 gave 2.0–2.3K at 2K / 14K / 30K. 32K / 64K: 3.7–3.85K before the overlap (not re-measured) |
 | long context | needle‑in‑a‑haystack **32K: 3/3, 64K: 3/3** (depths 0.1 / 0.5 / 0.9; TTFT 8.5 s / 16.5–16.8 s) |
 | concurrency (4 streams, 60‑min soak) | **1,888 requests, 0 errors, no leak**; aggregate **98 tok/s** (24.5 per stream) — every stream brings its own expert misses (~136 CPU experts per 4‑token step, 22–25 ms of CPU per step), so the hybrid serves one stream fast and several streams correctly but slowly; `--max-num-seqs 1` is the serving default |
 | quality, paired against the native FP4 reference | **HumanEval 159/164 vs 160/164** (McNemar p = 1.0, 134 identical programs); **MATH‑500 level 5: 55/60 vs 55/60** (0 discordant items, 59 identical answers) |
 | identity | bit‑exact against the all‑resident b12x path within one boot: 21,040 compact calls per rank, 98,220 CPU‑computed rows, 0 differ (`DEBUG_COMPACT`); the CPU kernel bit‑exact against b12x's GPU kernels on four parity sets |
 | expert hit rate (pairs resident) | 0.83–0.85 on short prompts, **0.87 on HumanEval, 0.91 on MATH‑500** |
 | host RAM while up | ~450 GB used (the expert store 64.7 GB per rank + the Engram tables 2 × 23.6 GiB per rank, pinned), MemAvailable ~45 GB |
-| VRAM | 29.9 GB per card at util 0.92; KV cache 0.8–1.1 GiB (nvfp4 MLA: 300K+ tokens) |
+| VRAM | 30.5 GB per card at util 0.94 (0.92 until 10-29; the second prefill scratch set takes 0.56 GiB); KV cache ~0.9 GiB (nvfp4 MLA: 230K+ tokens) |
 | boot | ~6 min (weights 160–250 s + 65 GB of records pinned per rank in ~60 s + warmup; the page cache dropped before the boot and after the weights — pinning the records *before* the weights instead was measured slower: the loader then streams 290 GB through ~45 GB of cache, 527 s) |
 
 ## How it works
@@ -121,13 +121,15 @@ prefill TTFT on disjoint prompts), `cpu_tier/cpu_placement_probe.sh` (who runs o
 
 - DSpark (k = 5) does not pay for the hybrid: a verify step routes ~5× more distinct experts for 3.6× more tokens and
   the CPU kernel's cost per extra token (~73 µs) keeps it CPU‑bound; k = 0 is the serving mode.
-- Prefill is PCIe‑bound (0.12 ms per missing expert per rank): 2.1–2.4K tok/s on 2K prompts, 3.9K on 14K with the
-  4096‑token chunk; a CPU tail for experts with few tokens and double‑buffered staging are the next levers.
+- Prefill is PCIe‑bound (0.09–0.10 ms per missing expert per rank with the side‑stream staging of 10-29; 0.12 before):
+  2.4–2.7K tok/s on 2K prompts, 4.4K on 14K, 4.7–4.8K on 30K with the 4096‑token chunk; a CPU tail for experts with few
+  tokens is the next lever (its numerics budget is 1 ulp of bf16: the streamed path sums two b12x runs).
 - Concurrency: the CPU tier's cost is the number of distinct missing experts a step pulls from DRAM, and concurrent
   sequences almost never share their misses (the traces: 34 → 82 → 197 distinct CPU experts per step at 1 / 2 / 4
   streams; the soak: 98 tok/s aggregate at 4 streams against 120–143 for one) — a single‑stream (at most two‑stream)
   design on this box's memory bandwidth. `routing/promo_sim.py --streams N` models it.
-- `GPU_MEM_UTIL` 0.92 is needed with the 4096‑token chunk: 0.90 leaves 0.18 GiB of KV, too little for one 64K request.
+- `GPU_MEM_UTIL` 0.94 is the default since 10-29 (the two prefill scratch sets; 0.92 was needed already with the 4096‑token
+  chunk: 0.90 leaves 0.18 GiB of KV, too little for one 64K request).
 - The GPU 0 of this box dropped off the PCIe bus twice under sustained full‑power four‑GPU prefill (hardware), so the
   cards run capped at 400 W (`gpu-power-cap.service`, persisted).
 - The working notes with every measurement and its command: `internal/dsv41-5090-cpu/handoff/*.md` and

@@ -24,7 +24,7 @@
 #                        PROMOTIONS (4) per layer per step
 #            TIMEOUT_MS (500)        the in-graph wait's bound (fail-closed)
 #            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
-#            GPU_MEM_UTIL (0.92)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts
+#            GPU_MEM_UTIL (0.94; 0.92 until 10-29 - the second prefill scratch set needs the 0.64 GiB)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts
 #                        prefill at 3.9K tok/s against 2.2K with 2048)  CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
 #            SCRATCH (64)            slots of the prefill scratch pool (phase 2.5; 64 = 0.6 GB per rank, 128 = 1.2; 0 = the missing
@@ -47,19 +47,25 @@
 #                        step's jobs: +3 % decode on 10-25); 0 = pause
 #            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded (the RAM item: the loader's
 #                        pinned staging blocks), with MemAvailable logged before / after
-#            POOL_SPIN_US ("")       the kernel pool's spin before it sleeps on the futex (the pool's default 500; the cores
-#                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins through a
-#                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever)
-#            PREFETCH ("")           MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (10-29: the
-#                        expert from DRAM costs 119 us in-kernel against 69 from L3; D = 1 takes 11 % off back to back and 7 %
-#                        under the decode's gaps on the bench; bits untouched by construction); PREFETCH_HINT (1 = L2)
-#            PREFILL_OVERLAP (0)     1 = a second prefill scratch set + a side stream: a non-compact call's round 0 is staged
-#                        during the stock b12x run and round r + 1 during round r's extra run (bit-identical to the
-#                        serial path - mini-real A/B 10-29; costs SCRATCH x 4.7 MB x 2 more VRAM: use GPU_MEM_UTIL=0.94);
+#            POOL_SPIN_US (5000)     the kernel pool's spin before it sleeps on the futex (the pool's own default 500; the
+#                        cores then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins
+#                        through a decode step's gaps and sleeps only when the API is idle; -1 = spin forever). Default
+#                        since 10-29 (k0-pf, with PREFETCH=1: in-kernel 127-135 us per expert against 148-154, the wait
+#                        2.06-2.12 ms against 2.62-3.11, step 7.61 against 8.40 ms, decode 148 / 129 against 143 / 120)
+#            PREFETCH (1)            MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (the expert
+#                        from DRAM costs 119 us in-kernel against 69 from L3; bits untouched by construction, parity PASS);
+#                        PREFETCH_HINT (1 = L2). Default since 10-29 (k0-pf, see POOL_SPIN_US); 0 = off
+#            PREFILL_OVERLAP (1)     a second prefill scratch set + a side stream: a non-compact call's round 0 is staged
+#                        during the stock b12x run and round r + 1 during round r's extra run - bit-identical to the
+#                        serial path (mini-real A/B), TTFT -15 % at 2K / 14K / 30K (k0-pfill vs k0-pfill-base 10-29: 0.94 ->
+#                        0.80 s, 3.8 -> 3.25 s, 7.7 -> 6.4 s; 0.12 -> 0.09 ms per streamed expert). Costs SCRATCH x 4.7 MB x 2
+#                        of VRAM - hence GPU_MEM_UTIL 0.94 (0.92 would leave the KV at the 64K minimum). 0 = off;
 #                        DEBUG_OVERLAP=1 re-runs every call serially and compares bit for bit
-#            SPIN_TOUCH_STRIDE ("")  MOE_B12X_POOL_SPIN_TOUCH_STRIDE for POOL_SPIN_HOT=2: 64 = every worker streams its 32 MB
-#                        buffer sequentially instead of a line per page (10-29 bench: the whole after-a-gap penalty of FC1,
-#                        -13 % per expert, at ~3 GB/s per core of idle DRAM traffic; the page stride gave -4 % and lost in situ)
+#            SPIN_TOUCH_STRIDE ("")  MOE_B12X_POOL_SPIN_TOUCH_STRIDE for POOL_SPIN_HOT=2 (the kernel's default is 64 since
+#                        10-29 = every worker streams its 32 MB buffer sequentially while idle; 4160 = the old page stride).
+#                        POOL_SPIN_HOT=2 measured 10-29 (k0-pf-touch): in-kernel 115-126 us per expert on every rank, the
+#                        wait 1.84-1.90 ms, decode 150.6 / 131.6 - at ~19 GB/s per CCD of idle DRAM reads and a slower
+#                        host under the profiler (rank 0's step 10.1 ms profiled); not the default until k0-new-touch
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
@@ -110,11 +116,11 @@ DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
 DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
-POOL_SPIN_US="${POOL_SPIN_US:-}"
-PREFETCH="${PREFETCH:-}"
+POOL_SPIN_US="${POOL_SPIN_US:-5000}"
+PREFETCH="${PREFETCH:-1}"
 PREFETCH_HINT="${PREFETCH_HINT:-1}"
 SPIN_TOUCH_STRIDE="${SPIN_TOUCH_STRIDE:-}"
-PREFILL_OVERLAP="${PREFILL_OVERLAP:-0}"
+PREFILL_OVERLAP="${PREFILL_OVERLAP:-1}"
 DEBUG_OVERLAP="${DEBUG_OVERLAP:-0}"
 POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
 POOL_THREADS="${POOL_THREADS:-6}"
@@ -190,7 +196,7 @@ docker run -d --name "$NAME" --restart no \
   ${PREFETCH:+-e MOE_B12X_PREFETCH=$PREFETCH -e MOE_B12X_PREFETCH_HINT=$PREFETCH_HINT} \
   ${SPIN_TOUCH_STRIDE:+-e MOE_B12X_POOL_SPIN_TOUCH_STRIDE=$SPIN_TOUCH_STRIDE} \
   -e VLLM_MOET_CPU_TIER_PREFILL_OVERLAP="$PREFILL_OVERLAP" -e VLLM_MOET_CPU_TIER_DEBUG_OVERLAP="$DEBUG_OVERLAP" \
-  -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.92}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
+  -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \

@@ -759,8 +759,10 @@ static void worker_main(Pool* P, int tid) {
     // DRAM-missing loads on EVERY poll to stay away: MOE_B12X_POOL_SPIN_TOUCH_STRIDE=64 (a sequential stream per worker,
     // ~3 GB/s each) removes it completely (FC1 57, the back-to-back figure), the default page stride 4096 + 64 only
     // partly (67); one line every 2nd poll, 1-3 touching workers, an AVX-512 spin, or a buffer that fits L2 / L3
-    // (MOE_B12X_POOL_SPIN_TOUCH_KB < 32768) do nothing. Mode 2 with the page stride lost in situ (note §19.1).
-    static const int64_t touch_stride = getenv("MOE_B12X_POOL_SPIN_TOUCH_STRIDE") ? atoll(getenv("MOE_B12X_POOL_SPIN_TOUCH_STRIDE")) : 4096 + 64;
+    // (MOE_B12X_POOL_SPIN_TOUCH_KB < 32768) do nothing. Mode 2 with the page stride lost in situ (note §19.1); with the
+    // sequential stride it won on every rank (k0-pf-touch 10-29: in-kernel 115-126 us per expert against 127-135 with
+    // prefetch alone and 148-154 before, note §20.6) - the sequential stride is the default since then.
+    static const int64_t touch_stride = getenv("MOE_B12X_POOL_SPIN_TOUCH_STRIDE") ? atoll(getenv("MOE_B12X_POOL_SPIN_TOUCH_STRIDE")) : 64;
     static const int64_t touch_bytes = getenv("MOE_B12X_POOL_SPIN_TOUCH_KB") ? (int64_t)atoll(getenv("MOE_B12X_POOL_SPIN_TOUCH_KB")) << 10 : 32ll << 20;   // a power of two
     uint8_t* touch = P->spin_hot_mode >= 2 ? (uint8_t*)big_alloc(touch_bytes) : nullptr;   // zeroed = faulted in
     int64_t touch_off = 0;
