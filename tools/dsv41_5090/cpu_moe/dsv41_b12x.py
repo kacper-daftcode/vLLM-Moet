@@ -120,6 +120,10 @@ def load_lib(path: str | None = None, tables_dir: str | None = None):
         ]
         lib.moe_b12x_rows_quant.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
         lib.moe_b12x_pool_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
+        lib.moe_b12x_pool_prefetch_start.restype = ctypes.c_int
+        lib.moe_b12x_pool_prefetch_start.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p)]
+        lib.moe_b12x_pool_prefetch_finish.restype = ctypes.c_int
+        lib.moe_b12x_pool_prefetch_finish.argtypes = [ctypes.c_void_p]
         assert lib.moe_b12x_record_bytes() == RECORD_BYTES
         _LIB = lib
     if not _TABLES_LOADED:
@@ -184,9 +188,20 @@ class Pool:
 
     def stats(self, reset: bool = True) -> dict:
         """FC2 blocks / blocks through the general (truncating) path; worker 0's TSC cycles per phase."""
-        buf = (ctypes.c_int64 * 7)()
+        buf = (ctypes.c_int64 * 8)()
         self.lib.moe_b12x_pool_stats(self.handle, buf, 1 if reset else 0)
-        return dict(fc2_blocks=buf[0], fc2_general=buf[1], cyc_prepare=buf[2], cyc_fc1=buf[3], cyc_act=buf[4], cyc_fc2=buf[5], fc2_q0=buf[6])
+        return dict(fc2_blocks=buf[0], fc2_general=buf[1], cyc_prepare=buf[2], cyc_fc1=buf[3], cyc_act=buf[4], cyc_fc2=buf[5], fc2_q0=buf[6],
+                    prefetch_done=buf[7])
+
+    def prefetch_start(self, record_ptrs: list[int]) -> None:
+        """Kick a prefetch job (11-02): every worker streams its own row shares of these records into its L2 while the
+        pool is otherwise idle; returns at once. experts_forward() ends / collects it; prefetch_finish() does so early."""
+        self._pf = (ctypes.c_void_p * len(record_ptrs))(*record_ptrs)   # kept alive while the job runs
+        rc = self.lib.moe_b12x_pool_prefetch_start(self.handle, len(record_ptrs), self._pf)
+        assert rc == 0, f"prefetch_start rc {rc}"
+
+    def prefetch_finish(self) -> None:
+        self.lib.moe_b12x_pool_prefetch_finish(self.handle)
 
     def experts_forward(self, record_ptrs: list[int], m_per_expert: list[int], token_idx: list[int],
                         pair_weight: list[float], out_row: list[int], aq: np.ndarray, as_: np.ndarray,

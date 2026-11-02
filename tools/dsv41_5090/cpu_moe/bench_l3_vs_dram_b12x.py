@@ -12,6 +12,12 @@ pool's CCD (mpstat the cores first); no ds41-hyb boot of ours up (rule: no CPU b
 (ccd_bw.cpp: one CCD streams 55-57 GB/s = 82 us per record). With GAP_US=250 only FC1 slows (54 -> 75), B does not:
 the after-a-gap penalty is a per-core memory-path state (note §20). MOE_B12X_PREFETCH=1: A 110 (-11 %). Prefetch +
 POOL_SPIN_HOT=2 with the sequential touch stream: the gap case 151 -> 120.5 us per expert (-20 %).
+11-02 (the predicted-miss prefetch lever, note §20.8): PRE_POOL=1 = the pool's own prefetch job streams the next record's
+row shares into each worker's L2 during the gap (a perfect prediction): in-kernel 113 -> 93 us (FC1 57 -> 36, FC2 54
+unchanged); PRE_L3=1 (the main thread reads the record into its L2 / the L3) the same 93. FC2 is fast (30) only when the
+whole record set is L3-resident (cycling 4 records = 19 MB: 31; 6 = 28 MB: 41; 8 = 38 MB: 49; 12+: 53) - its W2 share
+prefetched into the worker's L2 does not survive the FC1 phase and is not kept in the victim L3. So a predicted record
+is worth -18 % (FC1 only), not -40 %, and at recall 0.5 the lever is ~+2 % decode: measured, not pursued.
 """
 import os, sys, time
 import numpy as np, torch
@@ -41,21 +47,27 @@ def job(i):
     pool.experts_forward([ptrs[i]], [1], [0], [0.5], [i], aq, as_, out)
 
 GAP = float(os.environ.get("GAP_US", "0"))
+PRE_L3 = os.environ.get("PRE_L3", "0") == "1"      # the main thread reads the next record during the gap (into its L2 / the L3)
+PRE_POOL = os.environ.get("PRE_POOL", "0") == "1"  # the pool's own prefetch job for the next record during the gap (11-02)
+def touch_record(i):
+    return int(np.frombuffer(arena.slot(i), dtype=np.uint64).sum() & 1)
 def busy(us):
     t = time.perf_counter()
     while (time.perf_counter() - t) * 1e6 < us: pass
 def run(label, seq):
     job(seq[0]); pool.stats(reset=True)
-    t0 = time.perf_counter(); n = 0; lat = 0.0; k = 0
+    t0 = time.perf_counter(); n = 0; lat = 0.0; k = 0; sink = 0
     while time.perf_counter() - t0 < SECS:
         i = seq[k % len(seq)]; k += 1
+        if PRE_L3: sink ^= touch_record(i)
+        if PRE_POOL: pool.prefetch_start([ptrs[i]])   # a perfect prediction: the record the next job needs
         if GAP > 0: busy(GAP)
         t1 = time.perf_counter(); job(i); lat += time.perf_counter() - t1; n += 1
     st = pool.stats(reset=True)
     cyc = st["cyc_prepare"] + st["cyc_fc1"] + st["cyc_act"] + st["cyc_fc2"]
     fc1 = st["cyc_fc1"] / TSC / 1e3 / n; fc2 = st["cyc_fc2"] / TSC / 1e3 / n
     pre = st["cyc_prepare"] / TSC / 1e3 / n; act = st["cyc_act"] / TSC / 1e3 / n
-    print(f"gap {GAP:4.0f} {label:>14}: {lat / n * 1e6:6.1f} us per expert (worker-0 in-kernel {cyc / TSC / 1e3 / n:6.1f}: prep {pre:4.1f} fc1 {fc1:5.1f} act {act:4.1f} fc2 {fc2:5.1f}); n {n}", flush=True)
+    print(f"gap {GAP:4.0f} pre-l3 {int(PRE_L3)} pre-pool {int(PRE_POOL)} {label:>14}: {lat / n * 1e6:6.1f} us per expert (worker-0 in-kernel {cyc / TSC / 1e3 / n:6.1f}: prep {pre:4.1f} fc1 {fc1:5.1f} act {act:4.1f} fc2 {fc2:5.1f}); n {n}", flush=True)
 
 for rep in range(int(os.environ.get("REPS", "3"))):
     run("A dram 48 rec", list(range(N)))

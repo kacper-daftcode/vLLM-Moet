@@ -307,6 +307,8 @@ static inline double pow2_d(int e) {  // 2^e as a double (normal range)
 // the pool
 // ------------------------------------------------------------------------------------------------------------
 struct Job {
+    int kind = 0;                       // 0 = the experts' forward; 1 = prefetch: each worker streams its own row shares of
+                                        //     n_experts records into its L2 (the next layer's predicted misses, 11-02)
     int n_experts = 0;
     const uint8_t* const* records = nullptr;
     const int* m_per_expert = nullptr;
@@ -351,6 +353,8 @@ struct Pool {
     std::atomic<int> n_sleeping{0};
     std::atomic<int> bar_count{0};
     std::atomic<int> bar_gen{0};
+    std::atomic<int> prefetch_abort{0};   // set by the main thread to end a prefetch job early (a real job is due)
+    bool prefetch_inflight = false;      // main-thread bookkeeping: a prefetch job was kicked and not yet collected
     std::atomic<int> error{0};
     Job job;
     std::vector<int> tok_off_storage;
@@ -721,6 +725,47 @@ static void run_job(Pool& P, int tid) {
     }
 }
 
+// The prefetch job (kind 1): worker tid streams, for every record, exactly the row ranges it would compute in run_job
+// (split_rows over N13 for FC1, over N2 for FC2) with 64-byte loads, so the lines land in ITS OWN L2 (783 KB per record
+// per worker; a line in another core's L2 or in the victim L3 is not worth much to FC2 - note §20.8). It checks the
+// abort flag every few rows: a real job pre-empts it within ~100 ns. Reads only: the bits cannot move.
+static std::atomic<int64_t> g_prefetch_done{0};   // worker prefetch passes that reached the end (debug counter)
+static void run_prefetch(Pool& P, int tid) {
+    const Job& J = P.job;
+    const int n = P.nthreads;
+    __m512i acc = _mm512_setzero_si512();
+    static const int part = getenv("MOE_B12X_PREFETCH_PART") ? atoi(getenv("MOE_B12X_PREFETCH_PART")) : 3;   // 1 = FC1 rows, 2 = FC2 rows, 3 = both (a bisection knob)
+    for (int e = 0; e < J.n_experts && !P.prefetch_abort.load(std::memory_order_relaxed); ++e) {
+        const uint8_t* rec = J.records[e];
+        int r0, r1;
+        split_rows(N13, n, tid, r0, r1);
+        if (!(part & 1)) r1 = r0;
+        for (int r = r0; r < r1; ++r) {
+            if ((r & 3) == 0 && P.prefetch_abort.load(std::memory_order_relaxed)) return;
+            const bool up = r >= INTER_R;
+            const int row = up ? r - INTER_R : r;
+            const uint8_t* nib = rec + (up ? OFF_W3N : OFF_W1N) + (int64_t)row * (K1 / 2);
+            for (int o = 0; o < K1 / 2; o += 64) acc = _mm512_add_epi64(acc, _mm512_loadu_si512((const void*)(nib + o)));
+            const uint8_t* sc = rec + (up ? OFF_W3S : OFF_W1S) + (int64_t)row * B1;
+            for (int o = 0; o < B1; o += 64) acc = _mm512_add_epi64(acc, _mm512_loadu_si512((const void*)(sc + o)));
+        }
+        split_rows(N2, n, tid, r0, r1);
+        if (!(part & 2)) r1 = r0;
+        const uint8_t* nib0 = rec + OFF_W2N + (int64_t)r0 * (K2 / 2);
+        const int64_t nbytes = (int64_t)(r1 - r0) * (K2 / 2);
+        for (int64_t o = 0; o < nbytes; o += 64) {
+            if ((o & 0x3fff) == 0 && P.prefetch_abort.load(std::memory_order_relaxed)) return;
+            acc = _mm512_add_epi64(acc, _mm512_loadu_si512((const void*)(nib0 + o)));
+        }
+        const uint8_t* sc0 = rec + OFF_W2S + (int64_t)r0 * B2;
+        const int64_t sbytes = (int64_t)(r1 - r0) * B2;
+        for (int64_t o = 0; o < sbytes; o += 64) acc = _mm512_add_epi64(acc, _mm512_loadu_si512((const void*)(sc0 + o)));
+    }
+    volatile int64_t sink = _mm512_reduce_add_epi64(acc);
+    (void)sink;
+    g_prefetch_done.fetch_add(1, std::memory_order_relaxed);
+}
+
 static void pin_to_cpu(int cpu) {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -797,7 +842,8 @@ static void worker_main(Pool* P, int tid) {
             }
         }
         seen = g;
-        run_job(*P, tid);
+        if (P->job.kind == 1) run_prefetch(*P, tid);
+        else run_job(*P, tid);
         P->done.fetch_add(1, std::memory_order_acq_rel);
     }
     if (touch) big_free(touch, touch_bytes);
@@ -912,6 +958,7 @@ static void ref_fc2(const uint8_t* rec, const uint8_t* q, const uint8_t* sbytes,
 // C API
 // ------------------------------------------------------------------------------------------------------------
 extern "C" {
+int moe_b12x_pool_prefetch_finish(void* pool);
 
 int64_t moe_b12x_record_bytes(void) { return RECORD_BYTES; }
 void* moe_b12x_alloc(int64_t nbytes) { return big_alloc(nbytes); }
@@ -974,6 +1021,7 @@ int moe_b12x_experts_forward(void* pool, int n_experts, const uint8_t* const* re
     if (!P || n_experts < 0) return -1;
     for (int e = 0; e < n_experts; ++e)
         if (m_per_expert[e] < 1 || m_per_expert[e] > MAX_M) return -2;
+    if (P->prefetch_inflight) moe_b12x_pool_prefetch_finish(pool);
     if (n_tokens > P->x_cap) {
         big_free(P->X, (int64_t)P->x_cap * sizeof(XPrep));
         P->x_cap = n_tokens;
@@ -1007,6 +1055,37 @@ int moe_b12x_experts_forward(void* pool, int n_experts, const uint8_t* const* re
     return 0;
 }
 
+// The prefetch job (11-02): the workers stream their own row shares of n records (the next layer's predicted misses)
+// into their L2 while the pool would otherwise idle. _start returns at once (the main thread keeps polling its
+// mailboxes); _finish ends it early if it still runs and collects it - experts_forward calls _finish itself when a
+// prefetch is in flight. Records = pointers into the pinned store. 0 on success.
+int moe_b12x_pool_prefetch_start(void* pool, int n_records, const uint8_t* const* records) {
+    Pool* P = (Pool*)pool;
+    if (!P || n_records < 1) return -1;
+    if (P->prefetch_inflight) moe_b12x_pool_prefetch_finish(pool);
+    Job& J = P->job;
+    J = Job();
+    J.kind = 1;
+    J.n_experts = n_records;
+    J.records = records;
+    P->prefetch_abort.store(0, std::memory_order_release);
+    P->done.store(0, std::memory_order_release);
+    P->prefetch_inflight = true;
+    pool_kick(*P);
+    return 0;
+}
+
+int moe_b12x_pool_prefetch_finish(void* pool) {
+    Pool* P = (Pool*)pool;
+    if (!P) return -1;
+    if (!P->prefetch_inflight) return 0;
+    P->prefetch_abort.store(1, std::memory_order_release);
+    while (P->done.load(std::memory_order_acquire) < P->nthreads) _mm_pause();
+    P->prefetch_inflight = false;
+    P->prefetch_abort.store(0, std::memory_order_release);
+    return 0;
+}
+
 // statistics since the last reset: out[0] FC2 blocks, out[1] FC2 blocks through the general path, out[2..5] worker
 // 0's TSC cycles in prepare / FC1 / activation / FC2 (barrier waits included); reset != 0 clears them
 void moe_b12x_pool_stats(void* pool, int64_t* out, int reset) {
@@ -1018,8 +1097,11 @@ void moe_b12x_pool_stats(void* pool, int64_t* out, int reset) {
     out[1] = general;
     for (int i = 0; i < 4; ++i) out[2 + i] = P->stats[0].cyc[i];
     out[6] = q0 * 4;   // in row-blocks, like out[0] / out[1]
-    if (reset)
+    out[7] = g_prefetch_done.load(std::memory_order_relaxed);   // worker prefetch passes completed (not aborted)
+    if (reset) {
         for (int t = 0; t < P->nthreads; ++t) P->stats[t] = Pool::Stats();
+        g_prefetch_done.store(0, std::memory_order_relaxed);
+    }
 }
 
 // the scalar reference for one (token, expert) pair: proj [1152] bf16, q [576], sbytes [18], out [5120] bf16
