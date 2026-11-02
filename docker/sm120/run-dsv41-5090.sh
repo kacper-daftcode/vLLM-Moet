@@ -43,8 +43,13 @@
 #            POOL_THREADS (6)        kernel pool threads per rank = cores of its CCD: 6 (8r+2..8r+7), 7 (8r+1..8r+7, the dispatcher on
 #                        main's SMT sibling) or 8 (the whole CCD; main + dispatcher on siblings) - 10-28: the GPU waits
 #                        ~2.6 ms per decode step for the tier, the bench kernel is 14-17 % faster on 8 threads than on 6
-#            POOL_SPIN_HOT (1)       the kernel pool's spin does ALU work instead of `pause` (keeps the cores' clock up between a
-#                        step's jobs: +3 % decode on 10-25); 0 = pause
+#            POOL_SPIN_HOT (2)       the kernel pool's idle spin: 1 = ALU work instead of `pause` (keeps the cores' clock up between
+#                        a step's jobs: +3 % decode on 10-25); 2 = also every idle worker streams a private 32 MB buffer from
+#                        DRAM (SPIN_TOUCH_STRIDE 64) - the kernel's after-a-gap penalty is a per-core memory-path state that
+#                        only continuous DRAM-missing loads keep away (note §20.2): in situ -8 % per expert on every rank
+#                        (k0-pf-touch, k0-new-touch: 128-138 -> 113-134 us, decode 148 / 129 -> 150 / 132) at ~19 GB/s per CCD
+#                        of idle DRAM reads while the pool spins and a ~1.6x slower Python host under memory pressure (hidden
+#                        behind the GPU step at one stream). Default since 10-30 (k0-new-touch); 1 = the 10-25..10-29 default
 #            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded (the RAM item: the loader's
 #                        pinned staging blocks), with MemAvailable logged before / after
 #            POOL_SPIN_US (5000)     the kernel pool's spin before it sleeps on the futex (the pool's own default 500; the
@@ -62,10 +67,8 @@
 #                        of VRAM - hence GPU_MEM_UTIL 0.94 (0.92 would leave the KV at the 64K minimum). 0 = off;
 #                        DEBUG_OVERLAP=1 re-runs every call serially and compares bit for bit
 #            SPIN_TOUCH_STRIDE ("")  MOE_B12X_POOL_SPIN_TOUCH_STRIDE for POOL_SPIN_HOT=2 (the kernel's default is 64 since
-#                        10-29 = every worker streams its 32 MB buffer sequentially while idle; 4160 = the old page stride).
-#                        POOL_SPIN_HOT=2 measured 10-29 (k0-pf-touch): in-kernel 115-126 us per expert on every rank, the
-#                        wait 1.84-1.90 ms, decode 150.6 / 131.6 - at ~19 GB/s per CCD of idle DRAM reads and a slower
-#                        host under the profiler (rank 0's step 10.1 ms profiled); not the default until k0-new-touch
+#                        10-29 = every worker streams its 32 MB buffer sequentially while idle; 4160 = the old page stride,
+#                        which lost in situ on 10-29)
 #            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
 #                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
 #                        outputs by ulps -> bit-identity across boots needs the pin)
@@ -122,7 +125,7 @@ PREFETCH_HINT="${PREFETCH_HINT:-1}"
 SPIN_TOUCH_STRIDE="${SPIN_TOUCH_STRIDE:-}"
 PREFILL_OVERLAP="${PREFILL_OVERLAP:-1}"
 DEBUG_OVERLAP="${DEBUG_OVERLAP:-0}"
-POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
+POOL_SPIN_HOT="${POOL_SPIN_HOT:-2}"
 POOL_THREADS="${POOL_THREADS:-6}"
 PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
 HOST_EMPTY_CACHE="${HOST_EMPTY_CACHE:-0}"
