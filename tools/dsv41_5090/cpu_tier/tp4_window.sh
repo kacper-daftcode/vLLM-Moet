@@ -36,7 +36,7 @@ note() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$SUMMARY"; }
 KEEP="${KEEP_DIR:-$REPO/internal/dsv41-5090-cpu/handoff/boots}"
 keep_artefacts() {
   mkdir -p "$KEEP" 2>/dev/null || return 0
-  for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-needle.json" "/tmp/ds41-hyb-$TAG-soak.json" "/tmp/ds41-hyb-$TAG-placement.txt"; do
+  for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-needle.json" "/tmp/ds41-hyb-$TAG-soak.json" "/tmp/ds41-hyb-$TAG-placement.txt" "/tmp/ds41-hyb-$TAG-thermal.txt"; do
     [[ -s "$f" ]] && cp -f "$f" "$KEEP/" 2>/dev/null
   done
   [[ -s "$LOG" ]] && gzip -c "$LOG" > "$KEEP/$(basename "$LOG").gz" 2>/dev/null
@@ -274,8 +274,22 @@ if [[ -n "${NEEDLE_LENGTHS:-}" ]]; then
 fi
 if [[ -n "${SOAK_MINUTES:-}" ]]; then
   note "soak: $SOAK_MINUTES min x ${SOAK_CONC:-4} streams, max_tokens ${SOAK_TOKENS:-256}"
+  # the host's thermal / power / clock trace during the soak (11-02: the 60-min soak's kernel went 121 -> 155 us per
+  # expert after ~15 min with the hot spin + DRAM stream on 24 cores; the socket's PPT is 350 W, Tctl idles at ~70 C):
+  # every 30 s Tctl, the socket's HSMP power, the pool cores' MHz (mean of the 24), the GPUs' power
+  THERM="/tmp/ds41-hyb-$TAG-thermal.txt"
+  ( echo "t_s Tctl_C socket_W pool_MHz_mean gpu_W_sum"; t0=$(date +%s); while :; do
+      tctl=$(( $(cat /sys/class/hwmon/hwmon4/temp1_input 2>/dev/null || echo 0) / 1000 ))
+      sw=$(( $(cat /sys/class/hwmon/hwmon5/power1_input 2>/dev/null || echo 0) / 1000000 ))
+      mhz=$(awk '/^cpu MHz/ {n++; if ((n-1)%8 >= 2) {s += $4; k++}} END {if (k) printf "%d", s / k; else print 0}' /proc/cpuinfo)
+      gw=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {printf "%d", s}')
+      echo "$(( $(date +%s) - t0 )) $tctl $sw $mhz $gw"; sleep 30; done ) > "$THERM" 2>/dev/null &
+  THERM_PID=$!
   $PY "$REPO/tools/dsv41_5090/cpu_tier/soak_probe.py" --port "$PORT" --model "$MODEL" --minutes "$SOAK_MINUTES" \
     --conc "${SOAK_CONC:-4}" --max-tokens "${SOAK_TOKENS:-256}" --out "/tmp/ds41-hyb-$TAG-soak.json" 2>&1 | tail -8 | tee -a "$SUMMARY"
+  kill $THERM_PID 2>/dev/null; wait $THERM_PID 2>/dev/null
+  note "thermal trace ($THERM): $(awk 'NR == 2 {a = $0} END {print "start [" a "]  end [" $0 "]"}' "$THERM")  (t_s Tctl_C socket_W pool_MHz gpu_W)"
+  awk 'NR > 1 {if ($2 > t) t = $2; if ($3 > w) w = $3; s += $4; n++} END {if (n) printf "  Tctl max %d C, socket W max %d, pool MHz mean %d over %d samples\n", t, w, s / n, n}' "$THERM" | tee -a "$SUMMARY"
   docker logs "$NAME" > "$LOG" 2>&1
   grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
   note "server log: error / traceback lines after the soak: $(grep -ciE "error word|fail.*closed|Traceback" "$LOG")"
