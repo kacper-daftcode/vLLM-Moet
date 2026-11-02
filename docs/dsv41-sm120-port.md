@@ -1932,6 +1932,62 @@ DRAM floor), the dense MXFP8 GEMVs ~0.9 ms on the path, the mHC boundaries (P2P 
 push on the PCIe egress floor) ~1.1 ms, the drafter graph 0.75 ms, the sparse attention + indexer ~0.5 ms; what is
 left bit‑for‑bit is ≈ 1–2 % (sparse‑MLA leftovers, the drafter's small‑expert MoE, the indexer's −1 fills).
 
+## The prefill front: where a 163K prefill goes on `-r21`, and steps 40–41 (2026‑10‑28..30)
+
+With decode on its floors the work moved to prefill. First the budget, on the production configuration with the real
+model (rank 0 of a fresh 163K‑token prefill = 40 chunks of 4096 tokens, 21 full layers + 19 CED‑trimmed ones; the
+profile classes summed to the chunk time ± 3 %): the GPU is busy **99.5 %** of the time (0.9 ms of idle per 202‑ms
+chunk, the host at 38 %), so a kernel saving lands 1:1 on the chunk. Per chunk: NCCL all‑reduce / all‑gather
+**29.4 %** (two `[4096, 5120]` bf16 all‑reduces per full layer, 1.34–1.49 ms each on the PCIe ring), the b12x MoE
+**28.9 %** (FC1 18.7 %, FC2 10.2 % — 2.6 ms per full layer‑chunk where DeepGEMM does the same shapes in 1.0 ms and the
+expert weight bytes alone take 0.83 ms), the sparse‑MLA prefill 10.5 %, the dense MXFP8 GEMMs 10.5 % (CUTLASS, at its
+floor), the mHC TileLang pair 5.7 %, the rest (cuBLAS bf16, elementwise, indexer, routing, prenorm) 11 %. The static
+census of the kernels (`cubit disassemble --frozen`: non‑MMA instructions per MMA, floor ≈ 16) put the headroom at
+≈ 70 for the FP8 sparse‑MLA prefill kernel, 24 / 17 for the MoE FC1 / FC2, ≈ 10 for the dense GEMM.
+
+Two things were ready to ship without a new kernel, and went into `-r22` behind runtime switches (the table rows of
+steps 40 and 41 in [`tools/dsv41_sm120/README.md`](../tools/dsv41_sm120/README.md) carry the mechanism and every
+number; the measurements are from GPUs 4–7 with the real model in the served configuration, alternating arms):
+
+* **Step 40 — the sparse‑MLA prefill on FlashInfer's full‑BF16 SM120 kernel** (`VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1`).
+  The trtllm entry vLLM calls has no precision knob and serves the V4.1 records' prefill rows with the single‑group FP8
+  kernel; the same storage is read by the full‑BF16 kernel (`SparseMLASm120Wrapper(compute_precision="bf16")`), which
+  is what every other platform computes. On the real records it is 24× closer to an fp32 reference (mean 3.7e‑6 vs
+  8.8e‑5, 0.12 % vs 2.8 % relative) at the same speed within ±8 %; on the real model +1 % prefill time, GSM8K‑200
+  194/200 vs 193/200 (McNemar p = 1), needle 6/6 the same answers. This is the level‑A decision of the front, taken
+  once: the BF16 kernel's bits are the frozen specification the SASS attention kernel will have to reproduce exactly.
+* **Step 41 — sequence‑parallel mHC boundaries for eager prefill steps of ≥ 2048 tokens** (`VLLM_MOET_PREFILL_SP=1`),
+  the option measured without the model above, now with the pieces that make it correct and worth it: the pre‑mix
+  split‑k pinned to the unsharded step's value (the boundary on a row shard is then bit‑identical per row), the
+  attention's replicated input projections computed on the shard and all‑gathered as `[T, 1792]` (35 % of the
+  bytes), the compressor / indexer layers projecting on the full rows (cuBLAS picks split‑k by the row count), the
+  CED replay rows gathered back once. Per 4096‑row boundary 1749 → 1125 µs at the attention input and → 1564 at the
+  MoE input; on the real model **fresh prefill 163K 8.50–8.59 → 7.67–7.74 s (−9.7 %), 19K −7.2 %**, GSM8K‑200
+  193 = 193, needle 6/6 the same, prompts below the gate identical. The bits above the gate are NCCL's
+  reduce‑scatter order (one bf16 ulp on 32 % of the boundary input, 2–6 top‑1 flips over 3–13K prompt positions —
+  the size of the served configuration's own run‑to‑run noise from the indexer top‑k tie order). A reduce‑scatter in
+  the all‑reduce's own per‑element order exists (`tools/dsv41_sm120/p2p_rs/`: NCCL's order probed per distinct M,
+  the peers' row blocks pushed over P2P, the four partials added in the table's order): bit‑identical end to end on
+  the real model with the deterministic top‑k in both arms, 0 of 30 137 prompt positions different, at +1–2 % of the
+  NCCL arm's time; the owner chose the faster arm for serving and the P2P one stays the bit‑identity tool.
+
+Both on (`-r22`, 2026‑10‑30): **fresh prefill 163K 7.67–7.79 s (21.0–21.3k tok/s) against 8.47–8.58 s with both off on
+the same image (−9.4 %), 19K 0.899–0.912 s against 1.006–1.019 (−10.5 %)**; GSM8K‑200 194/200 (p = 1), needle 6/6 the
+same answers, tools / JSON / vision OK, 0 Traceback; both off is `-r21-mxfp8` bit for bit (short prompts ALL
+IDENTICAL); with both on the greedy outputs differ (13–25 top‑1 flips per long prompt, almost all of them the BF16
+attention's — the expected size of an algorithm change, not of a bug). Decode is untouched by construction (graphs,
+replay rows and the drafter keep the old code). What did **not** make it: FlashInfer's b12x backend for the dense
+MXFP8 GEMMs (`patch_vllm_mxfp8_gemm_b12x_sm120.py`, kept as a documented negative result) — bit‑identical to CUTLASS
+and −26…29 % in a one‑GPU harness, but +2.3 % on the real prefill, because its Python path (autotuner, plan, CuTe‑DSL
+marshalling per call) starves the GPU at ~215 GEMMs per chunk (GPU idle 1.1 → 10.4 %). The lesson is the method rule
+of this front: a harness win is not an in‑situ win; every candidate is measured with the GPU‑idle share of a real
+prefill.
+
+Next on this front, in order of (time × headroom): the MoE FC1 / FC2 (a bit‑identical CUDA replacement of b12x's
+`dynamic` kernels already runs the call1 layer in 1.76 ms against b12x's 2.31 and spec B's 2.10 — 2.1× over the DRAM
+floor of 0.83 ms, with the DeepGEMM 1.0 ms as the intermediate target), then the sparse‑MLA prefill kernel in SASS
+against the BF16 specification, then the all‑gather of the MoE input in MXFP8 instead of bf16.
+
 ## Apply / build / run
 
 ```bash

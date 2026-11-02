@@ -15,21 +15,27 @@ official vLLM images do not run them or the official checkpoints do not fit. Two
 The official checkpoint ([`deepseek-ai/DeepSeek-V4.1-Flash-1017`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017):
 552B plus a 196B Engram table, MXFP8 dense, MXFP4 experts, 510 GB) on four RTX PRO 6000 (96 GB, PCIe):
 TP4, 512K context, DSpark speculative decoding (k = 7), vision, thinking, tool calling, KV offload to
-host RAM and disk. Served image: `vllm-moet-sm120:dsv41-nightly-df3bd094-r21` (the cards at 400 W),
-i.e. vLLM nightly df3bd094 (FlashInfer 0.7.2, DeepGEMM 727f8470) plus Dockerfile steps 17–36 in
+host RAM and disk. Served image: `vllm-moet-sm120:dsv41-nightly-df3bd094-r21-mxfp8` (the cards at 400 W),
+i.e. vLLM nightly df3bd094 (FlashInfer 0.7.2, DeepGEMM 727f8470) plus Dockerfile steps 17–39 in
 [`tools/dsv41_sm120/`](tools/dsv41_sm120/) (b12x MoE at TP4, the fused decode MoE, the deterministic
 indexer top-k, P2P all-reduce in NCCL's summation order, the sparse-MLA gather with its XV loads on
 `ldmatrix`, the mHC boundary kernel as a CTA cluster, the drafter's input prep, the SWA builders'
 decode build and the drafter's SWA update in one launch each, the DSA candidate blocks on the
-deterministic top-k, the shared-expert add fused into the MoE top-k sum — most behind runtime
-switches; as served: the fused MoE, the sparse-MLA gather and steps 30–33 and 36 on, every one of them
-bit-identical to the path it replaces).
+deterministic top-k, the shared-expert add fused into the MoE top-k sum, the boundary kernel's MXFP8
+copy of the layer input — most behind runtime switches; as served: the fused MoE, the sparse-MLA gather
+and steps 30–33, 36, 38–39 on, every one of them bit-identical to the path it replaces). The next image,
+`-r22` (this commit; steps 40–41, the prefill front), moves the sparse-MLA prefill onto FlashInfer's
+full-BF16 kernel and makes the eager prefill's mHC boundaries sequence parallel: on the same cards a fresh
+163K-token prefill takes 7.7 s instead of 8.5 s (−9.4 %, 21K tok/s), 19K tokens 0.90 s instead of 1.01 s,
+with GSM8K-200 194/200, needle 6/6 and decode untouched — a quality-gated change of the prefill's
+arithmetic, not a bit-identical one ([`tools/dsv41_sm120/README.md`](tools/dsv41_sm120/README.md), steps
+40 and 41); it goes into production in the next maintenance window.
 
 | | measured on the served image (`-r21-mxfp8` = `-r21` + steps 38–39 + the deterministic MoE sum of step 27a, DSpark k = 7, 400 W) |
 |---|---|
 | decode, 1 stream | prose **~293 tok/s median (waves 277–301)**, code **~802 tok/s median (waves 786–813)** (128–130 steps/s on short prompts; the Fraser bench below is the stricter single-prompt code measure) |
 | decode, 8 streams | prose ~721 tok/s median (716–759), code ~2,258 tok/s median (2,227–2,289) aggregate, 8 × 1,024 tokens |
-| fresh prefill | 163K tokens in 9.0 s (~18K tok/s), 391K in 22.6 s |
+| fresh prefill | 163K tokens in 9.0 s (~18K tok/s), 391K in 22.6 s; `-r22` (steps 40–41, measured on GPUs 4–7 in the served configuration, 2026-10-30): 163K in 7.7 s (21K tok/s), 19K in 0.90 s |
 | KV cache | **9.62M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
 | quality | GSM8K-200 (no-think, 4 streams) **193/200** on the served image vs 194/200 on the `-r8` baseline (one flip, exact McNemar p = 1); needle PASS at 29K / 106K / 400K; tool calls / JSON / vision pass; identical requests return identical logits at any batch size (three identical teacher-forced calls at 12 and 128 rows: 0 differences) (2026-10-28) |
 
@@ -49,6 +55,8 @@ bit-identical to the path it replaces).
 | mHC boundary | on the model stream (the side-stream version is SM100-only) | off the critical path: +3–5 % steps/s |
 | launch gaps | the indexer's `weights_proj` on 2 cuBLAS CTAs (the main stream waits ~26 µs per layer) | one launch with cuBLAS's bits; 0.4 µs; programmatic dependent launch in our kernels |
 | prefill | the indexer's TP row sharding starts at 65,536 rows, which a 4096-token chunk never reaches; Engram's `wkv` all-gathers on every chunk (+1.8 ms per layer) | sharding from 2048 rows (vllm#61647, −4 % at 391K); `wkv` split over the ranks at decode only |
+| prefill attention (`-r22`) | the V4.1-record prefill rows on sm_120 go through FlashInfer's single-group FP8 kernel (Q, QK, P and PV in FP8; H100 / B200 compute the same attention in BF16) | the full-BF16 SM120 kernel FlashInfer also ships for this storage (both caches dequantized exactly, BF16 QK with fp32 accumulation, fp32 softmax and PV): 24× closer to the fp32 reference on the real records at the same speed (±8 %); runtime switch |
+| prefill collectives (`-r22`) | two `[4096, 5120]` bf16 all-reduces per layer and chunk on the PCIe ring, 29 % of a 163K prefill's GPU time | sequence-parallel mHC boundaries from 2048 tokens per step: reduce-scatter, the boundary on this rank's row shard (bit-identical per row), all-gather of the attention projections (35 % of the bytes) and of the MoE input; fresh prefill −9.4 % at 163K, −10.5 % at 19K; the bits above the gate follow NCCL's reduce-scatter order (`p2p_rs/` reproduces the all-reduce's order exactly, +1 %); runtime switch |
 | `reasoning_effort` | `minimal` / `medium` answer HTTP 400 | accepted (25 / 62) |
 
 Two earlier items are upstream in the current base (vLLM nightly df3bd094) and are no longer differences:
@@ -71,17 +79,18 @@ plus the 64 GiB offload region), so one server per host.
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /srv/models/DeepSeek-V4.1-Flash-1017
-export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r21 \
+export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r22 \
   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .   # ~10 min
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .   # ~11 min
 
 # first start, ~22 min: FlashInfer autotunes into CACHE_DIR (on an empty cache the sweep OOMs at 0.95)
 GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh
 # later starts, as served: 0.94, KV offload to RAM + disk, indexer sharding from 2048 rows, the fused
-# decode MoE and the sparse-MLA gather on, DSpark k = 7 on the b12x MoE backend (target and drafter)
+# decode MoE and the sparse-MLA gather on, DSpark k = 7 on the b12x MoE backend (target and drafter);
+# the last two switches are -r22's prefill front (BF16 sparse-MLA prefill, sequence-parallel boundaries)
 docker stop -t 60 ds41-flash
 KV_OFFLOAD_GIB=64 KV_OFFLOAD_FS_DIR=/srv/kvcache KV_OFFLOAD_PROMPT_ONLY=0 INDEXER_TP_SHARD_MIN_ROWS=2048 \
-  EXTRA_DOCKER_ARGS="-e VLLM_MOET_B12X_MOE_FUSED=1 -e VLLM_MOET_SPARSE_MLA_LDG=1 -e VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 -e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16" \
+  EXTRA_DOCKER_ARGS="-e VLLM_MOET_B12X_MOE_FUSED=1 -e VLLM_MOET_SPARSE_MLA_LDG=1 -e VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 -e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8 -e VLLM_MOET_DFLASH_PREP_GROUPS=1 -e VLLM_MOET_CANDIDATE_DET_TOPK=1 -e VLLM_MOET_SWA_DECODE_BUILD=1 -e VLLM_MOET_MOE_TOPKSUM_ADD=1 -e VLLM_MOET_SWA_DRAFT_BUILD=1 -e B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 -e VLLM_MOET_MHC_MXFP8=1 -e VLLM_MOET_MHC_SIDE_DEFER=1 -e VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 -e VLLM_MOET_PREFILL_SP=1" \
   EXTRA_ARGS='--moe-backend b12x --speculative-config {"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"probabilistic","rejection_sample_method":"block","enable_adaptive_verification":false,"moe_backend":"b12x"}' \
   docker/sm120/run-dsv41.sh
 ```
