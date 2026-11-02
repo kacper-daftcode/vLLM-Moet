@@ -278,18 +278,19 @@ if [[ -n "${SOAK_MINUTES:-}" ]]; then
   # expert after ~15 min with the hot spin + DRAM stream on 24 cores; the socket's PPT is 350 W, Tctl idles at ~70 C):
   # every 30 s Tctl, the socket's HSMP power, the pool cores' MHz (mean of the 24), the GPUs' power
   THERM="/tmp/ds41-hyb-$TAG-thermal.txt"
-  ( echo "t_s Tctl_C socket_W pool_MHz_mean gpu_W_sum"; t0=$(date +%s); while :; do
+  ( echo "t_s Tctl_C socket_W pool_MHz_mean gpu_W_sum gpu_C_max gpu_sm_MHz_min gpu_throttle"; t0=$(date +%s); while :; do
       tctl=$(( $(cat /sys/class/hwmon/hwmon4/temp1_input 2>/dev/null || echo 0) / 1000 ))
       sw=$(( $(cat /sys/class/hwmon/hwmon5/power1_input 2>/dev/null || echo 0) / 1000000 ))
       mhz=$(awk '/^cpu MHz/ {n++; if ((n-1)%8 >= 2) {s += $4; k++}} END {if (k) printf "%d", s / k; else print 0}' /proc/cpuinfo)
-      gw=$(nvidia-smi --query-gpu=power.draw --format=csv,noheader,nounits 2>/dev/null | awk '{s += $1} END {printf "%d", s}')
-      echo "$(( $(date +%s) - t0 )) $tctl $sw $mhz $gw"; sleep 30; done ) > "$THERM" 2>/dev/null &
+      g=$(nvidia-smi --query-gpu=power.draw,temperature.gpu,clocks.sm,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null | \
+          awk -F', *' '{w += $1; if ($2 > t) t = $2; if (m == "" || $3 < m) m = $3; r = r $4 ","} END {printf "%d %d %d %s", w, t, m, r}')
+      echo "$(( $(date +%s) - t0 )) $tctl $sw $mhz $g"; sleep 30; done ) > "$THERM" 2>/dev/null &
   THERM_PID=$!
   $PY "$REPO/tools/dsv41_5090/cpu_tier/soak_probe.py" --port "$PORT" --model "$MODEL" --minutes "$SOAK_MINUTES" \
     --conc "${SOAK_CONC:-4}" --max-tokens "${SOAK_TOKENS:-256}" --out "/tmp/ds41-hyb-$TAG-soak.json" 2>&1 | tail -8 | tee -a "$SUMMARY"
   kill $THERM_PID 2>/dev/null; wait $THERM_PID 2>/dev/null
-  note "thermal trace ($THERM): $(awk 'NR == 2 {a = $0} END {print "start [" a "]  end [" $0 "]"}' "$THERM")  (t_s Tctl_C socket_W pool_MHz gpu_W)"
-  awk 'NR > 1 {if ($2 > t) t = $2; if ($3 > w) w = $3; s += $4; n++} END {if (n) printf "  Tctl max %d C, socket W max %d, pool MHz mean %d over %d samples\n", t, w, s / n, n}' "$THERM" | tee -a "$SUMMARY"
+  note "thermal trace ($THERM): $(awk 'NR == 2 {a = $0} END {print "start [" a "]  end [" $0 "]"}' "$THERM")  (t_s Tctl_C socket_W pool_MHz gpu_W gpu_C_max gpu_sm_MHz_min throttle)"
+  awk 'NR > 1 {if ($2 > t) t = $2; if ($3 > w) w = $3; s += $4; n++; if ($6 > gt) gt = $6; if (gm == "" || $7 < gm) gm = $7} END {if (n) printf "  Tctl max %d C, socket W max %d, pool MHz mean %d, GPU max %d C, GPU SM MHz min %d over %d samples\n", t, w, s / n, gt, gm, n}' "$THERM" | tee -a "$SUMMARY"
   docker logs "$NAME" > "$LOG" 2>&1
   grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
   note "server log: error / traceback lines after the soak: $(grep -ciE "error word|fail.*closed|Traceback" "$LOG")"
