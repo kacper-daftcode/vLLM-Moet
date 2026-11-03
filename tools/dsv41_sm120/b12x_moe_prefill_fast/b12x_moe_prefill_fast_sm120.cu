@@ -9,21 +9,22 @@
 //              atomics, no ordering race) and the CTA work lists of FC1 / FC2 ((expert, 64-row chunk, column tile),
 //              tile-major within an expert so that consecutive items share the expert's weight tile in L2).
 //   fc1        persistent CTAs (256 threads = 8 warps), work item = (expert, <= 4 m16 tiles of its rows, 128-column
-//              tile of gate+up; the 5th tile: 64 columns); warps = 4 n32 slices x 2 row groups (2 m-tiles each, 64 fp32
-//              accumulators per thread). K in K64 stages through a cp.async ring (STAGES deep) holding the k32 blocks
-//              of B (b12x's n64-repacked words as laid out in the plane: one LDS.128 per lane per k32 and projection),
-//              the A rows (XOR-swizzled 16 B chunks, LDS.64 per row and k32) and the k128 scale words of both; the
-//              stage stream is continuous across items (the next item's first stages are in flight during the
-//              epilogue). Per output element the QMMA chain is spec B's: accumulate in C over the k32 blocks in order,
-//              from +0. Epilogue in registers: alpha * input_global_scale, SwiGLU with limit (min.NaN / max.NaN), ex2 /
-//              rcp approx, cvt.rn.satfinite.bf16x2, then per row and 32-column block (= the warp's n32 slice) the amax
-//              over the quad (max is commutative: the same value as the sequential compare-and-select),
-//              quantize_block_fp8_mx per element, a 4x4 transpose of the e4m3 pairs across the quad, one 8 B store per
-//              lane and row, the scale byte.
+//              tile of gate+up; the 5th tile: 64 columns); warps = 8 n16 column slices, every warp over all m-tiles of
+//              the item (acc[4][2 proj][2 n8][4] = 64 fp32 per thread; the 64-column tile: 4 slices x 2 m-tile halves).
+//              K in K64 stages through a cp.async ring (STAGES deep) holding the k32 blocks of B (b12x's n64-repacked
+//              words as laid out in the plane: one LDS.64 per lane per k32 and projection, spread to e2m1 containers
+//              once per CTA), the A rows (one LDS.128 per m-tile and k32, see the skeleton header) and the k128 scale
+//              words of both; the stage stream is continuous across items (the next item's first stages are in flight
+//              during the epilogue). Per output element the QMMA chain is spec B's: accumulate in C over the k32 blocks
+//              in order, from +0. Epilogue in registers: alpha * input_global_scale, SwiGLU with limit (min.NaN /
+//              max.NaN), ex2 / rcp approx, cvt.rn.satfinite.bf16x2, then per row and 32-column block the amax: over the
+//              quad for the warp's 16 columns, then with the other half's partial through shared memory (max is
+//              commutative and exact: the same value as the sequential compare-and-select), quantize_block_fp8_mx per
+//              element, a transpose of the e4m3 pairs across the quad, two 8 B stores per row and slice, the scale byte.
 //   fc2        the same skeleton with K = 640 (18 live k32 blocks + the zero tail: 20 QMMAs per n8 tile as b12x),
-//              item = (expert, <= 4 m-tiles, 128 output columns); epilogue: (down_alpha * global_scale) * token weight,
-//              cvt.rn.satfinite.bf16x2 into the token-major route rows (a 4x4 word transpose across the quad: 16 B
-//              stores).
+//              item = (expert, <= 4 m-tiles, 128 output columns), acc[4][2][4] = 32 per thread; epilogue:
+//              (down_alpha * global_scale) * token weight (staged with the pairs), cvt.rn.satfinite.bf16x2 into the
+//              token-major route rows (a word transpose across the quad: two 16 B stores per row and slice).
 //   topk_sum   out[t, col] = bf16((((0 + r0) + r1) + ...)) over the token's pairs in slot order (ids < 0 skipped), fp32
 //              adds of the bf16 route values - spec B's topk_sum, 8 columns per thread (integrated, b12x's own TopKSum
 //              runs instead: the route rows are the interface).
@@ -410,38 +411,52 @@ __global__ void __launch_bounds__(kFrontThreads) frontend_kernel(FrontArgs a) {
 // its rows, one column tile); for every item it streams K64 stages through a STAGES-deep cp.async ring; the stage
 // stream does not stop at item boundaries (the next item's first stages are in flight during the epilogue).
 //
-// Stage layout (bytes): B [kk 2][n32 chunk NS][lane 32][16 B] per projection (FC1: 2 projections), then A as
-// [m-tile 4][kk 2][quad row 8][c 4][4 words] where the 4 words of a (m-tile, kk, q, c) group are
-// (row q: k32 word 2c, row q + 8: word 2c, row q: word 2c + 1, row q + 8: word 2c + 1) = the QMMA A fragment of lane
-// (q, c) in register order: one LDS.128 per m-tile and k32, no shuffling. Then the k128 scale words of the 64 rows and
-// of the columns ([proj][128] words; FC2's tail slice: 128 x u16).
+// Warp tiling (v6, "retile"): the 8 warps are 8 n16 column slices of the tile and every warp computes ALL m-tiles of the
+// item (FC1: acc[m-tile 4][proj 2][n8 2][4] = 64 fp32, FC2: acc[4][2][4] = 32). Every B word is therefore spread by one
+// warp (the n32 x 2-row-group tiling of v1-v5 spread each word twice) and 1-, 2- and 3-tile items keep all 8 warps busy
+// (v5 idled half of them on 1- and 2-tile items). FC1's 64-column tile (tile 4): n16 slice = warp & 3, m-tiles
+// 2 (warp >> 2), +1. The per-element arithmetic and the per-accumulator QMMA chain (k32 blocks in order, acc in C from
+// +0) are unchanged; only which warp owns an output element differs.
+//
+// Stage layout (bytes): B [kk 2][n32 chunk NS][lane 32][16 B] per projection (FC1: 2 projections) = the plane's layout
+// (an n16 slice reads 8 B per lane out of the 16 B: LDS.64), then A as [m-tile 4][kk 2][quad row 8][c 4][4 words] where
+// the 4 words of a (m-tile, kk, q, c) group are (row q: k32 word 2c, row q + 8: word 2c, row q: word 2c + 1, row q + 8:
+// word 2c + 1) = the QMMA A fragment of lane (q, c) in register order: one LDS.128 per m-tile and k32, no shuffling. Then
+// the k128 scale words of the 64 rows and of the columns ([proj][128] words; FC2's tail slice: 128 x u16).
 // A is copied with 4 B cp.async: warp w takes k32 block kk = w / 4 of the rows p, p + 8, p + 1, p + 9 (p = 2 (w % 4)),
 // lane = (row of the four, word 0..7 of the k32 block) - the 32 words of one instruction land in 32 distinct banks.
+// The rows' k128 scale words are copied by warps 0-1 (thread = row). Rows of padding and of the tiles >= m_tiles have
+// the offset 0xFFFFFFFF in ring.aoff and are zero-filled (cp.async src-size 0).
 //
 // Work-item hand-off: item_0 = blockIdx.x; item_{k+1} = gridDim.x + atomicAdd(counter) (dynamic) or item_k + gridDim.x
 // (static). Thread 0 claims it 10 stages before the issue side needs it (ring.items[(k+1) & 1]); the item's metadata
 // (four ints, threads 0-3) and its 64 row -> pair entries (threads 0-63) are staged through ring.meta / ring.pairs /
-// ring.aoff (slot (k+1) & 1), every global load consumed two stages after it was issued (one register per thread in
-// between), every shared hand-off with a barrier in between. The compute side reads the same slots: meta at the start
-// of item k + 1, items at the end of item k, pairs in the epilogue (slot k & 1, rewritten only while item k + 1 is
-// being issued, long after).
+// ring.aoff (FC2: + ring.tw, the token weights, by cp.async) (slot (k+1) & 1), every global load consumed two stages
+// after it was issued (one register per thread in between), every shared hand-off with a barrier in between. The
+// compute side reads the same slots: meta at the start of item k + 1, items at the end of item k, pairs / tw in the
+// epilogue (slot k & 1, rewritten only while item k + 1 is being issued, long after). The compute side's item index k
+// is not kept: the issue side is exactly STAGES - 1 stages ahead (one issue per computed stage, STAGES - 1 in the
+// prologue, STAGES - 1 < n_stages), so iss_k == k at the start of item k and iss_k == k + 1 after its K-loop (iss_k is
+// bumped when the last stage of an item is issued, also when no item follows).
 struct ItemRing {
   int items[2];
-  int4 meta[2];        // (expert, row0, m_tiles, tile); m_tiles == 0: no item
-  int pairs[2][64];    // pair of the 64 rows (-1: padding)
+  int4 meta[2];          // (expert, row0, m_tiles, tile); m_tiles == 0: no item
+  int pairs[2][64];      // pair of the 64 rows (-1: padding)
   uint32_t aoff[2][64];  // A row byte offset of the 64 rows (0xFFFFFFFF: padding)
+  float tw[2][64];       // FC2: token weight of the 64 rows (0 for padding)
 };
 
 __device__ __forceinline__ int claim_next_item(int32_t* counter, int cur, int dynamic_schedule) {
   return dynamic_schedule ? (int)gridDim.x + atomicAdd(counter, 1) : cur + (int)gridDim.x;
 }
 
-// the staged hand-off of the next work item (see above): t = the stage being issued, c = claim_at
-template <typename AoffFn>
+// the staged hand-off of the next work item (see above): t = the stage being issued, c = claim_at; on_pair(nb, tid, pair)
+// runs for threads 0-63 in the step that publishes the pairs (FC2 stages the token weight there)
+template <typename AoffFn, typename PairFn>
 __device__ __forceinline__ void stage_next_item(ItemRing& ring, int t, int c, int nb, int tid, int n_items,
                                                 const int4* items, const int32_t* row_pair, int32_t* counter,
                                                 int cur_item, int dynamic_schedule, int& nxt_item, int& nxt_meta_i,
-                                                int& nxt_pair, AoffFn aoff_of) {
+                                                int& nxt_pair, AoffFn aoff_of, PairFn on_pair) {
   if (t == c && tid == 0) nxt_item = claim_next_item(counter, cur_item, dynamic_schedule);
   if (t == c + 2 && tid == 0) ring.items[nb] = nxt_item;
   if (t == c + 3 && tid < 4) {
@@ -456,6 +471,7 @@ __device__ __forceinline__ void stage_next_item(ItemRing& ring, int t, int c, in
   if (t == c + 8 && tid < 64) {
     ring.pairs[nb][tid] = nxt_pair;
     ring.aoff[nb][tid] = nxt_pair >= 0 ? aoff_of(nxt_pair) : 0xFFFFFFFFu;
+    on_pair(nb, tid, nxt_pair);
   }
 }
 
@@ -479,6 +495,7 @@ template <int STAGES, int MINB>
 __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
+  __shared__ float s_amax[2][8][16];  // epilogue: a warp's partial amax (its 16 columns) of the 16 rows of an m-tile, by m-tile parity
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int q = lane >> 2, c = lane & 3;
   const int K = a.K, n_stages = K / 64;
@@ -492,8 +509,8 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   const int my_r16 = 2 * (warp & 3) + (sub >> 1) + 8 * (sub & 1);
   const uint32_t a_dst0 = (uint32_t)((kk_c * 8 + 2 * (warp & 3) + (sub >> 1)) * 64 + (kw8 >> 1) * 16 + ((kw8 & 1) * 2 + (sub & 1)) * 4);
   const uint32_t a_src0 = kk_c * 32 + kw8 * 4;
-  const bool sfa_role = (tid & 0x87) == 0;  // kk 0, word 0: the row's k128 scale word
   const auto aoff_of = [&](int pair) { return (uint32_t)(pair / a.topk) * (uint32_t)K; };
+  const auto no_pair_hook = [](int, int, int) {};
 
   // ---- issue side
   int iss_item = blockIdx.x, iss_k = 0, iss_stage = 0, iss_mtiles = 0, iss_slot = 0;
@@ -518,11 +535,12 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
     if (iss_mtiles > 0) {
       const uint32_t sb = sbase0 + buf * kF1Stage;
       const int t = iss_stage, nb = (iss_k + 1) & 1;
-      uint32_t aoff4[4];  // the rows' A offsets first: their LDS latency overlaps the B address work (ncu: ISETP on them stalled)
+      uint32_t aoff4[4];  // the rows' A offsets first: their LDS latency overlaps the B address work
 #pragma unroll
       for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[iss_slot][j * 16 + my_r16];
+      const uint32_t aoff_sf = warp < 2 ? ring.aoff[iss_slot][tid] : 0xFFFFFFFFu;  // warps 0-1: the scale word of row tid
       stage_next_item(ring, t, claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 3, iss_item,
-                      a.dynamic_schedule, nxt_item, nxt_meta_i, nxt_pair, aoff_of);
+                      a.dynamic_schedule, nxt_item, nxt_meta_i, nxt_pair, aoff_of, no_pair_hook);
       // B: two projections, the 2 k32 blocks of the stage (128-column tiles: 256 x 16 B per projection)
       if (iss_wide) {
         const uint32_t o = (tid >> 7) * 2048 + (tid & 127) * 16;
@@ -545,14 +563,18 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
           cp_async16(sb + kF1B + kF1A + kF1SFA + proj * 512 + j * 16, iss_sfb + proj * sproj_b + (t >> 1) * 256 + j * 16);
         }
       }
-      // A: one word per thread and m-tile (+ the row's k128 scale word), zero-filled for padding rows / tiles
+      // A: one word per thread and m-tile, zero-filled for padding rows and for the tiles >= m_tiles (offset 0xFFFFFFFF)
 #pragma unroll
       for (int j = 0; j < 4; ++j) {
         const uint32_t off = aoff4[j];
-        const bool on = j < iss_mtiles && off != 0xFFFFFFFFu;
+        const bool on = off != 0xFFFFFFFFu;
         const uint32_t o = on ? off : 0u;
         cp_async4_zfill(sb + kF1B + a_dst0 + j * 1024, reinterpret_cast<const uint8_t*>(a.a_values) + o + t * 64 + a_src0, on ? 4 : 0);
-        if (sfa_role) cp_async4_zfill(sb + kF1B + kF1A + (j * 16 + my_r16) * 4, a.a_scales + (o >> 5) + (t >> 1) * 4, on ? 4 : 0);
+      }
+      if (warp < 2) {  // the rows' k128 scale words: row tid
+        const bool on = aoff_sf != 0xFFFFFFFFu;
+        const uint32_t o = on ? aoff_sf : 0u;
+        cp_async4_zfill(sb + kF1B + kF1A + tid * 4, a.a_scales + (o >> 5) + (t >> 1) * 4, on ? 4 : 0);
       }
       if (++iss_stage == n_stages) {
         iss_item = ring.items[nb];
@@ -564,9 +586,6 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   };
 
   // ---- the first item: metadata, pairs and offsets straight from global memory
-  // the compute side's item index k is not kept: the issue side is exactly STAGES - 1 stages ahead (one issue per
-  // computed stage, STAGES - 1 in the prologue, STAGES - 1 < n_stages), so iss_k == k at the start of item k and
-  // iss_k == k + 1 after its K-loop (iss_k is bumped when the last stage of an item is issued, also when no item follows).
   int item = blockIdx.x;
   if (tid < 4) reinterpret_cast<int*>(&ring.meta[0])[tid] = item < n_items ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + tid) : 0;
   __syncthreads();
@@ -589,62 +608,59 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   while (item < n_items) {
     const int4 it = ring.meta[iss_k & 1];  // slot k & 1
     const int e = it.x, m_tiles = it.z, tile = it.w;
-    const int lg = tile == kN1Tiles - 1 ? 1 : 2, NG = 8 >> lg;  // 4 n32 slices (2 for the 64-column tile)
-    const int ns = warp & ((1 << lg) - 1), mg = warp >> lg;
-    const int mt0 = mg, mt1 = mg + NG;
-    const bool v0 = mt0 < m_tiles, v1 = mt1 < m_tiles;
+    const bool wide = tile != kN1Tiles - 1;
+    // warp tiling: 128-column tiles: n16 slice = warp, all m-tiles; the 64-column tile: slice = warp & 3, m-tiles 2 (warp >> 2), +1
+    const int ns16 = wide ? warp : (warp & 3);
+    const int mt_lo = wide ? 0 : 2 * (warp >> 2), mt_hi = wide ? 4 : mt_lo + 2;
+    bool act[4];
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) act[mt] = mt >= mt_lo && mt < mt_hi && mt < m_tiles;  // warp-uniform
     const float alpha = fmul(__ldg(a.alpha + e), __ldg(a.input_global_scale + (a.igs_per_expert ? e : 0)));
 
-    float acc[2][2][4][4];
+    float acc[4][2][2][4];
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
       for (int p = 0; p < 2; ++p)
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
+        for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
-          for (int r = 0; r < 4; ++r) acc[i][p][nt][r] = 0.f;
+          for (int r = 0; r < 4; ++r) acc[mt][p][nt][r] = 0.f;
 
-    const uint32_t a_off0 = kF1B + (mt0 * 16 + q) * 64 + c * 16;  // + kk * 512
-    const uint32_t a_off1 = kF1B + (mt1 * 16 + q) * 64 + c * 16;
-    const uint32_t sfa_off0 = kF1B + kF1A + (mt0 * 16 + q + ((lane & 1) << 3)) * 4;
-    const uint32_t sfa_off1 = kF1B + kF1A + (mt1 * 16 + q + ((lane & 1) << 3)) * 4;
-    const uint32_t b_off = ns * 512 + lane * 16;
-    const uint32_t sfb_off = kF1B + kF1A + kF1SFA + (ns * 32 + q) * 4;
+    const uint32_t a_off = kF1B + q * 64 + c * 16;                        // + mt * 1024 + kk * 512
+    const uint32_t sfa_off = kF1B + kF1A + (q + ((lane & 1) << 3)) * 4;    // + mt * 64
+    const uint32_t b_off = (ns16 >> 1) * 512 + lane * 16 + (ns16 & 1) * 8; // + p * 4096 + kk * 2048 (8 B of the lane's 16 B)
+    const uint32_t sfb_off = kF1B + kF1A + kF1SFA + (ns16 * 16 + q) * 4;   // + p * 512 + nt * 32
 
     auto compute_stage = [&](const uint8_t* sp, auto kb_tag) {
       constexpr int KB0 = decltype(kb_tag)::value;
-      uint32_t sfb[2][4], sfa0 = 0u, sfa1 = 0u;
+      uint32_t sfb[2][2], sfa[4];
 #pragma unroll
       for (int p = 0; p < 2; ++p)
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) sfb[p][nt] = *reinterpret_cast<const uint32_t*>(sp + sfb_off + p * 512 + nt * 32);
-      if (v0) sfa0 = *reinterpret_cast<const uint32_t*>(sp + sfa_off0);
-      if (v1) sfa1 = *reinterpret_cast<const uint32_t*>(sp + sfa_off1);
+        for (int nt = 0; nt < 2; ++nt) sfb[p][nt] = *reinterpret_cast<const uint32_t*>(sp + sfb_off + p * 512 + nt * 32);
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
-        // both A fragments first, then one projection's B at a time: 8 + 8 live fragment registers instead of 16 + 4
-        // (the per-accumulator QMMA chain is unchanged: acc[i][p][nt] still sees the k32 blocks in order)
-        uint4 af0 = make_uint4(0u, 0u, 0u, 0u), af1 = make_uint4(0u, 0u, 0u, 0u);
-        if (v0) af0 = *reinterpret_cast<const uint4*>(sp + a_off0 + kk * 512);
-        if (v1) af1 = *reinterpret_cast<const uint4*>(sp + a_off1 + kk * 512);
+        // the warp's n16 slice of B (both projections) once, then the A fragment of each m-tile (acc[mt][p][nt] still sees
+        // the k32 blocks in order)
+        uint32_t b[2][2][2];
 #pragma unroll
         for (int p = 0; p < 2; ++p) {
-          uint32_t b[4][2];
-          const uint4 w = *reinterpret_cast<const uint4*>(sp + p * 4096 + kk * 2048 + b_off);
-          spread_e2m1x8(w.x, b[0][0], b[0][1]);
-          spread_e2m1x8(w.y, b[1][0], b[1][1]);
-          spread_e2m1x8(w.z, b[2][0], b[2][1]);
-          spread_e2m1x8(w.w, b[3][0], b[3][1]);
-          if (v0) {
+          const uint2 w = *reinterpret_cast<const uint2*>(sp + p * 4096 + kk * 2048 + b_off);
+          spread_e2m1x8(w.x, b[p][0][0], b[p][0][1]);
+          spread_e2m1x8(w.y, b[p][1][0], b[p][1][1]);
+        }
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt)
-              qmma_kk<KB0>(kk, acc[0][p][nt], af0.x, af0.y, af0.z, af0.w, b[nt][0], b[nt][1], sfa0, sfb[p][nt]);
-          }
-          if (v1) {
+        for (int mt = 0; mt < 4; ++mt) {
+          if (act[mt]) {
+            const uint4 af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
 #pragma unroll
-            for (int nt = 0; nt < 4; ++nt)
-              qmma_kk<KB0>(kk, acc[1][p][nt], af1.x, af1.y, af1.z, af1.w, b[nt][0], b[nt][1], sfa1, sfb[p][nt]);
+            for (int p = 0; p < 2; ++p)
+#pragma unroll
+              for (int nt = 0; nt < 2; ++nt)
+                qmma_kk<KB0>(kk, acc[mt][p][nt], af.x, af.y, af.z, af.w, b[p][nt][0], b[p][nt][1], sfa[mt], sfb[p][nt]);
           }
         }
       }
@@ -666,43 +682,61 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
       buf = buf + 1 == STAGES ? 0 : buf + 1;
     }
 
-    // ---- epilogue: activation, bf16, MXFP8 per row and 32-column block (this warp's n32 slice), in registers
+    // ---- epilogue: activation, bf16, MXFP8 per row and 32-column block. A warp holds 16 of the block's 32 columns: its
+    // partial amax (4 values per lane, quad max) meets the partner warp's (warp ^ 1, the other n16 half of the same rows)
+    // through shared memory; max is exact and commutative, so the block amax, the scale byte and the e4m3 bytes are the
+    // same as with one warp per block. One barrier per m-tile (the m-tile loop is CTA-uniform: m_tiles is the item's).
+    const int pslot = (iss_k + 1) & 1;  // slot k & 1 (iss_k == k + 1 here)
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      if (!(i == 0 ? v0 : v1)) continue;
-      const int mt = i == 0 ? mt0 : mt1;
+    for (int mt = 0; mt < 4; ++mt) {  // fully unrolled: acc[mt] stays in registers; `mt < m_tiles` is CTA-uniform
+      if (mt >= m_tiles) continue;
+      float v[2][4], am[2] = {0.f, 0.f};
+      if (act[mt]) {
 #pragma unroll
-      for (int hf = 0; hf < 2; ++hf) {
-        const int pair = ring.pairs[(iss_k + 1) & 1][mt * 16 + q + hf * 8];  // slot k & 1 (iss_k == k + 1 here)
-        float v[8];
-        uint32_t h[4];
+        for (int hf = 0; hf < 2; ++hf) {
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
-          // projection 0 of the plane = up, 1 = gate
-          const float x0 = activated_value(acc[i][1][nt][2 * hf], acc[i][0][nt][2 * hf], alpha, a.limit);
-          const float x1 = activated_value(acc[i][1][nt][2 * hf + 1], acc[i][0][nt][2 * hf + 1], alpha, a.limit);
-          const uint32_t pk = pack_bf16x2(x0, x1);
-          v[2 * nt] = __uint_as_float(pk << 16);
-          v[2 * nt + 1] = __uint_as_float(pk & 0xFFFF0000u);
+          for (int nt = 0; nt < 2; ++nt) {
+            // projection 0 of the plane = up, 1 = gate
+            const float x0 = activated_value(acc[mt][1][nt][2 * hf], acc[mt][0][nt][2 * hf], alpha, a.limit);
+            const float x1 = activated_value(acc[mt][1][nt][2 * hf + 1], acc[mt][0][nt][2 * hf + 1], alpha, a.limit);
+            const uint32_t pk = pack_bf16x2(x0, x1);
+            v[hf][2 * nt] = __uint_as_float(pk << 16);
+            v[hf][2 * nt + 1] = __uint_as_float(pk & 0xFFFF0000u);
+          }
+          float amax = 0.f;
+#pragma unroll
+          for (int kx = 0; kx < 4; ++kx) amax = fmax_plain(amax, fabs_plain(v[hf][kx]));
+          amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+          amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+          am[hf] = amax;
+          if (c == 0) s_amax[mt & 1][warp][q + hf * 8] = amax;
         }
-        float amax = 0.f;
+      }
+      __syncthreads();
+      if (act[mt]) {
 #pragma unroll
-        for (int kx = 0; kx < 8; ++kx) amax = fmax_plain(amax, fabs_plain(v[kx]));
-        amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
-        amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
-        float inv;
-        const uint32_t byte = mx_scale(amax, inv);
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt) h[nt] = cvt_e4m3x2(fmul(v[2 * nt], inv), fmul(v[2 * nt + 1], inv));
-        uint32_t o0, o1;
-        quad_transpose16(h, c, o0, o1);
-        if (pair >= 0) {
-          uint2* dst = reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(a.inter) + (size_t)pair * kInterBytes +
-                                               tile * 128 + ns * 32 + c * 8);
-          *dst = make_uint2(o0, o1);
-          uint8_t* sf = a.inter_sf + (size_t)pair * (kSlices * 4) + tile * 4;
-          if (c == 0) sf[ns] = (uint8_t)byte;
-          if (tile == kN1Tiles - 1 && c == 1) sf[ns + 2] = 0;  // the tail slice's zero scale bytes
+        for (int hf = 0; hf < 2; ++hf) {
+          const int row = mt * 16 + q + hf * 8;
+          const int pair = ring.pairs[pslot][row];
+          const float amax = fmax_plain(am[hf], s_amax[mt & 1][warp ^ 1][q + hf * 8]);
+          float inv;
+          const uint32_t byte = mx_scale(amax, inv);
+          uint32_t h[4] = {cvt_e4m3x2(fmul(v[hf][0], inv), fmul(v[hf][1], inv)),
+                           cvt_e4m3x2(fmul(v[hf][2], inv), fmul(v[hf][3], inv)), 0u, 0u};
+          uint32_t o0, o1;
+          quad_transpose16(h, c, o0, o1);  // lanes 0 / 1 now hold the 8 bytes of columns 0-7 / 8-15 of the slice
+          if (pair >= 0) {
+            if (c < 2) {
+              uint2* dst = reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(a.inter) + (size_t)pair * kInterBytes +
+                                                   tile * 128 + ns16 * 16 + c * 8);
+              *dst = make_uint2(o0, o1);
+            }
+            if ((ns16 & 1) == 0) {  // the block's scale byte (and the tail slice's zero bytes) by the even half
+              uint8_t* sf = a.inter_sf + (size_t)pair * (kSlices * 4) + tile * 4;
+              if (c == 0) sf[ns16 >> 1] = (uint8_t)byte;
+              if (!wide && c == 1) sf[(ns16 >> 1) + 2] = 0;
+            }
+          }
         }
       }
     }
@@ -743,8 +777,11 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
   const int my_r16 = 2 * (warp & 3) + (sub >> 1) + 8 * (sub & 1);
   const uint32_t a_dst0 = (uint32_t)((kk_c * 8 + 2 * (warp & 3) + (sub >> 1)) * 64 + (kw8 >> 1) * 16 + ((kw8 & 1) * 2 + (sub & 1)) * 4);
   const uint32_t a_src0 = kk_c * 32 + kw8 * 4;
-  const bool sfa_role = (tid & 0x87) == 0;
   const auto aoff_of = [](int pair) { return (uint32_t)pair * (uint32_t)kInterBytes; };
+  // the token weight of the row goes into ring.tw with the pairs (cp.async, zero for padding rows)
+  const auto tw_hook = [&](int nb, int row, int pair) {
+    cp_async4_zfill(smem_addr(&ring.tw[nb][row]), a.token_weights + (pair >= 0 ? pair : 0), pair >= 0 ? 4 : 0);
+  };
 
   int iss_item = blockIdx.x, iss_k = 0, iss_stage = 0, iss_mtiles = 0, iss_slot = 0;
   const uint8_t* iss_b = reinterpret_cast<const uint8_t*>(a.w2);
@@ -769,18 +806,23 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
       uint32_t aoff4[4];
 #pragma unroll
       for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[iss_slot][j * 16 + my_r16];
+      const uint32_t aoff_sf = warp < 2 ? ring.aoff[iss_slot][tid] : 0xFFFFFFFFu;
       stage_next_item(ring, t, claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 4, iss_item,
-                      a.dynamic_schedule, nxt_item, nxt_meta_i, nxt_pair, aoff_of);
+                      a.dynamic_schedule, nxt_item, nxt_meta_i, nxt_pair, aoff_of, tw_hook);
       if (t < n_stages - 1) {  // the last stage is the zero tail: nothing to load
         const uint32_t o = (tid >> 7) * 2048 + (tid & 127) * 16;
         cp_async16(sb + o, iss_b + (size_t)t * 4096 + o);
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           const uint32_t off = aoff4[j];
-          const bool on = j < iss_mtiles && off != 0xFFFFFFFFu;
+          const bool on = off != 0xFFFFFFFFu;
           const uint32_t oo = on ? off : 0u;
           cp_async4_zfill(sb + kF2B + a_dst0 + j * 1024, reinterpret_cast<const uint8_t*>(a.inter) + oo + t * 64 + a_src0, on ? 4 : 0);
-          if (sfa_role) cp_async4_zfill(sb + kF2B + kF2A + (j * 16 + my_r16) * 4, a.inter_sf + (oo >> 5) + (t >> 1) * 4, on ? 4 : 0);
+        }
+        if (warp < 2) {
+          const bool on = aoff_sf != 0xFFFFFFFFu;
+          const uint32_t oo = on ? aoff_sf : 0u;
+          cp_async4_zfill(sb + kF2B + kF2A + tid * 4, a.inter_sf + (oo >> 5) + (t >> 1) * 4, on ? 4 : 0);
         }
         const int s = t >> 1;
         if (tid < (s == kSlices - 1 ? 16 : 32)) cp_async16(sb + kF2B + kF2A + kF2SFA + tid * 16, iss_sf + s * 512 + tid * 16);
@@ -794,7 +836,7 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     cp_async_commit();
   };
 
-  int item = blockIdx.x, k = 0;
+  int item = blockIdx.x;
   if (tid < 4) reinterpret_cast<int*>(&ring.meta[0])[tid] = item < n_items ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + tid) : 0;
   __syncthreads();
   if (tid < 64) {
@@ -802,6 +844,7 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     const int pr = tid < m.z * 16 ? __ldg(a.row_pair + m.y + tid) : -1;
     ring.pairs[0][tid] = pr;
     ring.aoff[0][tid] = pr >= 0 ? aoff_of(pr) : 0xFFFFFFFFu;
+    ring.tw[0][tid] = pr >= 0 ? __ldg(a.token_weights + pr) : 0.f;
   }
   __syncthreads();
   start_issue_item(0);
@@ -814,80 +857,56 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
   }
   int buf = 0;
   while (item < n_items) {
-    const int4 it = ring.meta[k & 1];
+    const int4 it = ring.meta[iss_k & 1];  // slot k & 1
     const int e = it.x, m_tiles = it.z, tile = it.w;
-    const int ns = warp & 3, mg = warp >> 2;
-    const int mt0 = mg, mt1 = mg + 2;
-    const bool v0 = mt0 < m_tiles, v1 = mt1 < m_tiles;
+    const int ns16 = warp;  // n16 slice of the 128 output columns; every warp takes all m-tiles
     const float down_scale = fmul(__ldg(a.down_alpha + e), __ldg(a.global_scale + (a.gs_per_expert ? e : 0)));
-    // the epilogue's pairs and token weights, fetched now (latency hidden behind the item's stages)
-    int ep_pair[2][2];
-    float ep_tw[2][2];
-#pragma unroll
-    for (int i = 0; i < 2; ++i)
-#pragma unroll
-      for (int hf = 0; hf < 2; ++hf) {
-        const int mt = i == 0 ? mt0 : mt1;
-        const int pr = (i == 0 ? v0 : v1) ? ring.pairs[k & 1][mt * 16 + q + hf * 8] : -1;
-        ep_pair[i][hf] = pr;
-        ep_tw[i][hf] = __ldg(a.token_weights + (pr >= 0 ? pr : 0));
-      }
 
-    float acc[2][4][4];
+    float acc[4][2][4];
 #pragma unroll
-    for (int i = 0; i < 2; ++i)
+    for (int mt = 0; mt < 4; ++mt)
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt)
+      for (int nt = 0; nt < 2; ++nt)
 #pragma unroll
-        for (int r = 0; r < 4; ++r) acc[i][nt][r] = 0.f;
+        for (int r = 0; r < 4; ++r) acc[mt][nt][r] = 0.f;
 
-    const uint32_t a_off0 = kF2B + (mt0 * 16 + q) * 64 + c * 16;
-    const uint32_t a_off1 = kF2B + (mt1 * 16 + q) * 64 + c * 16;
-    const uint32_t sfa_off0 = kF2B + kF2A + (mt0 * 16 + q + ((lane & 1) << 3)) * 4;
-    const uint32_t sfa_off1 = kF2B + kF2A + (mt1 * 16 + q + ((lane & 1) << 3)) * 4;
-    const uint32_t b_off = ns * 512 + lane * 16;
-    const int col_q = ns * 32 + q;
+    const uint32_t a_off = kF2B + q * 64 + c * 16;                        // + mt * 1024 + kk * 512
+    const uint32_t sfa_off = kF2B + kF2A + (q + ((lane & 1) << 3)) * 4;    // + mt * 64
+    const uint32_t b_off = (ns16 >> 1) * 512 + lane * 16 + (ns16 & 1) * 8; // + kk * 2048
+    const int col_q = ns16 * 16 + q;
 
     // ZERO: the k32 blocks 18-19 (zero A, zero B, zero scale bytes); TAIL: slice 4 (u16 scale words)
     auto compute_stage = [&](const uint8_t* sp, auto kb_tag, auto zero_tag, auto tail_tag) {
       constexpr int KB0 = decltype(kb_tag)::value;
       constexpr bool ZERO = decltype(zero_tag)::value;
       constexpr bool TAIL = decltype(tail_tag)::value;
-      uint32_t sfb[4] = {0u, 0u, 0u, 0u}, sfa0 = 0u, sfa1 = 0u;
+      uint32_t sfb[2] = {0u, 0u}, sfa[4] = {0u, 0u, 0u, 0u};
       if constexpr (!ZERO) {
 #pragma unroll
-        for (int nt = 0; nt < 4; ++nt) {
+        for (int nt = 0; nt < 2; ++nt) {
           if constexpr (TAIL) sfb[nt] = *reinterpret_cast<const uint16_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 2);
           else sfb[nt] = *reinterpret_cast<const uint32_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 4);
         }
-        if (v0) sfa0 = *reinterpret_cast<const uint32_t*>(sp + sfa_off0);
-        if (v1) sfa1 = *reinterpret_cast<const uint32_t*>(sp + sfa_off1);
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
       }
 #pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
-        uint32_t b[4][2];
-        uint4 af0 = make_uint4(0u, 0u, 0u, 0u), af1 = make_uint4(0u, 0u, 0u, 0u);
+        uint32_t b[2][2] = {{0u, 0u}, {0u, 0u}};
         if constexpr (!ZERO) {
-          const uint4 w = *reinterpret_cast<const uint4*>(sp + kk * 2048 + b_off);
+          const uint2 w = *reinterpret_cast<const uint2*>(sp + kk * 2048 + b_off);
           spread_e2m1x8(w.x, b[0][0], b[0][1]);
           spread_e2m1x8(w.y, b[1][0], b[1][1]);
-          spread_e2m1x8(w.z, b[2][0], b[2][1]);
-          spread_e2m1x8(w.w, b[3][0], b[3][1]);
-          if (v0) af0 = *reinterpret_cast<const uint4*>(sp + a_off0 + kk * 512);
-          if (v1) af1 = *reinterpret_cast<const uint4*>(sp + a_off1 + kk * 512);
-        } else {
-#pragma unroll
-          for (int nt = 0; nt < 4; ++nt) b[nt][0] = b[nt][1] = 0u;
         }
-        if (v0) {
 #pragma unroll
-          for (int nt = 0; nt < 4; ++nt)
-            qmma_kk<KB0>(kk, acc[0][nt], af0.x, af0.y, af0.z, af0.w, b[nt][0], b[nt][1], sfa0, sfb[nt]);
-        }
-        if (v1) {
+        for (int mt = 0; mt < 4; ++mt) {
+          if (mt < m_tiles) {
+            uint4 af = make_uint4(0u, 0u, 0u, 0u);
+            if constexpr (!ZERO) af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
 #pragma unroll
-          for (int nt = 0; nt < 4; ++nt)
-            qmma_kk<KB0>(kk, acc[1][nt], af1.x, af1.y, af1.z, af1.w, b[nt][0], b[nt][1], sfa1, sfb[nt]);
+            for (int nt = 0; nt < 2; ++nt)
+              qmma_kk<KB0>(kk, acc[mt][nt], af.x, af.y, af.z, af.w, b[nt][0], b[nt][1], sfa[mt], sfb[nt]);
+          }
         }
       }
     };
@@ -911,27 +930,28 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     step(I0{}, F{}, Tr{});   // stage 8: k32 16, 17 (the tail slice's u16 scale words)
     step(I2{}, Tr{}, Tr{});  // stage 9: k32 18, 19 (zeros)
 
-    // ---- epilogue: scale, bf16, token-major route rows (16 B per lane after the quad transpose)
+    // ---- epilogue: scale, bf16, token-major route rows (the slice's 16 columns = 32 B per row: lanes 0 / 1 store 16 B)
+    const int pslot = (iss_k + 1) & 1;  // slot k & 1 (iss_k == k + 1 here)
 #pragma unroll
-    for (int i = 0; i < 2; ++i) {
-      if (!(i == 0 ? v0 : v1)) continue;
+    for (int mt = 0; mt < 4; ++mt) {
+      if (mt >= m_tiles) continue;  // CTA-uniform
 #pragma unroll
       for (int hf = 0; hf < 2; ++hf) {
-        const int pair = ep_pair[i][hf];
-        const float scale = fmul(down_scale, ep_tw[i][hf]);
+        const int row = mt * 16 + q + hf * 8;
+        const int pair = ring.pairs[pslot][row];
+        const float scale = fmul(down_scale, ring.tw[pslot][row]);
         uint32_t w[4], o[4];
-#pragma unroll
-        for (int nt = 0; nt < 4; ++nt)
-          w[nt] = pack_bf16x2(fmul(scale, acc[i][nt][2 * hf]), fmul(scale, acc[i][nt][2 * hf + 1]));
+        w[0] = pack_bf16x2(fmul(scale, acc[mt][0][2 * hf]), fmul(scale, acc[mt][0][2 * hf + 1]));
+        w[1] = pack_bf16x2(fmul(scale, acc[mt][1][2 * hf]), fmul(scale, acc[mt][1][2 * hf + 1]));
+        w[2] = w[3] = 0u;
         quad_transpose32(w, c, o);
-        if (pair >= 0) {
-          uint4* dst = reinterpret_cast<uint4*>(a.route + (size_t)pair * (a.K / 2) + (tile * 128 + ns * 32 + c * 8) / 2);
+        if (pair >= 0 && c < 2) {
+          uint4* dst = reinterpret_cast<uint4*>(a.route + (size_t)pair * (a.K / 2) + (tile * 128 + ns16 * 16 + c * 8) / 2);
           *dst = make_uint4(o[0], o[1], o[2], o[3]);
         }
       }
     }
-    item = ring.items[(k + 1) & 1];
-    ++k;
+    item = ring.items[iss_k & 1];  // slot (k + 1) & 1
   }
   cp_async_wait<0>();
 }

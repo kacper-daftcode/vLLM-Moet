@@ -62,6 +62,12 @@ def _moet_prefill_fast_module():
                 import b12x_moe_prefill_fast_sm120 as module
 
                 _MOET_PREFILL_FAST = module
+                print(
+                    "vllm-moet sm_120 fast prefill MoE: active for b12x's dynamic path (FC1 + SwiGLU + FC2 from "
+                    + path + "; VLLM_MOET_B12X_MOE_PREFILL_FAST=0 turns it off)",
+                    file=sys.stderr,
+                    flush=True,
+                )
             except ImportError:
                 _MOET_PREFILL_FAST = False
     return _MOET_PREFILL_FAST
