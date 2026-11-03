@@ -17,3 +17,7 @@ patch/*.whl
 
 # bench: smoke-test results are transient (real releases are committed)
 bench/results/smoke/
+
+# test / tool caches
+.pytest_cache/
+cache-y/
