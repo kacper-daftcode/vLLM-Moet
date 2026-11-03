@@ -13,6 +13,13 @@
 #                        port on each of them, e.g. "10.100.0.12: 127.0.0.1:" = the LAN plus the loopback the
 #                        watchdog probes, nothing on Tailscale)
 #            API_KEY_FILE ("")       docker env file with VLLM_API_KEY=...; "" serves without a key
+#            API_KEYS_FILE ("")      file with one API key per line ('#' comments): every key is accepted
+#                        (vllm serve --api-key k1 k2 k3), for per-client keys (a gateway, a second gateway, a person).
+#                        Takes precedence over API_KEY_FILE. The keys land in the container's command line, which only
+#                        root on the host can read. vLLM guards /v1, /v2, /inference and /cohere only: /health and
+#                        /metrics stay open (the watchdog probes /health), and the Python API server's /invocations
+#                        is unauthenticated by design - the network is still the boundary, keys are for telling
+#                        clients apart and revoking one of them.
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm (FlashInfer JIT,
 #                        torch.compile, vLLM and DeepGEMM caches; later starts reuse them)
 #            SERVED_NAME (moonshotai/Kimi-K3)
@@ -81,6 +88,7 @@ NAME="${NAME:-vllm-k3}"
 PORT="${PORT:-8000}"
 BIND="${BIND-127.0.0.1:}"
 API_KEY_FILE="${API_KEY_FILE:-}"
+API_KEYS_FILE="${API_KEYS_FILE:-}"
 CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
 SERVED_NAME="${SERVED_NAME:-moonshotai/Kimi-K3}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
@@ -115,6 +123,13 @@ if [[ "$LOAD_FORMAT" != dummy && ! -e "$MODEL_DIR/.download-complete" ]]; then
   exit 1
 fi
 [[ -z "$API_KEY_FILE" || -r "$API_KEY_FILE" ]] || { echo "API_KEY_FILE=$API_KEY_FILE is not readable" >&2; exit 1; }
+[[ -z "$API_KEYS_FILE" || -r "$API_KEYS_FILE" ]] || { echo "API_KEYS_FILE=$API_KEYS_FILE is not readable" >&2; exit 1; }
+KEY_ARGS=()
+if [[ -n "$API_KEYS_FILE" ]]; then
+  mapfile -t API_KEYS < <(grep -vE '^[[:space:]]*(#|$)' "$API_KEYS_FILE" | tr -d '\r' | sed 's/[[:space:]]*$//')
+  (( ${#API_KEYS[@]} > 0 )) || { echo "API_KEYS_FILE=$API_KEYS_FILE contains no keys" >&2; exit 1; }
+  KEY_ARGS=(--api-key "${API_KEYS[@]}")
+fi
 case "$DCP" in 1|2|4|8) ;; *) echo "DCP must divide TP 8 (1, 2, 4 or 8), got $DCP" >&2; exit 1 ;; esac
 case "$KV_OFFLOAD_PROMPT_ONLY" in 0|1) ;; *) echo "KV_OFFLOAD_PROMPT_ONLY must be 0 or 1, got $KV_OFFLOAD_PROMPT_ONLY" >&2; exit 1 ;; esac
 case "$KV_OFFLOAD" in off|disk|cpu|native) ;; *) echo "KV_OFFLOAD must be off, disk, cpu or native, got $KV_OFFLOAD" >&2; exit 1 ;; esac
@@ -253,7 +268,8 @@ docker run -d --name "$NAME" --restart no \
   --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
   "${ARGS[@]}" \
   ${EXTRA_ARGS} \
+  "${KEY_ARGS[@]}" \
   --host 0.0.0.0 --port "$PORT"
 
-echo "container $NAME started; logs: docker logs -f $NAME ; API: $(for prefix in ${BIND:-0.0.0.0:}; do printf 'http://%s%s/v1 ' "$prefix" "$PORT"; done)"
+echo "container $NAME started; logs: docker logs -f $NAME ; API: $(for prefix in ${BIND:-0.0.0.0:}; do printf 'http://%s%s/v1 ' "$prefix" "$PORT"; done)${API_KEYS_FILE:+ (${#API_KEYS[@]} API keys from $API_KEYS_FILE)}"
 exit 0
