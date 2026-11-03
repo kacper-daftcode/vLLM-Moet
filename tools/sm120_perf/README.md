@@ -1,14 +1,13 @@
 # SM120 serving performance tools
 
-Small host-side scripts used in the 2026-09-18 optimisation sessions on the 4× RTX PRO 6000
-(TP4) servers. They need only Python 3 (+ `torch`/`vllm` inside the serving image for the
-all-reduce benchmark). Findings they produced: `docs/dsv41-sm120-port.md` ("Where a decode
-step goes"), `tools/qwen38_sm120/README.md`.
+Host-side benchmark and profiling scripts for the 4× RTX PRO 6000 (TP4) servers. They need only
+Python 3 (+ `torch`/`vllm` inside the serving image for the all-reduce benchmark). What they
+found: `docs/dsv41-sm120-internals.md`, `tools/qwen38_sm120/README.md`.
 
 | script | what it does |
 |---|---|
 | `decode_bench.py BASE MODEL [chat_template_kwargs_json]` | single-stream prose/code decode (tok/s, steps/s, tok/step via streaming chunks) + a ~16K prefill; `API_KEY` env adds the Bearer header |
-| `spec_matrix.py --base URL --model M [--concurrencies 1,4,8] [--modes prose,code] [--output-tokens 512] [--repeats 2] [--metrics-url URL/metrics] --out F` | decode matrix for speculative-decoding settings: prose and code prompts at concurrency 1 / 4 / 8 (streaming chat, thinking off, `ignore_eos`): shared-window aggregate tok/s, per-request tok/s, steps/s and tokens per step from the streamed chunks, DSpark accepted-per-step / acceptance from `/metrics` deltas; used for the adaptive-verification and draft-length comparisons (`docs/dsv41-sm120-port.md`, "Tried and not kept") |
+| `spec_matrix.py --base URL --model M [--concurrencies 1,4,8] [--modes prose,code] [--output-tokens 512] [--repeats 2] [--metrics-url URL/metrics] --out F` | decode matrix for speculative-decoding settings: prose and code prompts at concurrency 1 / 4 / 8 (streaming chat, thinking off, `ignore_eos`): shared-window aggregate tok/s, per-request tok/s, steps/s and tokens per step from the streamed chunks, DSpark accepted-per-step / acceptance from `/metrics` deltas; used for the adaptive-verification and draft-length comparisons (`docs/dsv41-sm120-internals.md`) |
 | `openai_matrix.py --base URL --model M --model-dir DIR --sizes ... --concurrencies ... --output-tokens N --out F` | burst-serving matrix with 0xSero's `benchmarks/matrix.py` methodology (exact-size token-id prompts, forced output budget, shared decode window) through `/v1/completions`, so vLLM and SGLang are measured by one client; `--metrics-url` reads vLLM's DSpark counters per wave — `docs/dsv41-sm120-vs-0xsero.md` |
 | `quality_cmp.py --base URL --model M --out F [--api-key K]` | same-checkpoint fidelity probes: arithmetic (thinking off/on), coherence, 24 greedy answers for cross-stack diff, tool round trip, strict JSON schema, vision smoke, needle at ~29K/106K/400K tokens |
 | `compare_outputs.py A.json B.json [--tokenizer tokenizer.json]` | two `quality_cmp.py` results side by side + greedy-output agreement (identical count, first divergence in chars/tokens) |
@@ -34,7 +33,7 @@ step goes"), `tools/qwen38_sm120/README.md`.
 | `trace_graphs.py TRACE.json.gz [--graph N] [--order]` | kernels grouped by `cudaGraphLaunch` (correlation id): clusters of launches by kernel count (decode graph, drafter graph, prefill pieces), per-cluster kernel composition and launch order — how the DSpark drafter graph (167 kernels, 1.18 ms) was broken down |
 | `dg_moe_blockm_bench.py` (inside the ds41 image) | vLLM's DeepGEMM FP8×FP4 MoE chain (permute → FC1 → silu·up+quant → FC2 → gather) on the served decode shape under different M alignments / `mk_alignment_scope` values, cold expert weights; `--save-out/--compare-out` for bit-exact comparisons of patched glue kernels |
 
-How the qwen38 PLE finding was made (2026-09-18): `trace_step_skew.py` showed the first NCCL
+How the qwen38 PLE finding was made: `trace_step_skew.py` showed the first NCCL
 kernel of every step waiting 0.5–1.1 ms and a 1.2 ms step-start skew between ranks;
 `trace_gaps.py` showed the dominant idle gap (1.16 ms median, once per step) *inside* the main
 CUDA graph between `_hc_combine_kernel` and the next kernel — i.e. a non-kernel graph node;

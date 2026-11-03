@@ -1,0 +1,179 @@
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.
+
+I have a FastAPI service that receives webhook events from a payment provider and stores them in Postgres with asyncpg. The current handler:
+
+```python
+@app.post("/webhooks/payments")
+async def payments_webhook(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    if payload["type"] == "invoice.paid":
+        await pool.execute(
+            "INSERT INTO invoices (id, amount) VALUES ($1, $2)",
+            payload["data"]["id"], payload["data"]["amount"],
+        )
+    return {"status": "ok"}
+```
+
+Problems: the `X-Signature` header is never verified, retried deliveries insert the same invoice twice, and any exception returns a 500 so the provider retries forever.
+
+Rewrite this as a proper module: verify the signature with HMAC-SHA256 over the raw body and reject stale timestamps, make inserts idempotent on the event id, dispatch event types through a registry instead of if-chains, and return 2xx for event types we don't handle. Use pydantic models, full type hints, and no bare except. Include the SQL for the idempotency table and a pytest test for the signature check, then list the failure modes you would alert on.

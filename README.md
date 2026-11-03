@@ -1,197 +1,78 @@
-# vLLM-Moet: frontier MoE models on consumer/workstation Blackwell (SM120)
+# vLLM-Moet
 
-vLLM-Moet serves frontier Mixture-of-Experts models on RTX PRO 6000 and RTX 5090 (sm_120), where the
-official vLLM images do not run them or the official checkpoints do not fit. Two lines of work:
+Frontier Mixture-of-Experts models on RTX PRO 6000 and RTX 5090 (sm_120), where the official vLLM
+images do not run them or the official checkpoints do not fit. The changes are kernel-side patches
+on official vLLM images, bit-identical to the paths they replace unless a doc says otherwise, each
+behind a runtime switch.
 
-- **Official checkpoints on official vLLM images**: the sm_120 gaps closed and the decode step rebuilt
-  around small tensor-core kernels. DeepSeek-V4.1-Flash, served this way on 4× RTX PRO 6000 (the
-  active line), gets 1.5× the decode and 2.5× the GPU KV tokens of the official image with only the
-  fixes it needs to start; Qwen3.8-Flash-Next-FP8 decodes 1.5× faster.
-- **2-bit experts on vLLM v0.24.0**: GLM-5.2 (753B), DeepSeek-V4-Flash (159B) and Kimi-K2.7-Code (1T)
-  on one to four cards that cannot hold their checkpoints.
+| line | what | status | doc |
+|---|---|---|---|
+| **DeepSeek-V4.1-Flash on 4× RTX PRO 6000** | the official checkpoint on vLLM nightly: the sm_120 gaps closed, the decode step and the prefill rebuilt around small tensor-core kernels | **active, in production** | [docs/dsv41-sm120.md](docs/dsv41-sm120.md) |
+| **DeepSeek-V4.1-Flash on 4× RTX 5090 (MoET hybrid)** | 110 of the 384 experts per layer resident on the cards, every other routed expert computed on the CPU from the checkpoint's own bytes, bit-identical to the all-resident path; ~148 / ~129 tok/s single stream | serving on one reference box | [docs/moet-hybrid.md](docs/moet-hybrid.md) |
+| **2-bit experts on vLLM v0.24.0** | GLM-5.2 (753B), DeepSeek-V4-Flash (159B) and Kimi-K2.7-Code (1T) on one to four cards that cannot hold their checkpoints: a 2-bit codebook on hand-written SASS, an FP4 delta cache | frozen (builds, fixes accepted, no development) | [docs/v024-2bit.md](docs/v024-2bit.md) |
+| **Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000** | the official nightly with the PLE table on the GPUs, the skinny GEMM and an FP8 MoE GEMV | as built | [docs/qwen38-sm120.md](docs/qwen38-sm120.md) |
 
-## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
+## Results, as served
 
-The official checkpoint ([`deepseek-ai/DeepSeek-V4.1-Flash`](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash):
-552B plus a 196B Engram table, MXFP8 dense, MXFP4 experts, 510 GB) on four RTX PRO 6000 (96 GB, PCIe):
-TP4, 512K context, DSpark speculative decoding (k = 5), vision, thinking, tool calling, KV offload to
-host RAM and disk. Served image: `vllm-moet-sm120:dsv41-nightly-49cb2bbf-r1`, i.e. vLLM nightly
-49cb2bbf (FlashInfer 0.7.2, DeepGEMM a7a92773) plus the patches in [`tools/dsv41_sm120/`](tools/dsv41_sm120/).
+DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r23`
+(TP4, 512K context, DSpark k = 7, vision, thinking, tool calling, KV offload to host RAM and disk):
 
-| | measured on the served image, 2026-10-16 |
-|---|---|
-| decode, 1 stream | prose **190–224 tok/s**, code **436–466 tok/s** (88–90 steps/s) |
-| decode, 8 streams | prose 596–615 tok/s, code 1,494–1,597 tok/s aggregate |
-| fresh prefill | 163K tokens in 8.5 s, 391K in 21.4 s |
-| KV cache | **3.69M tokens** on the GPUs (7× concurrency at 512K), 76.7M more in 64 GiB of host RAM, plus a disk tier |
-| quality | GSM8K-200 193/200, needle 6/6 to 367K tokens, tool calls / JSON / vision pass |
-
-### What we changed against official vLLM
-
-| | official vLLM image on sm_120 | vLLM-Moet image |
+| | vLLM-Moet | official vLLM image on the same cards |
 |---|---|---|
-| indexer pages | DeepGEMM's SM120 paged MQA logits admit 32/64-row pages, V4.1's ratio-1 layers use 128: the indexer asserts | 128-row pages admitted, bit-exact to 64-row pages |
-| KV formats | fp8 compressed record (584 B/state) and FP8 indexer cache (132 B/key); the checkpoint's FP4 record and the MXFP4 indexer are SM100-only | FP4 record (288 B) and MXFP4 indexer (68 B): **2× the GPU KV tokens** (1.49M → 3.06M on the same image) |
-| KV offload | one host copy per TP rank, 3.6 KB per token | one copy, 896 B per token |
-| dense decode GEMMs | CUTLASS's 128-row tile on a 6-row batch; `wo_a` as BF16 weights through cuBLAS bmm | tensor-core MXFP8 GEMV: 1.8–3.4× faster, `wo_a` 2.9× |
-| MoE at decode | every routed expert padded to 128 rows (grouped GEMM 2× slower); 7 launches from router to FC1; FC2's padding rows written back to HBM | 64-row tiles, one fused launch, the padding dropped from L2 |
-| mHC boundary | on the model stream (the side-stream version is SM100-only) | off the critical path: +3–5 % steps/s |
-| launch gaps | the indexer's `weights_proj` on 2 cuBLAS CTAs (the main stream waits ~26 µs per layer); in graphs each NCCL kernel starts 2.8 µs after its predecessor | one launch with cuBLAS's bits; 0.4 µs; programmatic dependent launch in our kernels |
-| prefill | the indexer's TP row sharding starts at 65,536 rows, which a 4096-token chunk never reaches; Engram's `wkv` all-gathers on every chunk (+1.8 ms per layer) | sharding from 2048 rows (−4 % at 391K); `wkv` split over the ranks at decode only |
-| `reasoning_effort` | `minimal` / `medium` answer HTTP 400 | accepted (25 / 62) |
+| decode, 1 stream | prose ~293 tok/s, code ~802 tok/s (129 steps/s); Fraser bench 688 tok/s median, 746 best over 40 reps | 60 steps/s with only the fixes it needs to start |
+| decode, 8 streams | prose ~721, code ~2,258 tok/s aggregate | — |
+| fresh prefill | 163K tokens in 7.2 s (22.7K tok/s), 19K in 0.86 s; BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
+| KV cache | 9.62M tokens on the GPUs (18× concurrency at 512K) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
+| quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; identical requests return identical logits at any batch size and prompt length | the same checkpoint's quality |
 
-Net on the same four cards, against the recipe's official image with only the fixes it needed to start
-(2026-09-17): single-stream decode **60 → 88–90 steps/s (1.5×)**, GPU KV **1.49M → 3.69M tokens
-(2.5×)**, quality unchanged. Most of the decode gain and 2× of the KV come from the changes above; newer
-vLLM bases added the rest, and most of the prefill speed-up (163K tokens: ~15.5 → 8.5 s). The changes
-are bit-identical to the paths they replace, except the dense GEMVs (within one bf16 rounding of the
-fp32 reference) and the two KV formats, which passed a quality gate (GSM8K-200, needle retrieval,
-greedy agreement). Most have a runtime switch (`VLLM_MOET_*=0`, [docs/sm120-deploy.md](docs/sm120-deploy.md)).
+Measurement records: [docs/benchmarks/](docs/benchmarks/). The hybrid's numbers are in
+[docs/moet-hybrid.md](docs/moet-hybrid.md), the 2-bit line's tables in [docs/v024-2bit.md](docs/v024-2bit.md).
 
-### Build and serve
+## Quick start: DeepSeek-V4.1-Flash
 
-Needs 4× RTX PRO 6000 (an RTX 5090 does not fit the model at TP4), Docker with the NVIDIA container
-toolkit, GPU peer-to-peer over PCIe, and ~330 GB of host shared memory per server (the loader's segments
-plus the 64 GiB offload region), so one server per host.
+Four RTX PRO 6000 (an RTX 5090 does not fit the model at TP4), Docker with the NVIDIA container
+toolkit, PCIe peer-to-peer, ~330 GB of host shared memory (less: `KV_OFFLOAD_GIB=0`).
 
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
-hf download deepseek-ai/DeepSeek-V4.1-Flash --local-dir /srv/models/DeepSeek-V4.1-Flash
-export IMAGE=vllm-moet-sm120:dsv41-nightly-49cb2bbf-r1 \
-  MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash CACHE_DIR=/srv/cache/ds41
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .   # ~10 min
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /srv/models/DeepSeek-V4.1-Flash-1017
+export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r23 \
+  MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .     # ~11 min
 
-# first start, ~22 min: FlashInfer autotunes into CACHE_DIR (on an empty cache the sweep OOMs at 0.95)
-GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh
-# later starts, ~20 min, as served: 0.94, KV offload to RAM + disk, indexer sharding from 2048 rows
+GPU_MEM_UTIL=0.92 docker/sm120/run-dsv41.sh      # first start (~22 min: FlashInfer autotunes into CACHE_DIR)
 docker stop -t 60 ds41-flash
-KV_OFFLOAD_GIB=64 KV_OFFLOAD_FS_DIR=/srv/kvcache KV_OFFLOAD_PROMPT_ONLY=0 INDEXER_TP_SHARD_MIN_ROWS=2048 \
-  docker/sm120/run-dsv41.sh
+GPU_MEM_UTIL=0.94 KV_OFFLOAD_GIB=64 KV_OFFLOAD_FS_DIR=/srv/kvcache KV_OFFLOAD_PROMPT_ONLY=0 \
+  INDEXER_TP_SHARD_MIN_ROWS=2048 SERVED=1 docker/sm120/run-dsv41.sh            # the served configuration
 ```
 
-The OpenAI-compatible API listens on `127.0.0.1:8001` (`BIND=` publishes it; put an authenticating
-proxy in front). Every knob is an environment variable documented in the header of
-[`docker/sm120/run-dsv41.sh`](docker/sm120/run-dsv41.sh). vLLM never deletes disk-tier files, so run
-[`docker/sm120/kvcache-ttl.sh`](docker/sm120/kvcache-ttl.sh) from cron;
-[`docker/sm120/ds41-watchdog.sh`](docker/sm120/ds41-watchdog.sh) restarts a crashed server. Validate with
-`tools/sm120_perf/spec_matrix.py` (88–90 steps/s single stream) and `tools/sm120_perf/needle_any.py`.
-
-Known limits: with the disk tier, each request on the 49cb2bbf base pays ~20 ms more before its first
-token (cause open); TP8 with a 1M window on eight cards was validated at the bring-up, not on this image.
-
-The port with every gap and measurement: **[docs/dsv41-sm120-port.md](docs/dsv41-sm120-port.md)**.
-Build, serve, validate and every image tag: **[docs/sm120-deploy.md](docs/sm120-deploy.md)**. Op-level
-tests: [tools/dsv41_sm120/README.md](tools/dsv41_sm120/README.md). Head-to-head with an SGLang recipe on
-the same host (2026-09-19): [docs/dsv41-sm120-vs-0xsero.md](docs/dsv41-sm120-vs-0xsero.md).
-
-## Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000
-
-The official `vllm/vllm-openai` nightly ran this 177B-A6B model on sm_120 at 65 decode steps/s as first
-deployed. [`Dockerfile.sm120-qwen38`](Dockerfile.sm120-qwen38) keeps the model's numerics and changes
-where the time goes: the 51 GB n-gram PLE table stays on the GPUs instead of the CPU offload worker
-(whose handoff stalled every decode graph by ~1.2 ms), vLLM's CuTe-DSL skinny GEMM (gated to B300
-upstream) runs the ~480 BF16 decode GEMMs on sm_120 with plans tuned for it, and the routed experts
-get a tuned Triton config plus an FP8 MoE GEMV with silu·up and the quantization fused in,
-bit-identical to Triton. TP4, MTP k = 3: **98.5 steps/s, prose 243 / code 346 tok/s single stream,
-1.5× the first deployment's 65 steps/s and 137–160 / 228 tok/s** (2026-09-19). Launcher
-`docker/sm120/run-qwen38.sh`; write-up: [tools/qwen38_sm120/README.md](tools/qwen38_sm120/README.md).
-
-## 2-bit experts on vLLM v0.24.0
-
-A generated patch on official vLLM v0.24.0 ([`patch/`](patch/), image `Dockerfile.sm120-v024`) serves
-checkpoints the hardware cannot hold: GLM-5.2 (753B) on two RTX PRO 6000 at 28–32 tok/s (128K window)
-and on four at 105 tok/s, DeepSeek-V4-Flash (159B) on one RTX 5090 at ~31 tok/s (32K) and on one
-RTX PRO 6000 at 161 tok/s, Kimi-K2.7-Code (1T) on four RTX PRO 6000 at 51 tok/s (256K).
-
-- **2-bit experts at FP4 quality.** The routed experts go to a sign-symmetric 2-bit codebook on
-  hand-written SASS kernels (naive 2-bit fails through sign asymmetry, not error size); a delta cache
-  and a confidence gate bring FP4 back where it matters.
-- **Experts beyond VRAM.** The 2-bit base can live in host RAM or NVMe pack files with the GPU as an
-  expert cache; a miss is fetched and the step's graph replayed, bit-identical to a resident forward.
-- **Against official v0.24.0.** The release cannot serve these models on SM120 as shipped: the patch
-  moves the DeepGEMM and FlashInfer pins, gates the cluster-launch top-k off, fixes the o_proj scale
-  layout and captures CUDA graphs in thread-local error mode, and adds MTP under pipeline parallelism
-  and an NVFP4 KV cache. With the `VLLM_MOE_W2*` knobs off, the SM120 fixes are the only change.
-
-Hooks, knobs and measurements: **[docs/v024-port.md](docs/v024-port.md)**; quality method:
-[docs/quality.md](docs/quality.md); kernels: [kernels/MANIFEST.md](kernels/MANIFEST.md). The recipes
-image serves each benchmarked configuration ([bench/README.md](bench/README.md)):
-
-```bash
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-v024 -t vllm-moet-sm120:v024 .
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.recipes -t vllm-moet-recipes:v024 .
-docker run --rm --gpus all --network host --ipc host --shm-size 64g -v /srv/models:/models \
-  -e HF_TOKEN=... vllm-moet-recipes:v024 glm-5.2-nvfp4/pro6000x4-tp4-mtp   # --list: all recipes
-```
-
-### Benchmark results
-
-<!-- bench:table:begin (generated by bench/runner/render.py - do not edit) -->
-
-Release **`v2026.08.28-x4-prefill`** — one row per supported recipe (`bench/recipes/`), measured by `bench/runner/bench.py`; full report: [`docs/benchmarks/v2026.08.28-x4-prefill.md`](docs/benchmarks/v2026.08.28-x4-prefill.md). Single-stream decode and prefill are medians; batch is aggregate tok/s at the noted concurrency.
-
-| model | hardware | config | ctx | decode tok/s | batch | prefill 8K | needle | notes |
-|---|---|---|---:|---:|---:|---:|---|---|
-| deepseek-v4-flash | 1x RTX 5090 (32 GB) | host-resident 2-bit base, GPU as expert cache | 8K | **38** | — | — | — | acc 2.83 † |
-| deepseek-v4-flash | 4x RTX 5090 TP4 | consumer-card throughput | 16K | **214.4** | 1 560 @32 | 6 101 | — | acc 2.6 † |
-| deepseek-v4-flash | 2x RTX PRO 6000 TP2 | throughput | 24K | **209.6** | 380 @3 | 5 791 | — | acc 2.6 † |
-| glm-5.2-exl3 | 4x RTX PRO 6000 TP4 | EXL3 trellis base (2,2,1) resident via EP, MTP k=2, decode-wave M8+M16 dual-set | 8K | **71.9** | 196.7 @32 | 2 106 | PASS ≤6K tok | acc 2.62 |
-| glm-5.2-nvfp4 | 2x RTX PRO 6000 TP2 | host-resident base, 44 GiB/rank expert cache | 32K | **33** | — | — | PASS ≤27K tok | acc 3 † |
-| glm-5.2-nvfp4 | 4x RTX PRO 6000 TP4 | 2-bit base + MTP k=2, 128K window | 128K | **105** | — | 2 500 | PASS ≤276K tok | † |
-| glm-5.2-nvfp4 | 4x RTX PRO 6000 TP4 | + FP4 delta (auto) + confidence gate tau=0.60 | 128K | **84** | — | — | — | † |
-| kimi-k2.7-code-nvfp4 | 2x RTX PRO 6000 TP2 | host-resident base, 52 GiB/rank cache (~39% coverage) | 16K | **14.4** | — | — | PASS ≤8K tok | † |
-| kimi-k2.7-code-nvfp4 | 4x RTX PRO 6000 TP4 | GPU-resident 2-bit + FP4 delta, 256K window | 256K | **51** | 222 @8 | 2 448 | PASS ≤248K tok | † |
-| kimi-k2.7-code-nvfp4 | 4x RTX PRO 6000 TP4 | + Eagle3 drafter (k=3, drafter TP4) | 256K | **57** (±44%) | — | — | — | acc 3.5 † |
-
-† imported from pre-harness measurements (README/docs history) — re-measured on the next release.
-
-<!-- bench:table:end -->
-
-### Quality vs native
-
-The row below is retained as explicitly imported historical evidence, not as a
-fresh release gate. A correctness audit found that the W2 path had omitted the
-checkpoint's SwiGLU clamp and that the attached THINK artifact did not encode
-the request/baseline metadata claimed by the compact result. It must be
-re-measured through the schema-v2 harness before being certified again.
-
-<!-- bench:quality:begin (generated by bench/runner/render.py - do not edit) -->
-
-Quality release **`v2026.07.30-quality`** — dataset evals vs the committed **native baselines** (`bench/baselines/`, same tool/checkpoint/hardware, stock serving path). Cells: accuracy (Δpp vs native, completion-token inflation vs native). Full report: [`docs/benchmarks/v2026.07.30-quality.md`](docs/benchmarks/v2026.07.30-quality.md); process: [`bench/README.md`](bench/README.md).
-
-| model | hardware | config | GSM8K | GPQA | GPQA think | needle | notes |
-|---|---|---|---|---|---|---|---|
-| deepseek-v4-flash | 2x RTX PRO 6000 TP2 | max-quality candidate (revalidation required) | **95.5%** (-1.5pp, tok +1.3%) | **73.2%** (-1.0pp, tok +10.6%) | — | — | † |
-
-† imported from the measurement campaign logs — re-measured by the harness on the next quality release.
-
-<!-- bench:quality:end -->
+The OpenAI-compatible API listens on `127.0.0.1:8001`. `SERVED=1` turns on the switches production
+runs with; every knob and switch is listed in [docs/dsv41-sm120.md](docs/dsv41-sm120.md).
 
 ## Kernels and tools
 
-- [`blackwell-isa`](https://github.com/kacper-daftcode/blackwell-isa) (a machine-readable SM120 SASS ISA
-  database, [searchable reference](https://kacper-daftcode.github.io/blackwell-isa/SM120_ISA_REFERENCE.html))
-  and [`cubit`](https://github.com/kacper-daftcode/cubit) (an SM120 assembler / disassembler built on it)
-  produce the 2-bit line's SASS kernels in `kernels/`: stock CUDA compiles the block-scaled MMA, but not
-  the scheduling and register shaping these kernels need.
-- The DeepSeek-V4.1 decode kernels are CUDA C++ compiled into the image, each with op-level tests, in
-  `tools/dsv41_sm120/` (`sm120_gemv/`, `moe_quant_scatter/`, `mhc_overlap/`, `bf16_gemm/`, `moe_l2/`),
-  Qwen3.8's MoE GEMV in `tools/qwen38_sm120/moe_gemv/`; the profiling and benchmark scripts behind the
-  numbers are in [`tools/sm120_perf/`](tools/sm120_perf/).
+- [`blackwell-isa`](https://github.com/kacper-daftcode/blackwell-isa) (a machine-readable SM120 SASS
+  ISA database, [searchable reference](https://kacper-daftcode.github.io/blackwell-isa/SM120_ISA_REFERENCE.html))
+  and [`cubit`](https://github.com/kacper-daftcode/cubit) (an SM120 assembler / disassembler built on
+  it) produce the 2-bit line's SASS kernels in [`kernels/`](kernels/MANIFEST.md); every kernel the
+  DeepSeek image ships round-trips through cubit bit for bit (`tools/dsv41_sm120/cubit_gate.py`).
+- The DeepSeek-V4.1 kernels are CUDA C++ compiled into the image, each with an op-level test:
+  [`tools/dsv41_sm120/`](tools/dsv41_sm120/README.md). Qwen3.8's MoE GEMV: `tools/qwen38_sm120/moe_gemv/`.
+- Host-side benchmark and profiling scripts: [`tools/sm120_perf/`](tools/sm120_perf/README.md).
+- SM120 kernel-design notes from the hardware counters: [docs/sm120-alu-subunits.md](docs/sm120-alu-subunits.md).
 
 ## Repository layout
 
 | path | what |
 |---|---|
-| `Dockerfile.sm120-dsv41-nightly`, `tools/dsv41_sm120/`, `docker/sm120/run-dsv41.sh` | DeepSeek-V4.1-Flash: the served image, its patchers, kernels and tests, the launcher (`docker/sm120/` also holds its cron scripts) |
-| `Dockerfile.sm120-dsv41` | the same on the recipe's `deepseekv41-flash-0909` image (served until 2026-09-23) |
+| `Dockerfile.sm120-dsv41-nightly`, `tools/dsv41_sm120/`, `docker/sm120/run-dsv41.sh` | DeepSeek-V4.1-Flash: the image, its patchers, kernels and tests, the launcher (+ the cron scripts in `docker/sm120/`) |
 | `Dockerfile.sm120-qwen38`, `tools/qwen38_sm120/`, `docker/sm120/run-qwen38.sh` | Qwen3.8-Flash-Next-FP8 |
-| `tools/sm120_perf/` | profiling and benchmark scripts |
-| `patch/`, `Dockerfile.sm120-v024`, `Dockerfile.recipes`, `docker/serve_recipe.py` | the 2-bit line: the generated v0.24.0 patch (never edited by hand, see [AGENTS.md](AGENTS.md)), its image, the recipes image |
-| `bench/` | recipes, the runner and committed results; the tables above are rendered from it and checked in CI |
-| `kernels/`, `tools/*.py` | SASS sources, prebuilt SM120 cubins and generators; the 2-bit line's tests |
-| `docs/` | port notes, the deploy guide, the quality method, benchmark reports |
+| `patch/`, `Dockerfile.sm120-v024`, `Dockerfile.recipes`, `docker/serve_recipe.py`, `bench/`, `kernels/`, `tools/*.py` | the 2-bit line: the generated v0.24.0 patch (never edited by hand), its images, the recipes and the benchmark runner, SASS sources and cubins, its tests |
+| `tools/sm120_perf/` | benchmark and profiling scripts |
+| `docs/` | one doc per line, the benchmark records, the kernel-design notes |
 
-## License
+## Contributing and license
 
-Apache License 2.0 ([LICENSE](LICENSE)); third-party components in [NOTICE](NOTICE).
+[CONTRIBUTING.md](CONTRIBUTING.md) says where a change goes and how it is validated;
+[CHANGELOG.md](CHANGELOG.md) lists the served images. Apache License 2.0 ([LICENSE](LICENSE));
+third-party components in [NOTICE](NOTICE).

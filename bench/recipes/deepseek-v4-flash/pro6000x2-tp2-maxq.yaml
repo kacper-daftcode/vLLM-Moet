@@ -23,7 +23,7 @@ load_timeout_s: 2400
 #   cover their whole step; uncapped promote sound ABOVE the floor;
 #   PREFILL_FP4=ensure -> decode-class guarantee for prefill (the 2-bit
 #   prefill KV was the whole +8-11% token inflation - see
-#   internal/PREFILL_KV_INFLATION_FINDINGS.md); PREFILL_T=16 routes short
+#   the prefill-KV inflation finding); PREFILL_T=16 routes short
 #   prompts (T<=96) into the guarantee (largest decode step at seqs 2
 #   spec 2 = 6 tokens).
 # tau 1.0 -> 0.60 (2026-07-30): a live TAU_FILE sweep measured tau 1.0 at

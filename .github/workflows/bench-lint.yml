@@ -1,6 +1,6 @@
 # Bookkeeping CI for the bench system. GPU runs are operator-driven
 # (bench/README.md); this workflow only guarantees the data is well-formed
-# and the README/report never drift from the committed results.
+# and the rendered tables (docs/v024-2bit.md, the reports) never drift from the committed results.
 name: bench-lint
 
 on:
@@ -11,8 +11,13 @@ on:
       - "bench/**"
       - "docker/**"
       - "Dockerfile.recipes"
+      - "docs/**"
       - "README.md"
-      - "docs/benchmarks/**"
+      - "CONTRIBUTING.md"
+      - "CHANGELOG.md"
+      - "tools/**"
+      - "kernels/MANIFEST.md"
+      - "Dockerfile.*"
       - "patch/**"
       - "tools/check_patch_files.py"
       - ".github/workflows/bench-lint.yml"
@@ -34,7 +39,7 @@ jobs:
         run: python3 bench/runner/lint.py --release current
       - name: Benchmark integrity unit tests
         run: python3 -m unittest discover -s bench/tests -p 'test_*.py' -v
-      - name: Verify README table + report match committed results
+      - name: Verify the rendered tables + report match committed results
         run: python3 bench/runner/render.py --check
       - name: Smoke the recipe launcher (--list + --print on every recipe)
         env:
@@ -54,3 +59,13 @@ jobs:
             echo "== $r"
             python3 docker/serve_recipe.py "$r" --print
           done
+
+  docs-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Public-tree hygiene (host paths, session notes, internal references, Markdown links, py_compile, bash -n)
+        run: python3 tools/docs_lint.py

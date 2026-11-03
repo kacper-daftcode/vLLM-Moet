@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Decode tok/s + MTP acceptance vs prompt depth, on a REAL corpus.
 
-Phase-0 probe of the MTP-decay task (sesja 2026-07-12): the original
+Phase-0 probe of the MTP-decay task (2026-07-12): the original
 decode_at_depth probe filled the context with random words; a junk
 context may confuse the drafter more than a real document, so the
 observed acceptance decay (2.9 -> 1.8 @891K) must be re-validated on
 real text before it is treated as a production problem.
 
-Differences vs decode_at_depth.py (sesja A, random-word reconstruction):
+Differences vs decode_at_depth.py (random-word reconstruction):
   * filler = deterministic concatenation of source files from a git
     tree (non-repeating, real code/prose), sliced to EXACT token depths
     with the model's own tokenizer (no live calibration);

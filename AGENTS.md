@@ -5,6 +5,15 @@ Multiple agents and humans work on this project concurrently, often in the
 the generated patch as a source file. Read this before your first commit;
 every rule below traces back to a real incident.
 
+## The lines of work and where their code lives
+
+| line | source of truth | how a change ships |
+|---|---|---|
+| DeepSeek-V4.1-Flash on 4× RTX PRO 6000 (active) | `tools/dsv41_sm120/` + `Dockerfile.sm120-dsv41-nightly` | a numbered Dockerfile step: an anchored patcher, a kernel with its op-level test, a build arg and a `com.vllm-moet.*` label, a runtime switch (`VLLM_MOET_*`, off by default until validated); `cubit_gate.py` on the built image; the step's row in `docs/dsv41-sm120.md` and `tools/dsv41_sm120/README.md` |
+| MoET hybrid on 4× RTX 5090 | `tools/dsv41_5090/` + the Dockerfile's CPU-tier step, `docker/sm120/run-dsv41-5090.sh` | the same; identity against the all-resident path is the gate |
+| 2-bit experts on vLLM v0.24.0 (frozen) | the vllm fork branch `moet-v0.24.0`; `patch/` is **generated** from it | the procedure below — never the patch file |
+| Qwen3.8-Flash-Next-FP8 | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` | as the first line |
+
 ## The iron rule
 
 `patch/vllm-moet-v0.24.0.patch` is a **generated artifact**: byte-for-byte
@@ -44,9 +53,16 @@ worktree, not on `moet-v0.24.0`.
 | vLLM runtime code (`moe_w2_*`, loaders, runner, attention, …) | fork branch `moet-v0.24.0` | regen the patch here — procedure below |
 | SASS kernels / cubins | `kernels/` | a `kernels/MANIFEST.md` row (generator + validation status) |
 | serve configs | `bench/recipes/` | `bench/models.yaml`, `bench/matrix.yaml`; run `bench/runner/lint.py` |
-| bench results | `bench/results/<release>/` | `bench/runner/render.py` — the README table and per-release report are **generated**; never hand-edit the marked README block |
-| docs | `docs/`, README outside the generated block | — |
-| session notes / handoffs / experiment scraps | `internal/` (gitignored, stays local) | never into `docs/` |
+| bench results | `bench/results/<release>/` | `bench/runner/render.py` — the tables in `docs/v024-2bit.md` and the per-release report are **generated**; never hand-edit the marked blocks |
+| docs | `docs/` (one doc per line + `docs/benchmarks/` records), `README.md` | — |
+| session notes / handoffs / experiment logs / coordination | `internal/` (gitignored, its own private repo) | never into `docs/` |
+
+Public docs are reference, not a journal: present tense, no dates outside
+`CHANGELOG.md` and `docs/benchmarks/`, no host paths, no session letters, no
+`internal/` references, one place per fact (a switch is described in the
+switch table of its line's doc and nowhere else). A measurement worth keeping
+is a record in `docs/benchmarks/<topic>-<date>.md`; the reasoning behind a
+change is a paragraph in `docs/<line>-internals.md`, not a dated section.
 
 Never commit: wheels (`patch/*.whl` is ignored), checkpoints, expert packs,
 smoke results (`bench/results/smoke/`).
@@ -132,7 +148,7 @@ python3 tools/check_patch_files.py       # patch <-> FILES.txt <-> SOURCE.txt
 python3 bench/runner/lint.py             # recipes/boxes/suites/results schemas
 python3 bench/runner/lint.py --release current  # strict live release gate
 python3 -m unittest discover -s bench/tests -p 'test_*.py' -v
-python3 bench/runner/render.py --check   # README table == committed results
+python3 bench/runner/render.py --check   # docs/v024-2bit.md tables == committed results
 ```
 
 Plus `python3 docker/serve_recipe.py <recipe> --print` if you touched

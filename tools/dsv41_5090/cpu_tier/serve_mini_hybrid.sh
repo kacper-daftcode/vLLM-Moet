@@ -10,7 +10,7 @@
 #          -e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_RESIDENT=8 -e VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=1 \
 #          -e VLLM_MOET_CPU_TIER_TABLES=/parity -e VLLM_MOET_CPU_TIER_CPUS=9-15 -e VLLM_MOET_CPU_TIER_LOG=1 \
 #          -v /mnt/nvme/models/mini-hyb576:/model -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache \
-#          -v /mnt/nvme/vLLM-Moet-cpu:/repo:ro -v /mnt/nvme/vLLM-Moet-cpu/internal/dsv41-5090-cpu/parity:/parity:ro \
+#          -v <checkout>:/repo:ro -v <parity dir>:/parity:ro \
 #          -p 127.0.0.1:8031:8031 --entrypoint bash vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1 \
 #          /repo/tools/dsv41_5090/cpu_tier/serve_mini_hybrid.sh /model 8031
 set -u
