@@ -54,13 +54,16 @@
 #                        default 10-30..11-03; 1 again since 11-03. 0 = pause
 #            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded (the RAM item: the loader's
 #                        pinned staging blocks), with MemAvailable logged before / after
-#            POOL_SPIN_US (500)      the kernel pool's spin before it sleeps on the futex (the pool's own default; the cores
-#                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps; 5000 spins through a
-#                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever). 5000 was the default
-#                        10-29..11-03 (k0-pf, with PREFETCH=1: decode 148 / 129) - but a 30-min single-stream soak with the
-#                        old policy (k0-therm-cool: 500 + POOL_SPIN_HOT=1) holds the kernel at 128-131 us per expert and
-#                        87 tok/s per stream FLAT, where the hot spin + DRAM stream fell off a cliff after 18 min (note
-#                        §20.11); 5000 with POOL_SPIN_HOT=1 alone is the open question (k0-therm-spin)
+#            POOL_SPIN_US (5000)     the kernel pool's spin before it sleeps on the futex (the pool's own default is 500; the
+#                        cores then drop into C2 and the kernel runs up to 2x slower after ms-long gaps; 5000 spins through
+#                        a decode step's gaps and sleeps only when the API is idle; -1 = spin forever). 5000 since 10-29
+#                        (k0-pf, with PREFETCH=1: decode 148 / 129), back to 500 for a day while the 11-02 thermal pair was
+#                        read - the cliff after 18 min was the DRAM stream of POOL_SPIN_HOT=2, not the spin: k0-therm-spin
+#                        (11-03, 5000 + POOL_SPIN_HOT=1, a 30-min single-stream soak with the thermal trace) is as flat as
+#                        k0-therm-cool (500): the kernel 127-132 us per expert throughout, per-minute tok/s -0.1 % first vs
+#                        second half, Tctl max 85 C, and decode 148.7 / 129.3 vs 145.4 / 124.2 at the start (note §20.12;
+#                        the soak aggregates 86.3 vs 87.6 tok/s are inside the +-3.5 % boot-to-boot band and on a different
+#                        prompt mix). Under load both settings sit at the socket's 350 W PPT; idle, the pool sleeps after 5 ms
 #            PREFETCH (1)            MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (the expert
 #                        from DRAM costs 119 us in-kernel against 69 from L3; bits untouched by construction, parity PASS);
 #                        PREFETCH_HINT (1 = L2). Default since 10-29 (k0-pf, see POOL_SPIN_US); 0 = off
@@ -123,7 +126,7 @@ DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
 DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
-POOL_SPIN_US="${POOL_SPIN_US:-500}"
+POOL_SPIN_US="${POOL_SPIN_US:-5000}"
 PREFETCH="${PREFETCH:-1}"
 PREFETCH_HINT="${PREFETCH_HINT:-1}"
 SPIN_TOUCH_STRIDE="${SPIN_TOUCH_STRIDE:-}"

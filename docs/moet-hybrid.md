@@ -8,11 +8,11 @@ GPU, and its rows are injected into the GPU's own MoE kernel before the top‑k 
 the hybrid's output is **bit‑identical to the all‑resident b12x path** on every step. The box: a Threadripper PRO
 9975WX (32 cores, 4 CCDs), 498 GB of DDR5, 4× RTX 5090 on PCIe 5.0 x16, NVMe RAID for the stores.
 
-Measured (2026‑10‑26, the launcher's defaults, TP4, no DSpark):
+Measured (2026‑10‑26 → 11‑03, the launcher's defaults, TP4, no DSpark):
 
 | | |
 |---|---|
-| decode, single stream, short prompts | **145 / 124 tok/s** ('Hello' / 'def fib(n):') with the defaults of 11-03 — the CPU kernel's software prefetch (143 / 120 before 10-29). A 5 ms pool spin gave 148 / 129 and an idle-time DRAM stream 150 / 132 in 10-minute windows, but the stream degrades after ~18 minutes of serving (the CPU kernel +34 %) and is off; the 5 ms spin alone is being re-measured over 30 minutes. The step is ~7.5 ms, of which ~2.0 ms is the GPU waiting for the CPU tier on the ~10 layers per step that miss (one expert's full CPU latency each, ~130 µs in situ); the degenerate 'Hello' run has a hit rate → 1 |
+| decode, single stream, short prompts | **145–149 / 124–129 tok/s** ('Hello' / 'def fib(n):') with the defaults of 11-03 — the CPU kernel's software prefetch and the 5 ms pool spin (143 / 120 before 10-29; the two 30-minute single-stream soaks of 11-02/03 opened at 145 / 124 with a 0.5 ms spin and 148.7 / 129.3 with the 5 ms spin, both flat over the half hour — the CPU kernel 127–132 µs per expert throughout). An idle-time DRAM stream from the idle pool workers gave 150 / 132 in 10-minute windows but degrades after ~18 minutes of serving (the CPU kernel +34 %) and is off. The step is ~7.5 ms, of which ~2.0 ms is the GPU waiting for the CPU tier on the ~10 layers per step that miss (one expert's full CPU latency each, ~130 µs in situ); the degenerate 'Hello' run has a hit rate → 1 |
 | decode behind 2K / 14K / 30K of context | 56–81 / 64 / 47 tok/s (the attention side) |
 | prefill with the streamed experts (chunk 4096, the default) | **2.4–2.7K tok/s at 2K, 4.4K at 14K, 4.7–4.8K at 30K** with the 10-29 default `PREFILL_OVERLAP=1` (the records' staging on a side stream, during the resident run and the previous round's run — bit-identical to the serial path; TTFT 0.77–0.84 s / 3.25 s / 6.3–6.5 s against 0.94 / 3.8 / 7.7 s before, −15 %). PCIe‑bound: 0.09–0.10 ms per missing expert per rank ≈ 50 GB/s per link (0.12 before); the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token — chunk 2048 gave 2.0–2.3K at 2K / 14K / 30K. 32K / 64K: 3.7–3.85K before the overlap (not re-measured) |
 | long context | needle‑in‑a‑haystack **32K: 3/3, 64K: 3/3** (depths 0.1 / 0.5 / 0.9; TTFT 8.5 s / 16.5–16.8 s) |
@@ -45,7 +45,8 @@ Per TP rank (the four ranks are symmetric and need no CPU‑side coordination):
    integer block dots on the MXFP4 nibbles × MXFP8 activations (AVX‑512 VNNI), with the sm_120 block‑scaled MMA's
    rounding and truncation rules reproduced (`qmma_probe.cu` measured them) — bit‑identical to b12x's compact W4A8
    path. ~111 µs per expert per token from DRAM (4.7 MB per expert slice at 45 GB/s per CCD), 145–165 µs in situ.
-   The pool spins through a decode step's gaps and sleeps on a futex when the API is idle.
+   The pool spins through a decode step's gaps (5 ms of ALU work after each job, `POOL_SPIN_US`) and sleeps on a
+   futex when the API is idle.
 4. **The expert store.** Every rank's slices of the experts that can be missing live in pinned host RAM in the
    checkpoint's own layout (`cpu_moe/build_store.py` writes them once to NVMe, 269 GB; the loader pins 344 × 40
    records per rank). A promotion is a 4.7 MB H2D of the record plus a small repack kernel into b12x's tiled layout.
@@ -85,7 +86,7 @@ MODEL_DIR=/mnt/nvme/models/DeepSeek-V4.1-Flash BAKED=0 docker/sm120/run-dsv41-50
 ```
 
 `docker/sm120/run-dsv41-5090.sh` boots the measured serving configuration by default; its header lists every knob
-(`PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `MAX_NUM_BATCHED_TOKENS`, `ENGRAM_THP`, `POOL_SPIN_HOT`, `SPEC_TOKENS`,
+(`PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `MAX_NUM_BATCHED_TOKENS`, `ENGRAM_THP`, `POOL_SPIN_HOT`, `POOL_SPIN_US`, `SPEC_TOKENS`,
 `PREFIX_CACHE`, `GPU_MEM_UTIL`, `BAKED`, …). The hybrid's own switches arrive in the container as `VLLM_MOET_CPU_TIER_*` (documented at the
 top of `tools/dsv41_5090/cpu_tier/vllm_moet_cpu_tier.py`); everything is inert unless `VLLM_MOET_MOE_CPU_TIER=1`.
 `tools/dsv41_5090/cpu_tier/tp4_window.sh TAG [KEY=VALUE …]` runs one boot with the measurements (identity prompts,
