@@ -43,20 +43,24 @@
 #            POOL_THREADS (6)        kernel pool threads per rank = cores of its CCD: 6 (8r+2..8r+7), 7 (8r+1..8r+7, the dispatcher on
 #                        main's SMT sibling) or 8 (the whole CCD; main + dispatcher on siblings) - 10-28: the GPU waits
 #                        ~2.6 ms per decode step for the tier, the bench kernel is 14-17 % faster on 8 threads than on 6
-#            POOL_SPIN_HOT (2)       the kernel pool's idle spin: 1 = ALU work instead of `pause` (keeps the cores' clock up between
+#            POOL_SPIN_HOT (1)       the kernel pool's idle spin: 1 = ALU work instead of `pause` (keeps the cores' clock up between
 #                        a step's jobs: +3 % decode on 10-25); 2 = also every idle worker streams a private 32 MB buffer from
 #                        DRAM (SPIN_TOUCH_STRIDE 64) - the kernel's after-a-gap penalty is a per-core memory-path state that
-#                        only continuous DRAM-missing loads keep away (note §20.2): in situ -8 % per expert on every rank
-#                        (k0-pf-touch, k0-new-touch: 128-138 -> 113-134 us, decode 148 / 129 -> 150 / 132) at ~19 GB/s per CCD
-#                        of idle DRAM reads while the pool spins and a ~1.6x slower Python host under memory pressure (hidden
-#                        behind the GPU step at one stream). Default since 10-30 (k0-new-touch); 1 = the 10-25..10-29 default
+#                        only continuous DRAM-missing loads keep away (note §20.2): in situ -8 % per expert on every rank in
+#                        10-min windows (k0-pf-touch, k0-new-touch: 128-138 -> 113-134 us, decode 148 / 129 -> 150 / 132) -
+#                        BUT NOT FOR LONG: in a 30-min single-stream soak the kernel jumps 118 -> 158 us after ~18 min and the
+#                        stream's per-stream tok/s ends 14 % below the plain spin's (k0-therm-new vs k0-therm-cool, note §20.11:
+#                        ~77 GB/s of idle DRAM reads heat the memory side until it throttles; the plain spin is flat). 2 was the
+#                        default 10-30..11-03; 1 again since 11-03. 0 = pause
 #            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded (the RAM item: the loader's
 #                        pinned staging blocks), with MemAvailable logged before / after
-#            POOL_SPIN_US (5000)     the kernel pool's spin before it sleeps on the futex (the pool's own default 500; the
-#                        cores then drop into C2 and the kernel runs up to 2x slower after ms-long gaps: 5000 spins
-#                        through a decode step's gaps and sleeps only when the API is idle; -1 = spin forever). Default
-#                        since 10-29 (k0-pf, with PREFETCH=1: in-kernel 127-135 us per expert against 148-154, the wait
-#                        2.06-2.12 ms against 2.62-3.11, step 7.61 against 8.40 ms, decode 148 / 129 against 143 / 120)
+#            POOL_SPIN_US (500)      the kernel pool's spin before it sleeps on the futex (the pool's own default; the cores
+#                        then drop into C2 and the kernel runs up to 2x slower after ms-long gaps; 5000 spins through a
+#                        decode step's gaps and sleeps only when the API is idle; -1 = spin forever). 5000 was the default
+#                        10-29..11-03 (k0-pf, with PREFETCH=1: decode 148 / 129) - but a 30-min single-stream soak with the
+#                        old policy (k0-therm-cool: 500 + POOL_SPIN_HOT=1) holds the kernel at 128-131 us per expert and
+#                        87 tok/s per stream FLAT, where the hot spin + DRAM stream fell off a cliff after 18 min (note
+#                        §20.11); 5000 with POOL_SPIN_HOT=1 alone is the open question (k0-therm-spin)
 #            PREFETCH (1)            MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (the expert
 #                        from DRAM costs 119 us in-kernel against 69 from L3; bits untouched by construction, parity PASS);
 #                        PREFETCH_HINT (1 = L2). Default since 10-29 (k0-pf, see POOL_SPIN_US); 0 = off
@@ -119,13 +123,13 @@ DEBUG_COMPACT="${DEBUG_COMPACT:-0}"
 DEBUG_PREFILL="${DEBUG_PREFILL:-0}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 NCCL_CHANNELS="${NCCL_CHANNELS:-}"
-POOL_SPIN_US="${POOL_SPIN_US:-5000}"
+POOL_SPIN_US="${POOL_SPIN_US:-500}"
 PREFETCH="${PREFETCH:-1}"
 PREFETCH_HINT="${PREFETCH_HINT:-1}"
 SPIN_TOUCH_STRIDE="${SPIN_TOUCH_STRIDE:-}"
 PREFILL_OVERLAP="${PREFILL_OVERLAP:-1}"
 DEBUG_OVERLAP="${DEBUG_OVERLAP:-0}"
-POOL_SPIN_HOT="${POOL_SPIN_HOT:-2}"
+POOL_SPIN_HOT="${POOL_SPIN_HOT:-1}"
 POOL_THREADS="${POOL_THREADS:-6}"
 PROMOTE_WINDOW="${PROMOTE_WINDOW:-12}"
 HOST_EMPTY_CACHE="${HOST_EMPTY_CACHE:-0}"

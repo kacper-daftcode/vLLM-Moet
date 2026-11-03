@@ -278,13 +278,18 @@ if [[ -n "${SOAK_MINUTES:-}" ]]; then
   # expert after ~15 min with the hot spin + DRAM stream on 24 cores; the socket's PPT is 350 W, Tctl idles at ~70 C):
   # every 30 s Tctl, the socket's HSMP power, the pool cores' MHz (mean of the 24), the GPUs' power
   THERM="/tmp/ds41-hyb-$TAG-thermal.txt"
-  ( echo "t_s Tctl_C socket_W pool_MHz_mean gpu_W_sum gpu_C_max gpu_sm_MHz_min gpu_throttle"; t0=$(date +%s); while :; do
-      tctl=$(( $(cat /sys/class/hwmon/hwmon4/temp1_input 2>/dev/null || echo 0) / 1000 ))
-      sw=$(( $(cat /sys/class/hwmon/hwmon5/power1_input 2>/dev/null || echo 0) / 1000000 ))
+  # the hwmon numbers change between boots (11-03: k10temp hwmon4 -> hwmon5): resolve by name
+  HW_K10=$(grep -l '^k10temp$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs -r dirname)
+  HW_HSMP=$(grep -l '^amd_hsmp_hwmon$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs -r dirname)
+  HW_EC=$(grep -l '^asusec$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs -r dirname)
+  ( echo "t_s Tctl_C socket_W pool_MHz_mean gpu_W_sum gpu_C_max gpu_sm_MHz_min gpu_throttle cpu_pkg_C vrm_C"; t0=$(date +%s); while :; do
+      tctl=$(( $(cat "$HW_K10/temp1_input" 2>/dev/null || echo 0) / 1000 ))
+      sw=$(( $(cat "$HW_HSMP/power1_input" 2>/dev/null || echo 0) / 1000000 ))
+      pkg=$(( $(cat "$HW_EC/temp1_input" 2>/dev/null || echo 0) / 1000 )); vrm=$(( $(cat "$HW_EC/temp4_input" 2>/dev/null || echo 0) / 1000 ))
       mhz=$(awk '/^cpu MHz/ {n++; if ((n-1)%8 >= 2) {s += $4; k++}} END {if (k) printf "%d", s / k; else print 0}' /proc/cpuinfo)
       g=$(nvidia-smi --query-gpu=power.draw,temperature.gpu,clocks.sm,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null | \
           awk -F', *' '{w += $1; if ($2 > t) t = $2; if (m == "" || $3 < m) m = $3; r = r $4 ","} END {printf "%d %d %d %s", w, t, m, r}')
-      echo "$(( $(date +%s) - t0 )) $tctl $sw $mhz $g"; sleep 30; done ) > "$THERM" 2>/dev/null &
+      echo "$(( $(date +%s) - t0 )) $tctl $sw $mhz $g $pkg $vrm"; sleep 30; done ) > "$THERM" 2>/dev/null &
   THERM_PID=$!
   $PY "$REPO/tools/dsv41_5090/cpu_tier/soak_probe.py" --port "$PORT" --model "$MODEL" --minutes "$SOAK_MINUTES" \
     --conc "${SOAK_CONC:-4}" --max-tokens "${SOAK_TOKENS:-256}" --out "/tmp/ds41-hyb-$TAG-soak.json" 2>&1 | tail -8 | tee -a "$SUMMARY"
