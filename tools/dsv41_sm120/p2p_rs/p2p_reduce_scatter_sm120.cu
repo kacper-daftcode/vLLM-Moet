@@ -1,4 +1,4 @@
-// vllm-moet sm_120, AR track (session P, 29.10.2026): reduce-scatter of a [M, 5120] bf16 TP4 partial over PCIe P2P
+// vllm-moet sm_120: reduce-scatter of a [M, 5120] bf16 TP4 partial over PCIe P2P
 // whose rows carry the bits of NCCL's *all-reduce* of the same partials - the sequence-parallel prefill boundary
 // (patch_vllm_prefill_sp_sm120.py) can then run on this rank's row shard without changing a single bit of the served
 // prefill (NCCL's own reduce-scatter sums three quarters of the rows in another cyclic order than its all-reduce:

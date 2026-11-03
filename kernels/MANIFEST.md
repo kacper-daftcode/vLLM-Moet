@@ -172,7 +172,7 @@ by `gen/moe_w2_check.py` / `gen/moe_w4_check.py` (K=512 rel ~2–3e‑3, determi
 | `moe_w4_mm_k384_a32.cubin` | `moe_w4_mm_k384_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=384** (w2 @ inter 3072 TP8 — **Kimi‑K3 native**), **NWARP=3** |
 | `moe_w4_mm_k768_a32.cubin` | `moe_w4_mm_k768_a32.sass` | `moe_w4_mm` | FP4 GEMM, **K=768** (w2 @ inter 3072 **TP4** — Kimi‑K3), **NWARP=3** |
 
-### Kimi‑K3 TP4 set (2026‑07‑31, session N) — K=768 family
+### Kimi‑K3 TP4 set — K=768 family
 
 K3 under **TP4** shards the w2 contraction to **K=768** (w13 stays K=3584;
 per‑rank geometry `1536,3584,3584,768` — the glue's N13/2 == K2 invariant
@@ -185,7 +185,7 @@ worst_rel ≤3.5e‑3 deterministic (w2 MC1/MC4, w4), AFRAG bit‑exact vs mc4
 Serving needs `VLLM_MOE_W2_KS=...,3584,384,768` and TP4‑sharded packs
 (`k3_build_packs.py --tp 4`).
 
-### Kimi‑K3 native set (2026‑07‑29, session K) — kills the +52% padding tax
+### Kimi‑K3 native set — removes the +52% padding tax
 
 K3's native per‑rank TP8 geometry is `N13=768, K13=3584, N2=3584, K2=384`
 (vs the bring‑up packs zero‑padded to `1024,4096,4096,512`). The full `_a32`
@@ -206,7 +206,7 @@ bit‑exact vs mc4 0/96) + real‑weight K3 parity at native geometry
 run) + full‑model golden battery vs B300 (bit‑identical PASS). Serving
 needs `VLLM_MOE_W2_KS=7168,6144,4096,2048,1024,512,3584,384`.
 
-## EXL3 decode-wave M=8-native canons (`exl3-wave-m8/`, 2026-08-10/11, sessions K/M/E)
+## EXL3 decode-wave M=8-native canons (`exl3-wave-m8/`)
 
 Hand-SASS trellis GEMV canons of the EXL3 decode-wave M∈[2,8] route
 (charter M8 + charter CAPTURE-SAFE): each canon decodes its experts'
@@ -238,7 +238,7 @@ boot-cert PIECEWISE 16/16 + FULL 8/8 with the route captured; paired
 quality GSM8K-200/GPQA-198 NT: no significant regression (McNemar
 p=0.500/1.000). Empty ext-call 16.2 µs (stage early-outs under guarded).
 
-### GLM family (K=6144, BASE-ONLY — [N] 2026-08-24, tor B F-B0..F-B3)
+### GLM family (K=6144, base-only)
 
 Regenerated canons for the GLM-5.2 trellis geometry (H=6144, I=2048,
 serving pair base (2,2,1) cb0 — **no delta side stream**: the ext skips
@@ -270,7 +270,7 @@ the captured graph route (fixed G=T groups). Paired quality GSM8K-200
 (P6, same tool/config/items, OFF→ON): 93.0% → 93.5%, discordants 4/5,
 McNemar exact p=1.000 — no significant regression.
 
-### GLM family M=16 (dual-set with M8 — [O] 2026-08-25, tor C F-C0..F-C3)
+### GLM family M=16 (dual-set with M8)
 
 M=16-native canons widen the decode-wave window to **T∈[2,16]** — the
 HMMA tile is m16n8k16 and the m8 canons zeroed A-fragment rows 8-15;
@@ -324,7 +324,7 @@ needs deterministic KV headroom — pin `--kv-cache-memory-bytes`
 `cudagraph_capture_sizes` trims the G-fix empty groups at C1/C2
 (G 6→4 / 11→8) at zero numerical delta (pad rows are weight-0).
 
-### GLM family M=16×4 — prefill-native (tor D, [T]/[U]/[V] 2026-08-27)
+### GLM family M=16×4 — prefill-native
 
 Prefill-native canons amortize the trellis decode over **4 slabs of
 16 rows** (64 tokens per expert slot): 16 warps = 4 k-splits × 4 slab
@@ -346,7 +346,7 @@ experts). Generators: `internal` wave-sass-lab
 | `k1_m16x4_n6144.cubin` | `exl3_wave_k1cb0` | 74.63 (rot24 @1680; 0.5646) | 1152 |
 
 ¹ Absolute numbers measured at a VERIFIED sm-lock 1680 under load
-(clock-class finding [R]: older cert absolutes are boost-class).
+(older certification absolutes were measured at boost clocks).
 
 Validation: Gate1 oracle rel 2.05-2.09e-4 (both kernels, ×5/×5 runs);
 degenerate per slab: out-of-slab rows bit-zero ×4/×4; real GLM packs

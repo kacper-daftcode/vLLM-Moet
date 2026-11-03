@@ -1,110 +1,56 @@
 #!/usr/bin/env bash
-# DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, DSpark k=5, FP4 compressed KV + fp8 SWA KV, MXFP4
-# indexer cache, 512K context -- the validated deployment (docs/sm120-deploy.md, docs/dsv41-sm120-port.md).
-# Image: Dockerfile.sm120-dsv41-nightly (the vLLM main line, served since 2026-09-23; since 2026-10-13 on vLLM nightly
-# 21d93d0d + FlashInfer 0.7.1rc2: 3.4M-token KV, 88-90 steps/s single stream);
-# IMAGE=vllm-moet-sm120:dsv41-0909 (Dockerfile.sm120-dsv41, the recipe's 0909 image) is the rollback -- KV_MODE=auto
-# picks the right KV plumbing for either.
+# DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (sm_120), TP4, 512K context, DSpark, FP4 compressed KV + MXFP4 indexer
+# cache, optional KV offload to host RAM and disk. Image: Dockerfile.sm120-dsv41-nightly (docs/dsv41-sm120.md).
 #
-# Required:  MODEL_DIR   directory with the official DeepSeek-V4.1-Flash checkpoint
-# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
-#            BIND (127.0.0.1: only local; "" = all interfaces)
-#            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm
-#                        (FlashInfer autotune + JIT, DeepGEMM JIT; first start ~25 min, later ~17 min; the
-#                        dsv41-nightly-21d93d0d-* images load FlashInfer's sm_120 modules AOT, only the autotune
-#                        results and trtllm_utils land here)
-#            MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096)
-#            GPU_MEM_UTIL (0.94)     0.94 with a populated FlashInfer autotune cache; use 0.92 for
-#                        the very first start (the autotune sweep after KV allocation OOMs at 0.95)
-#            SPEC_TOKENS (5)         DSpark draft tokens; 0 disables the drafter (-2.4 GiB/GPU, ~106 tok/s)
-#            INDEXER_KV_DTYPE (mxfp4) indexer K cache: mxfp4 (68 B/key, the format the indexer was trained
-#                        with; validated 2026-09-20: greedy outputs, GSM8K-200 and needle identical to fp8,
-#                        2.29M instead of 1.49M KV tokens at 0.94) or fp8 (132 B/key, V3.2 layout, the
-#                        pre-2026-09-20 default). Passed as --attention-config '{"indexer_kv_dtype":...}';
-#                        mxfp4 needs the 2026-09-20 image (DeepGEMM sm120_fp4 paged logits on 128-key
-#                        pages + the lifted sm_10x gate). Peak GPU memory with mxfp4 at 0.94 is
-#                        97.0/97.9 GB (docs/sm120-deploy.md); GPU_MEM_UTIL=0.93 restores the fp8 margin.
-#            KV_RECORD (nvfp4)       compressed (main) KV record: nvfp4 (288 B/state: the checkpoint's own FP4
-#                        e2m1 + e4m3/16 format, validated 2026-09-21: GSM8K-200 / needle unchanged, greedy
-#                        outputs differ from fp8 the way two serving stacks differ, -1 % decode, -3 %
-#                        prefill, 3.06M instead of 2.29M KV tokens at 0.94), fp8_ds_mla (584 B, the stock
-#                        record served until 2026-09-21) or fp8_v41 (528 B, op-level validated only).
-#                        Needs the 2026-09-21 image (tools/dsv41_sm120/nvfp4_kv/); no rebuild to switch.
-#                        VLLM_MOET_KV_PREFILL_POOL_STATES (default MAX_MODEL_LEN states = 306 MB at 512K)
-#                        sizes the prefill dequant pool; VLLM_MOET_KV_GATHER_ROWS (64) the decode scratch.
-#            KV_MODE (auto)          how KV_RECORD reaches vLLM: "moet" = the 0909 image's plumbing
-#                        (--kv-cache-dtype fp8 + VLLM_MOET_KV_RECORD, our scratch/pool kernels);
-#                        "upstream" = the vLLM-main image (Dockerfile.sm120-dsv41-nightly): nvfp4 ->
-#                        --kv-cache-dtype nvfp4_ds_mla read by FlashInfer's DSv4.1 dual cache, fp8_ds_mla ->
-#                        --kv-cache-dtype fp8_ds_mla (fp8_v41 has no upstream equivalent). "auto" reads the
-#                        image label com.vllm-moet.kv-mode and falls back to "moet".
-#            KV_OFFLOAD_GIB (0)      > 0 = --kv-offloading-size N: vLLM main's native OffloadingConnector keeps
-#                        evicted KV in pinned host RAM (a /dev/shm region of N GiB, total over the TP ranks;
-#                        the container runs with --ipc host, so /dev/shm is the host's). Only the block-128
-#                        group (compressed MLA + indexer) is offloaded; the 128-token SWA window is replayed
-#                        on a hit. Measured 2026-09-23 (4x RTX PRO 6000): 179K-token context restored in
-#                        0.49 s instead of a 17.3 s prefill, decode and prefill unchanged. Host RAM per token:
-#                        896 B (one copy of the TP-replicated KV: the -kvdedup and -ced images,
-#                        patch_vllm_offload_replicated_mla.py; 64 GiB = 76.7M tokens), 3.58 KB on the plain
-#                        vLLM-main image (one copy per rank). Needs the vLLM-main image (Dockerfile.sm120-dsv41-nightly).
-#            KV_OFFLOAD_FS_DIR ("")  with KV_OFFLOAD_GIB > 0: a disk tier behind the host-RAM tier (spec
-#                        TieringOffloadingSpec, secondary tier "fs", bind-mounted at the same path). Every block
-#                        stored to RAM is also written there, one file per 128-token block named by its content
-#                        hash, so the KV outlives evictions from RAM and server restarts. vLLM never deletes
-#                        these files: run docker/sm120/kvcache-ttl.sh from cron. Measured 2026-09-23: a
-#                        221K-token context read back from disk (virtio on this KVM host) in 1.6 s instead of
-#                        a 22 s prefill, 896 B/token on disk (-kvdedup / -ced), prefill unchanged while the
-#                        writes run. INDEXER_KV_DTYPE other than mxfp4 writes to DIR/indexer-<dtype>: vLLM's
-#                        directory name does not cover the indexer format; neither does it the V4.1 record
-#                        placement, so images labeled com.vllm-moet.v41-kv-records=interleaved (vLLM after
-#                        vllm#61371) write to .../v41-interleaved.
-#            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (offload_prompt_only=false), so the
-#                        next turn also hits the previous answer. The V4.1 encoder keeps earlier reasoning and
-#                        tool calls in the history when the request has tools (agents) and drops the reasoning
-#                        otherwise; the dropped blocks only take room in the tiers.
-#            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
-#            PREFILL_DBO (0)         1 = --enable-dbo: an eager step of >= DBO_PREFILL_THRESHOLD (1024) tokens runs as
-#                        two microbatches whose TP all-reduces overlap each other's compute (Dockerfile step 15,
-#                        images built after 2026-10-15; the prefill's all-reduces are a third of its time on this
-#                        PCIe host). DBO_DECODE_THRESHOLD (4096) keeps every decode step (<= 64 tokens, FULL graphs)
-#                        one batch. Not bit-identical to the single-batch prefill (half-size ring chunks). Measured
-#                        2.4x SLOWER on the 1/5-scale dummy-weight model (two Python forwards per chunk pace the GPU;
-#                        docs/dsv41-sm120-port.md "Dual-batch overlap of the prefill all-reduces") - an experiment
-#                        switch, not a serving option, until the host side of the prefill is halved.
-#            INDEXER_TP_SHARD_MIN_ROWS ("")  the sparse indexer splits a step's prefill rows across the TP ranks
-#                        (vllm#54951) from this many rows on; "" keeps vLLM's 65,536, which a 4096-token chunk never
-#                        reaches. A full chunk holds 4,092 prefill rows with DSpark (the scheduler keeps 4 draft
-#                        slots per request out of the budget), so 4096 never fires either; 2048 is the measured value.
-#                        Images on vLLM 3f1bcfd82b+ (vllm#61647, backported by
-#                        patch_vllm_indexer_shard_rows.py); goes into --attention-config with INDEXER_KV_DTYPE=mxfp4.
-#            PROFILER (0)            1 = torch profiler endpoints, traces in PROFILE_DIR
-#            NCCL_P2P_LEVEL (SYS)    P2P over PCIe works in the KVM guests NCCL classifies as PHB
+# Required:  MODEL_DIR   the official DeepSeek-V4.1-Flash checkpoint directory
+#
+# Profile:   SERVED (0)  1 = the production configuration: --moe-backend b12x, DSpark k = 7 on the b12x backend,
+#                        --enable-prompt-tokens-details and the runtime switches production runs with (the list is
+#                        SERVED_SWITCHES below; docs/dsv41-sm120.md explains each). EXTRA_DOCKER_ARGS="-e VAR=0" after it
+#                        overrides a single switch. 0 = vLLM's defaults plus the image's build-time changes only.
+#
+# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r23)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+#            BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
+#            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results + DeepGEMM JIT; the first start fills it (~22 min)
+#            SERVED_NAME (deepseek-ai/DeepSeek-V4.1-Flash)  the model name the API answers to
+#            NCCL_P2P_LEVEL (SYS)    P2P over PCIe also in KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
-# Runtime kill switches (env, no rebuild): VLLM_MOET_SM120_GEMV=0 (CUTLASS instead of the dense MXFP8
-# GEMV), VLLM_MOET_GEMV_IMPL=v1 (the pre-2026-09-20 GEMV kernel instead of v3), VLLM_MOET_SM120_GEMV_BMM=0
-# (BF16 emulation for wo_a), VLLM_MOET_DECODER_REPLAY=0 (the -ced .. -pdl images on vLLM 0961bbae prefill layers 21-39
-# on every prompt token again instead of the last 128; on the dsv41-nightly-21d93d0d-* images the replay is vLLM's own and
-# EXTRA_ARGS="--no-swa-bounded-replay" turns off both of its sides), VLLM_MOET_MOE_QUANT_SCATTER=0 (the -moeqs image quantizes
-# the MoE input in prepare() and permutes it with vLLM's kernels again instead of one fused launch at
-# decode shapes), VLLM_MOET_MHC_OVERLAP=0 (the -mhc image runs the mHC boundary as the TileLang pair on
-# the model stream again, all-reduce back in the linear layers; sub-options VLLM_MOET_MHC_FUSE_ALLREDUCE=0,
-# VLLM_MOET_MHC_PDL=0, VLLM_MOET_MHC_PROJ=fused|tf32), VLLM_MOET_BF16_GEMM=0 (the -bf16 image runs the small-M
-# BF16 GEMMs on cuBLAS again; VLLM_MOET_BF16_GEMM_SITES=indexer,wk,router[,compressor] picks the sites),
-# VLLM_MOET_ENGRAM_WKV_TP=0 (the -engram image runs Engram's wkv replicated at decode again); on the -pdl images also
-# VLLM_MOET_GEMV_PDL=0, VLLM_MOET_GEMV_EVICT_FIRST=0, VLLM_MOET_BF16_GEMM_PDL=0, VLLM_MOET_MOE_QUANT_SCATTER_PDL=0 (plain
-# launches as before), VLLM_MOET_BF16_CHAIN=v2 (opt-in ring chain), VLLM_MOET_NCCL_GRAPH_RECORDS=0 (NCCL's graph event
-# records kept), VLLM_MOET_MOE_FC2_DISCARD=0 (FC2 padding rows left in L2), VLLM_MOET_MOE_FC2_DISCARD_SIDE=1 (images
-# built after 2026-10-14, opt-in: the discard on a side stream joined after the gather instead of inline).
-# Pass them with EXTRA_DOCKER_ARGS="-e VAR=0". enable_adaptive_verification must stay
-# false on this path (DeepseekV4IndexerBackend does not support it on sm_120).
-# Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100,
-# default high = 75; OpenAI aliases minimal 25 / medium 62 / xhigh 87 are accepted). Pin a
-# budget per request with chat_template_kwargs {"reasoning_effort": <1..100>} or the OpenAI
-# `reasoning_effort` field; "none" or {"thinking": false} turns thinking off.
+#
+# Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk)
+#            GPU_MEM_UTIL (0.94)     0.92 for the very first start (the autotune sweep OOMs at 0.95 on a cold CACHE_DIR)
+#            SPEC_TOKENS (5; 7 with SERVED=1)  DSpark draft tokens, 0 = no drafter (-2.4 GiB per GPU)
+#            MOE_BACKEND ("" ; b12x with SERVED=1)  --moe-backend; b12x = FlashInfer's W4A8 compact path the fused
+#                        decode MoE and the prefill MoE kernels (steps 17, 22, 27, 42) attach to
+#            LANGUAGE_ONLY (0)       1 = --language-model-only (no vision encoder, +0.3 GiB KV)
+#
+# KV cache:  KV_RECORD (nvfp4)       compressed KV record: nvfp4 (288 B/state, the checkpoint's own FP4 format; 9.6M GPU
+#                        tokens at 0.94), fp8_ds_mla (584 B, vLLM's stock record) or fp8_v41 (528 B, the 0909 image only)
+#            INDEXER_KV_DTYPE (mxfp4) indexer K cache: mxfp4 (68 B/key, the indexer's training format) or fp8 (132 B/key)
+#            KV_MODE (auto)          how KV_RECORD reaches vLLM: auto reads the image label com.vllm-moet.kv-mode
+#                        (upstream = --kv-cache-dtype nvfp4_ds_mla / fp8_ds_mla; moet = the 0909 image's plumbing)
+#            INDEXER_TP_SHARD_MIN_ROWS ("")  from this many prefill rows per step the indexer shards its rows over the TP
+#                        ranks; "" keeps vLLM's 65,536 (never reached with 4096-token chunks); production runs 2048
+#            KV_OFFLOAD_GIB (0)      > 0: evicted KV kept in N GiB of pinned host RAM (one /dev/shm region for all ranks,
+#                        896 B per token) and restored on a prefix hit; the host needs ~330 GB of shared memory in total
+#                        with 64 GiB - on a host with less RAM keep 0 (nothing changes below the GPU KV capacity)
+#            KV_OFFLOAD_FS_DIR ("")  with KV_OFFLOAD_GIB > 0: a disk tier behind the RAM tier (one file per 128-token
+#                        block, survives restarts). vLLM never deletes the files: run docker/sm120/kvcache-ttl.sh from
+#                        cron. Images labeled com.vllm-moet.v41-kv-records=interleaved write under DIR/v41-interleaved;
+#                        INDEXER_KV_DTYPE=fp8 under DIR/indexer-fp8 (the formats must not share a directory)
+#            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (the next turn hits the previous answer)
+#
+# Experiments: PREFILL_DBO (0)  1 = --enable-dbo (two prefill microbatches; needs an image built with step 15; measured
+#                        slower on this host), DBO_PREFILL_THRESHOLD (1024), DBO_DECODE_THRESHOLD (4096)
+#            PROFILER (0)            1 = torch profiler endpoints (/start_profile, /stop_profile), traces in PROFILE_DIR
+#
+# Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100, default high; the OpenAI
+# aliases minimal 25 / medium 62 / xhigh 87 are accepted) - chat_template_kwargs {"reasoning_effort": 1..100} or the
+# OpenAI reasoning_effort field; "none" or {"thinking": false} turns thinking off. enable_adaptive_verification stays
+# false (DeepseekV4IndexerBackend does not support it on sm_120).
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-21d93d0d-pdl}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -116,7 +62,29 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
+SERVED="${SERVED:-0}"
+case "$SERVED" in
+  0|1) ;;
+  *) echo "SERVED must be 0 or 1, got $SERVED" >&2; exit 1 ;;
+esac
+# The production configuration (docs/dsv41-sm120.md, "Switches"): the runtime switches of the image's steps that are
+# off by default, in the state production serves them. EXTRA_DOCKER_ARGS comes later on the docker command line, so
+# "-e VAR=0" there overrides one of these.
+SERVED_SWITCHES=(
+  VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1
+  VLLM_MOET_P2P_AR=1 VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8
+  VLLM_MOET_DFLASH_PREP_GROUPS=1 VLLM_MOET_CANDIDATE_DET_TOPK=1 VLLM_MOET_SWA_DECODE_BUILD=1
+  VLLM_MOET_MOE_TOPKSUM_ADD=1 VLLM_MOET_SWA_DRAFT_BUILD=1 B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
+  VLLM_MOET_MHC_MXFP8=1 VLLM_MOET_MHC_SIDE_DEFER=1
+  VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1
+  VLLM_MOET_DET_TOPK=1
+)
+if [[ "$SERVED" == "1" ]]; then
+  : "${SPEC_TOKENS:=7}"
+  : "${MOE_BACKEND:=b12x}"
+fi
 SPEC_TOKENS="${SPEC_TOKENS:-5}"
+MOE_BACKEND="${MOE_BACKEND:-}"
 INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-mxfp4}"
 KV_RECORD="${KV_RECORD:-nvfp4}"
 LANGUAGE_ONLY="${LANGUAGE_ONLY:-0}"
@@ -137,9 +105,17 @@ EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 mkdir -p "$CACHE_DIR/dot-cache" "$CACHE_DIR/deep_gemm"
 
 ARGS=()
+SERVED_ENV=()
+if [[ "$SERVED" == "1" ]]; then
+  for kv in "${SERVED_SWITCHES[@]}"; do SERVED_ENV+=(-e "$kv"); done
+  ARGS+=(--enable-prompt-tokens-details)
+fi
+[[ -n "$MOE_BACKEND" ]] && ARGS+=(--moe-backend "$MOE_BACKEND")
 if [[ "$SPEC_TOKENS" != "0" ]]; then
+  SPEC_MOE=""
+  [[ -n "$MOE_BACKEND" ]] && SPEC_MOE=",\"moe_backend\":\"$MOE_BACKEND\""
   ARGS+=(--speculative-config
-    "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false}")
+    "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false${SPEC_MOE}}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
 case "$PREFILL_DBO" in
@@ -245,6 +221,7 @@ docker run -d --name "$NAME" --restart no \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e NCCL_P2P_DISABLE=0 -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \
   "${KV_ENV[@]}" \
+  "${SERVED_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
   "$IMAGE" \
   --model /model --served-model-name "$SERVED_NAME" \

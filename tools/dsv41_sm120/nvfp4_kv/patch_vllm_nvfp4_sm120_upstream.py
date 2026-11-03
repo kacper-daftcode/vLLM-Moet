@@ -2,7 +2,7 @@
 """vLLM main: let `--kv-cache-dtype nvfp4_ds_mla` run on sm_120 through FlashInfer's DSv4.1 dual-cache
 sparse MLA (flashinfer-ai/flashinfer#5197, in the FlashInfer nightly wheels since 0.7.0.dev20260919).
 
-This is our upstream PR (branch `dsv41-sm120-nvfp4-flashinfer`, internal/upstream-dsv41-sm120-nvfp4-PR.md)
+This is our upstream PR (branch `dsv41-sm120-nvfp4-flashinfer`)
 as an idempotent, anchor-based patcher for the vllm-openai:nightly based image, applied until the PR is
 merged. Three files:
 

@@ -56,7 +56,8 @@ def _profile(torch, fn, iters, tag):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dumps", default="/workspace/tmp/par31/L/win/dumps")
+    ap.add_argument("--dumps", default=os.environ.get("VLLM_MOET_DUMPS", "dumps"),
+                    help="directory with the served model's MoE dumps (patch_vllm_b12x_moe_dump_sm120.py); env VLLM_MOET_DUMPS")
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--cfgs", nargs="*", default=["0,0,1", "1,0,1", "0,1,1", "1,1,1", "0,0,0"],
                     help="cfg1,cfg2,dynamic tuples")

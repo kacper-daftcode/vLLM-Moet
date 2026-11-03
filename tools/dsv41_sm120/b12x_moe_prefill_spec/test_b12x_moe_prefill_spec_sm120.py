@@ -9,7 +9,7 @@
    B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 (the served setting since step 27a) runs the dynamic path (T > 8); its route
    rows (workspace.route_output, token-major pair rows, spied from _impl._launch_dynamic) and its output must equal
    ours (`torch.equal` on the int16 views).
-2. Dumps (--dumps, default /workspace/tmp/par31/L/win/dumps): the served model's MoE layer (weights_layer2.pt: the exact
+2. Dumps (--dumps, or VLLM_MOET_DUMPS): the served model's MoE layer (weights_layer2.pt: the exact
    tensors handed to b12x prepare_weights on rank 0; call1_layer2.pt: hidden_states / topk_ids / topk_weights / output of
    a real 4096-row prefill chunk). b12x re-run here must reproduce the dumped output exactly (the served arithmetic
    recorded), and ours must equal both.
@@ -100,7 +100,8 @@ def _planes(torch, prepared, spied):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dumps", default="/workspace/tmp/par31/L/win/dumps")
+    ap.add_argument("--dumps", default=os.environ.get("VLLM_MOET_DUMPS", "dumps"),
+                    help="directory with the served model's MoE dumps (patch_vllm_b12x_moe_dump_sm120.py); env VLLM_MOET_DUMPS")
     ap.add_argument("--synthetic-only", action="store_true")
     ap.add_argument("--rows", type=int, default=0, help="limit the dump case to the first N rows (0 = all 4096)")
     a = ap.parse_args()

@@ -6,7 +6,7 @@ The raw driver JSONs are annotated and compacted through the SAME code path
 the harness quality probe uses (paired_token_stats + harness_invocation
 binding + the exact compact vs_baseline structure), so the schema-2 strict
 validator re-derives identical values. Provenance stays `imported` because
-the serve was launched by hand (session I's sweep server), not by bench.py;
+the serve was launched by hand (the tau sweep server), not by bench.py;
 the env deltas vs the recipe are documented in `source`.
 
 Runtime pins (byte-verified): image vllm-moet-sm120:v024-db13b2e9c =

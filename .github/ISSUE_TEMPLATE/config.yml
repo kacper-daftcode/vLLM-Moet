@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Validation report (other hardware, other model, numbers)
+    url: https://github.com/kacper-daftcode/vLLM-Moet/discussions
+    about: Reports and questions go to Discussions; issues are for bugs with a reproduction.

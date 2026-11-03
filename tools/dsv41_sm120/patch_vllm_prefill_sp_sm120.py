@@ -10,7 +10,7 @@ with the boundaries owning the reductions (fuse_mhc_all_reduce, the sm_120 defau
 <= 64 tokens) and every replay-batch step keep today's code: P2P all-reduce + boundary kernel.
 
 Why. A fresh 163K prefill spends 29.4 % of its GPU time in NCCL all-reduces: two [4096, 5120] bf16 all-reduces per
-full layer per 4096-token chunk, 1.34-1.49 ms each (Phase 0, /workspace/tmp/par31/L/phase0/PHASE0_RESULTS.md §2, §5).
+full layer per 4096-token chunk, 1.34-1.49 ms each (the Phase 0 profile).
 On this PCIe ring (NCCL 2.30.7, 4 x RTX PRO 6000): all_reduce 1 341 us, reduce_scatter 728, all_gather 719. Every
 sublayer output is a per-rank partial sum that only the mHC boundary (post-mix of the residual streams, the pre-mix
 projection + Sinkhorn, RMSNorm of the collapsed input) consumes, and that boundary is row-wise: it can run on this
@@ -88,7 +88,7 @@ Usage:
   --dist   the vllm package directory (default /usr/local/lib/python3.12/dist-packages/vllm)
   --check  dry run: report whether every anchor is present (or the patch is already applied), change nothing
 
-Reduce-scatter order (session P, 29.10): VLLM_MOET_PREFILL_SP_RS=nccl (default) uses vLLM's sp_reduce_scatter - NCCL's
+Reduce-scatter order: VLLM_MOET_PREFILL_SP_RS=nccl (default) uses vLLM's sp_reduce_scatter - NCCL's
 ring order, 1 ulp on 32 % of the elements against the served all-reduce; =p2p uses tools/dsv41_sm120/p2p_rs (module
 directory VLLM_MOET_P2P_RS_DIR, default /opt/vllm-moet/dsv41_sm120/p2p_rs): a P2P push of the peers' row blocks and
 a consumer that adds the four partials of every 8-element group in the order NCCL's all-reduce used for it (tables

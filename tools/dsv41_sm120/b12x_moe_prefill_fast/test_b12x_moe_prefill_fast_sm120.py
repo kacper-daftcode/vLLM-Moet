@@ -33,7 +33,8 @@ E, H, N, TOPK, LIMIT = 384, 5120, 576, 6, 10.0
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dumps", default="/workspace/tmp/par31/L/win/dumps")
+    ap.add_argument("--dumps", default=os.environ.get("VLLM_MOET_DUMPS", "dumps"),
+                    help="directory with the served model's MoE dumps (patch_vllm_b12x_moe_dump_sm120.py); env VLLM_MOET_DUMPS")
     ap.add_argument("--synthetic-only", action="store_true")
     ap.add_argument("--rows", type=int, default=0)
     ap.add_argument("--cfg1", type=int, default=None)

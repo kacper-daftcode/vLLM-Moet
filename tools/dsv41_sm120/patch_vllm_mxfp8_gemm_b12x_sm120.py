@@ -5,7 +5,7 @@ vLLM's MXFP8 linear kernel on sm_120 (`model_executor/kernels/linear/mxfp8/flash
 `flashinfer.mm_mxfp8(..., backend="cutlass")` for every row count above the GEMV range: the CUTLASS SM120 block-scaled
 GEMM (tile 128 x 128 x 128). FlashInfer 0.7.2 also ships a b12x (CuTe-DSL, warp-level MMA) backend for the same inputs
 (1D swizzled 128x4 scales, K % 128 == 0). Measured on one RTX PRO 6000 at M = 4096 (Phase 0, 2026-10-29,
-/workspace/tmp/par31/L/phase0/out/dense_gemm.json): 6144 -> 6400: 790 -> 564 us, 1280 -> 4096: 108 -> 78,
+the Phase 0 harness): 6144 -> 6400: 790 -> 564 us, 1280 -> 4096: 108 -> 78,
 5120 -> 5120: 527 -> 377, 2048 -> 5120: 226 -> 166 (-26...-29 %), and the outputs are bit-identical (`torch.equal`) -
 the same QMMA.SF instruction, fp32 accumulation per 32-wide block, the same epilogue rounding. The dense MXFP8 GEMMs are
 10.5 % of a 163K prefill's GPU time, so this is ~-3 % of the chunk for a backend switch.
@@ -15,7 +15,7 @@ VLLM_MOET_MXFP8_GEMM_B12X_MIN_M (default 128: decode-size calls keep CUTLASS / o
 the b12x backend refuses falls back to CUTLASS once per process (logged), so a shape outside its envelope cannot break
 serving. Bits: identical to CUTLASS on every shape of the bit test (tools/dsv41_sm120/mxfp8_gemm_b12x/). Default 0.
 
-RESULT IN SITU: NEGATIVE - not in any image, kept as the documented measurement (session L, 2026-10-29, GPUs 4-7, real
+RESULT IN SITU: NEGATIVE - not in any image, kept as the documented measurement (2026-10-29, GPUs 4-7, real
 model, served configuration). Bit test 119/119 shapes identical, but end to end the fresh 163K prefill took 8.67-8.73 s
 with the switch on against 8.48-8.55 s off (+2.3 %); the 19K profile shows the b12x kernel at 103 ms over 875 launches
 against CUTLASS's 93 ms (+11 % in situ, the opposite of the one-GPU harness) and the GPU idle share of the prefill

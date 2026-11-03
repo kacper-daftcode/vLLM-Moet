@@ -1,4 +1,4 @@
-// B2 v3 (sm120-perf-32, session A): one-shot push all-reduce over PCIe P2P for decode-sized [M, 5120] bf16, TP4.
+// One-shot push all-reduce over PCIe P2P for decode-sized [M, 5120] bf16, TP4.
 //
 // Platform rule (measured, p2p_bw_all.py): one GPU must write to ONE peer at a time - a kernel writing to several peers
 // concurrently is ~16x slower. push_phased therefore streams to peer 0, then peer 1, then peer 2, inside one launch:
