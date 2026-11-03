@@ -37,7 +37,7 @@ def main() -> int:
     ap.add_argument("--out", default="/mnt/nvme/models/mini-real576")
     ap.add_argument("--layers", default="0,1,2,3,20,21,24,23", help="real layer of every mini layer, in order")
     ap.add_argument("--experts", type=int, default=16)
-    ap.add_argument("--inter", type=int, default=576, help="moe_intermediate_size: 576 (TP1 = TP4 rank 0) or 1152 (TP2 = TP4 ranks 0+1)")
+    ap.add_argument("--inter", type=int, default=576, help="moe_intermediate_size: 576 (one TP4 slice: TP1 = rank 0), 1152 (two slices: TP2 or TP1 with 2 virtual ranks) or 2304 (the full experts: TP4, or TP1 / TP2 with 4 / 2 virtual ranks - mini-real2304*)")
     args = ap.parse_args()
     real_layers = [int(x) for x in args.layers.split(",")]
     E = args.experts

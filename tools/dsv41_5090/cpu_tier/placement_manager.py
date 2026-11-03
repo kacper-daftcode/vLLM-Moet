@@ -35,10 +35,13 @@ def load_layout(tables_dir: str, device: torch.device) -> dict:
 
 class ResidentPool:
     def __init__(self, layer: int, n_experts: int, R: int, device: torch.device, pool: dict | None = None,
-                 slot_table: torch.Tensor | None = None, record_ok=None):
+                 slot_table: torch.Tensor | None = None, record_ok=None, V: int = 1):
         self.layer, self.E, self.R, self.device = layer, n_experts, R, device
+        # V = slices per expert (virtual ranks, 2026-11-04): the pool tensors have R * V rows, row s * V + v = (slot s,
+        # slice v); the slot table and the LRU bookkeeping stay per expert slot (an expert's slices move together)
+        self.V = V
         # pool=None: own tensors; pool={}: attached later (vLLM's prepared storages, at the layer's first launch)
-        self.pool = pool if pool is not None else {name: torch.zeros(R, w, dtype=torch.int32, device=device) for name, w in WORDS.items()}
+        self.pool = pool if pool is not None else {name: torch.zeros(R * V, w, dtype=torch.int32, device=device) for name, w in WORDS.items()}
         self.slot_table = slot_table if slot_table is not None else torch.full((n_experts,), -1, dtype=torch.int32, device=device)
         self.expert_of_slot = np.full(R, -1, dtype=np.int32)        # host mirror of the table
         self.slot_of_expert = np.full(n_experts, -1, dtype=np.int32)
@@ -98,9 +101,12 @@ class PlacementManager:
     def __init__(self, ext, layout: dict, pools: list[ResidentPool], records_of, copy_stream: torch.cuda.Stream,
                  max_promotions_per_layer: int = 4, record_ptr=None):
         """records_of(layer, expert) -> a pinned host uint8 tensor [RECORD_BYTES] (the store); record_ptr(layer,
-        expert) -> its host address (for the batched promotion; derived from records_of when None)."""
+        expert) -> its host address (for the batched promotion; derived from records_of when None). With virtual
+        ranks (pools[].V > 1) both take a third argument v = the slice (store rank) and are called per slice."""
         self.ext, self.layout, self.pools, self.records_of = ext, layout, pools, records_of
-        self.record_ptr = record_ptr or (lambda layer, e: int(records_of(layer, e).data_ptr()))
+        self.record_ptr = record_ptr or (lambda layer, e, *v: int(records_of(layer, e, *v).data_ptr()))
+        self.V = int(pools[0].V) if pools else 1
+        assert all(int(P.V) == self.V for P in pools), "every layer has the same number of slices per expert"
         self.copy = copy_stream
         self.max_per_layer = max_promotions_per_layer
         self.unmap_events: list[torch.cuda.Event] = []     # U of the last after_launch
@@ -114,9 +120,28 @@ class PlacementManager:
         self.last_miss = [np.full(P.E, -10 ** 9, dtype=np.int64) for P in pools] if self.window > 0 else None
 
     def _repack_into(self, P: ResidentPool, layer: int, e: int, s: int) -> None:
-        P.staging.copy_(self.records_of(layer, e), non_blocking=True)
-        self.ext.repack_record(P.staging, self.layout["w13"], self.layout["w13s"], self.layout["w2"], self.layout["w2s"],
-                               P.pool["w13"], P.pool["w13s"], P.pool["w2"], P.pool["w2s"], s)
+        if self.V == 1:
+            P.staging.copy_(self.records_of(layer, e), non_blocking=True)
+            self.ext.repack_record(P.staging, self.layout["w13"], self.layout["w13s"], self.layout["w2"], self.layout["w2s"],
+                                   P.pool["w13"], P.pool["w13s"], P.pool["w2"], P.pool["w2s"], s)
+            return
+        for v in range(self.V):   # the expert's V slices into rows s * V + v
+            P.staging.copy_(self.records_of(layer, e, v), non_blocking=True)
+            self.ext.repack_record(P.staging, self.layout["w13"], self.layout["w13s"], self.layout["w2"], self.layout["w2s"],
+                                   P.pool["w13"], P.pool["w13s"], P.pool["w2"], P.pool["w2s"], s * self.V + v)
+
+    def _promote_batch(self, P: ResidentPool, layer: int, out: list) -> None:
+        """The batched GPU side of one layer's promotions (V = 1: promote_batch, unchanged; V > 1: promote_batch_v
+        with the V slice records per expert)."""
+        experts = [e for e, _, _, _ in out]
+        slots = [s for _, s, _, _ in out]
+        pool = (P.pool["w13"], P.pool["w13s"], P.pool["w2"], P.pool["w2s"])
+        lay = (self.layout["w13"], self.layout["w13s"], self.layout["w2"], self.layout["w2s"])
+        if self.V == 1:
+            self.ext.promote_batch(P.staging, *lay, *pool, P.slot_table, [self.record_ptr(layer, e) for e in experts], experts, slots)
+        else:
+            ptrs = [self.record_ptr(layer, e, v) for e in experts for v in range(self.V)]
+            self.ext.promote_batch_v(P.staging, *lay, *pool, P.slot_table, ptrs, experts, slots, self.V)
 
     def fill_initial(self, layer: int, residents: list[int], stream: torch.cuda.Stream | None = None) -> None:
         """Static placement at startup: residents in slot order (synchronous)."""
@@ -221,10 +246,7 @@ class PlacementManager:
             for layer, out in plans.items():
                 P = self.pools[layer]
                 if self.batched:
-                    self.ext.promote_batch(P.staging, self.layout["w13"], self.layout["w13s"], self.layout["w2"], self.layout["w2s"],
-                                           P.pool["w13"], P.pool["w13s"], P.pool["w2"], P.pool["w2s"], P.slot_table,
-                                           [self.record_ptr(layer, e) for e, _, _, _ in out], [e for e, _, _, _ in out],
-                                           [s for _, s, _, _ in out])
+                    self._promote_batch(P, layer, out)
                 else:
                     for e, s, _, _ in out:
                         self._repack_into(P, layer, e, s)

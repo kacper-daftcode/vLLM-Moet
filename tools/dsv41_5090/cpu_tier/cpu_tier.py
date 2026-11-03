@@ -263,3 +263,121 @@ class CpuTier:
         buf = (ctypes.c_int64 * 7)()
         self.lib.cpu_tier_pool_stats(self.handle, buf, 1 if reset else 0)
         return dict(fc2_blocks=buf[0], fc2_general=buf[1], cyc_prepare=buf[2], cyc_fc1=buf[3], cyc_act=buf[4], cyc_fc2=buf[5], fc2_q0=buf[6])
+
+
+class TierGroup:
+    """Virtual ranks (TP2 / TP1 on one GPU, 2026-11-04): V CpuTiers in one process - one per 576-row slice of the
+    experts, each with its own mailboxes, dispatcher thread, kernel pool (its CCD) and record set (the store's rank
+    r * V + v) - driven as one: one publish launch writes the V requests of a layer from the EXPANDED routing
+    (topk_ids [T, K * V], pair p -> slice p % V), one wait launch waits for the V acks and injects every slice's rows.
+    The step counter, the per-layer sequence numbers and the error word are tier 0's (shared). The host-side
+    observation (uses / misses / kpis) is tier 0's: every virtual rank serves the same (token, expert) misses; the
+    pool statistics are per virtual rank. Same interface as CpuTier where the runtime needs it."""
+
+    def __init__(self, n_layers: int, n_experts: int, cpu_ids_per_rank: list, dispatcher_cpus: list, device: torch.device,
+                 tables_dir: str, timeout_ms: float = 500.0, vs1: float = 1.0, vs2: float = 1.0, lib_path: str | None = None):
+        V = len(cpu_ids_per_rank)
+        assert 2 <= V <= cuda_ext().max_vranks(), V
+        assert len(dispatcher_cpus) == V
+        self.tiers = [CpuTier(n_layers, n_experts, cpu_ids_per_rank[v], dispatcher_cpus[v], device, tables_dir,
+                              timeout_ms=timeout_ms, vs1=vs1, vs2=vs2, lib_path=lib_path) for v in range(V)]
+        t0 = self.tiers[0]
+        self.V, self.ext, self.lib = V, t0.ext, t0.lib
+        self.n_layers, self.n_experts, self.device = n_layers, n_experts, device
+        self.timeout_ns = t0.timeout_ns
+        self.step_dev, self.seq_dev, self.err_d = t0.step_dev, t0.seq_dev, t0.err_d
+        self.req_d = [[t.req_d[L] for t in self.tiers] for L in range(n_layers)]
+        self.ack_d = [[t.ack_d[L] for t in self.tiers] for L in range(n_layers)]
+        self.staging_d = [[t.staging_d[L] for t in self.tiers] for L in range(n_layers)]
+        self.started = False
+
+    # ---- store: the record of (layer, expert) for virtual rank v ---------------------------------------------------
+    def set_record(self, layer: int, expert: int, host_ptr: int, v: int = 0) -> None:
+        self.tiers[v].set_record(layer, expert, host_ptr)
+
+    # ---- lifecycle --------------------------------------------------------------------------------------------
+    def start(self, first_step: int = 1) -> None:
+        for t in self.tiers:
+            t.start(first_step)
+        self.started = True
+
+    def restart_from_device(self) -> None:
+        seq = self.seq_dev.cpu().numpy().astype(np.uint32) + 1
+        arr = (ctypes.c_uint32 * self.n_layers)(*seq.tolist())
+        for t in self.tiers:
+            assert self.lib.cpu_tier_start_seq(t.handle, arr) == 0
+            t.started = True
+        self.started = True
+
+    def stop(self) -> None:
+        for t in self.tiers:
+            t.stop()
+        self.started = False
+
+    def close(self) -> None:
+        for t in self.tiers:
+            t.close()
+
+    # ---- the captured ops -------------------------------------------------------------------------------------
+    def step_begin(self) -> None:
+        self.ext.step_begin(self.step_dev)
+
+    def publish(self, layer: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor, slot_table: torch.Tensor,
+                a_values: torch.Tensor, a_scales: torch.Tensor, n_tokens: int, remapped: torch.Tensor) -> torch.Tensor:
+        """topk_ids / topk_weights: the expanded routing [T, K * V]; remapped gets slot * V + v (-1 = missing)."""
+        self.ext.publish_v(self.req_d[layer], self.seq_dev[layer:layer + 1], topk_ids, topk_weights, slot_table, remapped,
+                           a_values, a_scales, int(n_tokens))
+        return remapped
+
+    def wait_inject(self, layer: int, route_output: torch.Tensor) -> None:
+        self.ext.wait_inject_v(self.ack_d[layer], self.req_d[layer], self.staging_d[layer], self.seq_dev[layer:layer + 1],
+                               route_output, self.err_d, self.timeout_ns)
+
+    # ---- host-side observation --------------------------------------------------------------------------------
+    def error(self) -> int:
+        return self.tiers[0].error()
+
+    def clear_error(self) -> None:
+        self.tiers[0].clear_error()
+
+    def totals(self) -> dict:
+        """Tier 0's totals (the shared sequence), plus per virtual rank: busy ns, errors, layers served."""
+        tot = self.tiers[0].totals()
+        per = [t.totals() for t in self.tiers]
+        tot["busy_ns_v"] = [p["busy_ns"] for p in per]
+        tot["errors_v"] = [p["errors"] for p in per]
+        tot["layers_v"] = [p["layers"] for p in per]
+        tot["errors"] = sum(p["errors"] for p in per)
+        tot["busy_ns"] = max(p["busy_ns"] for p in per)
+        return tot
+
+    def kpis(self, cap: int = 4096) -> np.ndarray:
+        return self.tiers[0].kpis(cap)
+
+    def kpis_v(self, v: int, cap: int = 4096) -> np.ndarray:
+        return self.tiers[v].kpis(cap)
+
+    def misses(self, cap: int = 65536) -> np.ndarray:
+        """Tier 0's miss log (the virtual ranks serve the same (step, layer, expert) misses); the other tiers' logs
+        are drained so that their cursors do not fall behind the rings."""
+        out = self.tiers[0].misses(cap)
+        for t in self.tiers[1:]:
+            t.misses(cap)
+        return out
+
+    def uses(self, cap: int = 16384):
+        out = self.tiers[0].uses(cap)
+        for t in self.tiers[1:]:
+            t.uses(cap)
+        return out
+
+    def now_ns(self) -> int:
+        return self.tiers[0].now_ns()
+
+    def pool_stats(self, reset: bool = True) -> dict:
+        """Tier 0's pool counters (the KPI line's worker-0 cycles) ..."""
+        return self.tiers[0].pool_stats(reset)
+
+    def pool_stats_v(self, reset: bool = True) -> list[dict]:
+        """... and every virtual rank's (tier 0's included, read once: call either this or pool_stats per interval)."""
+        return [t.pool_stats(reset) for t in self.tiers]

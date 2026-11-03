@@ -47,6 +47,18 @@ Environment:
                                         the scratch pool in one b12x run = the all-resident reference of this boot;
                                         the hybrid's route rows (GPU pairs / CPU pairs) and the layer output are
                                         compared bit for bit (R5 within one boot, where TP4 boots are not reproducible)
+  VLLM_MOET_CPU_TIER_VRANKS             virtual ranks (TP2 / TP1, 2026-11-04): auto (default) = a target layer whose
+                                        per-rank intermediate size is V x 576 (V = 4 at TP1, 2 at TP2) is served as V
+                                        "slice-experts" per expert slot - the TP4 rank slices the store holds, the same
+                                        compact kernels at N = 576, kernel v2 unchanged, one CPU pool (CCD) + mailbox set
+                                        per slice, the router's top-K expanded to K x V (token, slice) pairs, the compact
+                                        TopKSum adding the slices' FC2 rows in route order (k-major, slice-minor; fp32,
+                                        one bf16 rounding - the fixed order that replaces TP4's NCCL ring); 1 = only the
+                                        576 geometry (other geometries left on the GPU, as before 11-04)
+  VLLM_MOET_CPU_TIER_VRANK_CPUS         V > 1: the pools' CPUs per virtual rank, ';'-separated ranges ("2-7;10-15;18-23;26-31");
+  VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS  their dispatcher CPUs ("1,9,17,25"). Default: process (TP rank) r takes CCDs
+                                        r*V .. r*V+V-1 - per CCD g: dispatcher 8g+1, pool 8g+2..8g+7 (POOL_THREADS 6; 12 adds
+                                        the SMT siblings 8g+34..8g+39); main thread 8rV, the other threads 8rV+32/33
 """
 from __future__ import annotations
 
@@ -94,6 +106,11 @@ SCRATCH_SLOTS = int(os.environ.get("VLLM_MOET_CPU_TIER_SCRATCH", "0"))   # prefi
 # output, compared bit for bit (the in-boot A/B of the overlap; eager prefill only, host syncs allowed).
 PREFILL_OVERLAP = os.environ.get("VLLM_MOET_CPU_TIER_PREFILL_OVERLAP", "0") == "1"
 DEBUG_OVERLAP = os.environ.get("VLLM_MOET_CPU_TIER_DEBUG_OVERLAP", "0") == "1"
+# virtual ranks (2026-11-04, TP2 / TP1): "auto" = V = intermediate_size_per_partition / 576 (1, 2 or 4); "1" = the
+# pre-11-04 behaviour (only the TP4 slice geometry is hybrid)
+VRANKS_MODE = os.environ.get("VLLM_MOET_CPU_TIER_VRANKS", "auto")
+VRANKS_MAX = 4
+MAX_TOKENS_MAILBOX = 16   # CPU_TIER_MAX_TOKENS: the expanded-routing buffers of the compact path are sized for it
 
 
 def _log(msg: str) -> None:
@@ -120,9 +137,14 @@ class _State:
         self.layers: list[_LayerCfg] = []          # by hybrid index
         self.skip: set = set()                     # id(layer) of target layers left on the GPU (geometry)
         self.E = 0
-        self.remapped: list[torch.Tensor] = []     # per layer, [MAX_PAIRS] int32 (sliced per call)
+        self.remapped: list[torch.Tensor] = []     # per layer, [MAX_PAIRS * V] int32 (sliced per call)
         self.arena: dict[int, int] = {}            # dummy mode: li -> pinned arena base (E records)
-        self.store = None                          # store mode: cpu_tier.ExpertStore
+        self.store = None                          # store mode: cpu_tier.ExpertStore (virtual rank 0's)
+        self.stores: list = []                     # store mode: one ExpertStore per virtual rank (store rank r * V + v)
+        self.V = 1                                 # slices per expert on this GPU (virtual ranks): 1 = the TP4 geometry
+        self.ids_x: list[torch.Tensor] = []        # V > 1: per layer the expanded routing of the compact path (ids, static)
+        self.wts_x: list[torch.Tensor] = []        # V > 1: ... and its weights
+        self.vidx = None                           # V > 1: [TOPK_MAX * V] int32, pair column -> slice index (p % V)
         self.scratch = None                        # phase 2.5: the prefill scratch pool (_Scratch)
         self.scratch2 = None                       # PREFILL_OVERLAP: the second set (rounds alternate between the two)
         self.prefill_stream = None                 # PREFILL_OVERLAP: the side stream the staging + repack run on
@@ -217,6 +239,51 @@ def _cpu_layout() -> dict:
     return dict(pool=pool, dispatcher=disp, main=main, other=other)
 
 
+def _parse_cpu_list(spec: str) -> list[int]:
+    out = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        out.extend(range(int(a), int(b or a) + 1))
+    return out
+
+
+def _cpu_layout_v(V: int) -> dict:
+    """The CPUs of a process that serves V virtual ranks (TP2: V = 2, TP1: V = 4; 2026-11-04). TP rank r takes the
+    CCDs g = r * V .. r * V + V - 1 (TP1: all four, TP2: rank 0 CCDs 0-1, rank 1 CCDs 2-3 = exactly the four CCDs of
+    the TP4 layout, one per slice): per CCD g the dispatcher on 8g+1 and the pool on 8g+2..8g+7 (POOL_THREADS 6; 12 =
+    those and their SMT siblings 8g+34..8g+39; other values are not laid out for V > 1); the process's main thread on
+    the first CCD's core 8rV, its other threads on the siblings 8rV+32 / 8rV+33. Overrides: VLLM_MOET_CPU_TIER_VRANK_CPUS
+    ("a-b;c-d;..." per virtual rank), VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS ("x,y,..."), _MAIN_CPU, _OTHER_CPUS."""
+    r = _rank()
+    nthreads = int(os.environ.get("VLLM_MOET_CPU_TIER_POOL_THREADS", "6"))
+    if nthreads not in (6, 12):
+        raise RuntimeError(f"VLLM_MOET_CPU_TIER_POOL_THREADS={nthreads} has no CPU layout for {V} virtual ranks (6 or 12)")
+    g0 = r * V
+    pools, disps = [], []
+    for v in range(V):
+        g = g0 + v
+        pool = list(range(8 * g + 2, 8 * g + 8))
+        if nthreads == 12:
+            pool += list(range(8 * g + 34, 8 * g + 40))
+        pools.append(pool)
+        disps.append(8 * g + 1)
+    spec = os.environ.get("VLLM_MOET_CPU_TIER_VRANK_CPUS")
+    if spec:
+        pools = [_parse_cpu_list(part) for part in spec.split(";")]
+        if len(pools) != V:
+            raise RuntimeError(f"VLLM_MOET_CPU_TIER_VRANK_CPUS lists {len(pools)} pools for {V} virtual ranks")
+    dspec = os.environ.get("VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS")
+    if dspec:
+        disps = [int(x) for x in dspec.split(",")]
+        if len(disps) != V:
+            raise RuntimeError(f"VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS lists {len(disps)} CPUs for {V} virtual ranks")
+    main = os.environ.get("VLLM_MOET_CPU_TIER_MAIN_CPU")
+    main = int(main) if main else (8 * g0 if not spec else None)
+    other = os.environ.get("VLLM_MOET_CPU_TIER_OTHER_CPUS")
+    other = [int(x) for x in other.split(",")] if other else ([8 * g0 + 32, 8 * g0 + 33] if not spec else None)
+    return dict(pool=pools, dispatcher=disps, main=main, other=other)
+
+
 def _pin_process(layout: dict) -> str:
     """Pin this process's threads: the calling (main) thread to layout['main'], every other existing thread to
     layout['other'] (the tier's own threads pin themselves afterwards). VLLM_MOET_CPU_TIER_PIN=0 disables."""
@@ -308,20 +375,42 @@ def _slot_mapper(cfg: _LayerCfg):
 # ---------------------------------------------------------------------------------------------------------------
 # called from Mxfp4MoEMethod.create_weights (store mode: the parameters get R rows and the loader maps experts to slots)
 # ---------------------------------------------------------------------------------------------------------------
+def _vranks_of(hidden_size: int, intermediate_size_per_partition: int) -> int:
+    """Slices per expert for a layer geometry: 1 for the TP4 slice (576), 2 / 4 for the TP2 / TP1 shards (virtual
+    ranks); 0 = not a geometry the hybrid serves."""
+    if hidden_size != HID or intermediate_size_per_partition % N_R != 0:
+        return 0
+    V = intermediate_size_per_partition // N_R
+    if V == 1:
+        return 1
+    if VRANKS_MODE == "1" or V > VRANKS_MAX:
+        return 0
+    return V
+
+
 def on_create_weights(layer, num_experts: int, hidden_size: int, intermediate_size_per_partition: int) -> int:
     if not ENABLED or not is_target_layer(layer):
         return num_experts
-    if intermediate_size_per_partition != N_R or hidden_size != HID:
+    V = _vranks_of(hidden_size, intermediate_size_per_partition)
+    if V == 0:
         _log(f"layer {getattr(layer, 'layer_name', '?')}: intermediate {intermediate_size_per_partition} / hidden "
-             f"{hidden_size} is not the TP4-slice geometry the CPU kernel computes; left on the GPU")
+             f"{hidden_size} is not the TP4-slice geometry the CPU kernel computes"
+             f"{' (VLLM_MOET_CPU_TIER_VRANKS=1: virtual ranks off)' if VRANKS_MODE == '1' else ''}; left on the GPU")
         S.skip.add(id(layer))
         return num_experts
+    if V > 1 and not STORE:
+        _log(f"layer {getattr(layer, 'layer_name', '?')}: {V} virtual ranks need the expert store (dummy mode is TP4-slice only); left on the GPU")
+        S.skip.add(id(layer))
+        return num_experts
+    if S.layers and S.V != V:
+        raise RuntimeError(f"layer {getattr(layer, 'layer_name', '?')}: {V} slices per expert, the earlier layers have {S.V}")
+    S.V = V
     cfg = _register(layer, num_experts)
     if not STORE:
         return num_experts   # dummy mode: every expert is loaded, the subset is picked at process_weights time
     layer._map_global_expert_id_to_local_expert_id = _slot_mapper(cfg)
     _log(f"layer {cfg.name} -> hybrid layer {cfg.li}: parameters for {cfg.R} slots ({len(cfg.residents)} resident "
-         f"experts of {num_experts} + {SPARE} spare); the loader skips the rest")
+         f"experts of {num_experts} + {SPARE} spare){f' x {V} slices (virtual ranks)' if V > 1 else ''}; the loader skips the rest")
     # STORE_EARLY: pin the records at the LAST target layer's create_weights - the model is then constructed (vLLM's
     # loader runs after the construction), so the 260 GB of cudaHostAlloc happen before the weights and still AFTER the
     # Engram tables (engram_layer_ids 1 and 14 of V4.1-Flash: exact-size THP mmap + prefault + cudaHostRegister, 2 x 23.6
@@ -381,10 +470,33 @@ def _ensure_store(early: bool = False) -> None:
                 mask[c.model_layer, :] = 1
                 mask[c.model_layer, c.residents] = 0
     t0 = time.perf_counter()
-    S.store = ExpertStore(STORE, _rank(), n_layers, S.E, mask=mask, pinned=True, nthreads=16)
+    V = S.V
+    if V == 1:
+        S.store = ExpertStore(STORE, _rank(), n_layers, S.E, mask=mask, pinned=True, nthreads=16)
+        S.stores = [S.store]
+    else:
+        # virtual ranks: the records of store ranks r * V + v, one pinned arena per slice, read concurrently (the
+        # loader releases the GIL; 16 reader threads each - the files are on NVMe, the arenas pinned with cudaHostAlloc)
+        ranks = [_rank() * V + v for v in range(V)]
+        stores: list = [None] * V
+
+        def _load(v: int) -> None:
+            stores[v] = ExpertStore(STORE, ranks[v], n_layers, S.E, mask=mask, pinned=True, nthreads=16)
+
+        ths = [threading.Thread(target=_load, args=(v,), daemon=True) for v in range(V)]
+        for th in ths:
+            th.start()
+        for th in ths:
+            th.join()
+        if any(st is None for st in stores):
+            raise RuntimeError("store load failed for a virtual rank")
+        S.stores = stores
+        S.store = stores[0]
     S.store_layers = n_layers
-    _log(f"store {STORE} ({STORE_MODE}{', before the weights' if early else ''}): {S.store.n_records} records = "
-         f"{S.store.nbytes / 1e9:.1f} GB pinned, read {S.store.load_seconds:.1f} s, alloc+read {time.perf_counter() - t0:.1f} s")
+    _log(f"store {STORE} ({STORE_MODE}{', before the weights' if early else ''}"
+         f"{f', store ranks {[st.rank for st in S.stores]} = {V} virtual ranks' if V > 1 else ''}): "
+         f"{S.store.n_records} records x {V} = {sum(st.nbytes for st in S.stores) / 1e9:.1f} GB pinned, read "
+         f"{max(st.load_seconds for st in S.stores):.1f} s, alloc+read {time.perf_counter() - t0:.1f} s")
 
 
 def _has_record(li: int, e: int) -> bool:
@@ -393,15 +505,25 @@ def _has_record(li: int, e: int) -> bool:
     return li in S.arena
 
 
-def _record_ptr(li: int, e: int) -> int:
+def _record_ptr(li: int, e: int, v: int = 0) -> int:
+    """The host address of (layer, expert)'s record - of slice v's store with virtual ranks."""
     if S.store is not None:
-        return S.store.ptr(S.layers[li].model_layer, e)
+        return S.stores[v].ptr(S.layers[li].model_layer, e)
     return S.arena[li] + e * RECORD_BYTES
 
 
-def _record_view(li: int, e: int) -> torch.Tensor:
+def _record_view(li: int, e: int, v: int = 0) -> torch.Tensor:
     from cpu_tier import cuda_ext
-    return cuda_ext().host_view(_record_ptr(li, e), RECORD_BYTES)
+    return cuda_ext().host_view(_record_ptr(li, e, v), RECORD_BYTES)
+
+
+def _record_ptrs_v(li: int, experts) -> list[int]:
+    """The staging order of a list of experts with virtual ranks: expert j's V slice records at j * V .. j * V + V - 1
+    (V = 1: one record per expert, as before)."""
+    V = S.V
+    if V == 1:
+        return [_record_ptr(li, e) for e in experts]
+    return [_record_ptr(li, e, v) for e in experts for v in range(V)]
 
 
 def _create_tier_if_needed(device: torch.device):
@@ -413,16 +535,30 @@ def _create_tier_if_needed(device: torch.device):
 
     n_layers = len(S.layers)
     tables = os.environ["VLLM_MOET_CPU_TIER_TABLES"]
-    layout = _cpu_layout()
-    cpus = layout["pool"]
-    pin_msg = _pin_process(layout)
-    S.tier = CpuTier(n_layers, S.E, cpus, layout["dispatcher"], device, tables,
-                     timeout_ms=float(os.environ.get("VLLM_MOET_CPU_TIER_TIMEOUT_MS", "500")))
+    V = S.V
+    timeout_ms = float(os.environ.get("VLLM_MOET_CPU_TIER_TIMEOUT_MS", "500"))
+    if V == 1:
+        layout = _cpu_layout()
+        cpus = layout["pool"]
+        pin_msg = _pin_process(layout)
+        S.tier = CpuTier(n_layers, S.E, cpus, layout["dispatcher"], device, tables, timeout_ms=timeout_ms)
+        cpus_msg = f"pool CPUs {_ranges(cpus)} ({len(cpus)} threads), dispatcher {layout['dispatcher']}"
+    else:
+        from cpu_tier import TierGroup
+        layout = _cpu_layout_v(V)
+        pin_msg = _pin_process(layout)
+        S.tier = TierGroup(n_layers, S.E, layout["pool"], layout["dispatcher"], device, tables, timeout_ms=timeout_ms)
+        cpus_msg = (f"{V} virtual ranks (store ranks {[st.rank for st in S.stores]}): pools "
+                    f"{[_ranges(c) for c in layout['pool']]} ({len(layout['pool'][0])} threads each), dispatchers {layout['dispatcher']}")
     n_rec = 0
     for li in range(n_layers):
         for e in range(S.E):
             if _has_record(li, e):
-                S.tier.set_record(li, e, _record_ptr(li, e))
+                if V == 1:
+                    S.tier.set_record(li, e, _record_ptr(li, e))
+                else:
+                    for v in range(V):
+                        S.tier.set_record(li, e, _record_ptr(li, e, v), v)
                 n_rec += 1
     tables_layout = load_layout(tables, device)
     copy_stream = torch.cuda.Stream(device=device)
@@ -452,8 +588,8 @@ def _create_tier_if_needed(device: torch.device):
 
     atexit.register(_shutdown)
     _log(f"tier started: {n_layers} layers x {S.E} experts, slots {[c.R for c in S.layers][:3]}..., resident "
-         f"{[len(c.residents) for c in S.layers][:3]}..., records {n_rec}, pool CPUs {_ranges(cpus)} ({len(cpus)} threads), "
-         f"dispatcher {layout['dispatcher']}, {pin_msg}; promotion window {S.manager.window} steps; layers {[c.name for c in S.layers]}")
+         f"{[len(c.residents) for c in S.layers][:3]}..., records {n_rec}{f' x {V} slices' if V > 1 else ''}, {cpus_msg}, "
+         f"{pin_msg}; promotion window {S.manager.window} steps; layers {[c.name for c in S.layers]}")
     _host_memory_report("after the weights")
 
 
@@ -496,9 +632,11 @@ def on_process_weights(experts_impl, layer, w13: torch.Tensor, w2: torch.Tensor,
     """Returns None (stock path) or (w13, w2, w13_scale, w2_scale) with R rows: what b12x prepares."""
     if not ENABLED or not is_target_layer(layer) or id(layer) in S.skip:
         return None
-    if w13.dim() != 3 or w13.shape[1] != 2 * N_R or w13.shape[2] != HID // 2 or w2.shape[1] != HID:
+    V = S.V if S.layers else 1
+    if w13.dim() != 3 or w13.shape[1] != 2 * N_R * V or w13.shape[2] != HID // 2 or w2.shape[1] != HID \
+            or w2.shape[2] != N_R * V // 2:
         _log(f"layer {getattr(layer, 'layer_name', '?')}: geometry {tuple(w13.shape)} / {tuple(w2.shape)} is not the "
-             f"TP4-slice geometry the CPU kernel computes; left on the GPU")
+             f"TP4-slice geometry the CPU kernel computes{f' x {V} slices' if V > 1 else ''}; left on the GPU")
         S.skip.add(id(layer))
         return None
     from placement_manager import ResidentPool
@@ -520,7 +658,9 @@ def on_process_weights(experts_impl, layer, w13: torch.Tensor, w2: torch.Tensor,
         nonzero = (mag | (mag >> 1) | (mag >> 2)) & 0x11
         packed.bitwise_and_(0x77 | (nonzero << 3))
     residents = cfg.residents
-    if STORE:
+    if STORE and V > 1:
+        sub = _slice_experts(w13, w2, w13_scale, w2_scale, V)
+    elif STORE:
         sub = (w13, w2, w13_scale, w2_scale)
     else:
         # dummy mode: the records from the loaded GPU weights into a pinned arena of this layer
@@ -539,15 +679,22 @@ def on_process_weights(experts_impl, layer, w13: torch.Tensor, w2: torch.Tensor,
     # the slot table and the pool shell (its tensors are the prepared storages, attached at the first launch)
     slot_table = torch.full((E,), -1, dtype=torch.int32, device=w13.device)
     pool = ResidentPool(li, E, cfg.R, w13.device, pool={}, slot_table=slot_table,
-                        record_ok=lambda e, _li=li: _has_record(_li, e))
+                        record_ok=lambda e, _li=li: _has_record(_li, e), V=V)
     for s, e in enumerate(residents):
         slot_table[e] = s
         pool.expert_of_slot[s] = e
         pool.slot_of_expert[e] = s
         pool.last_used[s] = 0
     S.pools.append(pool)
-    S.remapped.append(torch.full((TOPK_MAX * 16,), -1, dtype=torch.int32, device=w13.device))
-    _log(f"layer {cfg.name} -> hybrid layer {li}: {len(residents)} of {E} experts resident in {cfg.R} slots, records "
+    S.remapped.append(torch.full((TOPK_MAX * MAX_TOKENS_MAILBOX * V,), -1, dtype=torch.int32, device=w13.device))
+    if V > 1:
+        # the expanded routing of the compact path (static buffers: the graph replays copy into them), [T, K, V]
+        S.ids_x.append(torch.full((MAX_TOKENS_MAILBOX * TOPK_MAX * V,), -1, dtype=torch.int32, device=w13.device))
+        S.wts_x.append(torch.zeros((MAX_TOKENS_MAILBOX * TOPK_MAX * V,), dtype=torch.float32, device=w13.device))
+        if S.vidx is None:
+            S.vidx = (torch.arange(TOPK_MAX * V, dtype=torch.int32, device=w13.device) % V).contiguous()
+    _log(f"layer {cfg.name} -> hybrid layer {li}: {len(residents)} of {E} experts resident in {cfg.R} slots"
+         f"{f' x {V} slices ({cfg.R * V} slice-experts of N = {N_R})' if V > 1 else ''}, records "
          f"{'from the store' if STORE else 'in a pinned arena'}")
     layer._moet_cpu_tier_layer = li
     experts_impl._moet_cpu_tier_layer = li
@@ -555,13 +702,74 @@ def on_process_weights(experts_impl, layer, w13: torch.Tensor, w2: torch.Tensor,
     return sub
 
 
+def _slice_experts(w13: torch.Tensor, w2: torch.Tensor, w13s: torch.Tensor, w2s: torch.Tensor, V: int):
+    """Virtual ranks: vLLM's TP shard of R expert slots, [R, 2 * 576V, K/2] (gate rows then up rows, the intermediate
+    axis = V consecutive TP4 slices of 576) + w2 [R, K, 576V/2], into R * V "slice-experts" of the TP4 geometry: row
+    s * V + v = (slot s, slice v) = [gate_v; up_v] / w2's columns [288v, 288v + 288) - byte for byte the store's rank-
+    (r * V + v) records of those experts, so kernel v2 and the promotions' repack see the TP4 layout. New contiguous
+    tensors (b12x repacks its prepared layout in place into them = the layer's pool storages; vLLM's parameters are
+    released by process_weights_after_loading): a transient copy of one layer at load time."""
+    R = int(w13.shape[0])
+    dev = w13.device
+
+    def rows(t: torch.Tensor) -> torch.Tensor:   # [R, 2 * N_R * V, C] -> [R * V, 2 * N_R, C]
+        C = t.shape[2]
+        out = torch.empty((R * V, 2 * N_R, C), dtype=t.dtype, device=dev)
+        o = out.view(R, V, 2 * N_R, C)
+        o[:, :, :N_R].copy_(t[:, : N_R * V].view(R, V, N_R, C))
+        o[:, :, N_R:].copy_(t[:, N_R * V:].view(R, V, N_R, C))
+        return out
+
+    def cols(t: torch.Tensor) -> torch.Tensor:   # [R, HID, W * V] -> [R * V, HID, W]
+        W = t.shape[2] // V
+        return t.view(R, HID, V, W).permute(0, 2, 1, 3).reshape(R * V, HID, W).contiguous()
+
+    return rows(w13), cols(w2), rows(w13s), cols(w2s)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # called from B12xExperts.apply (before the b12x run) and from the compact launch
 # ---------------------------------------------------------------------------------------------------------------
-def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
-    """Returns the ids the b12x run gets: the router's on the compact path (publish remaps them), remapped through
-    the slot table on any other path (memory-safe with R-row weights; the missing pairs are zero rows there - not
-    hybrid yet, phase 2.5)."""
+def plan_topk(experts_impl, topk: int) -> int:
+    """The top-k b12x's plans / workspaces / warmup launches of a hybrid layer are sized for: the router's K x V with
+    virtual ranks (on_apply expands the routing to K x V (token, slice) pairs), K otherwise."""
+    if getattr(experts_impl, "_moet_cpu_tier_layer", None) is None or S.V == 1:
+        return int(topk)
+    return int(topk) * S.V
+
+
+def _expand_routing(li: int, topk_ids: torch.Tensor, topk_weights: torch.Tensor, T: int):
+    """Virtual ranks: [T, K] -> [T, K * V] with ids_x[t, k * V + v] = ids[t, k] (the expert id V times; publish /
+    the slot remap turn it into slot * V + v), the weights repeated. Compact-path sizes (T <= 16) go into the
+    layer's static buffers (one copy kernel each, captured with the step); larger calls (prefill, eager) allocate."""
+    K, V = int(topk_ids.shape[1]), S.V
+    n = T * K * V
+    if T <= MAX_TOKENS_MAILBOX and K <= TOPK_MAX:
+        ids_x = S.ids_x[li][:n].view(T, K, V)
+        wts_x = S.wts_x[li][:n].view(T, K, V)
+    else:
+        ids_x = torch.empty((T, K, V), dtype=torch.int32, device=topk_ids.device)
+        wts_x = torch.empty((T, K, V), dtype=torch.float32, device=topk_ids.device)
+    ids_x.copy_(topk_ids.unsqueeze(-1).expand(T, K, V))
+    wts_x.copy_(topk_weights.unsqueeze(-1).expand(T, K, V))
+    return ids_x.view(T, K * V), wts_x.view(T, K * V)
+
+
+def _remap_slices(li: int, ids: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """The expanded routing through a slot table: slot * V + (column % V), -1 for missing / padded pairs."""
+    V = S.V
+    slots = table[ids.clamp(min=0).long()]
+    if V == 1:
+        return torch.where(ids >= 0, slots, ids.new_full((), -1))
+    vidx = S.vidx[: ids.shape[1]].unsqueeze(0)
+    return torch.where((ids >= 0) & (slots >= 0), slots * V + vidx, ids.new_full((), -1)).contiguous()
+
+
+def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor):
+    """Returns (ids, weights) the b12x run gets: the router's on the compact path (publish remaps the ids), remapped
+    through the slot table on any other path (memory-safe with R-row weights; the missing pairs are zero rows there,
+    which on_apply_end then adds from the scratch pool - phase 2.5). With virtual ranks both are expanded to the
+    K x V (token, slice) pairs first."""
     # the layer context lives from this apply to its compact launch only; an apply that takes another b12x path
     # (prefill-sized calls) must not leave it behind for launches made outside apply (vLLM's b12x warmup units)
     li = getattr(experts_impl, "_moet_cpu_tier_layer", None)
@@ -569,11 +777,14 @@ def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor) 
     S.ctx.prefill = None
     S.ctx.last_ids = topk_ids
     if li is None:
-        return topk_ids
+        return topk_ids, topk_weights
     if not S.created:
         with S.lock:
             _create_tier_if_needed(hidden_states.device)
     T = int(hidden_states.shape[0])
+    if S.V > 1:
+        topk_ids, topk_weights = _expand_routing(li, topk_ids, topk_weights, T)
+        S.ctx.last_ids = topk_ids
     if DEBUG:
         prep = getattr(experts_impl, "_prepared_experts", None)
         key = (id(experts_impl), id(prep), int(getattr(prep, "w13_rp", torch.empty(0)).data_ptr()) if prep is not None else 0)
@@ -599,12 +810,15 @@ def on_apply(experts_impl, hidden_states: torch.Tensor, topk_ids: torch.Tensor) 
             _log(f"{T}-token MoE call: b12x's non-compact path; missing experts "
                  f"{'streamed through the scratch pool' if SCRATCH_SLOTS else 'NOT computed (VLLM_MOET_CPU_TIER_SCRATCH=0)'}")
         table = S.pools[li].slot_table
-        remapped = torch.where(topk_ids >= 0, table[topk_ids.clamp(min=0).long()], topk_ids.new_full((), -1))
+        if S.V == 1:
+            remapped = torch.where(topk_ids >= 0, table[topk_ids.clamp(min=0).long()], topk_ids.new_full((), -1))
+        else:
+            remapped = _remap_slices(li, topk_ids, table)
         if PREFILL_OVERLAP and SCRATCH_SLOTS and S.scratch is not None and not torch.cuda.is_current_stream_capturing():
             _prefill_prefetch_round0(li, topk_ids)
-        return remapped
+        return remapped, topk_weights
     S.ctx.prefill = None
-    return topk_ids
+    return topk_ids, topk_weights
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -619,6 +833,11 @@ class _Scratch:
 
         n = SCRATCH_SLOTS
         self.n = n
+        # virtual ranks: a slot holds one slice; an expert takes V consecutive slots (j * V + v) -> n // V experts per round
+        self.V = S.V
+        self.per_round = n // self.V
+        if self.per_round < 1:
+            raise RuntimeError(f"VLLM_MOET_CPU_TIER_SCRATCH={n} < {self.V} slices per expert")
         w1 = torch.zeros(n, 2 * N_R, HID // 2, dtype=torch.uint8, device=device)
         w2 = torch.zeros(n, HID, N_R // 2, dtype=torch.uint8, device=device)
         w1s = torch.zeros(n, 2 * N_R, HID // 32, dtype=torch.uint8, device=device)
@@ -758,9 +977,19 @@ def _stage_round_async(sc, li: int, rnd: list) -> None:
     side = S.prefill_stream
     side.wait_event(sc.free_event)
     with torch.cuda.stream(side):
-        _stage_and_repack(sc, [_record_ptr(li, e) for e in rnd])
+        _stage_and_repack(sc, _record_ptrs_v(li, rnd))
         sc.ready_event.record(side)
     sc.staged = list(rnd)
+
+
+def _scratch_ids(sc, ids: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+    """The ids of an extra run: the call's (expanded) ids through the scratch table (expert -> its index in the
+    round; slice-slot = index * V + column % V), -1 for the pairs the round does not hold."""
+    if sc.V == 1:
+        return torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+    j = sc.table[ids.clamp(min=0).long()]
+    vidx = S.vidx[: ids.shape[1]].unsqueeze(0)
+    return torch.where(valid & (j >= 0), j * sc.V + vidx, ids.new_full((), -1)).contiguous()
 
 
 def _prefill_prefetch_round0(li: int, topk_ids: torch.Tensor) -> None:
@@ -772,7 +1001,7 @@ def _prefill_prefetch_round0(li: int, topk_ids: torch.Tensor) -> None:
     if not missing:
         return
     sets, _ = _overlap_sets()
-    _stage_round_async(sets[0], li, missing[:sets[0].n])
+    _stage_round_async(sets[0], li, missing[:sets[0].per_round])
     S.overlap_stats[1] += 1
 
 
@@ -781,7 +1010,7 @@ def _run_rounds(sc_of_round, li, ids, valid, missing, weights, hidden_states, ou
     """The streamed rounds of one call: for round r, the set sc_of_round(r) is staged (synchronously on the main
     stream, or already / asynchronously on the side stream), its table written, the extra b12x run added to output.
     Returns the number of rounds. The run and the add_ order are the same on every path."""
-    n = sc_of_round(0).n
+    n = sc_of_round(0).per_round
     rounds = [missing[r0:r0 + n] for r0 in range(0, len(missing), n)]
     main = torch.cuda.current_stream()
     for r, rnd in enumerate(rounds):
@@ -791,7 +1020,7 @@ def _run_rounds(sc_of_round, li, ids, valid, missing, weights, hidden_states, ou
         elif prefetch_next and r > 0:
             main.wait_event(sc.ready_event)          # staged while round r - 1 ran
         else:
-            _stage_and_repack(sc, [_record_ptr(li, e) for e in rnd])
+            _stage_and_repack(sc, _record_ptrs_v(li, rnd))
             sc.staged = list(rnd)
         assert sc.staged == list(rnd), f"prefill round {r} of layer {li}: set holds {len(sc.staged)} experts, round wants {len(rnd)}"
         if prefetch_next and r + 1 < len(rounds):
@@ -800,7 +1029,7 @@ def _run_rounds(sc_of_round, li, ids, valid, missing, weights, hidden_states, ou
         sc.table.fill_(-1)
         rnd_t = torch.tensor(rnd, dtype=torch.long, device=ids.device)
         sc.table[rnd_t] = torch.arange(len(rnd), dtype=torch.int32, device=ids.device)
-        rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+        rids = _scratch_ids(sc, ids, valid)
         run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights,
                  topk_ids=rids, output=tmp, unit_scale_contract=False)
         output.add_(tmp)
@@ -866,7 +1095,7 @@ def on_apply_end(experts_impl, hidden_states: torch.Tensor, topk_weights: torch.
     sc.pending.append((ev0, ev1, T, len(missing)))
     if sc.calls <= 3 or sc.calls % 200 == 0:
         _log(f"prefill call {sc.calls} (layer {li}, {T} tokens): {len(missing)} missing experts in "
-             f"{(len(missing) + sc.n - 1) // sc.n} rounds; totals {sc.experts_streamed} experts / {sc.rounds} rounds"
+             f"{(len(missing) + sc.per_round - 1) // sc.per_round} rounds; totals {sc.experts_streamed} experts / {sc.rounds} rounds"
              f"{sc.timing_summary()}")
     if DEBUG_PREFILL:
         _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output, run_plan, plan, buf, T)
@@ -883,13 +1112,14 @@ def _debug_overlap_check(li, T, ids, valid, missing, weights, hidden_states, out
                 prefetched_round0=False, prefetch_next=False)
     torch.cuda.synchronize()
     nd = int((ref != output).sum().item())
+    n_r = (len(missing) + sc0.per_round - 1) // sc0.per_round
     if nd:
         S.overlap_stats[2] += 1
         d = (ref.float() - output.float()).abs()
-        _log(f"DEBUG overlap layer {li} T {T}: {len(missing)} missing experts in {(len(missing) + sc0.n - 1) // sc0.n} rounds: "
+        _log(f"DEBUG overlap layer {li} T {T}: {len(missing)} missing experts in {n_r} rounds: "
              f"{nd} of {output.numel()} elements differ between the overlapped and the serial path, max |d| {d.max().item():.3e}")
     elif S.overlap_stats[0] <= 3 or S.overlap_stats[0] % 200 == 0:
-        _log(f"DEBUG overlap layer {li} T {T}: {len(missing)} missing experts in {(len(missing) + sc0.n - 1) // sc0.n} rounds: "
+        _log(f"DEBUG overlap layer {li} T {T}: {len(missing)} missing experts in {n_r} rounds: "
              f"overlapped == serial (0 of {output.numel()} differ); calls overlapped {S.overlap_stats[0]}, rounds prefetched "
              f"{S.overlap_stats[1]}, mismatching calls so far {S.overlap_stats[2]}")
 
@@ -899,8 +1129,8 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
     EVERY routed expert in the scratch pool in one b12x run = the all-resident reference for this layer's output;
     run twice to see the kernel's own run-to-run noise; the hybrid output (resident run + streamed rounds) against it."""
     routed = [int(e) for e in torch.unique(ids[valid]).tolist()]
-    if len(routed) > sc.n:
-        _log(f"DEBUG prefill layer {li}: {len(routed)} routed experts > {sc.n} scratch slots; reference skipped")
+    if len(routed) > sc.per_round:
+        _log(f"DEBUG prefill layer {li}: {len(routed)} routed experts > {sc.per_round} scratch slots per round; reference skipped")
         return
     # experts with a record are staged from the pinned store; the static residents have none in the nonresident store
     # (10-28: KeyError (0, 317) killed a boot in the profile run) - their prepared rows are copied from the layer's pool,
@@ -916,7 +1146,7 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
              f"attached yet (no compact launch so far); reference skipped")
         return
     if from_store:
-        _stage_and_repack(sc, [_record_ptr(li, e) for e in from_store])
+        _stage_and_repack(sc, _record_ptrs_v(li, from_store))
     if from_pool:
         S.manager.copy.synchronize()
         torch.cuda.synchronize()
@@ -926,11 +1156,10 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
             if s < 0:
                 _log(f"DEBUG prefill layer {li}: expert {e} has neither a record nor a slot; reference skipped")
                 return
-            for name in sc.pool:
-                sc.pool[name][j].copy_(P.pool[name][s])
+            _copy_pool_rows(sc, P, s, j)
     sc.table.fill_(-1)
     sc.table[torch.tensor(routed, dtype=torch.long, device=ids.device)] = torch.arange(len(routed), dtype=torch.int32, device=ids.device)
-    rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+    rids = _scratch_ids(sc, ids, valid)
     ref = torch.empty_like(output)
     ref2 = torch.empty_like(output)
     run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights, topk_ids=rids,
@@ -945,6 +1174,16 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
     _log(f"DEBUG prefill layer {li} T {T}: {len(routed)} routed experts; hybrid vs all-in-one-run reference: max |d| "
          f"{d.max().item():.3e} (rel {rel:.2e}), elements differing {(d > 0).float().mean().item():.4f}, reference run-to-run "
          f"max |d| {noise:.3e}; |ref| max {r.abs().max().item():.3e}")
+
+
+def _copy_pool_rows(sc, P, s: int, j: int) -> None:
+    """Debug references: the layer pool's prepared rows of slot s (its V slices) into scratch expert index j."""
+    V = sc.V
+    for name in sc.pool:
+        if V == 1:
+            sc.pool[name][j].copy_(P.pool[name][s])
+        else:
+            sc.pool[name][j * V:(j + 1) * V].copy_(P.pool[name][s * V:(s + 1) * V])
 
 
 def _debug_compact_reference(experts_impl, li, hidden_states, topk_weights, output, run_plan, scratch_nbytes) -> None:
@@ -975,25 +1214,25 @@ def _debug_compact_reference(experts_impl, li, hidden_states, topk_weights, outp
     gpu_ids = S.remapped[li][: T * K].cpu().numpy()   # what the compact kernel ran: the slot, or -1 = the host's pair
     table = P.slot_table.cpu().numpy()
     routed = sorted(set(int(e) for e in ids_h if e >= 0))
-    if len(routed) > sc.n:
-        _log(f"DEBUG compact layer {li}: {len(routed)} routed experts > {sc.n} scratch slots; check skipped")
+    if len(routed) > sc.per_round:
+        _log(f"DEBUG compact layer {li}: {len(routed)} routed experts > {sc.per_round} scratch slots per round"
+             f"{f' ({sc.n} slots / {sc.V} slices)' if sc.V > 1 else ''}; check skipped")
         return
     from_store = [e for e in routed if _has_record(li, e)]
     from_pool = [e for e in routed if not _has_record(li, e)]
     order = from_store + from_pool
     if from_store:
-        _stage_and_repack(sc, [_record_ptr(li, e) for e in from_store])
+        _stage_and_repack(sc, _record_ptrs_v(li, from_store))
     for j, e in enumerate(from_pool, start=len(from_store)):
         s = int(table[e])
         if s < 0:
             _log(f"DEBUG compact layer {li}: expert {e} has neither a record nor a slot; check skipped")
             return
-        for name in sc.pool:
-            sc.pool[name][j].copy_(P.pool[name][s])
+        _copy_pool_rows(sc, P, s, j)
     sc.table.fill_(-1)
     sc.table[torch.tensor(order, dtype=torch.long, device=ids.device)] = torch.arange(len(order), dtype=torch.int32, device=ids.device)
     valid = ids >= 0
-    rids = torch.where(valid, sc.table[ids.clamp(min=0).long()], ids.new_full((), -1)).contiguous()
+    rids = _scratch_ids(sc, ids, valid)
     plan, (buf, tmp) = sc.plan(T, K, scratch_nbytes)
     weights = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.to(torch.float32)
     ref = torch.empty_like(output)
@@ -1064,7 +1303,7 @@ def before_compiled(topk_ids: torch.Tensor, topk_weights: torch.Tensor, values: 
     P = S.pools[li]
     ptrs = tuple(int(t.data_ptr()) for t in (w13, w13_scales, w2, w2_scales))
     if not P.pool:  # attach the prepared storages as the pool tensors (first launch of this layer)
-        R = P.R
+        R = P.R * P.V   # rows: one per slot, or one per (slot, slice) with virtual ranks
         P.pool = dict(w13=w13.view(R, -1), w13s=w13_scales.view(R, -1), w2=w2.view(R, -1), w2s=w2_scales.view(R, -1))
         P.pool_ptrs = ptrs
     elif ptrs != P.pool_ptrs:
@@ -1168,7 +1407,12 @@ def runner_after_step() -> None:
                           f"{comp.sum() / max(1, pe.sum()):.0f} us per expert, {comp.sum() / max(1, served[:, 2].sum()):.0f} us per pair, "
                           f"{len(served)} of {len(kp)} requests had misses")
                 S.kpi["last_kpi_step"] = int(kp[:, 0].max())
-            ps = S.tier.pool_stats(reset=True)
+            if S.V == 1:
+                ps = S.tier.pool_stats(reset=True)
+                ps_v = []
+            else:
+                ps_v = S.tier.pool_stats_v(reset=True)   # every virtual rank's pool (tier 0's first)
+                ps = ps_v[0]
             cyc = [ps["cyc_prepare"], ps["cyc_fc1"], ps["cyc_act"], ps["cyc_fc2"]]
             if sum(cyc) > 0:
                 tot_c = sum(cyc)
@@ -1179,6 +1423,19 @@ def runner_after_step() -> None:
                     # TSC cycles -> time: the in-kernel time of worker 0 per expert, against the request's compute time per
                     # expert above (the difference = outside the kernel: wake-up, dispatch, the job barrier)
                     detail += f"; worker-0 in-kernel {tot_c / _TSC_GHZ / 1e3 / n_exp_interval:.0f} us per expert"
+                    if ps_v:
+                        # virtual ranks: the same per slice (CCD) - the step pays the slowest one, as the TP4 ranks do
+                        per_v = [sum(p[k] for k in ("cyc_prepare", "cyc_fc1", "cyc_act", "cyc_fc2")) / _TSC_GHZ / 1e3 / n_exp_interval for p in ps_v]
+                        detail += f" (per virtual rank {[round(x) for x in per_v]})"
+            if S.V > 1:
+                # each virtual rank's dispatcher latency over the interval: (t_done - t_seen) of the served requests
+                lat = []
+                for v in range(S.V):
+                    kv = S.tier.kpis_v(v, cap=4096)
+                    kv = kv[(kv[:, 0] > S.kpi.get("last_kpi_step_v", -1)) & (kv[:, 2] > 0)] if len(kv) else kv
+                    lat.append(f"{np.median((kv[:, 6] - kv[:, 5]) / 1e3):.0f}" if len(kv) else "-")
+                S.kpi["last_kpi_step_v"] = S.kpi.get("last_kpi_step", -1)
+                detail += f"; per virtual rank: median compute us per served layer {lat}, busy ms {[round(b / 1e6 / d_steps, 2) for b in tot.get('busy_ns_v', [])]}"
         except Exception as ex:  # diagnostics only
             detail = f"; kpi detail failed: {ex!r}"
         _log(f"step {S.step}: tier steps {tot['steps']} pairs {tot['pairs']} errors {tot['errors']}; cpu busy "
@@ -1211,25 +1468,26 @@ def _debug_check_promotions() -> None:
             s_ = P.mapped(e)
             if s_ < 0:
                 continue
-            rec = _record_view(li, e).numpy()
-            w1n, w1s = rec[0:1474560], rec[1474560:1566720]
-            w3n, w3s = rec[1566720:3041280], rec[3041280:3133440]
-            w2n, w2s = rec[3133440:4608000], rec[4608000:4700160]
-            nib13 = np.stack((np.concatenate([w1n, w3n]) & 0xF, np.concatenate([w1n, w3n]) >> 4), axis=-1).reshape(-1)
-            nib2 = np.stack((w2n & 0xF, w2n >> 4), axis=-1).reshape(-1)
-            exp = {
-                "w13": (nib13[_LAYOUT_NP["w13"]][0::2] | (nib13[_LAYOUT_NP["w13"]][1::2] << 4)).astype(np.uint8),
-                "w2": (nib2[_LAYOUT_NP["w2"]][0::2] | (nib2[_LAYOUT_NP["w2"]][1::2] << 4)).astype(np.uint8),
-                "w13s": np.concatenate([w1s, w3s])[_LAYOUT_NP["w13s"]],
-                "w2s": w2s[_LAYOUT_NP["w2s"]],
-            }
-            for name in exp:
-                got = P.pool[name][s_].view(torch.uint8).cpu().numpy()
-                checked += 1
-                d = int((got != exp[name]).sum())
-                if d:
-                    bad += 1
-                    _log(f"DEBUG layer {li} expert {e} slot {s_} {name}: {d} of {got.size} bytes differ from the host gather")
+            for v in range(S.V):   # every slice of the expert against its own store rank's record
+                rec = _record_view(li, e, v).numpy()
+                w1n, w1s = rec[0:1474560], rec[1474560:1566720]
+                w3n, w3s = rec[1566720:3041280], rec[3041280:3133440]
+                w2n, w2s = rec[3133440:4608000], rec[4608000:4700160]
+                nib13 = np.stack((np.concatenate([w1n, w3n]) & 0xF, np.concatenate([w1n, w3n]) >> 4), axis=-1).reshape(-1)
+                nib2 = np.stack((w2n & 0xF, w2n >> 4), axis=-1).reshape(-1)
+                exp = {
+                    "w13": (nib13[_LAYOUT_NP["w13"]][0::2] | (nib13[_LAYOUT_NP["w13"]][1::2] << 4)).astype(np.uint8),
+                    "w2": (nib2[_LAYOUT_NP["w2"]][0::2] | (nib2[_LAYOUT_NP["w2"]][1::2] << 4)).astype(np.uint8),
+                    "w13s": np.concatenate([w1s, w3s])[_LAYOUT_NP["w13s"]],
+                    "w2s": w2s[_LAYOUT_NP["w2s"]],
+                }
+                for name in exp:
+                    got = P.pool[name][s_ * S.V + v].view(torch.uint8).cpu().numpy()
+                    checked += 1
+                    d = int((got != exp[name]).sum())
+                    if d:
+                        bad += 1
+                        _log(f"DEBUG layer {li} expert {e} slot {s_} slice {v} {name}: {d} of {got.size} bytes differ from the host gather")
         tab = P.slot_table.cpu().numpy()
         mirror = np.array([P.mapped(x) for x in range(P.E)], dtype=np.int32)
         if not np.array_equal(tab, mirror):

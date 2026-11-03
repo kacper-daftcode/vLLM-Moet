@@ -133,6 +133,138 @@ __global__ void wait_inject_kernel(const CpuTierAck* ack, const CpuTierRequest* 
     }
 }
 
+// ---- virtual ranks (TP2 / TP1 on one GPU, 2026-11-04): on one GPU every expert stays its V = 4 / TP slices of 576
+// rows (the TP4 rank slices the store holds), prepared as "slice-experts" (row s * V + v of the pool = slot s, slice v)
+// and routed as (token, slice) pairs: the router's ids [T, K] are expanded to [T, K * V] with ids_x[t, k * V + v] =
+// ids[t, k] (the same expert id V times, the weight repeated). One mailbox set per virtual rank: slice v's pairs go
+// to request v and are computed by the pool on CCD v from the records of store rank v. One publish launch writes the
+// V requests, one wait launch waits for the V acks and injects every slice's rows into its own route row - the
+// compact TopKSum then adds the K * V rows of a token in route order (k-major, slice-minor), fp32, one bf16 rounding.
+// These kernels run only for V > 1; the V = 1 kernels above are untouched (the TP4 path).
+#define CPU_TIER_MAX_VRANKS 4
+struct VRanks {
+    int n;
+    CpuTierRequest* req[CPU_TIER_MAX_VRANKS];
+    const CpuTierAck* ack[CPU_TIER_MAX_VRANKS];
+    const uint16_t* staging[CPU_TIER_MAX_VRANKS];
+};
+
+// ids / wts: the EXPANDED pairs [n_pairs = T * topk], topk = K * V; pair p -> slice v = p % V, token p / topk
+__global__ void publish_v_kernel(VRanks vr, int* seq_dev, const int* ids, const float* wts, const int* slot,
+                                 int* remapped, int n_pairs, int topk, const uint8_t* a_values,
+                                 const uint8_t* a_scales, int n_tokens) {
+    __shared__ int s_n[CPU_TIER_MAX_VRANKS];
+    const int tid = threadIdx.x;
+    const int V = vr.n;
+    for (int p = tid; p < n_pairs; p += blockDim.x) {
+        const int e = ids[p];
+        const int v = p % V;
+        const int s = e >= 0 ? slot[e] : -1;   // the slot table read ONCE per pair (see publish_kernel)
+        remapped[p] = s >= 0 ? s * V + v : -1;
+        if (v == 0) {
+            // the use log of every virtual rank: one entry per (token, expert) pair, -1 = padding
+            for (int u = 0; u < V; ++u) vr.req[u]->ids[p / V] = (int16_t)e;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int n[CPU_TIER_MAX_VRANKS];
+        for (int u = 0; u < V; ++u) n[u] = 0;
+        for (int p = 0; p < n_pairs; ++p) {
+            const int e = ids[p];
+            if (e >= 0 && remapped[p] < 0) {
+                const int v = p % V;
+                if (n[v] < CPU_TIER_MAX_PAIRS) {
+                    CpuTierPair pr;
+                    pr.token = (uint16_t)(p / topk);
+                    pr.expert = (uint16_t)e;
+                    pr.row = (uint16_t)p;
+                    pr.pad = 0;
+                    pr.weight = wts[p];
+                    vr.req[v]->pairs[n[v]++] = pr;
+                }
+            }
+        }
+        for (int u = 0; u < V; ++u) s_n[u] = n[u];
+    }
+    // the tokens' quantized activations into every virtual rank's mailbox
+    {
+        const uint4* src = reinterpret_cast<const uint4*>(a_values);
+        const uint4* ssrc = reinterpret_cast<const uint4*>(a_scales);
+        const int nv = n_tokens * (CPU_TIER_HID / 16);
+        const int ns = n_tokens * (CPU_TIER_SCALES / 16);
+        for (int u = 0; u < V; ++u) {
+            uint4* dst = reinterpret_cast<uint4*>(&vr.req[u]->a_values[0][0]);
+            uint4* sdst = reinterpret_cast<uint4*>(&vr.req[u]->a_scales[0][0]);
+            for (int i = tid; i < nv; i += blockDim.x) dst[i] = src[i];
+            for (int i = tid; i < ns; i += blockDim.x) sdst[i] = ssrc[i];
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    if (tid == 0) {
+        const unsigned long long t = gtimer();
+        const int seq = seq_dev[0] + 1;
+        seq_dev[0] = seq;
+        for (int u = 0; u < V; ++u) {
+            CpuTierRequest* req = vr.req[u];
+            req->n_pairs = (uint32_t)s_n[u];
+            req->n_tokens = (uint32_t)n_tokens;
+            req->n_all = (uint32_t)(n_pairs / V);
+            req->flags = 0;
+            req->t_publish_ns = t;
+        }
+        __threadfence_system();
+        for (int u = 0; u < V; ++u) st_release_sys(&vr.req[u]->step, (uint32_t)seq);
+    }
+}
+
+// thread 0 of every CTA waits for the V acks of the layer's request (one timeout budget for all of them), then the
+// CTAs copy every virtual rank's rows into route_output (row = the expanded pair index the publish wrote)
+__global__ void wait_inject_v_kernel(VRanks vr, const int* seq_dev, uint16_t* route, int route_stride,
+                                     volatile uint32_t* err, long long timeout_ns) {
+    __shared__ int s_n[CPU_TIER_MAX_VRANKS];
+    const int tid = threadIdx.x;
+    const int V = vr.n;
+    if (tid == 0) {
+        const uint32_t step = (uint32_t)seq_dev[0];
+        for (int u = 0; u < V; ++u) s_n[u] = 0;
+        if (ld_acquire_sys(err) == 0) {
+            const unsigned long long t0 = gtimer();
+            bool ok = true;
+            for (int u = 0; u < V && ok; ++u) {
+                const CpuTierAck* ack = vr.ack[u];
+                for (;;) {
+                    const uint32_t a = ld_acquire_sys(&ack->step);
+                    if (a == step) break;
+                    if ((long long)(gtimer() - t0) > timeout_ns) { ok = false; break; }
+                }
+                if (!ok) {
+                    st_release_sys(err, CPU_TIER_ERR_TIMEOUT);
+                } else if (ack->status != 0) {
+                    st_release_sys(err, 16u + ack->status);
+                    ok = false;
+                }
+            }
+            if (ok)
+                for (int u = 0; u < V; ++u) s_n[u] = (int)vr.req[u]->n_pairs;
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    for (int u = 0; u < V; ++u) {
+        const int n = s_n[u];
+        const CpuTierRequest* req = vr.req[u];
+        const uint16_t* staging = vr.staging[u];
+        for (int i = blockIdx.x; i < n; i += gridDim.x) {
+            const int row = req->pairs[i].row;
+            const uint4* src = reinterpret_cast<const uint4*>(staging + (size_t)i * CPU_TIER_HID);
+            uint4* dst = reinterpret_cast<uint4*>(route + (size_t)row * route_stride);
+            for (int j = tid; j < CPU_TIER_HID / 8; j += blockDim.x) dst[j] = src[j];
+        }
+    }
+}
+
 // ---- promotion: a checkpoint-layout record -> b12x's prepared layout at pool slot s (the permutations measured by
 // b12x_layout_probe.py). Record: w1n [576][2560] | w1s [576][160] | w3n | w3s | w2n [5120][288] | w2s [5120][18].
 // The w13 input b12x saw is [w1; w3] nibbles (gate rows then up rows), its scales [w1s; w3s] bytes.
@@ -293,6 +425,27 @@ void promote_batch(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor i
     }
 }
 
+// virtual ranks: one layer's promotions with V slice records per expert (host_ptrs[i * nv + v] = the record of
+// store rank v for experts[i]) into pool rows slots[i] * nv + v; slot_table[experts[i]] = slots[i] after the expert's
+// last repack (stream order). nv = 1 is promote_batch.
+void promote_batch_v(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                     torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                     torch::Tensor pool_w2s, torch::Tensor slot_table, std::vector<int64_t> host_ptrs,
+                     std::vector<int64_t> experts, std::vector<int64_t> slots, int64_t nv) {
+    TORCH_CHECK(nv >= 1 && nv <= CPU_TIER_MAX_VRANKS);
+    TORCH_CHECK(host_ptrs.size() == experts.size() * (size_t)nv && experts.size() == slots.size());
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.numel() == 4700160 && staging.is_cuda());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    for (size_t i = 0; i < experts.size(); ++i) {
+        for (int64_t v = 0; v < nv; ++v) {
+            TORCH_CHECK(cudaMemcpyAsync(staging.data_ptr<uint8_t>(), (const void*)(uintptr_t)host_ptrs[i * nv + v], 4700160,
+                                        cudaMemcpyHostToDevice, stream) == cudaSuccess, "promotion H2D failed");
+            repack_record(staging, idx_w13, idx_w13s, idx_w2, idx_w2s, pool_w13, pool_w13s, pool_w2, pool_w2s, slots[i] * nv + v);
+        }
+        table_write(slot_table, {experts[i]}, {slots[i]});
+    }
+}
+
 // pinned (page-locked, portable) host memory for the expert store: H2D promotions DMA from it; not zeroed.
 // Default cudaHostAlloc (4 KB pages). MOET_CPU_TIER_STORE_THP=1: an anonymous mapping advised to transparent huge
 // pages, registered with the driver (2 MB TLB entries instead of 1,150 4 KB ones per 4.7 MB record) - measured
@@ -377,11 +530,62 @@ void wait_inject(int64_t ack_dev_ptr, int64_t req_dev_ptr, int64_t staging_dev_p
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
 }
 
+// virtual ranks: the V requests of a layer (device pointers of the mapped mailboxes, in slice order) from the expanded
+// routing (topk_ids [T, K * V]); seq_dev = the layer's one sequence number shared by the V mailboxes
+static VRanks make_vranks(const std::vector<int64_t>& req, const std::vector<int64_t>& ack, const std::vector<int64_t>& staging) {
+    TORCH_CHECK(req.size() >= 1 && req.size() <= CPU_TIER_MAX_VRANKS, "1..4 virtual ranks");
+    VRanks vr;
+    vr.n = (int)req.size();
+    for (int u = 0; u < CPU_TIER_MAX_VRANKS; ++u) {
+        vr.req[u] = u < vr.n ? (CpuTierRequest*)(uintptr_t)req[u] : nullptr;
+        vr.ack[u] = u < vr.n && u < (int)ack.size() ? (const CpuTierAck*)(uintptr_t)ack[u] : nullptr;
+        vr.staging[u] = u < vr.n && u < (int)staging.size() ? (const uint16_t*)(uintptr_t)staging[u] : nullptr;
+    }
+    return vr;
+}
+
+void publish_v(std::vector<int64_t> req_dev_ptrs, torch::Tensor seq_dev, torch::Tensor topk_ids, torch::Tensor topk_weights,
+               torch::Tensor slot_table, torch::Tensor remapped, torch::Tensor a_values, torch::Tensor a_scales,
+               int64_t n_tokens) {
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_weights.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(slot_table.scalar_type() == torch::kInt32 && remapped.scalar_type() == torch::kInt32);
+    TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous() && remapped.is_contiguous());
+    TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_scales.scalar_type() == torch::kUInt8);
+    TORCH_CHECK(n_tokens >= 0 && n_tokens <= CPU_TIER_MAX_TOKENS, "at most CPU_TIER_MAX_TOKENS tokens per step on the CPU tier");
+    const VRanks vr = make_vranks(req_dev_ptrs, {}, {});
+    const int n_pairs = (int)topk_ids.numel();
+    TORCH_CHECK(topk_ids.dim() == 2 && (int)topk_ids.size(1) % vr.n == 0 && n_pairs / vr.n <= CPU_TIER_MAX_PAIRS,
+                "the expanded routing must be [T, K * V] with T * K <= CPU_TIER_MAX_PAIRS");
+    TORCH_CHECK(remapped.numel() >= n_pairs);
+    publish_v_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        vr, seq_dev.data_ptr<int>(), topk_ids.data_ptr<int>(), topk_weights.data_ptr<float>(), slot_table.data_ptr<int>(),
+        remapped.data_ptr<int>(), n_pairs, (int)topk_ids.size(1), a_values.data_ptr<uint8_t>(), a_scales.data_ptr<uint8_t>(),
+        (int)n_tokens);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+void wait_inject_v(std::vector<int64_t> ack_dev_ptrs, std::vector<int64_t> req_dev_ptrs, std::vector<int64_t> staging_dev_ptrs,
+                   torch::Tensor seq_dev, torch::Tensor route_output, int64_t err_dev_ptr, int64_t timeout_ns) {
+    TORCH_CHECK(route_output.scalar_type() == torch::kBFloat16 && route_output.dim() == 2 &&
+                route_output.size(1) == CPU_TIER_HID && route_output.stride(1) == 1);
+    TORCH_CHECK(ack_dev_ptrs.size() == req_dev_ptrs.size() && staging_dev_ptrs.size() == req_dev_ptrs.size());
+    const VRanks vr = make_vranks(req_dev_ptrs, ack_dev_ptrs, staging_dev_ptrs);
+    wait_inject_v_kernel<<<8, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        vr, seq_dev.data_ptr<int>(), reinterpret_cast<uint16_t*>(route_output.data_ptr()), (int)route_output.stride(0),
+        (volatile uint32_t*)(uintptr_t)err_dev_ptr, timeout_ns);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
 int64_t request_bytes() { return (int64_t)sizeof(CpuTierRequest); }
 int64_t ack_bytes() { return (int64_t)sizeof(CpuTierAck); }
 int64_t staging_bytes() { return (int64_t)CPU_TIER_MAX_PAIRS * CPU_TIER_HID * 2; }
+int64_t max_vranks() { return CPU_TIER_MAX_VRANKS; }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("publish_v", &publish_v);
+    m.def("wait_inject_v", &wait_inject_v);
+    m.def("promote_batch_v", &promote_batch_v);
+    m.def("max_vranks", &max_vranks);
     m.def("alloc_mapped", &alloc_mapped);
     m.def("alloc_pinned", &alloc_pinned);
     m.def("host_view", &host_view);
