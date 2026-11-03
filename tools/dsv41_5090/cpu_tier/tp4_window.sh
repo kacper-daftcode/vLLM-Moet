@@ -19,15 +19,22 @@ fi
 TAG="${1:?tag}"
 shift
 for kv in "$@"; do export "$kv"; done
-REPO=/mnt/nvme/vLLM-Moet-cpu
+REPO="${REPO:-/mnt/nvme/vLLM-Moet-cpu}"
 PY=/root/work/venv/bin/python
 NAME="${NAME:-ds41-hyb}"
+# TP=2 / TP=1 (11-04, virtual ranks): the window takes the launcher's TP / GPUS (locks 0,1 / 0 held by the caller), checks
+# only its GPUs for foreign processes and reads the KPI lines of TP ranks (each rank's line carries its virtual ranks)
+TP="${TP:-4}"
+case "$TP" in 4) GPUS="${GPUS:-0,1,2,3}" ;; 2) GPUS="${GPUS:-0,1}" ;; 1) GPUS="${GPUS:-0}" ;; esac
+export TP GPUS
+RANKS=$(seq 0 $((TP - 1)) | tr '\n' ' ')
 PORT="${PORT:-8041}"
 READY_TIMEOUT="${READY_TIMEOUT:-2400}"
 GEN_TOKENS="${GEN_TOKENS:-256}"
 LOG=/tmp/ds41-hyb-$TAG.log
 SUMMARY=/tmp/ds41-hyb-$TAG-summary.txt
 BOARD=/root/work/GPU-BOARD.md
+WHO="${WHO:-MoET hybrid}"   # the board lines' author (an agent on a side branch sets its own)
 export MODEL_DIR="${MODEL_DIR:-/mnt/nvme/models/DeepSeek-V4.1-Flash}"
 
 note() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$SUMMARY"; }
@@ -49,7 +56,7 @@ cleanup() {
     docker logs "$NAME" > "$LOG" 2>&1
     docker stop -t 20 "$NAME" > /dev/null 2>&1
     docker rm -f "$NAME" > /dev/null 2>&1
-    echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"
+    echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"
   fi
   keep_artefacts
   rm -f "${TP4_WINDOW_COPY:-/nonexistent}"
@@ -61,7 +68,8 @@ trap cleanup EXIT TERM INT
 # scoring containers, `minisweagent-*` / `sweb.eval.*`) run for hours and must not block a window (10-26 14:24: a
 # window aborted on eight scoring containers after waiting 2 h 45 for the locks)
 gpu_containers=""
-for c in $(docker ps --format '{{.Names}}'); do
+# (TP < 4: the other GPUs may legitimately be busy - only the per-GPU compute-process check below applies)
+for c in $([[ "$TP" == "4" ]] && docker ps --format '{{.Names}}'); do
   info=$(docker inspect -f '{{len .HostConfig.DeviceRequests}} {{.HostConfig.Runtime}}{{range .Config.Env}} {{.}}{{end}}' "$c" 2>/dev/null) || continue
   devreq=${info%% *}
   if [[ "$devreq" != "0" || "$info" == *" nvidia"* || "$info" == *"NVIDIA_VISIBLE_DEVICES="* && "$info" != *"NVIDIA_VISIBLE_DEVICES=void"* ]]; then
@@ -71,8 +79,8 @@ done
 if [[ -n "$gpu_containers" ]]; then
   note "ABORT: GPU containers running: $gpu_containers"; exit 2
 fi
-if nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | grep -q .; then
-  note "ABORT: compute processes on the GPUs: $(nvidia-smi --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' ')"; exit 2
+if nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name --format=csv,noheader | grep -q .; then
+  note "ABORT: compute processes on GPUs $GPUS: $(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' ')"; exit 2
 fi
 # host RAM: the hybrid pins ~396 GB (4 x 52 GB store + 4 x 47 GiB Engram) and needs ~480 of the 498 GB while up; a boot
 # into a box with less than RAM_MIN_GB available dies in the OOM killer at the JIT warmup (10-24) - fail fast instead
@@ -80,7 +88,7 @@ avail_gb=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
 if (( avail_gb < ${RAM_MIN_GB:-465} )); then
   note "ABORT: MemAvailable ${avail_gb} GB < ${RAM_MIN_GB:-465} GB needed for the boot; top RSS: $(ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<5 {printf "%s %.0f GB; ", $2, $1/1048576}')"; exit 2
 fi
-echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: **4-GPU window started** (TP4 boot \`$TAG\`: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"
+echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: **${TP}-GPU window started** (TP$TP boot \`$TAG\` on GPUs $GPUS: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"
 note "window start: boot $TAG ($*); MemAvailable ${avail_gb} GB; GPU power limits: $(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | awk '{printf "%d ", $1}')W (cap $( (. /etc/default/gpu-power-cap 2>/dev/null; echo "${CAP_W:-400}") ) W, re-applied by the launcher if above)"
 # the box's memory-management activity across the window (compaction / page migration -> TLB shootdowns on the workers'
 # cores; kcompactd / khugepaged CPU time): snapshots at start, ready, end
@@ -150,7 +158,7 @@ if (( ready == 0 )); then
   note "NOT READY after $(( $(date +%s) - t0 )) s; last log lines:"
   grep -v "it/s\]" "$LOG" | tail -40 | tee -a "$SUMMARY"
   docker stop -t 30 "$NAME" > /dev/null 2>&1; docker logs "$NAME" > "$LOG" 2>&1; docker rm -f "$NAME" > /dev/null 2>&1
-  echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: window ended (boot \`$TAG\` did not come up; GPUs released)." >> "$BOARD"
+  echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` did not come up; GPUs released)." >> "$BOARD"
   exit 1
 fi
 note "ready after $(( $(date +%s) - t0 )) s"
@@ -163,7 +171,7 @@ if [[ "${PIN_ENGINE:-1}" == "1" ]]; then
   done
 fi
 grep -E "moet-cpu-tier\] rank 0: (store|tier started|layer language_model.model.layers.0.ffn)|Model loading took|Available KV cache memory|GPU KV cache size|init engine" "$LOG" | cut -c1-220 | tee -a "$SUMMARY"
-nvidia-smi --query-gpu=index,memory.used,memory.total --format=csv,noheader | tee -a "$SUMMARY"
+nvidia-smi -i "$GPUS" --query-gpu=index,memory.used,memory.total --format=csv,noheader | tee -a "$SUMMARY"
 ps -eo pid,rss,comm,args | grep -E "VLLM|EngineCore|vllm" | grep -v grep | awk '{printf "  pid %s rss %.1f GB %s\n", $1, $2/1048576, $3}' | tee -a "$SUMMARY"
 free -g | head -2 | tee -a "$SUMMARY"
 # where the host RAM goes (the RAM budget is an open item): meminfo + the workers' smaps_rollup
@@ -207,7 +215,7 @@ docker logs "$NAME" > "$LOG" 2>&1
 SNAP2=$(memsnap)
 note "memory management during the measurements: $(memdelta "$SNAP1" "$SNAP2")"
 grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -3 | cut -c1-300 | tee -a "$SUMMARY"
-for r in 0 1 2 3; do printf "  rank $r in-kernel us per expert (KPI lines): " | tee -a "$SUMMARY"; grep -o "rank $r: step [0-9]*:.*in-kernel [0-9]* us" "$LOG" | grep -v "step [0-9]:" | sed -E 's/.*in-kernel ([0-9]+) us/\1/' | tr '\n' ' ' | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"; done
+for r in $RANKS; do printf "  rank $r in-kernel us per expert (KPI lines): " | tee -a "$SUMMARY"; grep -o "rank $r: step [0-9]*:.*in-kernel [0-9]* us\( (per virtual rank \[[0-9, ]*\])\)\?" "$LOG" | grep -v "step [0-9]:" | sed -E 's/.*in-kernel ([0-9]+) us( \(per virtual rank (\[[0-9, ]*\])\))?/\1\3/' | tr '\n' ' ' | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"; done
 wait  # the placement probe
 if [[ -s "/tmp/ds41-hyb-$TAG-placement.txt" ]]; then
   note "CPU placement during decode (pool cores and their siblings; full list /tmp/ds41-hyb-$TAG-placement.txt):"
@@ -314,7 +322,7 @@ fi
 note "tier warnings in the log: $(grep -c "moet-cpu-tier\] rank 0: WARNING" "$LOG")"
 if [[ "${DEBUG_COMPACT:-0}" == "1" ]]; then
   # the within-boot identity check (every compact call vs all its experts in one b12x run): totals per rank, mismatches
-  for r in 0 1 2 3; do grep -o "rank $r: step [0-9]*:.*compact check: .*" "$LOG" | tail -1 | sed -E "s/(rank $r: step [0-9]+):.*compact check:/\1 compact check:/" | tee -a "$SUMMARY"; done
+  for r in $RANKS; do grep -o "rank $r: step [0-9]*:.*compact check: .*" "$LOG" | tail -1 | sed -E "s/(rank $r: step [0-9]+):.*compact check:/\1 compact check:/" | tee -a "$SUMMARY"; done
   note "compact check MISMATCH lines (all ranks): $(grep -c "DEBUG compact.*MISMATCH" "$LOG")"
   grep "DEBUG compact.*MISMATCH" "$LOG" | head -5 | cut -c1-300 | tee -a "$SUMMARY"
   note "compact check skipped lines: $(grep -c "DEBUG compact.*check skipped" "$LOG")"
@@ -326,5 +334,5 @@ docker stop -t 60 "$NAME" > /dev/null 2>&1
 docker logs "$NAME" > "$LOG" 2>&1
 docker rm -f "$NAME" > /dev/null 2>&1
 note "window end: $TAG stopped; log $LOG"
-echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — MoET hybrid: window ended (boot \`$TAG\` stopped; GPUs released; summary $SUMMARY)." >> "$BOARD"
+echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped; GPUs released; summary $SUMMARY)." >> "$BOARD"
 exit 0

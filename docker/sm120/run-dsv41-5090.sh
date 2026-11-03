@@ -41,8 +41,10 @@
 #                        card there; traces: 40+10 -> hit 0.565, 20+30 -> 0.658, 0+50 -> 0.708 - the all-LRU split is better
 #                        but every static expert made dynamic adds its record to the pinned store: +14 GiB for 20 static, +28
 #                        for 0, which this 498 GB box does not have next to the Engram tables; a 512 GB+ box can take it)
-#                        TP1 (1x 32 GB): SPARE 4 with the 9-static placement tp12-placement-0.026-uniform.json = 13 slots
-#                        (18.8 MB per expert per card)
+#                        TP1 (1x 32 GB): SPARE 9 with the 9-static placement tp12-placement-0.026-uniform.json = 18 slots
+#                        (18.8 MB per expert per card; traces: hit 0.43, ~138 CPU experts per step) and PROMOTIONS 1: a promotion
+#                        moves 4 / TP records (18.8 MB at TP1), the traces give the same hit rate at cap 1 as at cap 4 (0.420
+#                        vs 0.426) for 31 instead of 53 promotions per step (0.58 instead of 1.0 GB of H2D per step)
 #            TIMEOUT_MS (500)        the in-graph wait's bound (fail-closed)
 #            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
 #            GPU_MEM_UTIL (0.90 since 11-03 with SPARE=70: KV 1.28 GiB = 1.98 x a 512K request and ~1.3 GiB outside the budget for the
@@ -141,9 +143,9 @@ NAME="${NAME:-ds41-hyb}"
 TP="${TP:-4}"
 # the TP-dependent defaults (virtual ranks on 32 GB cards; see the header): GPUs, slots, context, chunk
 case "$TP" in
-  4) D_GPUS=0,1,2,3; D_SPARE=70; D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=524288; D_CHUNK=4096 ;;
-  2) D_GPUS=0,1;     D_SPARE=10; D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=65536;  D_CHUNK=4096 ;;
-  1) D_GPUS=0;       D_SPARE=4;  D_PLACEMENT=tp12-placement-0.026-uniform.json; D_MAX_MODEL_LEN=32768; D_CHUNK=2048 ;;
+  4) D_GPUS=0,1,2,3; D_SPARE=70; D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=524288; D_CHUNK=4096; D_PROMOTIONS=4 ;;
+  2) D_GPUS=0,1;     D_SPARE=10; D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=65536;  D_CHUNK=4096; D_PROMOTIONS=4 ;;
+  1) D_GPUS=0;       D_SPARE=9;  D_PLACEMENT=tp12-placement-0.026-uniform.json; D_MAX_MODEL_LEN=32768; D_CHUNK=2048; D_PROMOTIONS=1 ;;
   *) echo "TP=$TP is not 1, 2 or 4" >&2; exit 1 ;;
 esac
 GPUS="${GPUS:-$D_GPUS}"
@@ -162,7 +164,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$D_CHUNK}"
 if [[ "$TP" != "4" && $(echo "$GPUS" | tr ',' '\n' | wc -l) != "$TP" ]]; then
   echo "GPUS=$GPUS does not list $TP GPUs for TP=$TP" >&2; exit 1
 fi
-PROMOTIONS="${PROMOTIONS:-4}"
+PROMOTIONS="${PROMOTIONS:-$D_PROMOTIONS}"
 TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
 TIER_DEBUG="${TIER_DEBUG:-0}"
