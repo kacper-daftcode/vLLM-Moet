@@ -20,12 +20,21 @@
 #            PLACEMENT ($REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json = 40 static experts per layer;
 #                        0.28 = 107, 0.2526 = 97)  routing/placement.py's file;
 #                        RESIDENT=<int> instead = the first N experts of every layer (a test placement)
-#            SPARE (80)              LRU slots per layer for promote-on-miss (40 + 80 = the 120 slots of the 0.92 VRAM budget);
-#                        PROMOTIONS (4) per layer per step
+#            SPARE (70)              LRU slots per layer for promote-on-miss (40 + 70 = 110 slots since 11-03: ten slots = 1.75 GiB
+#                        per card traded for the 512K context's KV - short-prompt decode 144.7 / 125.3 tok/s, inside the
+#                        120-slot band; 40 + 80 = 120 was the default 10-25 .. 11-03);  PROMOTIONS (4) per layer per step
 #            TIMEOUT_MS (500)        the in-graph wait's bound (fail-closed)
 #            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
-#            GPU_MEM_UTIL (0.94; 0.92 until 10-29 - the second prefill scratch set needs the 0.64 GiB)  MAX_MODEL_LEN (65536)  MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts
-#                        prefill at 3.9K tok/s against 2.2K with 2048)  CAPTURE_SIZE (8)
+#            GPU_MEM_UTIL (0.90 since 11-03 with SPARE=70: KV 1.28 GiB = 1.98 x a 512K request and ~1.3 GiB outside the budget for the
+#                        indexer's runtime peak; 0.94 from 10-29 to 11-03 with 120 slots and the 64K max-model-len; 0.92 before)
+#            MAX_MODEL_LEN (524288 since 11-03: needle 3/3 at 512-519K, cold prefill 4.3-4.6K tok/s = TTFT ~2 min, decode 82 tok/s behind
+#                        512K; 65536 before)  INDEXER_LOGITS_MB (256)  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: the sparse-attention indexer's
+#                        prefill logits budget (vLLM default 512) - with the 512K max-model-len at util 0.94 the indexer OOMed on the 4th
+#                        chunk of a 128K prompt (its runtime peak is ~2x the budget: DeepGEMM output + fp32 upcast + top-k, and the
+#                        per-request buffers sized by max_model_len eat the ~190 MiB outside the budget); 256 + util 0.90 ran 128K / 256K /
+#                        512K prompts and the 512K needles clean
+#            MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts prefill at 3.9K tok/s against 2.2K with 2048)
+#            CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
 #            SCRATCH (64)            slots of the prefill scratch pool (phase 2.5; 64 = 0.6 GB per rank, 128 = 1.2; 0 = the missing
 #                        experts of > 8-token calls are not computed: decode-only diagnostics)
@@ -116,7 +125,7 @@ STORE_MODE="${STORE_MODE:-nonresident}"
 STORE_EARLY="${STORE_EARLY:-0}"
 PLACEMENT="${PLACEMENT:-$REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json}"
 RESIDENT="${RESIDENT:-}"
-SPARE="${SPARE:-80}"
+SPARE="${SPARE:-70}"
 PROMOTIONS="${PROMOTIONS:-4}"
 TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
@@ -206,7 +215,8 @@ docker run -d --name "$NAME" --restart no \
   ${PREFETCH:+-e MOE_B12X_PREFETCH=$PREFETCH -e MOE_B12X_PREFETCH_HINT=$PREFETCH_HINT} \
   ${SPIN_TOUCH_STRIDE:+-e MOE_B12X_POOL_SPIN_TOUCH_STRIDE=$SPIN_TOUCH_STRIDE} \
   -e VLLM_MOET_CPU_TIER_PREFILL_OVERLAP="$PREFILL_OVERLAP" -e VLLM_MOET_CPU_TIER_DEBUG_OVERLAP="$DEBUG_OVERLAP" \
-  -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-65536}" \
+  -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}" \
+  -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${INDEXER_LOGITS_MB:-256}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \

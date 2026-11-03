@@ -2,7 +2,8 @@
 
 **What it is.** The official `deepseek-ai/DeepSeek-V4.1-Flash` checkpoint (552B MoE, MXFP4 experts, UE8M0 scales)
 served at native quality on four 32 GB GeForce RTX 5090 cards — a box the model does not fit: the four cards hold
-the dense weights, the KV cache and **120 of the 384 experts per MoE layer per TP rank**; every other routed expert
+the dense weights, the KV cache and **110 of the 384 experts per MoE layer per TP rank** (120 until 11-03, when ten slots went
+to the 512K context's KV); every other routed expert
 of a decode step is **computed on the CPU** from the checkpoint's own bytes in pinned host RAM, in parallel with the
 GPU, and its rows are injected into the GPU's own MoE kernel before the top‑k sum. No re‑quantization, no replay:
 the hybrid's output is **bit‑identical to the all‑resident b12x path** on every step. The box: a Threadripper PRO
@@ -15,23 +16,23 @@ Measured (2026‑10‑26 → 11‑03, the launcher's defaults, TP4, no DSpark):
 | decode, single stream, short prompts | **145–149 / 124–129 tok/s** ('Hello' / 'def fib(n):') with the defaults of 11-03 — the CPU kernel's software prefetch and the 5 ms pool spin (143 / 120 before 10-29; the two 30-minute single-stream soaks of 11-02/03 opened at 145 / 124 with a 0.5 ms spin and 148.7 / 129.3 with the 5 ms spin, both flat over the half hour — the CPU kernel 127–132 µs per expert throughout). An idle-time DRAM stream from the idle pool workers gave 150 / 132 in 10-minute windows but degrades after ~18 minutes of serving (the CPU kernel +34 %) and is off. The step is ~7.5 ms, of which ~2.0 ms is the GPU waiting for the CPU tier on the ~10 layers per step that miss (one expert's full CPU latency each, ~130 µs in situ); the degenerate 'Hello' run has a hit rate → 1 |
 | decode behind 2K / 14K / 30K of context | 56–81 / 64 / 47 tok/s (the attention side) |
 | prefill with the streamed experts (chunk 4096, the default) | **2.4–2.7K tok/s at 2K, 4.4K at 14K, 4.7–4.8K at 30K** with the 10-29 default `PREFILL_OVERLAP=1` (the records' staging on a side stream, during the resident run and the previous round's run — bit-identical to the serial path; TTFT 0.77–0.84 s / 3.25 s / 6.3–6.5 s against 0.94 / 3.8 / 7.7 s before, −15 %). PCIe‑bound: 0.09–0.10 ms per missing expert per rank ≈ 50 GB/s per link (0.12 before); the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token — chunk 2048 gave 2.0–2.3K at 2K / 14K / 30K. 32K / 64K: 3.7–3.85K before the overlap (not re-measured) |
-| long context | needle‑in‑a‑haystack **32K: 3/3, 64K: 3/3** (depths 0.1 / 0.5 / 0.9; TTFT 8.5 s / 16.5–16.8 s) |
+| long context | needle‑in‑a‑haystack **32K: 3/3, 64K: 3/3** (depths 0.1 / 0.5 / 0.9; TTFT 8.5 s / 16.5–16.8 s; 10-26) and **~512K: 3/3** (11-03: fillers of 512–519K tokens, depths 0.1 / 0.5 / 0.9, cold prefill 117–118 s = 4.3–4.4K tok/s). The serving default is **`--max-model-len 524288`** since 11-03 (the model: 64K native, YaRN to 1M; sparse attention with a top‑512 indexer): a 128K prompt prefills in 34.7 s (3.8K tok/s), 512K in ~113 s (4.6K tok/s); **decode behind 128K / 256K / 512K of context: 58 / 78 / 82 tok/s** (the sparse attention keeps the step nearly context‑independent; the spread is the expert hit rate of different texts); a cached 512K prefix answers in 1.5 s. The KV cache holds 1.98 such requests |
 | concurrency (4 streams, 60‑min soak) | 11-02: **2,197 requests, 0 errors**, aggregate **114.6 tok/s** (10-26: 1,888 requests, 98 tok/s) — every stream brings its own expert misses (~136 CPU experts per 4‑token step, 22–25 ms of CPU per step), so the hybrid serves one stream fast and several streams correctly but slowly; `--max-num-seqs 1` is the serving default. A single stream of mixed prompts runs at ~87 tok/s flat over 30 minutes with the 11-03 defaults |
 | quality, paired against the native FP4 reference | **HumanEval 159/164 vs 160/164** (McNemar p = 1.0, 134 identical programs); **MATH‑500 level 5: 55/60 vs 55/60** (0 discordant items, 59 identical answers) |
 | identity | bit‑exact against the all‑resident b12x path within one boot: 21,040 compact calls per rank, 98,220 CPU‑computed rows, 0 differ (`DEBUG_COMPACT`); the CPU kernel bit‑exact against b12x's GPU kernels on four parity sets |
 | expert hit rate (pairs resident) | 0.83–0.85 on short prompts, **0.87 on HumanEval, 0.91 on MATH‑500** |
 | host RAM while up | ~450 GB used (the expert store 64.7 GB per rank + the Engram tables 2 × 23.6 GiB per rank, pinned), MemAvailable ~45 GB |
-| VRAM | 30.5 GB per card at util 0.94 (0.92 until 10-29; the second prefill scratch set takes 0.56 GiB); KV cache ~0.9 GiB (nvfp4 MLA: 230K+ tokens) |
+| VRAM | ~29.3 GB per card at util 0.90 with 110 expert slots (since 11-03; 30.5 GB at util 0.94 with 120 slots before); KV cache 1.28 GiB (nvfp4 MLA + mxfp4 indexer KV: 1.04M tokens by vLLM's count, 1.98 requests of 512K — a sequence's KV cost is sublinear in its length: 0.26 GiB at 64K, ~0.65 GiB at 512K); ~1.3 GiB outside vLLM's budget for the indexer's prefill peak (`VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=256`) |
 | boot | ~6 min (weights 160–250 s + 65 GB of records pinned per rank in ~60 s + warmup; the page cache dropped before the boot and after the weights — pinning the records *before* the weights instead was measured slower: the loader then streams 290 GB through ~45 GB of cache, 527 s) |
 
 ## How it works
 
 Per TP rank (the four ranks are symmetric and need no CPU‑side coordination):
 
-1. **Resident pool.** Each MoE layer's expert parameters are created with R = 120 rows instead of 384; vLLM's
+1. **Resident pool.** Each MoE layer's expert parameters are created with R = 110 rows (120 until 11-03) instead of 384; vLLM's
    weight loader maps a resident expert to its slot and skips the rest (its own path for non‑local EP experts). The
    pool is b12x's prepared storage; a per‑layer device table `slot[e]` (−1 = not resident) is read in‑graph. 40 of the
-   120 slots hold a **static placement** from routing frequencies (`routing/placement.py`); the other 80 are **LRU
+   slots hold a **static placement** from routing frequencies (`routing/placement.py`); the other 70 (80 until 11-03) are **LRU
    slots** filled by promotions (below). At equal VRAM, dynamic slots beat frequency‑placed static ones
    (`routing/promo_sim.py` on 237K traced positions: 107 + 13 → 0.777, 40 + 80 → 0.859, all 120 dynamic → 0.88).
 2. **The split, inside the captured decode graph.** After b12x's activation quant, a publish kernel remaps the
@@ -129,8 +130,10 @@ prefill TTFT on disjoint prompts), `cpu_tier/cpu_placement_probe.sh` (who runs o
   sequences almost never share their misses (the traces: 34 → 82 → 197 distinct CPU experts per step at 1 / 2 / 4
   streams; the soak: 98 tok/s aggregate at 4 streams against 120–143 for one) — a single‑stream (at most two‑stream)
   design on this box's memory bandwidth. `routing/promo_sim.py --streams N` models it.
-- `GPU_MEM_UTIL` 0.94 is the default since 10-29 (the two prefill scratch sets; 0.92 was needed already with the 4096‑token
-  chunk: 0.90 leaves 0.18 GiB of KV, too little for one 64K request).
+- `GPU_MEM_UTIL` 0.90 with 110 expert slots is the default since 11-03 (the 512K context: KV 1.28 GiB and ~1.3 GiB outside the
+  budget for the sparse‑attention indexer's prefill peak, which at util 0.94 with the 512K max‑model‑len OOMed on the 4th chunk of a
+  128K prompt); 0.94 with 120 slots was the default 10-29 .. 11-03 (the two prefill scratch sets; 0.92 was needed already with the
+  4096‑token chunk at 120 slots: 0.90 left 0.18 GiB of KV, too little for one 64K request).
 - The GPU 0 of this box dropped off the PCIe bus twice under sustained full‑power four‑GPU prefill (hardware), so the
   cards run capped at 400 W (`gpu-power-cap.service`, persisted).
 - The working notes with every measurement and its command: `internal/dsv41-5090-cpu/handoff/*.md` and
