@@ -23,7 +23,8 @@ RS="${2:-16 8 1}"
 PORT="${3:-8031}"
 shift 3 2>/dev/null || shift $#
 EXTRA="$*"
-REPO=/mnt/nvme/vLLM-Moet-cpu
+# the worktree this script lives in (= /mnt/nvme/vLLM-Moet-cpu in the main worktree)
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 IMG=vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1
 PY=/root/work/venv/bin/python
 CLIENT=$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py

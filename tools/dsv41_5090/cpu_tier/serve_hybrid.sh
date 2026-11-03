@@ -16,6 +16,11 @@ if [ "${HYBRID_PATCH_AT_START:-1}" = "1" ]; then
 else
   python3 -c "import vllm_moet_cpu_tier" || { echo "the image has no baked cpu tier (Dockerfile step 28); set HYBRID_PATCH_AT_START=1 with the worktree mounted"; exit 1; }
 fi
+# Engram v2 (ENGRAM_MODE=nvme in the launcher -> ENGRAM_PATCH_AT_START=1): the engram_v2 patcher from the mounted worktree
+# (idempotent; builds libengram_v2.so, ~5 s; the CUDA extension is JIT-built at the first lookup, cached under /root/.cache)
+if [ "${ENGRAM_PATCH_AT_START:-0}" = "1" ]; then
+  python3 "${HYBRID_SRC:-/repo/tools/dsv41_5090}/engram_v2/patch_vllm_engram_v2.py" || exit 1
+fi
 ARGS=()
 SPEC_TOKENS="${SPEC_TOKENS:-5}"
 if [ "$SPEC_TOKENS" != "0" ]; then

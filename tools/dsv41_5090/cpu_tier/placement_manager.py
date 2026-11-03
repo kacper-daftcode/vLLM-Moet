@@ -96,18 +96,23 @@ class ResidentPool:
 
 class PlacementManager:
     def __init__(self, ext, layout: dict, pools: list[ResidentPool], records_of, copy_stream: torch.cuda.Stream,
-                 max_promotions_per_layer: int = 4, record_ptr=None):
+                 max_promotions_per_layer: int = 4, record_ptr=None, record_release=None):
         """records_of(layer, expert) -> a pinned host uint8 tensor [RECORD_BYTES] (the store); record_ptr(layer,
-        expert) -> its host address (for the batched promotion; derived from records_of when None)."""
+        expert) -> its host address (for the batched promotion; derived from records_of when None). record_release
+        (the store tail): record_ptr pins the record (a cold one is read from NVMe first); the pin is released once the
+        promotion's copy has completed on the GPU (the M event of that after_launch, synchronised two steps later)."""
         self.ext, self.layout, self.pools, self.records_of = ext, layout, pools, records_of
         self.record_ptr = record_ptr or (lambda layer, e: int(records_of(layer, e).data_ptr()))
+        self.record_release = record_release
+        self.acquired_last: list[tuple[int, int]] = []     # (layer, expert) pinned by the last after_launch
+        self.acquired_prev: list[tuple[int, int]] = []     # by the one before (released when its M is done)
         self.copy = copy_stream
         self.max_per_layer = max_promotions_per_layer
         self.unmap_events: list[torch.cuda.Event] = []     # U of the last after_launch
         self.map_events_last: list[torch.cuda.Event] = []  # M of the last after_launch
         self.map_events_prev: list[torch.cuda.Event] = []  # M of the one before
         self.last_promoted: dict[int, set] = {}            # layer -> experts promoted by the last after_launch
-        self.stats = dict(promotions=0, skipped_no_victim=0, skipped_already=0, skipped_window=0)
+        self.stats = dict(promotions=0, skipped_no_victim=0, skipped_already=0, skipped_window=0, skipped_no_record=0)
         self.batched = hasattr(ext, "promote_batch")
         # admission window (steps; 0 = promote on every miss): the previous miss step per (layer, expert)
         self.window = int(os.environ.get("VLLM_MOET_CPU_TIER_PROMOTE_WINDOW", "0"))
@@ -135,8 +140,20 @@ class PlacementManager:
         ms = main_stream or torch.cuda.current_stream()
         for ev in self.map_events_prev + self.unmap_events:
             ms.wait_event(ev)
+        if self.record_release is not None and self.acquired_prev:
+            # the store tail: the records pinned two after_launches ago were copied by the M events of that call; the
+            # GPU has normally finished them by now (a step in between) - the host sync makes it certain before the
+            # pins drop and the LRU may reuse the slots
+            for ev in self.map_events_prev:
+                ev.synchronize()
+            for layer, e in self.acquired_prev:
+                self.record_release(layer, e)
+            self.acquired_prev = []
         self.map_events_prev = self.map_events_last
         self.map_events_last = []
+        if self.record_release is not None:
+            self.acquired_prev = self.acquired_last
+            self.acquired_last = []
         self.unmap_events = []
 
     def note_uses(self, uses) -> None:
@@ -183,9 +200,16 @@ class PlacementManager:
                 if s < 0:
                     self.stats["skipped_no_victim"] += 1
                     continue
+                # the record's host pointer (the store tail: pinned until the copy is done; a cold record read now)
+                ptr = int(self.record_ptr(int(layer), e))
+                if not ptr:
+                    self.stats["skipped_no_record"] += 1
+                    continue
+                if self.record_release is not None:
+                    self.acquired_last.append((int(layer), e))
                 victim = int(P.expert_of_slot[s])
                 P.set_slot(s, e, miss_step[e])
-                out.append((e, s, victim, miss_step[e]))
+                out.append((e, s, victim, miss_step[e], ptr))
                 self.stats["promotions"] += 1
             if out:
                 plans[int(layer)] = out
@@ -207,7 +231,7 @@ class PlacementManager:
             # phase 1: every victim of every layer unmapped, then U
             for layer, out in plans.items():
                 P = self.pools[layer]
-                victims = [v for _, _, v, _ in out if v >= 0]
+                victims = [v for _, _, v, _, _ in out if v >= 0]
                 if victims:
                     if self.batched:
                         self.ext.table_write(P.slot_table, victims, [-1] * len(victims))
@@ -223,13 +247,13 @@ class PlacementManager:
                 if self.batched:
                     self.ext.promote_batch(P.staging, self.layout["w13"], self.layout["w13s"], self.layout["w2"], self.layout["w2s"],
                                            P.pool["w13"], P.pool["w13s"], P.pool["w2"], P.pool["w2s"], P.slot_table,
-                                           [self.record_ptr(layer, e) for e, _, _, _ in out], [e for e, _, _, _ in out],
-                                           [s for _, s, _, _ in out])
+                                           [ptr for _, _, _, _, ptr in out], [e for e, _, _, _, _ in out],
+                                           [s for _, s, _, _, _ in out])
                 else:
-                    for e, s, _, _ in out:
+                    for e, s, _, _, _ in out:
                         self._repack_into(P, layer, e, s)
                         P.slot_table[e] = s
-                self.last_promoted[layer] = set(e for e, _, _, _ in out)
+                self.last_promoted[layer] = set(e for e, _, _, _, _ in out)
                 n_sched += len(out)
             m = torch.cuda.Event()
             m.record(self.copy)

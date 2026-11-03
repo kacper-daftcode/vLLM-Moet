@@ -14,12 +14,13 @@ set -u
 if [[ -z "${TP4_WINDOW_COPY:-}" ]]; then
   _copy="/tmp/tp4_window.$$.sh"
   cp "${BASH_SOURCE[0]}" "$_copy" || exit 1
-  TP4_WINDOW_COPY="$_copy" exec bash "$_copy" "$@"
+  # the worktree this script lives in (= /mnt/nvme/vLLM-Moet-cpu in the main worktree): resolved before the private copy runs
+  REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}" TP4_WINDOW_COPY="$_copy" exec bash "$_copy" "$@"
 fi
 TAG="${1:?tag}"
 shift
 for kv in "$@"; do export "$kv"; done
-REPO=/mnt/nvme/vLLM-Moet-cpu
+REPO="${REPO:-/mnt/nvme/vLLM-Moet-cpu}"
 PY=/root/work/venv/bin/python
 NAME="${NAME:-ds41-hyb}"
 PORT="${PORT:-8041}"
