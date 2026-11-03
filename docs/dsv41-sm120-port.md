@@ -1983,10 +1983,63 @@ marshalling per call) starves the GPU at ~215 GEMMs per chunk (GPU idle 1.1 → 
 of this front: a harness win is not an in‑situ win; every candidate is measured with the GPU‑idle share of a real
 prefill.
 
-Next on this front, in order of (time × headroom): the MoE FC1 / FC2 (a bit‑identical CUDA replacement of b12x's
-`dynamic` kernels already runs the call1 layer in 1.76 ms against b12x's 2.31 and spec B's 2.10 — 2.1× over the DRAM
-floor of 0.83 ms, with the DeepGEMM 1.0 ms as the intermediate target), then the sparse‑MLA prefill kernel in SASS
-against the BF16 specification, then the all‑gather of the MoE input in MXFP8 instead of bf16.
+Next on this front, in order of (time × headroom): the MoE FC1 / FC2 (below, `-r23`), then the sparse‑MLA prefill
+kernel in SASS against the BF16 specification, then the all‑gather of the MoE input in MXFP8 instead of bf16.
+
+## Step 42: the prefill MoE on our kernels, bit‑identical with b12x — `-r23` (2026‑10‑29..11‑03)
+
+The MoE was the largest kernel class of the prefill after the collectives (28.9 % on `-r21`): b12x's `W4A8MaterializedPhase1Kernel`
+(FC1 + SwiGLU + MXFP8 quant) and `Phase2Kernel` (FC2) take 1 673 + 925 µs per full layer‑chunk of 4096 tokens, against a floor of
+0.83 ms set by the expert weight bytes alone (319 active experts × 4.4 MB of FP4 per chunk at 1.8 TB/s) and DeepGEMM's grouped
+kernel doing the same shapes in 1.0 ms. ncu on the served dumps said why: 173 / 102 registers per thread, one wave per SM,
+16.7 % theoretical occupancy, DRAM 27–32 %, SM 44–48 % — latency‑bound, far from both floors. The method of the front
+(bit rule, level B): first an executable **bit specification** — `tools/dsv41_sm120/b12x_moe_prefill_spec/`, b12x's arithmetic
+as four naive kernels (the rows quant `_load_bf16x32_to_f32` + `quantize_block_fp8_mx`; FC1 as `mma.sync m16n8k32
+kind::mxf8f6f4` e4m3 × e2m1 with ue8m0 scales accumulating in C over the k32 blocks in b12x's order; `alpha ·
+input_global_scale` on the fp32 accumulators, SwiGLU limit 10 with `min.NaN / max.NaN`, `rcp.approx(1 + ex2.approx(gate ·
+−log2e))`, `cvt.rn.satfinite.bf16x2`, MXFP8 per row / 32 columns; FC2 as 20 QMMAs with b12x's zero tail, `down_alpha ·
+global_scale · token_weight`; the TopKSum in slot order; operands = b12x's prepared n64‑repacked planes), `torch.equal` with
+b12x on synthetic token counts and on dumps of a real 163K prefill taken with a hook in the served server (`weights_layer2.pt`,
+`call1`: 4096 rows, 319 experts, median 34 rows per expert, p90 185, max 1 255). Then the fast version,
+`tools/dsv41_sm120/b12x_moe_prefill_fast/`, which keeps every per‑element operation and its order and changes everything
+around it: one front‑end launch (MXFP8 rows quant, deterministic routing from shared‑memory integer counts and a stable
+scatter — no global atomics — and the CTA work lists, tile‑major per expert so consecutive items share the expert's
+weight tile in L2), persistent FC1 CTAs (8 warps = 8 n16 column slices of a 128‑column gate+up tile × every m16 tile of the
+expert's 64‑row chunk; K64 stages through a cp.async ring holding the plane words, XOR‑swizzled A rows and both scale
+words; the SwiGLU / MXFP8 epilogue in registers, the 32‑column amax exchanged through shared memory — max is
+commutative, so the bits are the spec's; padding to 16 rows only, where 64‑row tiles would pad +53 %), FC2 on the same
+skeleton with K = 640, the route rows written token‑major into b12x's `workspace.route_output`; b12x's own TopKSum (or
+step 33's fused shared‑expert add) reduces them as before. No atomics in any reduction.
+
+What it took: v1 (29.10) was bit‑identical at 1.75 ms per layer on the dump; v2 hung a GPU for 26 hours — a per‑thread trip
+count around `__match_any_sync(0xffffffff)` in the front‑end's pair‑count loop parked the lanes beyond `n_pairs` at the loop
+exit while the others waited in `WARPSYNC.COLLECTIVE` (T = 300 rows), found in the SASS and fixed with a warp‑uniform loop
+(and a `timeout` + hang detection around every kernel block since); v5 1.74 ms; v6 (the retiling to 8 n16 slices, 2–3.11)
+**1.67 ms of GPU kernels per layer against b12x's 2.28 and spec B's 2.10**, front‑end 75 µs. Gates: `torch.equal` with
+b12x and with spec B on T ∈ {16, 64, 300, 1024} and both served dumps, 3 repeats identical, every (stages, CTAs/SM,
+scheduler) configuration; the extension's cubin round‑trips strictly through cubit (11 488 / 11 488 — decision 0 of the
+front: a kernel the assembler cannot read is not shipped); in situ on GPUs 4–7 (image `-r22` + the served switches, the
+deterministic top‑k in both arms, the prebuilt extension bind‑mounted, switch 1 vs 0): **fresh prefill 163K 7 728–7 776 →
+7 014–7 074 ms (−9.2 %, 23.2k tok/s), 19K 924–930 → 839–842 ms**, `long_agree` (4 prompts of 3.2K–12.7K tokens, greedy +
+prompt top‑1 logprobs) and the short‑prompt panel ALL IDENTICAL, 0 Traceback; the profile of that arm: fc1 578 + fc2 365 µs
+per layer‑chunk, the MoE class 28 → 19 % of the prefill. The same A/B on the image `-r23` on a second host (four RTX PRO 6000
+**Server Edition** in a 354 GB VM, memory clock 12 481 MHz against 16 501 here, so slower in absolute terms): 163K 8.26–8.27 →
+7.57–7.58 s (−8.4 %), 19K −8.5 %, ALL IDENTICAL again, both arms deterministic run to run. **Production switch 2026‑11‑03
+20:10–20:21Z** (`-r22` → `-r23`, the same disk tier — same bits): fresh prefill 163K 7.82 → **7.17–7.21 s (22.6–22.8k tok/s)**,
+19K 0.94 → 0.86 s; Fraser ×10 129.85 → 129.3 steps/s, 679 → 677 tok/s median (decode untouched by construction: the fast
+kernels run only above 8 rows). Against `-r21-mxfp8` of a week earlier (163K 9.0 s, 18.1k tok/s) the prefill front is
+**−20 %**; against the recipe's image of September (~15.5 s) 2.15×.
+
+Lessons kept: (1) the bit specification first, the fast kernel second — every v2…v6 experiment was judged by `torch.equal`
+against spec B, never by tolerance; (2) a kernel that can hang needs `timeout` *and* a check that the card is idle afterwards
+(`docker stop` did not end the hung kernel; `nvidia-smi -r` did, and reset the card's power limit and memory offset, which
+had to be restored); (3) a 354 GB host cannot carry the served configuration: the loader's shared‑memory segments
+(~280 GB) plus the 64 GiB offload region OOM‑kill a worker at the last allocation — `KV_OFFLOAD_GIB=0` there, which changes
+nothing below the GPU KV capacity (9.7M tokens).
+
+What is left in the MoE class: 0.94 ms per layer‑chunk in situ against the 0.83 ms floor; the SASS version through cubit
+(Phase 1b) is the way to the floor, with the DeepGEMM grouped kernel (7 instructions per MMA in the census; its 34 words per
+cubin that cubit does not yet round‑trip are the next ISA task) as the schedule reference.
 
 ## Apply / build / run
 
