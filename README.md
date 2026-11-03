@@ -37,7 +37,7 @@ every length (+0.5–1 % prefill time).
 
 | | measured on the served image (`-r23` = `-r21-mxfp8` + steps 40–42 + the deterministic top-k of step 26, DSpark k = 7, 400 W) |
 |---|---|
-| decode, 1 stream | prose **~293 tok/s median (waves 277–301)**, code **~802 tok/s median (waves 786–813)** (128–130 steps/s on short prompts, 2026-10-28 on `-r21-mxfp8`; decode is untouched by steps 40–42: Fraser ×10 on the night of each switch 129.9 → 129.3 steps/s, 679 → 677 tok/s median) |
+| decode, 1 stream | prose **~293 tok/s median (waves 277–301)**, code **~802 tok/s median (waves 786–813)** (128–130 steps/s on short prompts, 2026-10-28 on `-r21-mxfp8`; decode is untouched by steps 40–42: Fraser ×40 on `-r23` 129.0 steps/s, 688 tok/s median, 746 best) |
 | decode, 8 streams | prose ~721 tok/s median (716–759), code ~2,258 tok/s median (2,227–2,289) aggregate, 8 × 1,024 tokens (2026-10-28) |
 | fresh prefill | **163K tokens in 7.17–7.21 s (22.6–22.8K tok/s), 19K in 0.86 s** (production, 2026-11-03 20:20Z, right after the switch; `-r22` the same evening 7.82 s / 0.94 s, `-r21-mxfp8` on 2026-10-29 9.0 s / 1.07 s, 391K in 22.6 s — not re-measured) |
 | KV cache | **9.62M tokens** on the GPUs (18× concurrency at 512K), a 64 GiB host offload region, plus a disk tier |
@@ -129,11 +129,14 @@ quote the best.
 | `-r21-mxfp8`, fused MoE + sparse-MLA gather + steps 30–33, 36, 38–39 on, `B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1`, `P2P_AR_FUSED_MAX_ROWS=8`, DSpark k = 7 (40 reps, 2026-10-29) | **679** | **740** | **128.4** | 5.29 |
 | `-r22` = the row above + steps 40–41 + the deterministic top-k (10 reps on production before the `-r23` switch, 2026-11-03) | 679 | 745 | 129.9 | 5.23 |
 | `-r23` = `-r22` + step 42 (10 reps on production right after the switch, 2026-11-03) | 677 | 708 | 129.3 | 5.25 |
+| `-r23`, the same server an hour later (40 reps, 2026-11-03 21:10Z; TTFT median 160 ms) | **688** | **746** | **129.0** | 5.37 |
 
 k = 7 steps are individually slower (more rows verified per step) but accept ~19 % more tokens each;
 in mixed traffic with lower draft acceptance the wider draft does not pay for itself, which is what
 `enable_adaptive_verification` exists for. The prefill front (steps 40–42) leaves this bench where it was:
-the decode graphs, the replay rows and the drafter keep the old code. Reproduce (the switches are production's):
+the decode graphs, the replay rows and the drafter keep the old code; the best-of-N column is the maximum of the
+per-run acceptance (0.68–0.69 behind the 745 bests, 0.64 behind the 708 of the ten-rep snapshot), which is why we
+engineer against the median and quote 40 reps. Reproduce (the switches are production's):
 
 ```bash
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r23 .
