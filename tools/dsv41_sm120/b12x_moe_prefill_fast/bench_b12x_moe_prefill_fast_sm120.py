@@ -5,8 +5,9 @@
 sum) for the configurations asked for, b12x's Phase1 / Silu / Phase2 / TopKSum for the same call, the spec's kernels,
 and the DRAM floor. Under `ncu` run one config with --iters 1 --no-b12x --no-profile.
 
-  python3 bench_b12x_moe_prefill_fast_sm120.py [--dumps DIR] [--iters 10] [--cfgs 0,0,1 1,0,1 ...] [--no-b12x] [--no-spec]
-  (--cfgs = cfg1,cfg2,dynamic tuples; the default list = (3,2)/(4,2) stage configs x dynamic, plus static)
+  python3 bench_b12x_moe_prefill_fast_sm120.py [--dumps DIR] [--iters 10] [--cfgs 0,0,1 1,0,1 ...] [--no-b12x] [--no-spec] [--pause S]
+  (--cfgs = cfg1,cfg2,dynamic tuples, repeats allowed; the default list = (3,2)/(4,2) stage configs x dynamic, plus static;
+  --pause = seconds of idle before each configuration: the card's clocks drift within a run - compare like with like)
 """
 from __future__ import annotations
 
@@ -64,6 +65,7 @@ def main() -> int:
     ap.add_argument("--no-b12x", action="store_true")
     ap.add_argument("--no-spec", action="store_true")
     ap.add_argument("--no-profile", action="store_true")
+    ap.add_argument("--pause", type=float, default=0.0, help="seconds to sleep before every configuration (clock / thermal settling)")
     a = ap.parse_args()
     os.environ.setdefault("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     import torch
@@ -111,6 +113,9 @@ def main() -> int:
     for cfg in a.cfgs:
         c1, c2, dyn = [int(v) for v in cfg.split(",")][:3]
         kw = dict(cfg1=c1, cfg2=c2, dynamic=dyn)
+        if a.pause > 0:
+            torch.cuda.synchronize()
+            time.sleep(a.pause)
         res = moe_prefill_fast(x, ids, w, planes, LIMIT, **kw)
         torch.cuda.synchronize()
         okb = torch.equal(res[0].view(torch.int16), out.view(torch.int16))

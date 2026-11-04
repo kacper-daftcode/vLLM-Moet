@@ -2,12 +2,14 @@
 // FC2 of b12x's `integration.tp_moe.dynamic` deterministic path, bit for bit with spec B
 // (../b12x_moe_prefill_spec/b12x_moe_prefill_spec_sm120.cu = b12x's arithmetic as naive kernels), but pipelined:
 //
-//   frontend   one launch: MXFP8 quant of the token rows (a warp per row; exactly spec B's quant_rows) in all blocks but
-//              the last, and in the last block the deterministic routing: per-expert pair counts (shared-memory integer
-//              atomics: the sums do not depend on order), padded (to 16 rows) expert offsets, a stable scatter of the
-//              pairs into row_pair (pair order within an expert; ranks from __match_any + a per-warp prefix: no global
-//              atomics, no ordering race) and the CTA work lists of FC1 / FC2 ((expert, 64-row chunk, column tile),
-//              tile-major within an expert so that consecutive items share the expert's weight tile in L2).
+//   frontend   two launches (v8; v1-v7 routed in one CTA behind the quant blocks): MXFP8 quant of the token rows (a warp
+//              per row; exactly spec B's quant_rows) in the first blocks (none with pre-quantized rows), then a block per
+//              512-pair chunk with the chunk's per-expert pair counts (shared-memory integer atomics: the sums do not
+//              depend on order), of which the last to finish scans: the prefix over the chunks, padded (to 16 rows)
+//              expert offsets, the CTA work lists of FC1 / FC2 ((expert, 64-row chunk, column tile), tile-major within an
+//              expert so that consecutive items share the expert's weight tile in L2); the scatter kernel (a block per
+//              chunk) then places the pairs into row_pair in pair order within an expert (ranks from the chunk prefix +
+//              a per-warp prefix + __match_any: no global atomics, no ordering race).
 //   fc1        persistent CTAs (256 threads = 8 warps), work item = (expert, <= 4 m16 tiles of its rows, 128-column
 //              tile of gate+up; the 5th tile: 64 columns); warps = 8 n16 column slices, every warp over all m-tiles of
 //              the item (acc[4][2 proj][2 n8][4] = 64 fp32 per thread; the 64-column tile: 4 slices x 2 m-tile halves).
@@ -21,21 +23,36 @@
 //              quad for the warp's 16 columns, then with the other half's partial through shared memory (max is
 //              commutative and exact: the same value as the sequential compare-and-select), quantize_block_fp8_mx per
 //              element, a transpose of the e4m3 pairs across the quad, two 8 B stores per row and slice, the scale byte.
-//   fc2        the same skeleton with K = 640 (18 live k32 blocks + the zero tail: 20 QMMAs per n8 tile as b12x),
+//   fc2        the same skeleton with K = 640 = 18 live k32 blocks (b12x and spec B also run the 2 zero blocks of the
+//              tail: exact +0.0 additions to the chain, skipped since v8 - see the fc2 kernel),
 //              item = (expert, <= 4 m-tiles, 128 output columns), acc[4][2][4] = 32 per thread; epilogue:
 //              (down_alpha * global_scale) * token weight (staged with the pairs), cvt.rn.satfinite.bf16x2 into the
 //              token-major route rows (a word transpose across the quad: two 16 B stores per row and slice).
 //   topk_sum   out[t, col] = bf16((((0 + r0) + r1) + ...)) over the token's pairs in slot order (ids < 0 skipped), fp32
-//              adds of the bf16 route values - spec B's topk_sum, 8 columns per thread (integrated, b12x's own TopKSum
-//              runs instead: the route rows are the interface).
+//              adds of the bf16 route values - spec B's topk_sum, 8 columns per thread. v8 can also fuse it into fc2's
+//              epilogue (VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1: the CTA that completes the last of a token's rows
+//              for a 128-column tile sums the token's rows for that tile; same chain, same order whoever sums) - on
+//              call1 break-even with this kernel, so off by default. Integrated (patch v2) the kernels write the output
+//              and b12x's TopKSum (0.166 ms) is skipped; with patch v1 the route rows are the interface.
 //
 // Determinism: no atomics in any reduction (the only atomics are the integer pair counts in shared memory, whose sums
-// are order-independent, and the work-item counters, which only decide which CTA computes an item). Three runs give
-// identical bits. Plane layouts and operand conventions are the spec's (see its header).
+// are order-independent, the work-item counters, which only decide which CTA computes an item, and the fused sum's
+// arrival counters, which only decide which CTA sums - in the fixed slot order). Three runs give identical bits. Plane
+// layouts and operand conventions are the spec's (see its header).
+//
+// History (call1 layer of the dumps: 4096 rows x top-6, 319 experts, one RTX PRO 6000 at 400 W, bits always identical):
+//   v1 (Q, 29.10) 1.756 ms; v2-v5 (S, 2.11) hang fix, NOMASK removed, fc1 spill removed: 1.746; v6 (S, 2.11) the retile
+//   (8 n16 warp slices x all m-tiles): 1.674 = served r23 (fc1 0.87 / fc2 0.56 / topk_sum 0.13 / front-end 0.11).
+//   v8 (W, 4.11): the routing front-end in two launches (histogram CTAs + scan in the last one, scatter CTAs; 0.108 ->
+//   0.033 ms), fc2 without the zero-tail stage (0.565 -> 0.549), the top-k sum fused into fc2's epilogue, a register
+//   diet of the issue side, the pre-quantized rows entry (U). Measured and dropped on the way (W/REPORT.md): a conflict-
+//   free B stage layout via 8 B cp.asyncs (+4.5 %), a staggered issue/compute order per warp half (+1-4 %), the fused
+//   sum done synchronously in the epilogue (+0.21 ms) or one item later behind the stores (+0.15 ms).
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
 #include <type_traits>
+#include <cstdlib>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -46,14 +63,14 @@ constexpr int kN = 576;             // intermediate size: 4 x 128 + 64 columns
 constexpr int kN1Tiles = 5;         // FC1 column tiles (gate+up each)
 constexpr int kSlices = 5;          // k128 slices of the intermediate (4.5)
 constexpr int kInterBytes = 640;    // MXFP8 intermediate row (576 + zero tail)
-constexpr int kF2Stages = 10;       // K64 stages of FC2 (9 live + the zero tail)
+constexpr int kF2Stages = 9;        // K64 stages of FC2: the 9 live ones (k32 blocks 0-17; the zero tail is not run)
 constexpr int kMaxE = 512;          // experts per rank (384 served)
 constexpr int kFrontThreads = 512;
 constexpr int kFrontWarps = kFrontThreads / 32;
 
 // stage layouts (bytes)
-constexpr int kF1B = 8192;    // [proj 2][kk 2][n32 chunk 4][lane 32][16 B]
-constexpr int kF1A = 4096;    // [64 rows][64 B] (16 B chunks XOR-swizzled by bit 1 of the row)
+constexpr int kF1B = 8192;    // [proj 2][kk 2][n32 chunk 4][lane 32][16 B] (the plane's layout)
+constexpr int kF1A = 4096;    // [m-tile 4][kk 2][quad row 8][c 4][4 words] = the A fragments in register order (see the skeleton header)
 constexpr int kF1SFA = 256;   // [64 rows] k128 scale word
 constexpr int kF1SFB = 1024;  // [proj 2][128 cols] k128 scale word
 constexpr int kF1Stage = kF1B + kF1A + kF1SFA + kF1SFB;  // 13568
@@ -235,15 +252,20 @@ __device__ __forceinline__ void quad_transpose32(const uint32_t (&w)[4], int c, 
 
 // ---------------------------------------------------------------------------------- 1. front-end (quant + routing)
 struct FrontArgs {
-  const uint32_t* hidden;   // [T][K] bf16
+  const uint32_t* hidden;   // [T][K] bf16 (null with pre-quantized rows)
   uint32_t* a_values;       // [T][K] e4m3
   uint8_t* a_scales;        // [T][K/32] ue8m0
   const int32_t* ids;       // [T * topk]
   int32_t* row_pair;        // [row_cap]
   int4* f1_items;           // [f1_cap] (expert, row0, m_tiles, tile)
   int4* f2_items;           // [f2_cap]
-  int32_t* counts;          // [8]: rows_padded, n_f1, n_f2, fc1 work counter, fc2 work counter
-  int T, K, n_pairs, E, n2_tiles, row_cap, f1_cap, f2_cap;
+  int32_t* counts;          // [8]: rows_padded, n_f1, n_f2, fc1 work counter, fc2 work counter, histogram arrivals (zeroed by the host)
+  int32_t* chunk_cnt;       // [n_chunks][kMaxE]: the 512-pair chunks' per-expert pair counts, after the scan the exclusive prefix over the chunks
+  int32_t* exp_off;         // [kMaxE] padded row offset of the expert (the scan CTA -> the scatter kernel)
+  int32_t* exp_cnt;         // [kMaxE] pair count of the expert
+  uint32_t* out;            // fused top-k sum: the output rows of tokens without a valid pair are zeroed here (nullptr: off)
+  int32_t* tok_valid;       // fused top-k sum: [T] bits 0-7 the token's valid pairs (0 <= id < E) = its FC2 arrivals per tile, bits 8-15 the slots with id >= 0
+  int T, K, n_pairs, E, n2_tiles, row_cap, f1_cap, f2_cap, n_chunks, quant_blocks, topk;
 };
 
 // quantize_block_fp8_mx of 32 fp32 values with their amax (payload = e4m3x4 words, returns the scale byte)
@@ -314,52 +336,77 @@ __device__ __forceinline__ int block_exclusive_scan(int v, int* s_warp, int& tot
   return before + x - v;
 }
 
+// The routing in two launches (v7; v2-v6 did it all in one CTA that ran 0.081 ms behind the 256 quant blocks' 0.02 ms):
+//   frontend_kernel   blocks [0, quant_blocks): MXFP8 quant of the token rows (a warp per row); blocks [quant_blocks, +n_chunks):
+//                     the per-expert pair counts of one 512-pair chunk (shared-memory integer atomics -> chunk_cnt[chunk][e]);
+//                     the LAST chunk block to finish (arrival counter counts[5], threadfence pattern - the atomic only decides who
+//                     does the work) scans: per expert the exclusive prefix over the chunks (in place), the padded (to 16 rows)
+//                     expert offsets, the CTA work lists of FC1 / FC2 (tile-major within an expert), the counts.
+//   scatter_kernel    a block per chunk: rank of a pair within its expert = pairs of the expert in earlier chunks (the prefix)
+//                     + in earlier warps of the chunk (per-warp counts, prefix over the warps) + earlier lanes of the warp
+//                     (__match_any + popc) - the same decomposition as the one-CTA scatter, so row_pair is identical; the
+//                     padding entries (-1) of the experts are written by the chunk block e % n_chunks.
+// No global atomics in anything that decides a value; every pair's row is a pure function of ids.
 __global__ void __launch_bounds__(kFrontThreads) frontend_kernel(FrontArgs a) {
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  if (blockIdx.x + 1 < gridDim.x) {  // token rows quant
+  if ((int)blockIdx.x < a.quant_blocks) {  // token rows quant
     const int row = blockIdx.x * kFrontWarps + warp;
     if (row < a.T) quant_row(a, row, lane);
     return;
   }
-  // ------------------------------------------------------------ deterministic routing (the last block)
+  // ------------------------------------------------------------ per-chunk pair counts (a block per 512 pairs)
   __shared__ int s_cnt[kMaxE];
-  __shared__ int s_off[kMaxE];    // padded row offset of the expert
-  __shared__ int s_run[kMaxE];    // pairs of the expert scattered so far
-  __shared__ int s_f1[kMaxE];     // first FC1 / FC2 item of the expert, its chunk count
+  __shared__ int s_off[kMaxE];    // padded row offset of the expert (scan CTA)
+  __shared__ int s_f1[kMaxE];     // first FC1 / FC2 item of the expert, its chunk count (scan CTA)
   __shared__ int s_f2[kMaxE];
   __shared__ int s_chunks[kMaxE];
-  __shared__ int s_w[kFrontWarps][kMaxE];  // per-warp per-expert counts of the chunk -> exclusive prefix over warps
   __shared__ int s_scan[kFrontWarps];
-  const int E = a.E, n_pairs = a.n_pairs;
-  for (int e = tid; e < kMaxE; e += kFrontThreads) { s_cnt[e] = 0; s_run[e] = 0; }
+  __shared__ int s_last;
+  const int E = a.E, n_pairs = a.n_pairs, n_chunks = a.n_chunks;
+  const int chunk = (int)blockIdx.x - a.quant_blocks;
+  for (int e = tid; e < kMaxE; e += kFrontThreads) s_cnt[e] = 0;
   __syncthreads();
   const uint32_t lanemask_lt = (1u << lane) - 1u;
-  // integer counts: the sums do not depend on the order. The chunk loop has a uniform trip count: every lane of every
-  // warp reaches the __match_any_sync (a per-thread trip count left a partial warp in the last chunk whenever
-  // n_pairs % 32 != 0 - e.g. T = 300 - and the full-mask match then waited forever for the lanes parked at the loop exit).
-  for (int base = 0; base < n_pairs; base += kFrontThreads) {
-    const int p = base + tid;
+  {  // integer counts: the sums do not depend on the order; every lane of every warp reaches the __match_any_sync
+    const int p = chunk * kFrontThreads + tid;
     int e = p < n_pairs ? a.ids[p] : -1;
     if (!(e >= 0 && e < E)) e = -1;
     const uint32_t mask = __match_any_sync(0xffffffffu, e);
     if (e >= 0 && (mask & lanemask_lt) == 0u) atomicAdd(&s_cnt[e], __popc(mask));  // one atomic per (warp, expert)
   }
   __syncthreads();
+  if (tid < E) a.chunk_cnt[(size_t)chunk * kMaxE + tid] = s_cnt[tid];
+  __threadfence();
+  __syncthreads();
+  if (tid == 0) s_last = atomicAdd(a.counts + 5, 1) == n_chunks - 1;
+  __syncthreads();
+  if (!s_last) return;
+  // ------------------------------------------------------------ the scan (the last chunk block): deterministic routing
+  __threadfence();
+  int cnt = 0;
+  if (tid < E) {  // exclusive prefix over the chunks, in place (the scatter kernel reads it), total -> cnt
+    int32_t* col = a.chunk_cnt + tid;
+    for (int j = 0; j < n_chunks; ++j) {
+      const int v = __ldcg(col + (size_t)j * kMaxE);
+      col[(size_t)j * kMaxE] = cnt;
+      cnt += v;
+    }
+    s_cnt[tid] = cnt;
+  }
   int padded = 0, chunks = 0;
   if (tid < E) {
-    padded = (s_cnt[tid] + 15) & ~15;
+    padded = (cnt + 15) & ~15;
     chunks = (padded / 16 + 3) >> 2;
   }
   int rows_padded, n_f1, n_f2;
   const int off = block_exclusive_scan(padded, s_scan, rows_padded);
   const int f1 = block_exclusive_scan(chunks * kN1Tiles, s_scan, n_f1);
   const int f2 = block_exclusive_scan(chunks * a.n2_tiles, s_scan, n_f2);
-  if (tid < E) { s_off[tid] = off; s_f1[tid] = f1; s_f2[tid] = f2; s_chunks[tid] = chunks; }
+  if (tid < E) { s_off[tid] = off; s_f1[tid] = f1; s_f2[tid] = f2; s_chunks[tid] = chunks; a.exp_off[tid] = off; a.exp_cnt[tid] = cnt; }
   if (tid == 0) {
     a.counts[0] = rows_padded; a.counts[1] = min(n_f1, a.f1_cap); a.counts[2] = min(n_f2, a.f2_cap);
-    a.counts[3] = 0; a.counts[4] = 0;  // the work counters of the persistent kernels
+    a.counts[3] = 0; a.counts[4] = 0;  // the work counters of the persistent kernels (also zeroed by the host's memset)
   }
-  for (int r = tid; r < rows_padded && r < a.row_cap; r += kFrontThreads) a.row_pair[r] = -1;
   __syncthreads();
   // the work items, tile-major within the expert (consecutive items share the weight tile): a thread per (expert, tile)
   for (int et = tid; et < E * (kN1Tiles + a.n2_tiles); et += kFrontThreads) {
@@ -374,35 +421,62 @@ __global__ void __launch_bounds__(kFrontThreads) frontend_kernel(FrontArgs a) {
       else if (i < a.f1_cap) a.f1_items[i] = v;
     }
   }
-  // stable scatter in chunks of 512 pairs: rank of a pair within its expert = the expert's pairs before it
-  for (int base = 0; base < n_pairs; base += kFrontThreads) {
-    const int p = base + tid;
-    int e = p < n_pairs ? a.ids[p] : -1;
-    const bool valid = e >= 0 && e < E;
-    if (!valid) e = -1;
-    const uint32_t mask = __match_any_sync(0xffffffffu, e);
-    const int rank = __popc(mask & lanemask_lt);
-    const bool leader = (mask & lanemask_lt) == 0u;
-    for (int i = lane; i < E; i += 32) s_w[warp][i] = 0;
-    __syncwarp();
-    if (valid && leader) s_w[warp][e] = __popc(mask);
-    __syncthreads();
-    if (tid < E) {  // exclusive prefix over the warps for this expert, carried across chunks
-      int run = s_run[tid];
+}
+
+// the stable scatter: a block per 512-pair chunk (after frontend_kernel: chunk_cnt holds the exclusive prefix over the chunks)
+__global__ void __launch_bounds__(kFrontThreads) scatter_kernel(FrontArgs a) {
+  __shared__ int s_w[kFrontWarps][kMaxE];  // per-warp per-expert counts of the chunk -> exclusive prefix over the warps
+  __shared__ int s_off[kMaxE];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int E = a.E, n_pairs = a.n_pairs, chunk = blockIdx.x;
+  const uint32_t lanemask_lt = (1u << lane) - 1u;
+  const int p = chunk * kFrontThreads + tid;
+  int e = p < n_pairs ? a.ids[p] : -1;
+  const bool valid = e >= 0 && e < E;
+  if (!valid) e = -1;
+  const uint32_t mask = __match_any_sync(0xffffffffu, e);
+  const int rank = __popc(mask & lanemask_lt);
+  const bool leader = (mask & lanemask_lt) == 0u;
+  for (int i = lane; i < E; i += 32) s_w[warp][i] = 0;
+  __syncwarp();
+  if (valid && leader) s_w[warp][e] = __popc(mask);
+  if (tid < E) s_off[tid] = a.exp_off[tid];
+  __syncthreads();
+  if (tid < E) {  // exclusive prefix over the warps for this expert, on top of the expert's pairs in the earlier chunks
+    int run = a.chunk_cnt[(size_t)chunk * kMaxE + tid];
 #pragma unroll
-      for (int w = 0; w < kFrontWarps; ++w) {
-        const int v = s_w[w][tid];
-        s_w[w][tid] = run;
-        run += v;
-      }
-      s_run[tid] = run;
+    for (int w = 0; w < kFrontWarps; ++w) {
+      const int v = s_w[w][tid];
+      s_w[w][tid] = run;
+      run += v;
     }
-    __syncthreads();
-    if (valid) {
-      const int r = s_off[e] + s_w[warp][e] + rank;
-      if (r < a.row_cap) a.row_pair[r] = p;
+    // the expert's padding rows (-1): by the chunk block e % n_chunks
+    if (tid % a.n_chunks == chunk) {
+      const int c = a.exp_cnt[tid], o = s_off[tid];
+      for (int r = o + c; r < o + ((c + 15) & ~15); ++r)
+        if (r < a.row_cap) a.row_pair[r] = -1;
     }
-    __syncthreads();  // the next chunk re-zeroes s_w
+  }
+  __syncthreads();
+  if (valid) {
+    const int r = s_off[e] + s_w[warp][e] + rank;
+    if (r < a.row_cap) a.row_pair[r] = p;
+  }
+  // fused top-k sum: the thread of a token's slot 0 counts the token's valid pairs (= its arrivals per output tile in
+  // FC2); a token without one gets no arrival - its output row is the sum of nothing = zeros (topk_sum_kernel's acc = +0
+  // -> bf16 0), written here (rare: synthetic -1 rows)
+  if (a.out != nullptr && p < n_pairs && p % a.topk == 0) {
+    int nvalid = 0, mask = 0;  // tok_valid word: bits 0-7 the valid-pair count (arrivals), bits 8-15 the slots with id >= 0 (summed)
+    for (int sl = 0; sl < a.topk; ++sl) {
+      const int id = a.ids[p + sl];
+      nvalid += (id >= 0 && id < E) ? 1 : 0;
+      mask |= (id >= 0 ? 1 : 0) << sl;
+    }
+    a.tok_valid[p / a.topk] = nvalid | (mask << 8);
+    if (nvalid == 0) {
+      uint4* o = reinterpret_cast<uint4*>(a.out + (size_t)(p / a.topk) * (a.K / 2));
+      for (int j = 0; j < a.K / 8; ++j) o[j] = make_uint4(0u, 0u, 0u, 0u);
+    }
   }
 }
 
@@ -419,7 +493,9 @@ __global__ void __launch_bounds__(kFrontThreads) frontend_kernel(FrontArgs a) {
 // +0) are unchanged; only which warp owns an output element differs.
 //
 // Stage layout (bytes): B [kk 2][n32 chunk NS][lane 32][16 B] per projection (FC1: 2 projections) = the plane's layout
-// (an n16 slice reads 8 B per lane out of the 16 B: LDS.64), then A as [m-tile 4][kk 2][quad row 8][c 4][4 words] where
+// (an n16 slice reads 8 B per lane out of the 16 B: LDS.64 at a 16 B stride = 4 wavefronts instead of 2 - measured and
+// kept: the conflict-free alternative, the two n16 halves de-interleaved by 8 B cp.asyncs, cost more in LDGSTS than it
+// saved in LDS: fc1 0.866 -> 0.907 ms, fc2 0.561 -> 0.595 on call1, W 4.11), then A as [m-tile 4][kk 2][quad row 8][c 4][4 words] where
 // the 4 words of a (m-tile, kk, q, c) group are (row q: k32 word 2c, row q + 8: word 2c, row q: word 2c + 1, row q + 8:
 // word 2c + 1) = the QMMA A fragment of lane (q, c) in register order: one LDS.128 per m-tile and k32, no shuffling. Then
 // the k128 scale words of the 64 rows and of the columns ([proj][128] words; FC2's tail slice: 128 x u16).
@@ -450,28 +526,29 @@ __device__ __forceinline__ int claim_next_item(int32_t* counter, int cur, int dy
   return dynamic_schedule ? (int)gridDim.x + atomicAdd(counter, 1) : cur + (int)gridDim.x;
 }
 
-// the staged hand-off of the next work item (see above): t = the stage being issued, c = claim_at; on_pair(nb, tid, pair)
-// runs for threads 0-63 in the step that publishes the pairs (FC2 stages the token weight there)
+// the staged hand-off of the next work item (see above): d = the stage being issued minus claim_at, nb = the next item's
+// slot (the current issue item is ring.items[nb ^ 1]); the three global loads share one staging register (`nxt`: their
+// live ranges - stages 0-2, 3-5, 6-8 - do not overlap; v7 register diet); on_pair(nb, tid, pair) runs for threads 0-63
+// in the step that publishes the pairs (FC2 stages the token weight there)
 template <typename AoffFn, typename PairFn>
-__device__ __forceinline__ void stage_next_item(ItemRing& ring, int t, int c, int nb, int tid, int n_items,
-                                                const int4* items, const int32_t* row_pair, int32_t* counter,
-                                                int cur_item, int dynamic_schedule, int& nxt_item, int& nxt_meta_i,
-                                                int& nxt_pair, AoffFn aoff_of, PairFn on_pair) {
-  if (t == c && tid == 0) nxt_item = claim_next_item(counter, cur_item, dynamic_schedule);
-  if (t == c + 2 && tid == 0) ring.items[nb] = nxt_item;
-  if (t == c + 3 && tid < 4) {
+__device__ __forceinline__ void stage_next_item(ItemRing& ring, int d, int nb, int tid, int n_items, const int4* items,
+                                                const int32_t* row_pair, int32_t* counter, int dynamic_schedule, int& nxt,
+                                                AoffFn aoff_of, PairFn on_pair) {
+  if (d == 0 && tid == 0) nxt = claim_next_item(counter, ring.items[nb ^ 1], dynamic_schedule);
+  if (d == 2 && tid == 0) ring.items[nb] = nxt;
+  if (d == 3 && tid < 4) {
     const int nx = ring.items[nb];
-    nxt_meta_i = nx < n_items ? __ldg(reinterpret_cast<const int32_t*>(items) + (size_t)nx * 4 + tid) : 0;
+    nxt = nx < n_items ? __ldg(reinterpret_cast<const int32_t*>(items) + (size_t)nx * 4 + tid) : 0;
   }
-  if (t == c + 5 && tid < 4) reinterpret_cast<int*>(&ring.meta[nb])[tid] = nxt_meta_i;
-  if (t == c + 6 && tid < 64) {
+  if (d == 5 && tid < 4) reinterpret_cast<int*>(&ring.meta[nb])[tid] = nxt;
+  if (d == 6 && tid < 64) {
     const int4 m = ring.meta[nb];
-    nxt_pair = tid < m.z * 16 ? __ldg(row_pair + m.y + tid) : -1;
+    nxt = tid < m.z * 16 ? __ldg(row_pair + m.y + tid) : -1;
   }
-  if (t == c + 8 && tid < 64) {
-    ring.pairs[nb][tid] = nxt_pair;
-    ring.aoff[nb][tid] = nxt_pair >= 0 ? aoff_of(nxt_pair) : 0xFFFFFFFFu;
-    on_pair(nb, tid, nxt_pair);
+  if (d == 8 && tid < 64) {
+    ring.pairs[nb][tid] = nxt;
+    ring.aoff[nb][tid] = nxt >= 0 ? aoff_of(nxt) : 0xFFFFFFFFu;
+    on_pair(nb, tid, nxt);
   }
 }
 
@@ -512,17 +589,15 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   const auto aoff_of = [&](int pair) { return (uint32_t)(pair / a.topk) * (uint32_t)K; };
   const auto no_pair_hook = [](int, int, int) {};
 
-  // ---- issue side
-  int iss_item = blockIdx.x, iss_k = 0, iss_stage = 0, iss_mtiles = 0, iss_slot = 0;
+  // ---- issue side (its item is ring.items[iss_k & 1]; the slot of the item being issued is iss_k & 1)
+  int iss_k = 0, iss_stage = 0, iss_mtiles = 0, nxt = 0;
   bool iss_wide = true;
   const uint8_t* iss_b = reinterpret_cast<const uint8_t*>(a.w13);
   const uint8_t* iss_sfb = reinterpret_cast<const uint8_t*>(a.w13_sf);
-  int nxt_item = 0, nxt_meta_i = 0, nxt_pair = -1;
 
   auto start_issue_item = [&](int slot) {
     const int4 it = ring.meta[slot];
     iss_stage = 0;
-    iss_slot = slot;
     iss_mtiles = it.z;
     if (it.z > 0) {
       const int e = it.x, tile = it.w;
@@ -534,13 +609,13 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   auto issue_stage = [&](int buf) {
     if (iss_mtiles > 0) {
       const uint32_t sb = sbase0 + buf * kF1Stage;
-      const int t = iss_stage, nb = (iss_k + 1) & 1;
+      const int t = iss_stage, slot = iss_k & 1, nb = slot ^ 1;
       uint32_t aoff4[4];  // the rows' A offsets first: their LDS latency overlaps the B address work
 #pragma unroll
-      for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[iss_slot][j * 16 + my_r16];
-      const uint32_t aoff_sf = warp < 2 ? ring.aoff[iss_slot][tid] : 0xFFFFFFFFu;  // warps 0-1: the scale word of row tid
-      stage_next_item(ring, t, claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 3, iss_item,
-                      a.dynamic_schedule, nxt_item, nxt_meta_i, nxt_pair, aoff_of, no_pair_hook);
+      for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[slot][j * 16 + my_r16];
+      const uint32_t aoff_sf = warp < 2 ? ring.aoff[slot][tid] : 0xFFFFFFFFu;  // warps 0-1: the scale word of row tid
+      stage_next_item(ring, t - claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 3, a.dynamic_schedule, nxt,
+                      aoff_of, no_pair_hook);
       // B: two projections, the 2 k32 blocks of the stage (128-column tiles: 256 x 16 B per projection)
       if (iss_wide) {
         const uint32_t o = (tid >> 7) * 2048 + (tid & 127) * 16;
@@ -577,7 +652,6 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
         cp_async4_zfill(sb + kF1B + kF1A + tid * 4, a.a_scales + (o >> 5) + (t >> 1) * 4, on ? 4 : 0);
       }
       if (++iss_stage == n_stages) {
-        iss_item = ring.items[nb];
         ++iss_k;
         start_issue_item(nb);
       }
@@ -588,6 +662,7 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   // ---- the first item: metadata, pairs and offsets straight from global memory
   int item = blockIdx.x;
   if (tid < 4) reinterpret_cast<int*>(&ring.meta[0])[tid] = item < n_items ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + tid) : 0;
+  if (tid == 0) ring.items[0] = item;  // the issue side's current item (claim_next_item's static-schedule base)
   __syncthreads();
   if (tid < 64) {
     const int4 m = ring.meta[0];
@@ -666,20 +741,21 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
       }
     };
 
+    // one K64 stage: wait for its data, barrier (everyone has left the buffer the issue side refills), issue stage
+    // t + STAGES - 1, compute stage t. (Letting warps 4-7 compute before they issue - alternating QMMA phases per SM
+    // sub-partition - was measured and dropped: fc1 0.907 -> 0.965 ms, fc2 0.595 -> 0.9 ms on call1, W 4.11.)
+    auto step = [&](auto kb_tag) {
+      cp_async_wait<STAGES - 2>();
+      __syncthreads();
+      issue_stage(buf_issue);
+      compute_stage(smem + buf * kF1Stage, kb_tag);
+      buf_issue = buf_issue + 1 == STAGES ? 0 : buf_issue + 1;
+      buf = buf + 1 == STAGES ? 0 : buf + 1;
+    };
 #pragma unroll 1
     for (int t = 0; t < n_stages; t += 2) {
-      cp_async_wait<STAGES - 2>();
-      __syncthreads();
-      issue_stage(buf_issue);
-      buf_issue = buf_issue + 1 == STAGES ? 0 : buf_issue + 1;
-      compute_stage(smem + buf * kF1Stage, std::integral_constant<int, 0>{});
-      buf = buf + 1 == STAGES ? 0 : buf + 1;
-      cp_async_wait<STAGES - 2>();
-      __syncthreads();
-      issue_stage(buf_issue);
-      buf_issue = buf_issue + 1 == STAGES ? 0 : buf_issue + 1;
-      compute_stage(smem + buf * kF1Stage, std::integral_constant<int, 2>{});
-      buf = buf + 1 == STAGES ? 0 : buf + 1;
+      step(std::integral_constant<int, 0>{});
+      step(std::integral_constant<int, 2>{});
     }
 
     // ---- epilogue: activation, bf16, MXFP8 per row and 32-column block. A warp holds 16 of the block's 32 columns: its
@@ -758,17 +834,34 @@ struct Fc2Args {
   const float* down_alpha;     // [E]
   const float* global_scale;   // [E] or [1]
   uint32_t* route;             // [pairs][K] bf16
-  int K, out_tiles, gs_per_expert, dynamic_schedule;
+  // the fused top-k sum (v8; out == nullptr: off, the route rows are the interface): out[t][col] = bf16 of the fp32 sum of
+  // the token's route values in slot order (ids < 0 skipped) = topk_sum_kernel, done by the CTA whose item completes the
+  // last of the token's rows for this 128-column tile (arrival counter per (token, tile), zeroed by the host)
+  uint32_t* out;               // [T][K] bf16 or nullptr
+  int32_t* arrive;             // [T * out_tiles]
+  const int32_t* ids;          // [T * topk]
+  const int32_t* tok_valid;    // [T] valid pairs of the token | slot mask << 8 (the scatter kernel; topk <= 8)
+  int K, out_tiles, gs_per_expert, dynamic_schedule, topk;
 };
 
 template <int STAGES, int MINB>
 __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
+  __shared__ int s_done[2][64];  // fused top-k sum: the lists - token + 1 of the rows whose (token, tile) slice item j completed, slot j & 1
+  __shared__ int s_mask[2][64];  // ... the token's slot mask (slots with id >= 0: the ones summed)
+  __shared__ int s_ltile[2];     // ... and that item's tile
+  __shared__ int s_tile[4];      // the tile of item j, slot j & 3 (read two items later)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int q = lane >> 2, c = lane & 3;
+  // The zero tail (k32 blocks 18-19: zero A, zero B, zero scales - b12x and spec B run them as the 10th K64 stage) is
+  // not computed (v8): its QMMAs add exact +0.0 to every accumulator, and acc + (+0.0) == acc bit for bit for every acc
+  // but -0.0, which the chain never holds (it starts at +0.0 and a round-to-nearest sum of zeros / cancelling terms is
+  // +0.0; a nonzero sum would have to underflow below 2^-149 to round to a signed zero - impossible for scales that
+  // are not 2^-127). Harness: identical on the dumps and the synthetic set (W, 4.11). 9 stages: claim at stage 0, the
+  // pairs published at stage 8 (the hand-off needs 9 stages per item).
   constexpr int n_stages = kF2Stages;
-  constexpr int claim_at = n_stages - 10;
+  constexpr int claim_at = n_stages - 9;
   constexpr uint32_t kTileBytes = 128 * (kSlices * 4 - 2) * 16;  // 36 KB of weights per 128-column tile (18 k32)
   constexpr uint32_t kTileSfBytes = 128 * (kSlices * 4 - 2);     // 2304 B of scales per tile
   const int n_items = a.counts[2];
@@ -783,15 +876,13 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     cp_async4_zfill(smem_addr(&ring.tw[nb][row]), a.token_weights + (pair >= 0 ? pair : 0), pair >= 0 ? 4 : 0);
   };
 
-  int iss_item = blockIdx.x, iss_k = 0, iss_stage = 0, iss_mtiles = 0, iss_slot = 0;
+  int iss_k = 0, iss_stage = 0, iss_mtiles = 0, nxt = 0;
   const uint8_t* iss_b = reinterpret_cast<const uint8_t*>(a.w2);
   const uint8_t* iss_sf = a.w2_sf;
-  int nxt_item = 0, nxt_meta_i = 0, nxt_pair = -1;
 
   auto start_issue_item = [&](int slot) {
     const int4 it = ring.meta[slot];
     iss_stage = 0;
-    iss_slot = slot;
     iss_mtiles = it.z;
     if (it.z > 0) {
       const int e = it.x, tile = it.w;
@@ -802,14 +893,14 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
   auto issue_stage = [&](int buf) {
     if (iss_mtiles > 0) {
       const uint32_t sb = sbase0 + buf * kF2Stage;
-      const int t = iss_stage, nb = (iss_k + 1) & 1;
+      const int t = iss_stage, slot = iss_k & 1, nb = slot ^ 1;
       uint32_t aoff4[4];
 #pragma unroll
-      for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[iss_slot][j * 16 + my_r16];
-      const uint32_t aoff_sf = warp < 2 ? ring.aoff[iss_slot][tid] : 0xFFFFFFFFu;
-      stage_next_item(ring, t, claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 4, iss_item,
-                      a.dynamic_schedule, nxt_item, nxt_meta_i, nxt_pair, aoff_of, tw_hook);
-      if (t < n_stages - 1) {  // the last stage is the zero tail: nothing to load
+      for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[slot][j * 16 + my_r16];
+      const uint32_t aoff_sf = warp < 2 ? ring.aoff[slot][tid] : 0xFFFFFFFFu;
+      stage_next_item(ring, t - claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 4, a.dynamic_schedule, nxt,
+                      aoff_of, tw_hook);
+      {
         const uint32_t o = (tid >> 7) * 2048 + (tid & 127) * 16;
         cp_async16(sb + o, iss_b + (size_t)t * 4096 + o);
 #pragma unroll
@@ -828,7 +919,6 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
         if (tid < (s == kSlices - 1 ? 16 : 32)) cp_async16(sb + kF2B + kF2A + kF2SFA + tid * 16, iss_sf + s * 512 + tid * 16);
       }
       if (++iss_stage == n_stages) {
-        iss_item = ring.items[nb];
         ++iss_k;
         start_issue_item(nb);
       }
@@ -838,6 +928,11 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
 
   int item = blockIdx.x;
   if (tid < 4) reinterpret_cast<int*>(&ring.meta[0])[tid] = item < n_items ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + tid) : 0;
+  if (tid == 0) ring.items[0] = item;
+  if (tid < 128) (&s_done[0][0])[tid] = 0;  // fused sum: empty lists
+  // fused sum, per row thread (lanes 0-7 of every warp, row = warp * 8 + lane): the token / valid-pair count of the row of the latest item (fs_tok1, fs_nv1),
+  // of the item before it (fs_tok2, fs_nv2) and the arrival-counter result of that item (fs_old); "not done" initially
+  int fs_old = -2, fs_nv1 = 0, fs_tok1 = 0, fs_nv2 = 0, fs_tok2 = 0;
   __syncthreads();
   if (tid < 64) {
     const int4 m = ring.meta[0];
@@ -855,6 +950,49 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     issue_stage(buf_issue);
     buf_issue = buf_issue + 1 == STAGES ? 0 : buf_issue + 1;
   }
+  // fused top-k sum: sum the list in slot `ls` (s_done[ls][row] = token + 1, tile s_ltile[ls]) - a half-warp per row
+  auto fused_sum_list = [&](int ls) {
+    const int hw = tid >> 4, hl = tid & 15;
+    const int ltile = s_ltile[ls];
+#pragma unroll 1
+    for (int row = hw; row < 64; row += 16) {
+      const int tk = s_done[ls][row] - 1;
+      if (tk < 0) continue;  // half-warp-uniform
+      const int mask = s_mask[ls][row];
+      float sum[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) sum[j] = 0.f;
+      const int col = ltile * 128 + hl * 8;
+      uint4 v[8];  // the (up to 8) slots' 16 B issued together (one L2 round trip; v8g loaded them one behind the other)
+#pragma unroll
+      for (int sl = 0; sl < 8; ++sl) {
+        v[sl] = make_uint4(0u, 0u, 0u, 0u);
+        if (sl < a.topk && ((mask >> sl) & 1))
+          v[sl] = __ldcg(reinterpret_cast<const uint4*>(a.route + ((size_t)(tk * a.topk + sl) * a.K + col) / 2));
+      }
+#pragma unroll
+      for (int sl = 0; sl < 8; ++sl) {
+        if (sl < a.topk && ((mask >> sl) & 1)) {  // skipped slots as topk_sum_kernel skips them
+          const uint32_t ws[4] = {v[sl].x, v[sl].y, v[sl].z, v[sl].w};
+#pragma unroll
+          for (int j = 0; j < 4; ++j) {
+            sum[2 * j] = fadd(sum[2 * j], bf16_bits_to_f32(ws[j] & 0xFFFFu));
+            sum[2 * j + 1] = fadd(sum[2 * j + 1], bf16_bits_to_f32(ws[j] >> 16));
+          }
+        }
+      }
+      uint32_t o[4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        unsigned short lo, hi;
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(lo) : "f"(sum[2 * j]));
+        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(hi) : "f"(sum[2 * j + 1]));
+        o[j] = (uint32_t)lo | ((uint32_t)hi << 16);
+      }
+      *reinterpret_cast<uint4*>(a.out + ((size_t)tk * a.K + col) / 2) = make_uint4(o[0], o[1], o[2], o[3]);
+    }
+  };
+
   int buf = 0;
   while (item < n_items) {
     const int4 it = ring.meta[iss_k & 1];  // slot k & 1
@@ -875,34 +1013,28 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     const uint32_t b_off = (ns16 >> 1) * 512 + lane * 16 + (ns16 & 1) * 8; // + kk * 2048
     const int col_q = ns16 * 16 + q;
 
-    // ZERO: the k32 blocks 18-19 (zero A, zero B, zero scale bytes); TAIL: slice 4 (u16 scale words)
-    auto compute_stage = [&](const uint8_t* sp, auto kb_tag, auto zero_tag, auto tail_tag) {
+    // TAIL: slice 4 (u16 scale words: the n64 tail of the intermediate has k32 blocks 16-17 only)
+    auto compute_stage = [&](const uint8_t* sp, auto kb_tag, auto tail_tag) {
       constexpr int KB0 = decltype(kb_tag)::value;
-      constexpr bool ZERO = decltype(zero_tag)::value;
       constexpr bool TAIL = decltype(tail_tag)::value;
-      uint32_t sfb[2] = {0u, 0u}, sfa[4] = {0u, 0u, 0u, 0u};
-      if constexpr (!ZERO) {
+      uint32_t sfb[2], sfa[4];
 #pragma unroll
-        for (int nt = 0; nt < 2; ++nt) {
-          if constexpr (TAIL) sfb[nt] = *reinterpret_cast<const uint16_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 2);
-          else sfb[nt] = *reinterpret_cast<const uint32_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 4);
-        }
-#pragma unroll
-        for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+      for (int nt = 0; nt < 2; ++nt) {
+        if constexpr (TAIL) sfb[nt] = *reinterpret_cast<const uint16_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 2);
+        else sfb[nt] = *reinterpret_cast<const uint32_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 4);
       }
 #pragma unroll
+      for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+#pragma unroll
       for (int kk = 0; kk < 2; ++kk) {
-        uint32_t b[2][2] = {{0u, 0u}, {0u, 0u}};
-        if constexpr (!ZERO) {
-          const uint2 w = *reinterpret_cast<const uint2*>(sp + kk * 2048 + b_off);
-          spread_e2m1x8(w.x, b[0][0], b[0][1]);
-          spread_e2m1x8(w.y, b[1][0], b[1][1]);
-        }
+        uint32_t b[2][2];
+        const uint2 w = *reinterpret_cast<const uint2*>(sp + kk * 2048 + b_off);
+        spread_e2m1x8(w.x, b[0][0], b[0][1]);
+        spread_e2m1x8(w.y, b[1][0], b[1][1]);
 #pragma unroll
         for (int mt = 0; mt < 4; ++mt) {
           if (mt < m_tiles) {
-            uint4 af = make_uint4(0u, 0u, 0u, 0u);
-            if constexpr (!ZERO) af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
+            const uint4 af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
 #pragma unroll
             for (int nt = 0; nt < 2; ++nt)
               qmma_kk<KB0>(kk, acc[mt][nt], af.x, af.y, af.z, af.w, b[nt][0], b[nt][1], sfa[mt], sfb[nt]);
@@ -914,24 +1046,80 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     using I2 = std::integral_constant<int, 2>;
     using F = std::false_type;
     using Tr = std::true_type;
-    auto step = [&](auto kb_tag, auto zero_tag, auto tail_tag) {
+    auto step = [&](auto kb_tag, auto tail_tag) {
       cp_async_wait<STAGES - 2>();
       __syncthreads();
       issue_stage(buf_issue);
+      compute_stage(smem + buf * kF2Stage, kb_tag, tail_tag);
       buf_issue = buf_issue + 1 == STAGES ? 0 : buf_issue + 1;
-      compute_stage(smem + buf * kF2Stage, kb_tag, zero_tag, tail_tag);
       buf = buf + 1 == STAGES ? 0 : buf + 1;
     };
 #pragma unroll 1
-    for (int t = 0; t < n_stages - 2; t += 2) {  // slices 0-3: stages 0..7
-      step(I0{}, F{}, F{});
-      step(I2{}, F{}, F{});
+    for (int t = 0; t < n_stages - 1; t += 2) {  // slices 0-3: stages 0..7
+      step(I0{}, F{});
+      step(I2{}, F{});
     }
-    step(I0{}, F{}, Tr{});   // stage 8: k32 16, 17 (the tail slice's u16 scale words)
-    step(I2{}, Tr{}, Tr{});  // stage 9: k32 18, 19 (zeros)
+    step(I0{}, Tr{});  // stage 8: k32 16, 17 (the tail slice's u16 scale words); the zero tail (k32 18, 19) is not run
 
     // ---- epilogue: scale, bf16, token-major route rows (the slice's 16 columns = 32 B per row: lanes 0 / 1 store 16 B)
     const int pslot = (iss_k + 1) & 1;  // slot k & 1 (iss_k == k + 1 here)
+    // ---- the fused top-k sum (out != nullptr), pipelined over four items so that nothing here waits on memory and no
+    // fence ever sits behind this item's own stores (v8c did fence + arrival right after the stores: +0.21 ms; v8d one
+    // item later but still after the stores: +0.15 - the fence drains the 16 KB of route rows just issued). At item k,
+    // BEFORE its route-row stores:
+    //   (i)   item k - 2: its arrival results (registers, issued one item ago) -> the list s_done[k & 1] (token + 1 per
+    //         row whose (token, tile) slice it completed = the last of the token's valid pairs) with the token's slot
+    //         mask, its tile -> s_ltile; the token's rows for that tile are prefetched into L2;
+    //   (ii)  item k - 1: the arrivals - one thread per row (8 per warp): one fence.acq_rel.gpu per item (release side for item k - 1's
+    //         stores, 9+ barriers old; acquire side for the sums of later epilogues w.r.t. the counters read before it -
+    //         a __threadfence costs ~1 us even when nothing is in flight: two per item were +0.06 ms), then a relaxed
+    //         atomicAdd on the (token, tile) counter, result kept in fs_old: no wait;
+    //   (iii) the route-row stores of item k (below);
+    //   (iv)  item k - 3: its list (prefetched one item ago) is summed - a half-warp per row, 8 columns per lane, fp32
+    //         adds in slot order from +0 (ids < 0 skipped) = topk_sum_kernel's chain, bf16 out;
+    //   (v)   item k: its tile -> s_tile[k & 3], its rows' token and valid-pair count -> fs_tok1 / fs_nv1.
+    // The atomic only decides who sums; the order is the slot order whoever sums: deterministic, identical to the separate
+    // kernel. After the last item the three pending items are flushed (below the loop). No extra barrier: every hand-off
+    // through shared memory or registers is separated by the K-loop's barriers of the items in between.
+    if (a.out != nullptr) {
+      const int k3 = (iss_k - 1) & 3;  // item k & 3
+      const int row8 = warp * 8 + lane;  // the row threads: lanes 0-7 of every warp (8 rows per warp - the work spread over all
+                                         // warps, since whatever one warp does extra here the whole CTA waits for at the next barrier)
+      if (lane < 8) {
+        {  // (i) item k - 2 -> list slot k & 1 (the acquire side is the fence of (ii) below: it follows the atomic that
+           // produced fs_old and precedes the loads of the sum, two epilogues later)
+          const int done = fs_old == (fs_nv2 & 0xFF) - 1;
+          s_done[pslot][row8] = done ? fs_tok2 + 1 : 0;
+          s_mask[pslot][row8] = fs_nv2 >> 8;
+          const int ptile = s_tile[(k3 + 2) & 3];
+          if (tid == 0) s_ltile[pslot] = ptile;
+          if (done) {
+#pragma unroll 1
+            for (int sl = 0; sl < a.topk; ++sl) {
+              const uint8_t* rowp = reinterpret_cast<const uint8_t*>(a.route) + ((size_t)(fs_tok2 * a.topk + sl) * a.K + ptile * 128) * 2;
+              asm volatile("prefetch.global.L2 [%0];" ::"l"(rowp));
+              asm volatile("prefetch.global.L2 [%0];" ::"l"(rowp + 128));
+            }
+          }
+        }
+        {  // (ii) item k - 1: the arrivals
+          fs_old = -2;
+          asm volatile("fence.acq_rel.gpu;" ::: "memory");  // one fence per item: release for item k - 1's stores, acquire for the sums
+          if ((fs_nv1 & 0xFF) > 0) fs_old = atomicAdd(a.arrive + (size_t)fs_tok1 * a.out_tiles + s_tile[(k3 + 3) & 3], 1);
+          fs_tok2 = fs_tok1;
+          fs_nv2 = fs_nv1;
+        }
+      }
+      if (tid == 0) s_tile[k3] = tile;  // (v)
+      if (lane < 8) {
+        const int pair = row8 < m_tiles * 16 ? ring.pairs[pslot][row8] : -1;
+        fs_nv1 = 0;
+        if (pair >= 0) {
+          fs_tok1 = pair / a.topk;
+          fs_nv1 = __ldg(a.tok_valid + fs_tok1);  // count >= 1: this pair is one of them
+        }
+      }
+    }
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
       if (mt >= m_tiles) continue;  // CTA-uniform
@@ -951,9 +1139,40 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
         }
       }
     }
+    if (a.out != nullptr) fused_sum_list(pslot ^ 1);  // (iv) item k - 3 (slot (k - 3) & 1), after the stores: the accumulators are dead
     item = ring.items[iss_k & 1];  // slot (k + 1) & 1
   }
   cp_async_wait<0>();
+  if (a.out != nullptr) {  // fused sum: flush items L - 2 (list ready), L - 1 (arrivals issued) and L (not yet) - L = the last item
+    const int Ls = (iss_k - 1) & 1, L3 = (iss_k - 1) & 3;  // iss_k == L + 1
+    __syncthreads();     // warps 0-1 may still be writing item L - 2's list (step (i) of the last epilogue); inside the loop
+                         // the next item's K-loop barriers separate the two, here nothing else does
+    fused_sum_list(Ls);  // item L - 2: slot L & 1 (prefetched at the epilogue of item L)
+    __syncthreads();
+    const int row8 = warp * 8 + lane;
+    if (lane < 8) {  // item L - 1 -> slot (L - 1) & 1 (its previous list, item L - 3, was summed at item L's epilogue)
+      __threadfence();
+      s_done[Ls ^ 1][row8] = fs_old == (fs_nv2 & 0xFF) - 1 ? fs_tok2 + 1 : 0;
+      s_mask[Ls ^ 1][row8] = fs_nv2 >> 8;
+      if (tid == 0) s_ltile[Ls ^ 1] = s_tile[(L3 + 3) & 3];
+      fs_old = -2;  // item L: its arrivals now (its stores are this CTA's last; the release fence waits for them once)
+      if ((fs_nv1 & 0xFF) > 0) {
+        __threadfence();
+        fs_old = atomicAdd(a.arrive + (size_t)fs_tok1 * a.out_tiles + s_tile[L3], 1);
+      }
+    }
+    __syncthreads();
+    fused_sum_list(Ls ^ 1);  // item L - 1
+    __syncthreads();
+    if (lane < 8) {  // item L -> slot L & 1 (item L - 2's list is summed)
+      __threadfence();
+      s_done[Ls][row8] = fs_old == (fs_nv1 & 0xFF) - 1 ? fs_tok1 + 1 : 0;
+      s_mask[Ls][row8] = fs_nv1 >> 8;
+      if (tid == 0) s_ltile[Ls] = s_tile[L3];
+    }
+    __syncthreads();
+    fused_sum_list(Ls);  // item L
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ 4. top-k sum
@@ -1026,27 +1245,99 @@ struct Launch {
   }
 };
 
+// the front-end launches shared by moe_prefill_fast and moe_prefill_fast_frontend: a memset of the counters, the quant +
+// histogram (+ scan) kernel, the scatter kernel. `routing` = the workspace tensors kept alive by the caller.
+struct Routing {
+  torch::Tensor row_pair, f1_items, f2_items, counts, chunk_cnt, exp_off, exp_cnt, tok_valid;
+};
+static bool fused_topk_sum_enabled() {  // VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1: the sum fused into fc2's epilogue (off by
+  // default: on call1 it is break-even with the separate topk_sum_kernel - fc2 +0.125 ms for the kernel's 0.130 - at more
+  // moving parts; W/REPORT.md §4)
+  static const bool on = [] { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM"); return v && v[0] == '1'; }();
+  return on;
+}
+static Routing launch_frontend(b12x_moe_prefill_fast::FrontArgs& fa, bool quant, int T, int K, int topk, int E, torch::Device dev) {
+  using namespace b12x_moe_prefill_fast;
+  auto o32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
+  const int pairs = T * topk;
+  // routing capacities: every expert may add up to 15 padding rows and one partial chunk
+  const int row_cap = pairs + 16 * E;
+  const int max_chunks = (pairs + 63) / 64 + E;
+  const int n2_tiles = K / 128;
+  const int f1_cap = max_chunks * kN1Tiles, f2_cap = max_chunks * n2_tiles;
+  const int n_chunks = std::max(1, (pairs + kFrontThreads - 1) / kFrontThreads);
+  Routing r;
+  r.row_pair = torch::empty({row_cap}, o32);
+  r.f1_items = torch::empty({f1_cap, 4}, o32);
+  r.f2_items = torch::empty({f2_cap, 4}, o32);
+  r.counts = torch::empty({8}, o32);
+  r.chunk_cnt = torch::empty({n_chunks, kMaxE}, o32);
+  r.exp_off = torch::empty({kMaxE}, o32);
+  r.exp_cnt = torch::empty({kMaxE}, o32);
+  fa.row_pair = r.row_pair.data_ptr<int32_t>();
+  fa.f1_items = reinterpret_cast<int4*>(r.f1_items.data_ptr());
+  fa.f2_items = reinterpret_cast<int4*>(r.f2_items.data_ptr());
+  fa.counts = r.counts.data_ptr<int32_t>();
+  fa.chunk_cnt = r.chunk_cnt.data_ptr<int32_t>();
+  fa.exp_off = r.exp_off.data_ptr<int32_t>();
+  fa.exp_cnt = r.exp_cnt.data_ptr<int32_t>();
+  fa.T = T; fa.K = K; fa.n_pairs = pairs; fa.E = E; fa.n2_tiles = n2_tiles;
+  fa.row_cap = row_cap; fa.f1_cap = f1_cap; fa.f2_cap = f2_cap; fa.n_chunks = n_chunks;
+  fa.quant_blocks = quant ? (T + kFrontWarps - 1) / kFrontWarps : 0;
+  fa.topk = topk;
+  fa.out = nullptr;
+  fa.tok_valid = nullptr;
+  return r;
+}
+static void run_frontend(const b12x_moe_prefill_fast::FrontArgs& fa, cudaStream_t stream) {
+  using namespace b12x_moe_prefill_fast;
+  cudaMemsetAsync(fa.counts, 0, 8 * sizeof(int32_t), stream);  // the histogram arrival counter and the work counters
+  frontend_kernel<<<fa.quant_blocks + fa.n_chunks, kFrontThreads, 0, stream>>>(fa);
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+  scatter_kernel<<<fa.n_chunks, kFrontThreads, 0, stream>>>(fa);
+  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
 }  // namespace
 
-// hidden [T, K] bf16, ids [T, topk] int32, token_weights [T, topk] fp32 (contiguous). Returns
-// {out, route, a_values, a_scales, inter, inter_sf, row_pair, counts}. `route_out` (if defined: [>= T*topk, K] bf16, the
-// b12x workspace's route_output) receives the route rows; `out` (if defined) the top-k sum (skipped when !topk_sum).
+// hidden [T, K] bf16 (or None with pre-quantized rows: a_values uint8 [T, K] e4m3 + a_scales uint8 [T, K/32] ue8m0, row-major,
+// exactly the bytes the front-end's quant_row writes; the quant stage is then skipped - session U's MXFP8 all-gather),
+// ids [T, topk] int32, token_weights [T, topk] fp32 (contiguous). Returns {out, route, a_values, a_scales, inter, inter_sf,
+// row_pair, counts}. `route_out` (if defined: [>= T*topk, K] bf16, the b12x workspace's route_output) receives the route
+// rows; `out` (if defined) the top-k sum (skipped when !topk_sum).
 // Tuning: cfg1 / cfg2 select (stages, CTAs per SM) of FC1 / FC2: 0 = (3, 2), 1 = (4, 2); dynamic_schedule (1: atomic work
 // counter, 0: static round-robin); grid caps. Every configuration computes the same bits.
-std::vector<torch::Tensor> moe_prefill_fast(torch::Tensor hidden, torch::Tensor ids, torch::Tensor token_weights,
+std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_opt, torch::Tensor ids, torch::Tensor token_weights,
                                             torch::Tensor w13, torch::Tensor w13_sf, torch::Tensor w2, torch::Tensor w2_sf,
                                             torch::Tensor alpha, torch::Tensor input_global_scale,
                                             torch::Tensor down_alpha, torch::Tensor global_scale, double limit,
                                             int64_t n, c10::optional<torch::Tensor> route_out_opt,
                                             c10::optional<torch::Tensor> out_opt, bool topk_sum,
                                             int64_t cfg1, int64_t cfg2, int64_t dynamic_schedule,
-                                            int64_t grid1_cap, int64_t grid2_cap) {
+                                            int64_t grid1_cap, int64_t grid2_cap,
+                                            c10::optional<torch::Tensor> a_values_opt, c10::optional<torch::Tensor> a_scales_opt) {
   using namespace b12x_moe_prefill_fast;
-  TORCH_CHECK(hidden.scalar_type() == torch::kBFloat16 && hidden.dim() == 2 && hidden.is_contiguous());
+  const bool prequant = a_values_opt.has_value() && a_values_opt->defined();
+  torch::Tensor hidden, a_values, a_scales;
+  int T, K;
+  if (prequant) {
+    a_values = *a_values_opt;
+    TORCH_CHECK(a_scales_opt.has_value() && a_scales_opt->defined(), "a_scales must come with a_values");
+    a_scales = *a_scales_opt;
+    TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_values.dim() == 2 && a_values.is_contiguous(), "a_values: uint8 [T, K], contiguous");
+    T = (int)a_values.size(0); K = (int)a_values.size(1);
+    TORCH_CHECK(a_scales.scalar_type() == torch::kUInt8 && a_scales.is_contiguous() && a_scales.numel() == (int64_t)T * (K / 32),
+                "a_scales: uint8 [T, K/32], contiguous");
+  } else {
+    TORCH_CHECK(hidden_opt.has_value() && hidden_opt->defined(), "hidden (bf16 rows) or a_values + a_scales (pre-quantized rows)");
+    hidden = *hidden_opt;
+    TORCH_CHECK(hidden.scalar_type() == torch::kBFloat16 && hidden.dim() == 2 && hidden.is_contiguous());
+    T = (int)hidden.size(0); K = (int)hidden.size(1);
+  }
   TORCH_CHECK(ids.scalar_type() == torch::kInt32 && ids.is_contiguous());
   TORCH_CHECK(token_weights.scalar_type() == torch::kFloat32 && token_weights.is_contiguous());
   TORCH_CHECK(n == kN, "intermediate 576 (five K128 slices, n64 tail)");
-  const int T = (int)hidden.size(0), K = (int)hidden.size(1), topk = (int)ids.size(1);
+  const int topk = (int)ids.size(1);
   TORCH_CHECK(K % 128 == 0 && K >= 128 && ids.size(0) == T && token_weights.numel() == ids.numel());
   const int E = (int)alpha.numel();
   TORCH_CHECK(E >= 1 && E <= kMaxE);
@@ -1058,12 +1349,13 @@ std::vector<torch::Tensor> moe_prefill_fast(torch::Tensor hidden, torch::Tensor 
   TORCH_CHECK(cfg1 >= 0 && cfg1 <= 1 && cfg2 >= 0 && cfg2 <= 1);
   TORCH_CHECK(K >= 640, "K >= 640 (the work-item staging needs 10 K64 stages per item)");
   const int pairs = T * topk;
-  auto dev = hidden.device();
-  auto o32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
+  auto dev = ids.device();
   auto o8 = torch::TensorOptions().dtype(torch::kUInt8).device(dev);
   auto obf = torch::TensorOptions().dtype(torch::kBFloat16).device(dev);
-  auto a_values = torch::empty({T, K}, o8);
-  auto a_scales = torch::empty({T, K / 32}, o8);
+  if (!prequant) {
+    a_values = torch::empty({T, K}, o8);
+    a_scales = torch::empty({T, K / 32}, o8);
+  }
   auto inter = torch::empty({pairs, kInterBytes}, o8);
   auto inter_sf = torch::empty({pairs, kSlices * 4}, o8);
   torch::Tensor route, out;
@@ -1084,34 +1376,27 @@ std::vector<torch::Tensor> moe_prefill_fast(torch::Tensor hidden, torch::Tensor 
   } else {
     out = torch::Tensor();
   }
-  // routing capacities: every expert may add up to 15 padding rows and one partial chunk
-  const int row_cap = pairs + 16 * E;
-  const int max_chunks = (pairs + 63) / 64 + E;
-  const int n2_tiles = K / 128;
-  const int f1_cap = max_chunks * kN1Tiles, f2_cap = max_chunks * n2_tiles;
-  auto row_pair = torch::empty({row_cap}, o32);
-  auto f1_items = torch::empty({f1_cap, 4}, o32);
-  auto f2_items = torch::empty({f2_cap, 4}, o32);
-  auto counts = torch::empty({8}, o32);
   auto stream = c10::cuda::getCurrentCUDAStream();
 
+  const bool fused_sum = topk_sum && topk <= 8 && fused_topk_sum_enabled();  // the slot mask of tok_valid holds 8 slots
+  torch::Tensor arrive;
   FrontArgs fa;
-  fa.hidden = reinterpret_cast<const uint32_t*>(hidden.data_ptr());
+  fa.hidden = prequant ? nullptr : reinterpret_cast<const uint32_t*>(hidden.data_ptr());
   fa.a_values = reinterpret_cast<uint32_t*>(a_values.data_ptr());
   fa.a_scales = a_scales.data_ptr<uint8_t>();
+  Routing rt = launch_frontend(fa, !prequant, T, K, topk, E, dev);
   fa.ids = ids.data_ptr<int32_t>();
-  fa.row_pair = row_pair.data_ptr<int32_t>();
-  fa.f1_items = reinterpret_cast<int4*>(f1_items.data_ptr());
-  fa.f2_items = reinterpret_cast<int4*>(f2_items.data_ptr());
-  fa.counts = counts.data_ptr<int32_t>();
-  fa.T = T; fa.K = K; fa.n_pairs = pairs; fa.E = E; fa.n2_tiles = n2_tiles;
-  fa.row_cap = row_cap; fa.f1_cap = f1_cap; fa.f2_cap = f2_cap;
-  const int quant_blocks = (T + kFrontWarps - 1) / kFrontWarps;
-  frontend_kernel<<<quant_blocks + 1, kFrontThreads, 0, stream>>>(fa);
-  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+  if (fused_sum) {
+    fa.out = reinterpret_cast<uint32_t*>(out.data_ptr());
+    rt.tok_valid = torch::empty({T}, torch::TensorOptions().dtype(torch::kInt32).device(dev));
+    fa.tok_valid = rt.tok_valid.data_ptr<int32_t>();
+    arrive = torch::empty({(int64_t)T * fa.n2_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(dev));
+    cudaMemsetAsync(arrive.data_ptr(), 0, (size_t)T * fa.n2_tiles * sizeof(int32_t), stream);
+  }
+  run_frontend(fa, stream);
 
   int sms = 0;
-  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, hidden.get_device());
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, ids.get_device());
 
   Fc1Args f1;
   f1.a_values = fa.a_values;
@@ -1141,8 +1426,12 @@ std::vector<torch::Tensor> moe_prefill_fast(torch::Tensor hidden, torch::Tensor 
   f2.down_alpha = down_alpha.data_ptr<float>();
   f2.global_scale = global_scale.data_ptr<float>();
   f2.route = reinterpret_cast<uint32_t*>(route.data_ptr());
-  f2.K = K; f2.out_tiles = n2_tiles; f2.gs_per_expert = global_scale.numel() > 1;
-  f2.dynamic_schedule = (int)dynamic_schedule;
+  f2.out = fused_sum ? reinterpret_cast<uint32_t*>(out.data_ptr()) : nullptr;
+  f2.arrive = fused_sum ? arrive.data_ptr<int32_t>() : nullptr;
+  f2.ids = ids.data_ptr<int32_t>();
+  f2.tok_valid = fa.tok_valid;
+  f2.K = K; f2.out_tiles = fa.n2_tiles; f2.gs_per_expert = global_scale.numel() > 1;
+  f2.dynamic_schedule = (int)dynamic_schedule; f2.topk = topk;
 
   auto run = [&](auto L) {
     using LL = decltype(L);
@@ -1150,8 +1439,8 @@ std::vector<torch::Tensor> moe_prefill_fast(torch::Tensor hidden, torch::Tensor 
     int g1 = LL::grid1(sms), g2 = LL::grid2(sms);
     if (grid1_cap > 0) g1 = std::min<int>(g1, (int)grid1_cap);
     if (grid2_cap > 0) g2 = std::min<int>(g2, (int)grid2_cap);
-    g1 = std::min(g1, f1_cap);
-    g2 = std::min(g2, f2_cap);
+    g1 = std::min(g1, fa.f1_cap);
+    g2 = std::min(g2, fa.f2_cap);
     LL::fc1(f1, g1, stream);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
     LL::fc2(f2, g2, stream);
@@ -1165,49 +1454,38 @@ std::vector<torch::Tensor> moe_prefill_fast(torch::Tensor hidden, torch::Tensor 
     default: run(Launch<4, 2, 4, 2>{}); break;
   }
 
-  if (topk_sum) {
+  if (topk_sum && !fused_sum) {
     const long long total = (long long)T * (K / 8);
     topk_sum_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const uint4*>(route.data_ptr()), ids.data_ptr<int32_t>(),
         reinterpret_cast<uint4*>(out.data_ptr()), T, topk, K);
     TORCH_CHECK(cudaGetLastError() == cudaSuccess);
   }
-  return {out, route, a_values, a_scales, inter, inter_sf, row_pair, counts};
+  return {out, route, a_values, a_scales, inter, inter_sf, rt.row_pair, rt.counts};
 }
 
-// the front-end alone (timing): routing_only = 1 launches just the routing block
+// the front-end alone (timing): routing_only = 1 launches just the routing (histogram / scan / scatter) blocks
 torch::Tensor moe_prefill_fast_frontend(torch::Tensor hidden, torch::Tensor ids, int64_t E, bool routing_only) {
   using namespace b12x_moe_prefill_fast;
-  const int T = (int)hidden.size(0), K = (int)hidden.size(1), topk = (int)ids.size(1), pairs = T * topk;
+  const int T = (int)hidden.size(0), K = (int)hidden.size(1), topk = (int)ids.size(1);
   auto dev = hidden.device();
-  auto o32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
   auto o8 = torch::TensorOptions().dtype(torch::kUInt8).device(dev);
   auto a_values = torch::empty({T, K}, o8);
   auto a_scales = torch::empty({T, K / 32}, o8);
-  const int row_cap = pairs + 16 * (int)E, max_chunks = (pairs + 63) / 64 + (int)E, n2_tiles = K / 128;
-  const int f1_cap = max_chunks * kN1Tiles, f2_cap = max_chunks * n2_tiles;
-  auto row_pair = torch::empty({row_cap}, o32);
-  auto f1_items = torch::empty({f1_cap, 4}, o32);
-  auto f2_items = torch::empty({f2_cap, 4}, o32);
-  auto counts = torch::empty({8}, o32);
   FrontArgs fa;
   fa.hidden = reinterpret_cast<const uint32_t*>(hidden.data_ptr());
   fa.a_values = reinterpret_cast<uint32_t*>(a_values.data_ptr());
   fa.a_scales = a_scales.data_ptr<uint8_t>();
+  Routing rt = launch_frontend(fa, !routing_only, T, K, topk, (int)E, dev);
   fa.ids = ids.data_ptr<int32_t>();
-  fa.row_pair = row_pair.data_ptr<int32_t>();
-  fa.f1_items = reinterpret_cast<int4*>(f1_items.data_ptr());
-  fa.f2_items = reinterpret_cast<int4*>(f2_items.data_ptr());
-  fa.counts = counts.data_ptr<int32_t>();
-  fa.T = T; fa.K = K; fa.n_pairs = pairs; fa.E = (int)E; fa.n2_tiles = n2_tiles;
-  fa.row_cap = row_cap; fa.f1_cap = f1_cap; fa.f2_cap = f2_cap;
-  const int quant_blocks = routing_only ? 0 : (T + kFrontWarps - 1) / kFrontWarps;
-  frontend_kernel<<<quant_blocks + 1, kFrontThreads, 0, c10::cuda::getCurrentCUDAStream()>>>(fa);
-  TORCH_CHECK(cudaGetLastError() == cudaSuccess);
-  return counts;
+  run_frontend(fa, c10::cuda::getCurrentCUDAStream());
+  return rt.counts;
 }
+
+bool prequant_rows_supported() { return true; }  // the loader probes this entry (session U's pre-quantized rows)
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_prefill_fast", &moe_prefill_fast);
   m.def("moe_prefill_fast_frontend", &moe_prefill_fast_frontend);
+  m.def("prequant_rows_supported", &prequant_rows_supported);
 }
