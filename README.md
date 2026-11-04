@@ -49,7 +49,7 @@ of prompt; the within-boot identity check passes in every cell; the per-window n
 
 | GPUs (context) | 512 GB host (the defaults: everything pinned) | 384 GB host (`ENGRAM_MODE=nvme`) | 256 GB host (+ the store's tail on NVMe) | 128 GB host |
 |---|---|---|---|---|
-| **4× RTX 5090** (512K) | 457 GiB · **146 / 126** · 0.9 / 3.3 s (30K: 6.5 s) | 278 GiB · 145 / 126 · 0.9 / 3.3 s; **+ the full LRU** (`STORE_MODE=all RESIDENT=0 SPARE=110`): 307 GiB · **147 / 125** · 0.9 / 3.4 s, mixed prompts +3.6 % | N = 280: **236 GiB · 138 / 120 · 1.3 / 4.9 s** (30K: 9.2 s, 1.4–1.5× the TTFT); N = 230: 200 GiB · 132 / 109 · 1.7 / 6.3 s | N = 110 (`ENGRAM_CACHE_GIB=1`): **112 GiB · 112 / 82 · 2.8 / 11.1 s**; N = 120: 120 GiB · 114 / 81 · 2.7 / 10.4 s (3.0–3.6× the TTFT) |
+| **4× RTX 5090** (512K) | 457 GiB · **146 / 126** · 0.9 / 3.3 s (30K: 6.5 s) | 278 GiB · 145 / 126 · 0.9 / 3.3 s; **+ the full LRU** (`STORE_MODE=all RESIDENT=0 SPARE=110`): 307 GiB · **147 / 126** · 0.9 / 3.5 s, **mixed prompts 86.5 tok/s flat over 30 min** (hit rate 0.88 vs 0.87; the 512 GB defaults' soak 84.4) | N = 280: **236 GiB · 138 / 120 · 1.3 / 4.9 s** (30K: 9.2 s, 1.4–1.5× the TTFT); N = 230: 200 GiB · 132 / 109 · 1.7 / 6.3 s | N = 110 (`ENGRAM_CACHE_GIB=1`): **112 GiB · 112 / 82 · 2.8 / 11.1 s**; N = 120: 120 GiB · 114 / 81 · 2.7 / 10.4 s (3.0–3.6× the TTFT) |
 | **2× RTX 5090** (64K) | 450 GiB · **46 / 47** · 1.9 / 7.3 s | 269 GiB · 45 / 47 · 2.0 / 7.4 s | N = 230: 190 GiB · **40 / 43** · 2.2 / 8.6 s | N = 110: 103 GiB · **36 / 35** · 3.4 / 13.4 s |
 | **1× RTX 5090** (32K) | ~470 GiB · **40 / 34** · 3.8 / 15 s | 285 GiB · 43 / 36 · 3.9 s | N = 230: 184 GiB · **40 / 32** · 4.1 s | N = 110: 98 GiB · **38 / 26** · 4.8 s |
 
