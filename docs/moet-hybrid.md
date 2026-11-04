@@ -130,31 +130,37 @@ and `ccd_bw.cpp` (the expert from DRAM vs L3, one CCD's DRAM ceiling), `routing/
 `cpu_tier/ttft_probe.py` (streamed prefill TTFT on disjoint prompts), `cpu_tier/profile_anatomy.py` (the decode step's
 GPU busy / idle anatomy from a torch profile), `cpu_tier/cpu_placement_probe.sh` (who runs on the pool cores).
 
-## Hosts with less RAM: Engram v2 and the expert store's NVMe tail (2026-11-04, branch `moet-hybrid-engram-v2`)
+## Hosts with less RAM: Engram v2 and the expert store's NVMe tail (2026-11-04)
 
-The serving configuration above pins ~457 GiB (the expert store 241 GiB + the Engram tables 189 GiB). Two opt‑in mechanisms,
-inert at the launcher's defaults, bring that down for smaller hosts ("slow is acceptable, but it must run"):
+The serving configuration above pins ~457 GB (the expert store 241 GiB + the Engram tables 189 GiB). Two opt-in mechanisms, inert at the
+launcher's defaults, bring that down for smaller hosts ("slow is acceptable, but it must run"). They ship in the image built with
+`--build-arg VLLM_MOET_CPU_TIER_PATCH=1 --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1` (Dockerfile step 44; the `-hyb-engram` tags) and need
+`docker/sm120/seccomp-io_uring.json` on `docker run` (docker's default profile denies io_uring) — the launcher adds both when a knob is on.
 
-- **`ENGRAM_MODE=nvme` — Engram v2 (384 GB hosts, ~275 GiB used).** The Engram tables stay in the checkpoint's safetensors shards on
-  NVMe. Per TP rank a fetcher thread serves every step's rows (6 per token per layer, 264 B each) from a 2 GiB DRAM row cache
-  (`ENGRAM_CACHE_GIB`) or from NVMe (io_uring, 512‑B O_DIRECT reads, 62 µs at QD 1); the rows reach the GPU through a mapped mailbox,
-  a bounded in‑stream wait and a device landing buffer that **vLLM's own lookup kernel** dequantizes — bit‑identical to the pinned
-  tables (the same bytes, the same kernel; verified at T = 1..4096). A decode step's 24 reads land in ~131 µs (median) against a
-  ~176 µs (p10 174, p90 421) window before the layer‑1 consumer; a prompt's first chunk waits ~20–70 ms for its rows, later chunks are warm
-  through the host‑side lookahead (the prompt's hashes = vLLM's kernel). The fetcher runs on the CPU tier's dispatcher thread (a poll hook).
-  **Measured on the full model (11-04): 271 GB used (457 before), decode 144.5 / 124.9 tok/s, a 5‑min mixed‑prompt soak at 84.6 tok/s against
-  the record's 84.4, TTFT 0.92 / 3.83 / 6.57 s (0.78 / 3.31 / 6.52 before).** Needs `docker/sm120/seccomp-io_uring.json` and the worktree
-  mounted (the launcher adds both); code under `tools/dsv41_5090/engram_v2/`.
+- **`ENGRAM_MODE=nvme` — Engram v2 (384 GB hosts).** The Engram tables stay in the checkpoint's safetensors shards on NVMe; the loader never
+  reads them. Per TP rank, the rows of every step are served from a 2 GiB DRAM row cache (`ENGRAM_CACHE_GIB`) or from NVMe (io_uring,
+  512-B O_DIRECT reads of the values; the 8-B scales stay resident, 1.5 GB per rank, `ENGRAM_RESIDENT_SCALES`) by a fetcher that runs on
+  the CPU tier's dispatcher thread; the rows reach the GPU through a mapped mailbox, a bounded in-stream wait and a device landing buffer
+  that **vLLM's own lookup kernel** dequantizes — bit-identical to the pinned tables (the same bytes, the same kernel; verified at
+  T = 1..4096). A decode step's rows are requested at the hash kernel and consumed ~176 µs later at layer 1 (2.5 ms at layer 14); a
+  prompt's first chunk waits ~20–50 ms for its rows, later chunks are warm through the host-side lookahead (the prompt's hashes = vLLM's
+  kernel). Code: `tools/dsv41_5090/engram_v2/`.
 - **`STORE_NVME=1 STORE_DRAM_RECORDS=N` — the store tail (256 GB hosts at N ≈ 230, 128 GB at N ≈ 110).** Only N records per layer per
   rank stay pinned (an LRU the CPU tier's dispatcher keeps); a cold record is read from the store file on a miss (one 4.7 MB read,
-  ~0.3–0.5 ms) into a spare slot while the request's resident experts compute — the same kernel on the same bytes. Promotions and
-  the prefill streaming read their cold records the same way (the prefill becomes NVMe‑bound). **Measured on the full model (11-04): N = 230 →
-  194 GB used, decode 130.5 / 108.0 tok/s (−10 / −14 %), TTFT 1.68 / 6.86 / 12.13 s (2.1–2.2× slower); N = 110 → 106 GB used, 111.0 / 81.5
-  tok/s (−24 / −35 %), TTFT 2.83 / 11.07 s (3.3–3.6×); the within‑boot identity check passes at N = 110 with Engram v2 (19,080 compact calls
-  per rank, 0 mismatches).**
+  ~0.3–0.5 ms) into a spare slot while the request's resident experts compute — the same kernel on the same bytes. Promotions and the
+  prefill streaming read their cold records the same way (the prefill becomes NVMe-bound).
 
-Measurements, the RAM budget per host size and the commands: `internal/dsv41-5090-cpu/handoff/engram-v2-2026-11-04.md` and
-`/root/work/HANDOFF-moet-hybrid-engram-v2.md`.
+Measured on the reference box (11-04, TP4, the baseline's sequence; the 512 GB record: 145.4 / 126.0 tok/s, TTFT 0.78 / 3.31 / 6.52 s,
+mixed-prompt soak 84.4 tok/s):
+
+| host | knobs | RAM used | decode 'Hello' / 'def fib(n):' | TTFT 2K / 14K / 30K | identity |
+|---|---|---|---|---|---|
+| 384 GB | `ENGRAM_MODE=nvme` | **272–278 GB** | **145.4 / 126.0** (dev flow), 145.5 / 125.6 (baked); 5-min mixed-prompt soak **84.6** | **0.93 / 3.80 / 6.62 s** | the Engram rows bit-identical (harness: 20 cases, 600 graph replays, 0 differences) |
+| 256 GB | `+ STORE_NVME=1 STORE_DRAM_RECORDS=230` | **194–200 GB** | **130.5–131.0 / 108.0–109.5** | 1.68 / 6.86 / 12.13 s (2.1–2.2×) | (the N = 110 check covers the path) |
+| 128 GB | `+ STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1` | **106–112 GB** | **111.0–112.4 / 81.5–82.5** | 2.83 / 11.07 / — (3.3–3.6×) | `DEBUG_COMPACT` PASS: 19,080 compact calls per rank, 0 mismatches |
+
+The working notes with every measurement and its command are the branch's handoff files (`engram-v2-2026-11-04.md` in the
+operators' notes, `HANDOFF-moet-hybrid-engram-v2.md`).
 
 ## Limits and open items
 
