@@ -20,10 +20,25 @@
 #   (holds the GPU's flock for each serve; logs /tmp/moet-mini-r<R>.log)
 set -u
 GPU="${1:?gpu index (or a list 1,2 for TP2)}"
-LOCKS=""; for g in ${GPU//,/ }; do LOCKS="$LOCKS flock -w 3600 /tmp/exl3diff-gpu$g.lock"; done
+# The GPU locks are taken by THIS script (fd-based flocks, held across each serve) before the container and the client
+# start: with the lock taken inside the backgrounded docker-run subshell (as until 11-04) a contended lock let the client
+# run against a container that did not exist yet, and the serve it finally started was never stopped (11-04 00:47).
 # NO_LOCK=1: the caller already holds the GPU's lock (e.g. a TP4 chain that runs this test under its four locks before
 # the full-model boot) - a second flock on the same file would block against it
-[ "${NO_LOCK:-0}" = "1" ] && LOCKS=""
+LOCK_FDS=()
+take_locks() {
+  [ "${NO_LOCK:-0}" = "1" ] && return 0
+  local fd=9
+  for g in ${GPU//,/ }; do
+    eval "exec $fd>/tmp/exl3diff-gpu$g.lock"
+    flock -w 3600 $fd || { echo "could not take /tmp/exl3diff-gpu$g.lock within 3600 s"; exit 1; }
+    LOCK_FDS+=($fd); fd=$((fd + 1))
+  done
+}
+release_locks() {
+  for fd in "${LOCK_FDS[@]}"; do flock -u $fd; eval "exec $fd>&-"; done
+  LOCK_FDS=()
+}
 TP="${TP:-$(echo $GPU | tr "," "\n" | wc -l)}"
 RS="${2:-16 8 1}"
 PORT="${3:-8031}"
@@ -48,12 +63,13 @@ if [ -n "$STORE" ]; then
   DUMMY_W=0
 fi
 for R in $RS; do
-  echo "== R=$R  $(date -u +%T)  model $MODEL_DIR load $LOAD_FORMAT store '${STORE}' spare ${SPARE:-0}"
+  echo "== R=$R  $(date -u +%T)  model $MODEL_DIR load $LOAD_FORMAT store '${STORE}' spare ${SPARE:-0}; waiting for the GPU lock(s) $GPU"
+  take_locks
   docker ps --format '{{.Names}}' | grep -q "^$NAME$" && { echo "container still up"; exit 1; }
   # R=placement: the model dir's placement.json (make_mini_real.py) instead of the first R experts
   RES_ARGS=(-e VLLM_MOET_CPU_TIER_RESIDENT=$R)
   [ "$R" = "placement" ] && RES_ARGS=(-e VLLM_MOET_CPU_TIER_PLACEMENT=/model/placement.json)
-  ( $LOCKS docker run --rm --gpus "\"device=$GPU\"" --name $NAME --ulimit memlock=-1:-1 --ipc host --shm-size 16g -e TP=$TP ${EXTRA_DOCKER_ENV:-} \
+  ( docker run --rm --gpus "\"device=$GPU\"" --name $NAME --ulimit memlock=-1:-1 --ipc host --shm-size 16g -e TP=$TP ${EXTRA_DOCKER_ENV:-} \
       -e VLLM_MOET_MOE_CPU_TIER=1 "${RES_ARGS[@]}" -e VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=$DUMMY_W \
       -e VLLM_MOET_CPU_TIER_TABLES=/parity ${CPUS:+-e VLLM_MOET_CPU_TIER_CPUS=$CPUS} -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY=${LOG_EVERY:-50} \
       -e VLLM_MOET_DET_TOPK=1 -e DSPARK=${DSPARK:-1} -e LOAD_FORMAT=$LOAD_FORMAT -e GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.3} -e MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-512} -e VLLM_MOET_CPU_TIER_SPARE=${SPARE:-0} \
@@ -74,6 +90,7 @@ for R in $RS; do
   docker ps -q -f name="^$NAME$" | grep -q . || { pkill -P $BG 2>/dev/null; kill $BG 2>/dev/null; }
   docker stop -t 20 $NAME > /dev/null 2>&1
   wait
+  release_locks
 done
 echo "== comparisons"
 for R in $RS; do

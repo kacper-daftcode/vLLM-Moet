@@ -256,6 +256,7 @@ def main() -> int:
     inst.mkdir(parents=True, exist_ok=True)
     for f in FILES_RUNTIME:
         shutil.copy2(HERE / f, inst / f)
+    shutil.copy2(HERE.parent / "engram_v2" / "uring.h", inst / "uring.h")   # the store tail's io_uring wrapper
     (inst / "cpu_moe").mkdir(exist_ok=True)
     shutil.copy2(HERE.parent / "cpu_moe" / "cpu_moe_b12x.cpp", inst / "cpu_moe" / "cpu_moe_b12x.cpp")
     env = dict(os.environ, ARCH=args.arch, OUT=str(inst / "libcpu_tier.so"), KERNEL_SRC=str(inst / "cpu_moe" / "cpu_moe_b12x.cpp"))

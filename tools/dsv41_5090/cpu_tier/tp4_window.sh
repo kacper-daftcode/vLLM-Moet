@@ -119,8 +119,14 @@ fi
 # (a change committed or not, without `docker build` of the image) - the window would measure stale code
 cd "$REPO" || exit 1
 if [[ "${BAKED:-1}" == "1" ]]; then
-  img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"   # = the launcher's BAKED=1 default
-  files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py'
+  # = the launcher's BAKED=1 default (the NVMe modes' default is the step-44 image: ENGRAM_MODE=nvme / STORE_NVME=1)
+  if [[ "${ENGRAM_MODE:-ram}" == "nvme" || "${STORE_NVME:-0}" == "1" ]]; then
+    img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-engram}"
+    files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py engram_v2/*.py engram_v2/*.cpp engram_v2/*.cu engram_v2/*.h'
+  else
+    img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
+    files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py'
+  fi
   stale=$(diff <(docker run --rm --entrypoint bash "$img" -c "cd /opt/vllm-moet/dsv41_5090 && md5sum $files 2>/dev/null" 2>/dev/null) \
                <(cd tools/dsv41_5090 && eval md5sum $files 2>/dev/null) | grep '^>' | awk '{print $3}' | tr '\n' ' ')
   if [[ -n "$stale" ]]; then

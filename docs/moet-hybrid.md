@@ -157,6 +157,48 @@ sample with the box's `kcompactd0` on a pool core's SMT sibling gave 143 / 121) 
 support and were not measured here: the run book — host requirements, the launcher lines at 96 GB, the window sequence, the expected
 numbers from the routing traces (~105–125 tok/s mixed / ~120–145 short at TP2, ~62–70 / ~80–90 at TP1) — is §13 of that note.
 
+## Hosts with less RAM: Engram v2 and the expert store's NVMe tail (2026-11-04)
+
+The serving configuration above pins ~457 GB (the expert store 241 GiB + the Engram tables 189 GiB). Two opt-in mechanisms, inert at the
+launcher's defaults, bring that down for smaller hosts ("slow is acceptable, but it must run"). They ship in the image built with
+`--build-arg VLLM_MOET_CPU_TIER_PATCH=1 --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1` (Dockerfile step 44; the `-hyb-engram` tags) and need
+`docker/sm120/seccomp-io_uring.json` on `docker run` (docker's default profile denies io_uring) — the launcher adds both when a knob is on.
+
+- **`ENGRAM_MODE=nvme` — Engram v2 (384 GB hosts).** The Engram tables stay in the checkpoint's safetensors shards on NVMe; the loader never
+  reads them. Per TP rank, the rows of every step are served from a 2 GiB DRAM row cache (`ENGRAM_CACHE_GIB`) or from NVMe (io_uring,
+  512-B O_DIRECT reads of the values; the 8-B scales stay resident, 1.5 GB per rank, `ENGRAM_RESIDENT_SCALES`) by a fetcher that runs on
+  the CPU tier's dispatcher thread; the rows reach the GPU through a mapped mailbox, a bounded in-stream wait and a device landing buffer
+  that **vLLM's own lookup kernel** dequantizes — bit-identical to the pinned tables (the same bytes, the same kernel; verified at
+  T = 1..4096). A decode step's rows are requested at the hash kernel and consumed ~176 µs later at layer 1 (2.5 ms at layer 14); a
+  prompt's first chunk waits ~20–50 ms for its rows, later chunks are warm through the host-side lookahead (the prompt's hashes = vLLM's
+  kernel; its tokenizer is built at load — built lazily it cost the first long prompt 0.45 s of TTFT). Code: `tools/dsv41_5090/engram_v2/`.
+- **`STORE_NVME=1 STORE_DRAM_RECORDS=N` — the store tail (256 GB hosts at N ≈ 230, 128 GB at N ≈ 110).** Only N records per layer per
+  rank stay pinned (an LRU the CPU tier's dispatcher keeps); a cold record is read from the store file on a miss (one 4.7 MB read,
+  ~0.3–0.5 ms) into a spare slot while the request's resident experts compute — the same kernel on the same bytes. Promotions and the
+  prefill streaming read their cold records the same way (the prefill becomes NVMe-bound).
+
+Measured on the reference box (11-04, TP4, the baseline's sequence; the 512 GB record: 145.4 / 126.0 tok/s, TTFT 0.78 / 3.31 / 6.52 s,
+mixed-prompt soak 84.4 tok/s):
+
+| host | knobs | RAM used | decode 'Hello' / 'def fib(n):' | TTFT 2K / 14K / 30K | identity |
+|---|---|---|---|---|---|
+| 384 GB | `ENGRAM_MODE=nvme` | **272–278 GB** | **145.4 / 126.0** (dev flow), 145.5 / 126.2 (baked); 5-min mixed-prompt soak **85.1** | **0.81–0.90 / 3.30–3.39 / 6.64–6.65 s** (= the pinned-table path's) | the Engram rows bit-identical (harness: 20 cases, 600 graph replays, 0 differences) |
+| 256 GB | `+ STORE_NVME=1 STORE_DRAM_RECORDS=230` | **194–200 GB** | **130.5–131.0 / 108.0–109.5** | 1.68 / 6.86 / 12.13 s (2.1–2.2×) | (the N = 110 check covers the path) |
+| 128 GB | `+ STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1` | **106–112 GB** | **111.0–112.4 / 81.5–82.5** | 2.83 / 11.07 / — (3.3–3.6×) | `DEBUG_COMPACT` PASS: 19,080 compact calls per rank, 0 mismatches |
+
+The working notes with every measurement and its command are the branch's handoff files (`engram-v2-2026-11-04.md` in the
+operators' notes, `HANDOFF-moet-hybrid-engram-v2.md`).
+
+### The two together: TP2 / TP1 on hosts with less RAM (branch `moet-hybrid-next`, 2026-11-04)
+
+Both mechanisms compose with the virtual ranks: the store tail is **per slice** — virtual rank v's records come from store rank
+r·V+v through its own DRAM LRU, io_uring fetcher (on its dispatcher thread) and prefill arena (`SCRATCH / V` records per set), so
+`STORE_DRAM_RECORDS=N` pins N × 4.7 MB × 40 × V per process (the same host RAM per GPU card as at TP4), and a cold expert costs V
+concurrent record reads (one per slice, as the TP4 ranks' do); promotions pin / read their V slice records; Engram v2 is per vLLM
+TP rank (its heads / row range come from vLLM's own TP sharding: 12 heads at TP2, all 24 at TP1) with one fetcher per process,
+polled by virtual rank 0's dispatcher. The measurements of the combinations (2× / 1× 5090 at 384 / 256 GB) are in the branch's
+handoff (`HANDOFF-moet-hybrid-next.md`).
+
 ## Limits and open items
 
 - DSpark does not pay for the hybrid: a verify step routes ~5× more distinct experts for 3.6× more tokens and the CPU

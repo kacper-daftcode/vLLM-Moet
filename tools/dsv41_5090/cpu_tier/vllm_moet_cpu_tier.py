@@ -31,6 +31,18 @@ Environment:
                                         instead of after loading - no reclaim storm against the loader's page cache (10-26;
                                         not at the first create_weights: the Engram tables' huge-page prefault then stalls
                                         in compaction behind 260 GB of pinned pages)
+  VLLM_MOET_CPU_TIER_STORE_NVME=1       the store tail (2026-11-04, the 256 / 128 GB tiers): only STORE_DRAM_RECORDS records per
+                                        layer stay pinned (an LRU the dispatcher keeps); a cold record is read from the store file
+                                        on a miss (io_uring, 4.7 MB into a spare arena slot; the DRAM-resident experts of the
+                                        request are computed while it is in flight; bit-identical rows), promotions pin / read their
+                                        sources, the prefill streaming reads its cold records into a pinned prefill arena
+                                        (PREFILL_OVERLAP ? 2 : 1 sets x SCRATCH records). Needs io_uring (docker seccomp).
+                                        With virtual ranks (TP2 / TP1) the tail is PER SLICE: store rank r*V+v's records
+                                        through virtual rank v's own LRU, io_uring fetcher (its dispatcher thread) and
+                                        prefill arena (SCRATCH / V records per set); N counts per layer per store rank,
+                                        so the DRAM is N x 4.7 MB x 40 x V per process = the same as TP4's per GPU card
+  VLLM_MOET_CPU_TIER_STORE_DRAM_RECORDS=N   records per layer per rank in DRAM (0 = the whole non-resident store, no tail)
+  VLLM_MOET_CPU_TIER_STORE_NVME_QD=8    reads in flight per rank (also the prefill reader threads; per virtual rank)
   VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=1    (dummy mode) overwrite the dummy expert weights with seeded sane random MXFP4
                                         bytes (scales 118..126), so that a stock run and a hybrid run see the same experts
   VLLM_MOET_CPU_TIER_TIMEOUT_MS         bounded wait (default 500)
@@ -86,6 +98,15 @@ DUMP_MAX = int(os.environ.get("VLLM_MOET_CPU_TIER_DUMP_MAX", "400"))
 STORE = os.environ.get("VLLM_MOET_CPU_TIER_STORE", "")
 STORE_MODE = os.environ.get("VLLM_MOET_CPU_TIER_STORE_MODE", "nonresident")
 STORE_EARLY = os.environ.get("VLLM_MOET_CPU_TIER_STORE_EARLY", "0") == "1"   # pin the records before the weights load
+# the store tail (2026-11-04, the 256 / 128 GB tiers): VLLM_MOET_CPU_TIER_STORE_NVME=1 pins only STORE_DRAM_RECORDS records
+# per layer (an LRU the dispatcher maintains); a cold record is read from the store file on a miss (io_uring, one 4.7 MB
+# read into a spare slot of the arena, the kernel then computes from it - the same bytes, bit-identical rows), promotions
+# and the debug references acquire records (pinned pointers, a cold one read synchronously), the prefill streaming reads
+# its cold records into a pinned prefill arena (PREFILL sets x SCRATCH records). The routing / placement / identity rules
+# are unchanged; only where a record's bytes come from differs.
+STORE_NVME = os.environ.get("VLLM_MOET_CPU_TIER_STORE_NVME", "0") == "1"
+STORE_DRAM_RECORDS = int(os.environ.get("VLLM_MOET_CPU_TIER_STORE_DRAM_RECORDS", "0"))
+STORE_NVME_QD = int(os.environ.get("VLLM_MOET_CPU_TIER_STORE_NVME_QD", "8"))
 SPARE = int(os.environ.get("VLLM_MOET_CPU_TIER_SPARE", "0"))
 LOG = os.environ.get("VLLM_MOET_CPU_TIER_LOG", "0") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_MOET_CPU_TIER_LOG_EVERY", "100"))
@@ -482,8 +503,14 @@ def _ensure_store(early: bool = False) -> None:
                 mask[c.model_layer, c.residents] = 0
     t0 = time.perf_counter()
     V = S.V
+    tail = {}
+    if STORE_NVME and STORE_DRAM_RECORDS > 0:
+        # the store tail, per store (= per virtual rank): N records per layer in DRAM, the prefill arena holds one round
+        # of the scratch pool per set - a round is SCRATCH / V experts, one slice record of each in every store
+        tail = dict(dram_records=STORE_DRAM_RECORDS, spare_slots=STORE_NVME_QD + 4, tail_qd=STORE_NVME_QD,
+                    prefill_sets=(2 if PREFILL_OVERLAP else 1) if SCRATCH_SLOTS else 0, prefill_slots=SCRATCH_SLOTS // V)
     if V == 1:
-        S.store = ExpertStore(STORE, _rank(), n_layers, S.E, mask=mask, pinned=True, nthreads=16)
+        S.store = ExpertStore(STORE, _rank(), n_layers, S.E, mask=mask, pinned=True, nthreads=16, **tail)
         S.stores = [S.store]
     else:
         # virtual ranks: the records of store ranks r * V + v, one pinned arena per slice, read concurrently (the
@@ -492,7 +519,7 @@ def _ensure_store(early: bool = False) -> None:
         stores: list = [None] * V
 
         def _load(v: int) -> None:
-            stores[v] = ExpertStore(STORE, ranks[v], n_layers, S.E, mask=mask, pinned=True, nthreads=16)
+            stores[v] = ExpertStore(STORE, ranks[v], n_layers, S.E, mask=mask, pinned=True, nthreads=16, **tail)
 
         ths = [threading.Thread(target=_load, args=(v,), daemon=True) for v in range(V)]
         for th in ths:
@@ -507,20 +534,69 @@ def _ensure_store(early: bool = False) -> None:
     _log(f"store {STORE} ({STORE_MODE}{', before the weights' if early else ''}"
          f"{f', store ranks {[st.rank for st in S.stores]} = {V} virtual ranks' if V > 1 else ''}): "
          f"{S.store.n_records} records x {V} = {sum(st.nbytes for st in S.stores) / 1e9:.1f} GB pinned, read "
-         f"{max(st.load_seconds for st in S.stores):.1f} s, alloc+read {time.perf_counter() - t0:.1f} s")
+         f"{max(st.load_seconds for st in S.stores):.1f} s, alloc+read {time.perf_counter() - t0:.1f} s"
+         + (f"; store tail: {STORE_DRAM_RECORDS} records per layer in DRAM, {S.store.n_cold} cold on NVMe, arena {S.store.n_slots} "
+            f"slots, prefill arena {S.store.prefill_sets} x {S.store.prefill_slots} records"
+            f"{f' (per virtual rank: {V} tails, one LRU + io_uring fetcher each)' if V > 1 else ''} "
+            f"({V * S.store.prefill_sets * S.store.prefill_slots * RECORD_BYTES / 1e9:.1f} GB pinned)" if tail else ""))
 
 
 def _has_record(li: int, e: int) -> bool:
+    """The record exists for the tier (in DRAM, or - store tail - cold on NVMe)."""
     if S.store is not None:
-        return int(S.store.slot_of[S.layers[li].model_layer, e]) >= 0
+        ml = S.layers[li].model_layer
+        return int(S.store.slot_of[ml, e]) >= 0 or (S.store.tail and bool(S.store.cold[ml, e]))
     return li in S.arena
 
 
+def _tiers() -> list:
+    """The CpuTiers of this process: [the tier] at V = 1, the TierGroup's V tiers (one per slice / store rank) with
+    virtual ranks. The store tail is per tier: slice v's records come from store rank r * V + v through tier v's own
+    DRAM LRU and io_uring fetcher (ExpertStore.attach wires store v to tier v in _create_tier_if_needed)."""
+    return [S.tier] if S.V == 1 else list(S.tier.tiers)
+
+
 def _record_ptr(li: int, e: int, v: int = 0) -> int:
-    """The host address of (layer, expert)'s record - of slice v's store with virtual ranks."""
+    """The host address of (layer, expert)'s record - of slice v's store with virtual ranks. Store tail: the pointer of a
+    record that is in DRAM at this moment (a cold one is read first; acquired and released - the caller does not copy
+    from it: debug / manager fallbacks). Tail callers that copy use _acquire_records / _prefill_round_ptrs, which
+    handle cold records and pins."""
     if S.store is not None:
+        if S.store.tail:
+            t = _tiers()[v] if S.created else None
+            p = t.record_acquire(li, e) if t is not None else 0
+            if p:
+                t.record_release(li, e)
+                return p
+            raise KeyError((li, e, v))
         return S.stores[v].ptr(S.layers[li].model_layer, e)
     return S.arena[li] + e * RECORD_BYTES
+
+
+def _acquire_records(li: int, experts: list) -> tuple[list, callable]:
+    """Pinned host pointers of the experts' records in staging order (expert j's V slice records at j * V .. j * V +
+    V - 1; cold ones read now, store tail) and a release callable the caller runs once the copies that use them have
+    completed on the host side (after a sync / the copy stream's event)."""
+    if S.store is None or not S.store.tail:
+        return _record_ptrs_v(li, experts), (lambda: None)
+    tiers = _tiers()
+    ptrs: list = []
+    got: list = []   # (tier, expert) pinned so far
+    for e in experts:
+        for v, t in enumerate(tiers):
+            p = t.record_acquire(li, e)
+            if not p:
+                for t2, e2 in got:
+                    t2.record_release(li, e2)
+                raise RuntimeError(f"[moet-cpu-tier] record ({li}, {e}) could not be acquired from the store tail "
+                                   f"(store rank {S.stores[v].rank})")
+            ptrs.append(p)
+            got.append((t, e))
+
+    def release(_li=li, _got=got):
+        for t, e in _got:
+            t.record_release(_li, e)
+    return ptrs, release
 
 
 def _record_view(li: int, e: int, v: int = 0) -> torch.Tensor:
@@ -530,7 +606,7 @@ def _record_view(li: int, e: int, v: int = 0) -> torch.Tensor:
 
 def _record_ptrs_v(li: int, experts) -> list[int]:
     """The staging order of a list of experts with virtual ranks: expert j's V slice records at j * V .. j * V + V - 1
-    (V = 1: one record per expert, as before)."""
+    (V = 1: one record per expert, as before). Not for the store tail's copies (_acquire_records / _prefill_round_ptrs)."""
     V = S.V
     if V == 1:
         return [_record_ptr(li, e) for e in experts]
@@ -562,22 +638,48 @@ def _create_tier_if_needed(device: torch.device):
         cpus_msg = (f"{V} virtual ranks (store ranks {[st.rank for st in S.stores]}): pools "
                     f"{[_ranges(c) for c in layout['pool']]} ({len(layout['pool'][0])} threads each), dispatchers {layout['dispatcher']}")
     n_rec = 0
-    for li in range(n_layers):
-        for e in range(S.E):
-            if _has_record(li, e):
-                if V == 1:
-                    S.tier.set_record(li, e, _record_ptr(li, e))
-                else:
-                    for v in range(V):
-                        S.tier.set_record(li, e, _record_ptr(li, e, v), v)
-                n_rec += 1
+    tail = S.store is not None and S.store.tail
+    if tail:
+        # the store tail: the warm records by pointer, the cold ones as fetchable, each store's arena as its tier's LRU -
+        # with virtual ranks store v (rank r * V + v) attaches to tier v: V independent tails, one LRU + io_uring fetcher
+        # on each slice's dispatcher thread (every slice of an expert misses in the same step, so the V fetches of a cold
+        # expert run concurrently, like the TP4 ranks' do)
+        tl = [c.model_layer for c in S.layers]
+        for st, t in zip(S.stores, _tiers()):
+            st.attach(t, tier_layers=tl)
+        n_rec = S.store.n_records + S.store.n_cold
+    else:
+        for li in range(n_layers):
+            for e in range(S.E):
+                if _has_record(li, e):
+                    if V == 1:
+                        S.tier.set_record(li, e, _record_ptr(li, e))
+                    else:
+                        for v in range(V):
+                            S.tier.set_record(li, e, _record_ptr(li, e, v), v)
+                    n_rec += 1
     tables_layout = load_layout(tables, device)
     copy_stream = torch.cuda.Stream(device=device)
+    if tail:
+        # the promotions' record pointers pin their records (a cold one is read first); per slice with virtual ranks
+        tiers = _tiers()
+        rec_ptr = S.tier.record_acquire if V == 1 else (lambda layer, e, v: tiers[v].record_acquire(layer, e))
+        rec_rel = S.tier.record_release if V == 1 else (lambda layer, e, v: tiers[v].record_release(layer, e))
+    else:
+        rec_ptr, rec_rel = _record_ptr, None
     S.manager = PlacementManager(S.tier.ext, tables_layout, S.pools, _record_view, copy_stream,
                                  max_promotions_per_layer=int(os.environ.get("VLLM_MOET_CPU_TIER_MAX_PROMOTIONS", "4")),
-                                 record_ptr=_record_ptr)
+                                 record_ptr=rec_ptr, record_release=rec_rel)
     S.tier.start(first_step=1)
     S.created = True
+    # Engram v2 (VLLM_MOET_ENGRAM_MODE=nvme): its row fetcher moves onto a dispatcher thread of this process (polled from
+    # its core) - virtual rank 0's with a TierGroup (one Engram fetcher per TP rank process, whatever V is)
+    try:
+        import vllm_moet_engram_v2 as _engram_v2
+        if _engram_v2.ENABLED:
+            _engram_v2.attach_dispatcher(_tiers()[0])
+    except ImportError:
+        pass
 
     def _shutdown():
         try:
@@ -883,6 +985,8 @@ class _Scratch:
         self.free_event = torch.cuda.Event()
         self.ready_event = torch.cuda.Event()
         self.staged: list = []         # the experts currently staged in this set, in slot order (host-side bookkeeping)
+        self.set_index = 0             # the prefill arena set this scratch set reads its cold records through (store tail)
+        self.tail_last = None          # (layer, experts) whose resident records are pinned for this set's last round
 
     def timing_summary(self) -> str:
         """Folds the completed events into per-token-count totals; returns a summary (no host sync)."""
@@ -976,19 +1080,62 @@ def _overlap_sets():
             if S.scratch2 is None:
                 li0 = next(iter(S.layer_modules))
                 S.scratch2 = _Scratch(S.scratch.impl, S.layer_modules[li0], S.scratch.staging.device)
+                S.scratch2.set_index = 1
                 S.prefill_stream = torch.cuda.Stream(device=S.scratch.staging.device)
                 _log(f"prefill overlap: a second scratch set of {SCRATCH_SLOTS} slots and a side stream "
                      f"(VLLM_MOET_CPU_TIER_PREFILL_OVERLAP=1{', DEBUG_OVERLAP: every call re-run serially and compared' if DEBUG_OVERLAP else ''})")
     return (S.scratch, S.scratch2), S.prefill_stream
 
 
+def _prefill_release(li: int, experts: list) -> None:
+    """Store tail: unpin a prefill round's resident records on every tier (slice)."""
+    for t in _tiers():
+        t.prefill_release(li, experts)
+
+
+def _prefill_round_ptrs(sc, li: int, rnd: list) -> list:
+    """The host pointers a round's H2D reads from, in staging order (expert j's V slices at j * V + v). Store tail: the
+    set's previous round must be through (its H2D read the set's prefill-arena slots and pinned resident records:
+    free_event, synchronised on the host), then the round's resident records are pinned in place and its cold records
+    read from NVMe into the set's prefill-arena slots (blocking: the NVMe time of the prefill - the GPU runs the
+    previous round meanwhile on the overlap path). With virtual ranks every tier fetches its slice's records into its
+    own prefill arena, the V fetches concurrently (one thread each; the ctypes calls release the GIL)."""
+    if S.store is None or not S.store.tail:
+        return _record_ptrs_v(li, rnd)
+    sc.free_event.synchronize()
+    if sc.tail_last is not None:
+        _prefill_release(*sc.tail_last)
+        sc.tail_last = None
+    tiers = _tiers()
+    if len(tiers) == 1:
+        ptrs = tiers[0].prefill_fetch(li, rnd, sc.set_index, nthreads=STORE_NVME_QD)
+    else:
+        per: list = [None] * len(tiers)
+
+        def _fetch(v: int) -> None:
+            per[v] = tiers[v].prefill_fetch(li, rnd, sc.set_index, nthreads=STORE_NVME_QD)
+
+        ths = [threading.Thread(target=_fetch, args=(v,), daemon=True) for v in range(1, len(tiers))]
+        for th in ths:
+            th.start()
+        _fetch(0)
+        for th in ths:
+            th.join()
+        if any(p is None for p in per):
+            raise RuntimeError(f"[moet-cpu-tier] prefill fetch failed on a virtual rank (layer {li})")
+        ptrs = [per[v][j] for j in range(len(rnd)) for v in range(len(tiers))]
+    sc.tail_last = (li, list(rnd))
+    return ptrs
+
+
 def _stage_round_async(sc, li: int, rnd: list) -> None:
     """Stage + repack one round into set `sc` on the side stream: after the set's last reader (free_event, main
     stream), then ready_event for the main stream's extra run."""
     side = S.prefill_stream
+    ptrs = _prefill_round_ptrs(sc, li, rnd)
     side.wait_event(sc.free_event)
     with torch.cuda.stream(side):
-        _stage_and_repack(sc, _record_ptrs_v(li, rnd))
+        _stage_and_repack(sc, ptrs)
         sc.ready_event.record(side)
     sc.staged = list(rnd)
 
@@ -1031,7 +1178,7 @@ def _run_rounds(sc_of_round, li, ids, valid, missing, weights, hidden_states, ou
         elif prefetch_next and r > 0:
             main.wait_event(sc.ready_event)          # staged while round r - 1 ran
         else:
-            _stage_and_repack(sc, _record_ptrs_v(li, rnd))
+            _stage_and_repack(sc, _prefill_round_ptrs(sc, li, rnd))
             sc.staged = list(rnd)
         assert sc.staged == list(rnd), f"prefill round {r} of layer {li}: set holds {len(sc.staged)} experts, round wants {len(rnd)}"
         if prefetch_next and r + 1 < len(rounds):
@@ -1156,8 +1303,10 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
         _log(f"DEBUG prefill layer {li}: {len(from_pool)} routed experts without a record and the layer's pool not "
              f"attached yet (no compact launch so far); reference skipped")
         return
+    release = lambda: None
     if from_store:
-        _stage_and_repack(sc, _record_ptrs_v(li, from_store))
+        ptrs, release = _acquire_records(li, from_store)   # staging order j * V + v; store tail: pinned / read now
+        _stage_and_repack(sc, ptrs)
     if from_pool:
         S.manager.copy.synchronize()
         torch.cuda.synchronize()
@@ -1178,6 +1327,7 @@ def _debug_prefill_reference(sc, li, ids, valid, weights, hidden_states, output,
     run_plan(plan=plan, scratch=buf, hidden_states=hidden_states, prepared=sc.prepared, topk_weights=weights, topk_ids=rids,
              output=ref2, unit_scale_contract=False)
     torch.cuda.synchronize()
+    release()
     o, r, r2 = output.float(), ref.float(), ref2.float()
     noise = (r - r2).abs().max().item()
     d = (o - r).abs()
@@ -1232,8 +1382,10 @@ def _debug_compact_reference(experts_impl, li, hidden_states, topk_weights, outp
     from_store = [e for e in routed if _has_record(li, e)]
     from_pool = [e for e in routed if not _has_record(li, e)]
     order = from_store + from_pool
+    release = lambda: None
     if from_store:
-        _stage_and_repack(sc, _record_ptrs_v(li, from_store))
+        ptrs, release = _acquire_records(li, from_store)   # staging order j * V + v; store tail: pinned / read now
+        _stage_and_repack(sc, ptrs)
     for j, e in enumerate(from_pool, start=len(from_store)):
         s = int(table[e])
         if s < 0:
@@ -1255,6 +1407,7 @@ def _debug_compact_reference(experts_impl, li, hidden_states, topk_weights, outp
     finally:
         S.ctx.want_ref_rows = False
     torch.cuda.synchronize()
+    release()
     ref_rows = getattr(S.ctx, "ref_rows", None)
     S.ctx.ref_rows = None
     n_pairs = T * K
@@ -1359,9 +1512,22 @@ def after_compiled(route: torch.Tensor) -> None:
 # ---------------------------------------------------------------------------------------------------------------
 # called around the model runner's execute_model (every target forward: eager, piecewise or a graph replay)
 # ---------------------------------------------------------------------------------------------------------------
+def _release_prefill_pins() -> None:
+    """Store tail: the resident records a prefill's last rounds pinned (prefill_fetch) are released once their H2D is
+    done (free_event); called before every live step so that pins never outlive a prefill (pinned records cannot be
+    evicted - a layer with more pins than DRAM slots would starve the dispatcher of spare slots)."""
+    for sc in (S.scratch, S.scratch2):
+        if sc is not None and sc.tail_last is not None:
+            sc.free_event.synchronize()
+            _prefill_release(*sc.tail_last)
+            sc.tail_last = None
+
+
 def runner_before_step() -> None:
     if not S.created or torch.cuda.is_current_stream_capturing():
         return
+    if S.store is not None and S.store.tail:
+        _release_prefill_pins()
     S.manager.before_launch()
 
 
@@ -1447,6 +1613,14 @@ def runner_after_step() -> None:
                     lat.append(f"{np.median((kv[:, 6] - kv[:, 5]) / 1e3):.0f}" if len(kv) else "-")
                 S.kpi["last_kpi_step_v"] = S.kpi.get("last_kpi_step", -1)
                 detail += f"; per virtual rank: median compute us per served layer {lat}, busy ms {[round(b / 1e6 / d_steps, 2) for b in tot.get('busy_ns_v', [])]}"
+            if S.store is not None and S.store.tail:
+                # the tiers' tails summed with virtual ranks (TierGroup.tail_stats): V fetches per cold expert
+                ts = S.tier.tail_stats(reset=True)
+                detail += (f"; store tail: NVMe fetches {ts['fetches']} (issue->landing {ts['fetch_ns'] / max(1, ts['fetches']) / 1e3:.0f} us "
+                           f"per request, exposed ~{ts['fetch_wait_ns'] / 1e6 / LOG_EVERY:.2f} ms per step), sync fetches {ts['sync_fetches']}, "
+                           f"prefill cold records {ts['prefill_fetches']} ({ts['prefill_ns'] / 1e9:.2f} s), evictions {ts['evictions']}, "
+                           f"resident {ts['resident']} spares {ts['spares']}, io errors {ts['io_errors']}"
+                           f"{f' ({S.V} virtual ranks summed)' if S.V > 1 else ''}")
         except Exception as ex:  # diagnostics only
             detail = f"; kpi detail failed: {ex!r}"
         _log(f"step {S.step}: tier steps {tot['steps']} pairs {tot['pairs']} errors {tot['errors']}; cpu busy "

@@ -88,6 +88,37 @@
 #            NCCL_P2P_LEVEL (SYS)  NCCL_P2P_DISABLE (0)  NCCL_CHANNELS ("" = NCCL's choice; a pin gives bit-identity across
 #                        boots - the all-reduce decomposition changes the outputs by ulps)
 #
+# Low RAM:   (384 / 256 / 128 GB hosts; 2026-11-04, docs/moet-hybrid.md "Hosts with less RAM"; all inert at the defaults = the 512 GB
+#            configuration. An NVMe mode needs an image with Dockerfile step 44 (--build-arg VLLM_MOET_ENGRAM_V2_PATCH=1, the
+#            -hyb-engram tags) with BAKED=1, or BAKED=0 with the checkout mounted; io_uring needs docker/sm120/seccomp-io_uring.json,
+#            which the launcher passes from its own checkout - docker's default seccomp profile denies io_uring_setup)
+#            ENGRAM_MODE (ram)       ram = vLLM's pinned Engram tables (2 x 23.6 GiB per rank); nvme = Engram v2: no pinned tables, the
+#                        rows come from the checkpoint's safetensors shards on NVMe through a DRAM row cache + an io_uring fetcher
+#                        per rank (tools/dsv41_5090/engram_v2/), vLLM's own lookup kernel dequantizes them from a device landing
+#                        buffer (bit-identical rows). Measured 11-04: 457 -> 271 GB used, decode unchanged, TTFT +0.1-0.5 s
+#            ENGRAM_CACHE_GIB (2)    the DRAM row cache per rank (plain memory, split over the two Engram layers)
+#            ENGRAM_QD (64)          io_uring depth per rank (128 equal, 256 slower in this implementation);  ENGRAM_TIMEOUT_MS (2000)
+#                        the in-stream wait's bound (fail-closed)
+#            ENGRAM_RESIDENT_SCALES (1)  this rank's ue8m0 scales stay in RAM (8 B per row: 1.5 GB per rank for the two tables), so a
+#                        row costs one NVMe read instead of two - Fraser Price's BRRR recipe does the same (bench: a decode step's
+#                        rows 133 -> 92 us median, a cold 4096-token chunk 101 -> 46 ms); 0 on the tightest hosts
+#            ENGRAM_POLLED (1)       the fetcher runs on the CPU tier's dispatcher thread (its dedicated core); 0 = a thread of its own
+#                        on ENGRAM_FETCH_CPU ("" = 8*rank+33)
+#            ENGRAM_LOOKAHEAD (1)    the prompt's rows hashed on the host and the next ENGRAM_LOOKAHEAD_CHUNKS (4) chunks' rows prefetched
+#                        into the row cache during a prefill (only a prompt's first chunk pays the NVMe latency)
+#            STORE_NVME (0)          1 = the expert store's cold tail on NVMe: only STORE_DRAM_RECORDS records per layer per rank stay
+#                        pinned (an LRU), the rest are read from the store files on a miss (io_uring, 4.7 MB reads into a spare
+#                        slot; kernel v2 computes from it - bit-identical rows); the prefill streaming and the promotions read their
+#                        cold records the same way. Measured 11-04: N = 230 -> 194 GB used, decode -10 / -14 %, TTFT 2.1-2.2x;
+#                        N = 110 -> 106 GB, -24 / -35 %, TTFT 3.3-3.6x (identity PASS at N = 110)
+#            STORE_DRAM_RECORDS (0)  records per layer per rank kept in DRAM when STORE_NVME=1 (0 = all 344 = today's store)
+#            STORE_NVME_QD (8)       record reads in flight per rank (also the prefill's reader threads)
+#            With TP=2 / TP=1 both compose with the virtual ranks: the store tail is PER SLICE (STORE_DRAM_RECORDS counts per layer
+#                        per store rank, so a process pins N x 4.7 MB x 40 x (4 / TP) = the same host RAM per GPU card as at TP4; a
+#                        cold expert is 4 / TP concurrent record reads), Engram v2 is per TP-rank process (vLLM's own head sharding:
+#                        12 heads at TP2, 24 at TP1; one fetcher, polled by virtual rank 0's dispatcher). The image needs steps 43
+#                        AND 44 from a checkout with the virtual ranks (the -hyb-next tag); serve_hybrid.sh refuses an older one
+#
 # Diagnostics: LOG_EVERY (100)  KPI line period (steps);  TIER_DEBUG (0)
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
@@ -99,9 +130,27 @@ set -euo pipefail
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
 : "${STORE:?STORE (the expert store written by tools/dsv41_5090/cpu_moe/build_store.py) is required}"
 BAKED="${BAKED:-1}"
-# the baked image by default (Dockerfile step 43 built in); the dev flow (BAKED=0) mounts the checkout and runs the patcher at start
+ENGRAM_MODE="${ENGRAM_MODE:-ram}"
+ENGRAM_CACHE_GIB="${ENGRAM_CACHE_GIB:-2}"
+ENGRAM_FETCH_CPU="${ENGRAM_FETCH_CPU:-}"
+ENGRAM_QD="${ENGRAM_QD:-64}"
+ENGRAM_TIMEOUT_MS="${ENGRAM_TIMEOUT_MS:-2000}"
+ENGRAM_POLLED="${ENGRAM_POLLED:-1}"
+ENGRAM_RESIDENT_SCALES="${ENGRAM_RESIDENT_SCALES:-1}"
+ENGRAM_LOOKAHEAD="${ENGRAM_LOOKAHEAD:-1}"
+ENGRAM_LOOKAHEAD_CHUNKS="${ENGRAM_LOOKAHEAD_CHUNKS:-4}"
+STORE_NVME="${STORE_NVME:-0}"
+STORE_DRAM_RECORDS="${STORE_DRAM_RECORDS:-0}"
+STORE_NVME_QD="${STORE_NVME_QD:-8}"
+NVME_TIER=0; [[ "$ENGRAM_MODE" == "nvme" || "$STORE_NVME" == "1" ]] && NVME_TIER=1
+# the baked image by default (Dockerfile step 43 built in; the NVMe modes need step 44 too: the -hyb-engram tag); the dev flow
+# (BAKED=0) mounts the checkout and runs the patcher(s) at start
 if [[ "$BAKED" == "1" ]]; then
-  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
+  if [[ "$NVME_TIER" == "1" ]]; then
+    IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-engram}"
+  else
+    IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
+  fi
 else
   IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
 fi
@@ -179,6 +228,27 @@ else
 fi
 # the store may be a directory of symlinks into another store (the mini-real test): STORE_ROOT mounts that root too
 [[ -n "$STORE_ROOT" ]] && MOUNTS+=(-v "$STORE_ROOT:$STORE_ROOT:ro")
+# the low-RAM tiers (ENGRAM_MODE=nvme / STORE_NVME=1): io_uring needs a seccomp profile that allows it (the checkout's);
+# BAKED=0 runs the engram_v2 patcher at start from the mounted checkout, BAKED=1 expects the image's step 44
+SECCOMP_ARGS=()
+if [[ "$NVME_TIER" == "1" ]]; then
+  [[ -f "$REPO/docker/sm120/seccomp-io_uring.json" ]] || { echo "missing $REPO/docker/sm120/seccomp-io_uring.json (io_uring for the NVMe tiers)" >&2; exit 1; }
+  SECCOMP_ARGS=(--security-opt "seccomp=$REPO/docker/sm120/seccomp-io_uring.json")
+fi
+if [[ "$ENGRAM_MODE" == "nvme" ]]; then
+  # the weight iterator's skip of the 2 x 98 GB engram.embed tensors must be in the workers' environment before vLLM's loader
+  # modules import (the runtime sets it too, but engram.py may import after ep_weight_filter.py)
+  TIER_ENV+=(-e ENGRAM_PATCH_AT_START="$([[ "$BAKED" == "1" ]] && echo 0 || echo 1)" -e 'VLLM_MOET_SKIP_WEIGHT_RE=(^|\.)engram\.embed\.(weight|scale)$'
+             -e VLLM_MOET_ENGRAM_MODE=nvme -e VLLM_MOET_ENGRAM_CACHE_GIB="$ENGRAM_CACHE_GIB" -e VLLM_MOET_ENGRAM_QD="$ENGRAM_QD"
+             -e VLLM_MOET_ENGRAM_TIMEOUT_MS="$ENGRAM_TIMEOUT_MS" -e VLLM_MOET_ENGRAM_MODEL_DIR=/model -e VLLM_MOET_ENGRAM_LOG=1
+             -e VLLM_MOET_ENGRAM_LOG_EVERY="$LOG_EVERY" -e VLLM_MOET_ENGRAM_POLLED="$ENGRAM_POLLED" -e VLLM_MOET_ENGRAM_LOOKAHEAD="$ENGRAM_LOOKAHEAD"
+             -e VLLM_MOET_ENGRAM_LOOKAHEAD_CHUNKS="$ENGRAM_LOOKAHEAD_CHUNKS" -e VLLM_MOET_ENGRAM_RESIDENT_SCALES="$ENGRAM_RESIDENT_SCALES")
+  [[ -n "$ENGRAM_FETCH_CPU" ]] && TIER_ENV+=(-e VLLM_MOET_ENGRAM_FETCH_CPU="$ENGRAM_FETCH_CPU")
+fi
+if [[ "$STORE_NVME" == "1" ]]; then
+  TIER_ENV+=(-e VLLM_MOET_CPU_TIER_STORE_NVME=1 -e VLLM_MOET_CPU_TIER_STORE_DRAM_RECORDS="$STORE_DRAM_RECORDS"
+             -e VLLM_MOET_CPU_TIER_STORE_NVME_QD="$STORE_NVME_QD")
+fi
 if [[ -n "$RESIDENT" ]]; then
   TIER_ENV+=(-e VLLM_MOET_CPU_TIER_RESIDENT="$RESIDENT")
 else
@@ -210,6 +280,7 @@ docker run -d --name "$NAME" --restart no \
   --ipc host --shm-size 32g \
   -p "${BIND}${PORT}:${PORT}" \
   --ulimit memlock=-1:-1 --ulimit stack=67108864 \
+  ${SECCOMP_ARGS[@]+"${SECCOMP_ARGS[@]}"} \
   "${MOUNTS[@]}" \
   -e VLLM_ENGINE_READY_TIMEOUT_S=3600 \
   -e NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-0}" -e NCCL_P2P_LEVEL="$NCCL_P2P_LEVEL" \

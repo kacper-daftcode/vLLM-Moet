@@ -75,6 +75,25 @@ def host_lib(path: str | None = None):
     lib.cpu_tier_pool_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
     lib.moe_b12x_init_tables.restype = ctypes.c_int
     lib.moe_b12x_init_tables.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    # the store tail (2026-11-04)
+    lib.cpu_tier_store_tail_init.restype = ctypes.c_int
+    lib.cpu_tier_store_tail_init.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int64, ctypes.c_int,
+                                             ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p]
+    lib.cpu_tier_set_record_cold.restype = ctypes.c_int
+    lib.cpu_tier_set_record_cold.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.cpu_tier_store_tail_adopt.restype = ctypes.c_int64
+    lib.cpu_tier_store_tail_adopt.argtypes = [ctypes.c_void_p]
+    lib.cpu_tier_record_acquire.restype = ctypes.c_int64
+    lib.cpu_tier_record_acquire.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.cpu_tier_record_release.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.cpu_tier_prefill_fetch.restype = ctypes.c_int64
+    lib.cpu_tier_prefill_fetch.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    lib.cpu_tier_prefill_release.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+    lib.cpu_tier_record_state.restype = ctypes.c_int
+    lib.cpu_tier_record_state.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.cpu_tier_tail_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
+    lib.cpu_tier_set_poll_hook.restype = ctypes.c_int
+    lib.cpu_tier_set_poll_hook.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     return lib
 
 
@@ -90,33 +109,64 @@ RECORD_BYTES = 4700160
 
 class ExpertStore:
     """A rank's expert records in one host arena (pinned through the extension, or a plain allocation), loaded
-    from build_store.py's files for the (layer, expert) pairs of `mask` ([n_layers, n_experts] bool; None = all)."""
+    from build_store.py's files for the (layer, expert) pairs of `mask` ([n_layers, n_experts] bool; None = all).
+
+    The store tail (dram_records = N > 0): only the first N experts of each layer's mask (in `warm_order` if given,
+    else by id) are read into the arena; the rest are "cold" - the tier reads them from the store files on a miss
+    into spare arena slots (an LRU of N records per layer: the arena has N x layers + spare slots) and the prefill
+    streaming reads them into its own pinned arena (prefill_sets x prefill_slots records). attach() wires it all."""
 
     def __init__(self, store_dir: str, rank: int, n_layers: int, n_experts: int, mask=None, pinned: bool = True,
-                 nthreads: int = 16, lib=None, ext=None):
+                 nthreads: int = 16, lib=None, ext=None, dram_records: int = 0, spare_slots: int = 10, warm_order=None,
+                 prefill_sets: int = 0, prefill_slots: int = 0, tail_qd: int = 8):
         self.lib = lib or host_lib()
         self.dir, self.rank, self.n_layers, self.n_experts = store_dir, rank, n_layers, n_experts
         m = np.ones((n_layers, n_experts), dtype=np.uint8) if mask is None else np.ascontiguousarray(mask, dtype=np.uint8)
+        self.tail = dram_records > 0
+        self.dram_records, self.tail_qd = dram_records, tail_qd
+        self.cold = np.zeros((n_layers, n_experts), dtype=np.uint8)
+        if self.tail:
+            # the warm subset: N per layer; everything else in the mask is cold
+            warm = np.zeros_like(m)
+            for l in range(n_layers):
+                cand = np.nonzero(m[l])[0]
+                if warm_order is not None:
+                    order = [e for e in warm_order[l] if m[l, e]]
+                    cand = np.array(order + [e for e in cand if e not in set(order)], dtype=np.int64)
+                warm[l, cand[:dram_records]] = 1
+            self.cold = (m & ~warm).astype(np.uint8)
+            m = warm
         self.n_records = int(m.sum())
-        self.nbytes = self.n_records * RECORD_BYTES
+        self.n_cold = int(self.cold.sum())
+        self.n_slots = (dram_records * n_layers + spare_slots) if self.tail else self.n_records
+        self.nbytes = self.n_slots * RECORD_BYTES
         self.pinned = pinned
         self.slot_of = np.full((n_layers, n_experts), -1, dtype=np.int32)
         self.load_seconds = 0.0
-        if self.n_records == 0:   # nothing to pin (e.g. every expert resident): an empty store
+        self.prefill_sets, self.prefill_slots = (prefill_sets, prefill_slots) if self.tail else (0, 0)
+        self.prefill_base = 0
+        if self.n_slots == 0:   # nothing to pin (e.g. every expert resident): an empty store
             self.base = 0
             return
         if pinned:
             self.ext = ext or cuda_ext()
             self.base = int(self.ext.alloc_pinned(self.nbytes))
+            if self.prefill_sets * self.prefill_slots:
+                self.prefill_base = int(self.ext.alloc_pinned(self.prefill_sets * self.prefill_slots * RECORD_BYTES))
         else:
-            self._buf = np.empty(self.nbytes, dtype=np.uint8)
-            self.base = int(self._buf.ctypes.data)
+            # plain memory, 4 KB-aligned (the tail's O_DIRECT reads land in the arena)
+            self._buf = np.empty(self.nbytes + 4096, dtype=np.uint8)
+            self.base = (int(self._buf.ctypes.data) + 4095) // 4096 * 4096
+            if self.prefill_sets * self.prefill_slots:
+                self._pbuf = np.empty(self.prefill_sets * self.prefill_slots * RECORD_BYTES + 4096, dtype=np.uint8)
+                self.prefill_base = (int(self._pbuf.ctypes.data) + 4095) // 4096 * 4096
         t0 = time.perf_counter()
-        rc = self.lib.cpu_tier_store_load(store_dir.encode(), rank, n_layers, n_experts, m.ctypes.data, self.base,
-                                          self.nbytes, self.slot_of.ctypes.data, nthreads)
+        if self.n_records:
+            rc = self.lib.cpu_tier_store_load(store_dir.encode(), rank, n_layers, n_experts, m.ctypes.data, self.base,
+                                              self.nbytes, self.slot_of.ctypes.data, nthreads)
+            if rc != self.n_records:
+                raise RuntimeError(f"store load failed: rc={rc} (dir {store_dir}, rank {rank}, {self.n_records} records)")
         self.load_seconds = time.perf_counter() - t0
-        if rc != self.n_records:
-            raise RuntimeError(f"store load failed: rc={rc} (dir {store_dir}, rank {rank}, {self.n_records} records)")
 
     def ptr(self, layer: int, expert: int) -> int:
         s = int(self.slot_of[layer, expert])
@@ -128,15 +178,26 @@ class ExpertStore:
         """uint8 [RECORD_BYTES] CPU tensor view (pinned when the arena is: a non_blocking H2D source)."""
         if self.pinned:
             return self.ext.host_view(self.ptr(layer, expert), RECORD_BYTES)
-        s = int(self.slot_of[layer, expert])
-        return torch.from_numpy(self._buf[s * RECORD_BYTES:(s + 1) * RECORD_BYTES])
+        off = self.ptr(layer, expert) - int(self._buf.ctypes.data)
+        return torch.from_numpy(self._buf[off:off + RECORD_BYTES])
 
-    def attach(self, tier: "CpuTier") -> None:
-        for layer in range(self.n_layers):
+    def attach(self, tier: "CpuTier", tier_layers=None) -> None:
+        """Hands the records to the tier: the loaded ones by pointer, and in tail mode the cold ones as fetchable, the
+        arena as the tier's LRU (the loaded records become its resident slots) and the prefill arena. tier_layers:
+        the store (model) layer of every tier layer (None = the tier's layers are the store's, in order)."""
+        tl = list(range(self.n_layers)) if tier_layers is None else list(tier_layers)
+        for li, layer in enumerate(tl):
             for e in range(self.n_experts):
                 s = int(self.slot_of[layer, e])
                 if s >= 0:
-                    tier.set_record(layer, e, self.base + s * RECORD_BYTES)
+                    tier.set_record(li, e, self.base + s * RECORD_BYTES)
+        if self.tail:
+            tier.store_tail_init(self.dir, self.rank, self.base, self.n_slots, self.dram_records, self.tail_qd, self.prefill_base,
+                                 self.prefill_sets, self.prefill_slots, file_layers=tl)
+            for li, layer in enumerate(tl):
+                for e in np.nonzero(self.cold[layer])[0]:
+                    tier.set_record_cold(li, int(e))
+            tier.store_tail_adopt()
 
 
 class CpuTier:
@@ -173,10 +234,64 @@ class CpuTier:
         self._miss_cursor = ctypes.c_int64(0)
         self._use_cursor = ctypes.c_int64(0)
         self.started = False
+        self.tail = False
 
     # ---- store ------------------------------------------------------------------------------------------------
     def set_record(self, layer: int, expert: int, host_ptr: int) -> None:
         assert self.lib.cpu_tier_set_record(self.handle, layer, expert, host_ptr) == 0
+
+    # ---- the store tail (the 256 / 128 GB tiers) ----------------------------------------------------------------
+    def store_tail_init(self, store_dir: str, rank: int, arena_ptr: int, n_slots: int, per_layer: int, qd: int,
+                        prefill_ptr: int = 0, prefill_sets: int = 0, prefill_slots: int = 0, file_layers=None) -> None:
+        fl = None if file_layers is None else np.ascontiguousarray(file_layers, dtype=np.int32)
+        rc = self.lib.cpu_tier_store_tail_init(self.handle, store_dir.encode(), rank, arena_ptr, n_slots, per_layer, qd,
+                                               prefill_ptr, prefill_sets, prefill_slots, None if fl is None else fl.ctypes.data)
+        if rc != 0:
+            raise RuntimeError(f"cpu_tier_store_tail_init failed: rc {rc} (store files? io_uring denied by seccomp?)")
+        self.tail = True
+
+    def set_record_cold(self, layer: int, expert: int) -> None:
+        assert self.lib.cpu_tier_set_record_cold(self.handle, layer, expert) == 0
+
+    def store_tail_adopt(self) -> int:
+        return int(self.lib.cpu_tier_store_tail_adopt(self.handle))
+
+    def record_acquire(self, layer: int, expert: int) -> int:
+        """A pinned host pointer to the record (resident: pinned in place; cold: read now, inserted, pinned). 0 = none.
+        Release with record_release once the copy that uses it has completed (host-observed)."""
+        return int(self.lib.cpu_tier_record_acquire(self.handle, layer, expert))
+
+    def record_release(self, layer: int, expert: int) -> None:
+        self.lib.cpu_tier_record_release(self.handle, layer, expert)
+
+    def record_state(self, layer: int, expert: int) -> int:
+        """1 = in DRAM now, 0 = cold (fetchable), -1 = not in the store."""
+        return int(self.lib.cpu_tier_record_state(self.handle, layer, expert))
+
+    def prefill_fetch(self, layer: int, experts, set_index: int, nthreads: int = 8) -> list[int]:
+        """Host pointers for a prefill round's experts: resident records pinned in place, cold ones read into the
+        prefill arena's set `set_index`. Blocking (the NVMe reads). Release the pins with prefill_release."""
+        ex = np.ascontiguousarray(experts, dtype=np.int32)
+        out = np.zeros(len(ex), dtype=np.int64)
+        rc = self.lib.cpu_tier_prefill_fetch(self.handle, layer, ex.ctypes.data, len(ex), set_index, out.ctypes.data, nthreads)
+        if rc < 0:
+            raise RuntimeError(f"cpu_tier_prefill_fetch failed: rc {rc}")
+        return [int(p) for p in out]
+
+    def prefill_release(self, layer: int, experts) -> None:
+        ex = np.ascontiguousarray(experts, dtype=np.int32)
+        self.lib.cpu_tier_prefill_release(self.handle, layer, ex.ctypes.data, len(ex))
+
+    def set_poll_hook(self, fn, arg) -> None:
+        """fn: a C function pointer `void fn(void*)` (ctypes) the dispatcher calls once per loop iteration; None clears it."""
+        fp = None if fn is None else ctypes.cast(fn, ctypes.c_void_p)
+        assert self.lib.cpu_tier_set_poll_hook(self.handle, fp, arg) == 0
+
+    def tail_stats(self, reset: bool = False) -> dict:
+        buf = (ctypes.c_int64 * 11)()
+        self.lib.cpu_tier_tail_stats(self.handle, buf, 1 if reset else 0)
+        return dict(fetches=buf[0], fetch_ns=buf[1], fetch_wait_ns=buf[2], sync_fetches=buf[3], prefill_fetches=buf[4],
+                    prefill_ns=buf[5], io_errors=buf[6], evictions=buf[7], resident_serves=buf[8], resident=buf[9], spares=buf[10])
 
     # ---- lifecycle --------------------------------------------------------------------------------------------
     def start(self, first_step: int = 1) -> None:
@@ -294,6 +409,24 @@ class TierGroup:
     # ---- store: the record of (layer, expert) for virtual rank v ---------------------------------------------------
     def set_record(self, layer: int, expert: int, host_ptr: int, v: int = 0) -> None:
         self.tiers[v].set_record(layer, expert, host_ptr)
+
+    # ---- the store tail: PER virtual rank (ExpertStore v attaches to tiers[v]: its own LRU, io_uring fetcher on its
+    # dispatcher thread, prefill arena; the runtime acquires / fetches / releases on every tier) -----------------------
+    @property
+    def tail(self) -> bool:
+        return any(t.tail for t in self.tiers)
+
+    def tail_stats(self, reset: bool = False) -> dict:
+        """The V tiers' tail counters summed (a cold expert is V record fetches, one per slice; resident / spares too)."""
+        out: dict = {}
+        for t in self.tiers:
+            s = t.tail_stats(reset)
+            out = s if not out else {k: out[k] + s[k] for k in out}
+        return out
+
+    def set_poll_hook(self, fn, arg) -> None:
+        """A poll hook (Engram v2's fetcher) runs on virtual rank 0's dispatcher thread."""
+        self.tiers[0].set_poll_hook(fn, arg)
 
     # ---- lifecycle --------------------------------------------------------------------------------------------
     def start(self, first_step: int = 1) -> None:

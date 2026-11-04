@@ -341,6 +341,22 @@ RUN if [ "$VLLM_MOET_CPU_TIER_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_
     && ls /opt/vllm-moet/cpu_tier/libcpu_tier.so \
     && python3 -c "import vllm_moet_cpu_tier, cpu_tier, placement_manager; print('cpu tier runtime importable')"; fi
 
+# 44. The hybrid on hosts with less RAM (docs/moet-hybrid.md "Hosts with less RAM"): Engram v2 - the Engram tables stay on NVMe, a
+#     DRAM row cache + an io_uring fetcher per rank serve the rows and vLLM's own lookup kernel dequantizes them from a device
+#     landing buffer (bit-identical rows; tools/dsv41_5090/engram_v2/). The patcher installs the runtime into /opt/vllm-moet/engram_v2
+#     (+ a .pth), builds libengram_v2.so (io_uring on raw syscalls, no liburing) and patches engram.py / ep_weight_filter.py / the
+#     model runner with markers; the CUDA extension is JIT-built at the first lookup (~30 s once, cached under /root/.cache). The
+#     expert store's NVMe tail (STORE_NVME) lives in step 43's tier. Inert unless VLLM_MOET_ENGRAM_MODE=nvme (the launcher's
+#     ENGRAM_MODE=nvme / STORE_NVME=1, which also pass docker/sm120/seccomp-io_uring.json - docker's default seccomp profile denies
+#     io_uring). Needs step 43. Default 0; the -hyb-engram tags are built with --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1.
+ARG VLLM_MOET_ENGRAM_V2_PATCH=0
+RUN if [ "$VLLM_MOET_ENGRAM_V2_PATCH" = "1" ]; then [ "$VLLM_MOET_CPU_TIER_PATCH" = "1" ] || { echo "step 44 (Engram v2) needs step 43 (the CPU tier)"; exit 1; } \
+    && python3 /opt/vllm-moet/dsv41_5090/engram_v2/patch_vllm_engram_v2.py \
+    && for f in vllm/models/deepseek_v41/common/engram.py vllm/model_executor/model_loader/ep_weight_filter.py vllm/v1/worker/gpu/model_runner.py; do \
+         grep -q "\[vllm-moet\] engram v2" /usr/local/lib/python3.12/dist-packages/$f || exit 1; done \
+    && ls /opt/vllm-moet/engram_v2/libengram_v2.so \
+    && python3 -c "import vllm_moet_engram_v2, engram_v2; import cpu_tier; assert hasattr(cpu_tier.CpuTier, 'store_tail_init'); print('engram v2 runtime importable, the tier has the store tail')"; fi
+
 # Labels: the launcher reads kv-mode and v41-kv-records; the tests and docs read the step flags.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="DeepSeek-V4.1-Flash on sm_120: vllm/vllm-openai nightly df3bd094 with the sm_120 gaps closed and the decode / prefill kernels of vLLM-Moet (docs/dsv41-sm120.md)" \
@@ -380,4 +396,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.prefill-sp="${VLLM_MOET_PREFILL_SP_PATCH}" \
       com.vllm-moet.b12x-moe-prefill-fast="${VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}" \
-      com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}"
+      com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}" \
+      com.vllm-moet.engram-v2="${VLLM_MOET_ENGRAM_V2_PATCH}"
