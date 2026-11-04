@@ -151,9 +151,9 @@ forces plain ranks; `VRANK_CPUS` / `VRANK_DISPATCHERS` lay the pools out on anot
 dispatcher 8g+1 and pool 8g+2..8g+7 per CCD g). `SCRATCH` counts slices (an expert = 4 / TP slots); `DEBUG_COMPACT` needs `SCRATCH ≥ 48 × 4 / TP`.
 `tp4_window.sh` takes `TP` / `GPUS` (the KPI lines of every rank carry their virtual ranks' in-kernel µs). The same image serves every TP
 (`vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-tp12` = this branch's step 43 on the merged `-r23` layers): on it the TP4 path is the
-record's (identity 0 mismatches over 19,080 compact calls per rank, 143–146 / 121–125 tok/s, TTFT 0.93 / 3.33 / 6.73 s at 2K / 14K / 30K)
-and TP2 repeats the numbers above (0 mismatches over 15,160 calls per rank; 44–46 / 47 tok/s; TTFT 1.89 / 7.42 s; the compact-path outputs
-bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
+record's (identity 0 mismatches over 19,080 compact calls per rank; 146.6 / 126.2 tok/s, TTFT 0.97 / 3.27 / 6.50 s at 2K / 14K / 30K — a
+sample with the box's `kcompactd0` on a pool core's SMT sibling gave 143 / 121) and TP2 repeats the numbers above (0 mismatches over
+15,160 calls per rank; 46.1 / 47.2 tok/s; TTFT 1.91 / 7.34 s; the compact-path outputs bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
 support and were not measured here: the run book — host requirements, the launcher lines at 96 GB, the window sequence, the expected
 numbers from the routing traces (~105–125 tok/s mixed / ~120–145 short at TP2, ~62–70 / ~80–90 at TP1) — is §13 of that note.
 
