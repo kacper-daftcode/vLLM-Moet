@@ -10,7 +10,7 @@ every rule below traces back to a real incident.
 | line | source of truth | how a change ships |
 |---|---|---|
 | DeepSeek-V4.1-Flash on 4× RTX PRO 6000 (active) | `tools/dsv41_sm120/` + `Dockerfile.sm120-dsv41-nightly` | a numbered Dockerfile step: an anchored patcher, a kernel with its op-level test, a build arg and a `com.vllm-moet.*` label, a runtime switch (`VLLM_MOET_*`, off by default until validated); `cubit_gate.py` on the built image; the step's row in `docs/dsv41-sm120.md` and `tools/dsv41_sm120/README.md` |
-| MoET hybrid on 4× RTX 5090 | `tools/dsv41_5090/` + the Dockerfile's CPU-tier step, `docker/sm120/run-dsv41-5090.sh` | the same; identity against the all-resident path is the gate |
+| MoET hybrid on 1–4× RTX 5090 | `tools/dsv41_5090/` (index in its README) + the Dockerfile's steps 43 (CPU tier) and 44 (Engram v2), `docker/sm120/run-dsv41-5090.sh` | the same; identity against the all-resident path (`DEBUG_COMPACT=1` in a `tp4_window.sh` boot) is the gate, at every TP and RAM tier a change touches |
 | 2-bit experts on vLLM v0.24.0 (frozen) | the vllm fork branch `moet-v0.24.0`; `patch/` is **generated** from it | the procedure below — never the patch file |
 | Qwen3.8-Flash-Next-FP8 | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` | as the first line |
 

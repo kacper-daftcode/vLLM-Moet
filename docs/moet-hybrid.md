@@ -1,4 +1,4 @@
-# The MoET hybrid: DeepSeek-V4.1-Flash on 4× RTX 5090 with CPU-computed experts
+# The MoET hybrid: DeepSeek-V4.1-Flash on 1–4× RTX 5090 with CPU-computed experts
 
 The official `deepseek-ai/DeepSeek-V4.1-Flash` checkpoint (552B MoE, MXFP4 experts, UE8M0 scales) served at native
 quality on four 32 GB GeForce RTX 5090 cards — a box the model does not fit. The cards hold the dense weights, the
@@ -6,7 +6,9 @@ KV cache and **110–120 of the 384 experts per MoE layer per TP rank**; every o
 **computed on the CPU** from the checkpoint's own bytes in pinned host RAM, in parallel with the GPU, and its rows are
 injected into the GPU's own MoE kernel before the top-k sum. No re-quantization, no replay: the hybrid's output is
 **bit-identical to the all-resident b12x path** on every step. The reference box: a Threadripper PRO 9975WX (32 cores,
-4 CCDs), 498 GB of DDR5, 4× RTX 5090 on PCIe 5.0 x16, NVMe for the stores.
+4 CCDs), 498 GB of DDR5, 4× RTX 5090 on PCIe 5.0 x16, NVMe for the stores. The same code runs on two cards or one
+(`TP=2` / `TP=1`, "virtual ranks" below) and on hosts with 384 / 256 / 128 GB of RAM (the Engram tables and the cold
+experts on NVMe, "Hosts with less RAM" below) — every configuration measured on the reference box, bit-identical in each.
 
 ## Measurements
 
@@ -26,7 +28,7 @@ datacenter — is [`benchmarks/moet-hybrid-4x5090-2026-11-04.md`](benchmarks/moe
 | quality, paired against the native FP4 reference (same prompts, greedy, thinking off) | **HumanEval 160/164 vs 160/164** (0 discordant, 127 identical programs, McNemar p = 1.0); **MATH-500 level 5: 55/60 vs 55/60** (1 / 1 discordant, 56 identical answers, p = 1.0) — 2026-11-04 on the served defaults; 2026-10-26 on the 120-slot configuration: 159/164 vs 160/164, 55/60 vs 55/60 |
 | identity | bit-exact against the all-resident b12x path within one boot: 21,040 compact calls per rank, 98,220 CPU-computed rows, 0 differ (`DEBUG_COMPACT=1`; re-run PASS at the 110-slot pool); the CPU kernel bit-exact against b12x's GPU kernels on four parity sets (0 of 890,880 `route_output` elements differ) |
 | expert hit rate (pairs resident) | 0.83–0.85 on short prompts, 0.87 on HumanEval, 0.91 on MATH-500 |
-| host RAM while up | ~457 GiB (the expert store 65 GB per rank + the Engram tables 2 × 23.6 GiB per rank, pinned), MemAvailable ~41 GiB. Hosts with less RAM (branch `moet-hybrid-next`, measured 2026-11-04 — the table in [`benchmarks/moet-hybrid-4x5090-2026-11-04.md`](benchmarks/moet-hybrid-4x5090-2026-11-04.md)): the Engram tables on NVMe → 278 GiB (307 with the full LRU) at the same speed; + the cold experts on NVMe → 236 GiB at 138 / 120 tok/s (TTFT 1.4–1.5×), 112 GiB at 112 / 83 (3.3×); footprint ≈ 35 GiB + 0.72 GiB × records per layer kept in DRAM |
+| host RAM while up | ~457 GiB (the expert store 65 GB per rank + the Engram tables 2 × 23.6 GiB per rank, pinned), MemAvailable ~41 GiB. Hosts with less RAM (measured 2026-11-04 — the section below and the table in [`benchmarks/moet-hybrid-4x5090-2026-11-04.md`](benchmarks/moet-hybrid-4x5090-2026-11-04.md)): the Engram tables on NVMe → 278 GiB (307 with the full LRU) at the same speed; + the cold experts on NVMe → 236 GiB at 138 / 120 tok/s (TTFT 1.4–1.5×), 112 GiB at 112 / 83 (3.3×); footprint ≈ 35 GiB + 0.72 GiB × records per layer kept in DRAM |
 | VRAM | ~29.3 GB per card at `GPU_MEM_UTIL` 0.90 with 110 expert slots; KV cache 1.28 GiB (nvfp4 MLA + mxfp4 indexer KV = 1.98 requests of 512K; a sequence's KV cost is sublinear in its length) |
 | boot | ~6 min (weights 160–250 s + 65 GB of records pinned per rank in ~60 s + warm-up) |
 
@@ -75,6 +77,8 @@ path; identity against the all-resident path is the quality gate.
 
 ```bash
 # the image: the DeepSeek-V4.1 image with Dockerfile step 43 (the CPU tier) built in; -march of the serving host's CPU
+# (znver4 | znver5 | sapphirerapids); add --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1 (step 44, the -hyb-engram tag) for the
+# NVMe modes of "Hosts with less RAM" - the launcher picks that tag by itself when an NVMe knob is on
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly \
   --build-arg VLLM_MOET_CPU_TIER_PATCH=1 --build-arg VLLM_MOET_CPU_TIER_ARCH=znver4 \
   -t vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb .
@@ -85,8 +89,13 @@ DSV41_MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash python tools/dsv41_5090/cpu_moe/
 mkdir -p /srv/cache/ds41-hyb/cpu-tier-tables
 CUDA_VISIBLE_DEVICES=1 tools/dsv41_5090/cpu_moe/qmma_probe --tables /srv/cache/ds41-hyb/cpu-tier-tables
 python tools/dsv41_5090/cpu_tier/b12x_layout_probe.py --out /srv/cache/ds41-hyb/cpu-tier-tables
-# serve
+# serve (4x 5090 + 512 GB: the flagship; port 8041)
 MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash STORE=/srv/packs/dsv41-hybrid CACHE_DIR=/srv/cache/ds41-hyb docker/sm120/run-dsv41-5090.sh
+# the other configurations (the same variables; the measured numbers in the two sections below)
+ENGRAM_MODE=nvme STORE_MODE=all RESIDENT=0 SPARE=110 docker/sm120/run-dsv41-5090.sh    # 4x 5090 + 384 GB: the full LRU, 307 GiB
+ENGRAM_MODE=nvme STORE_DRAM_RECORDS=auto docker/sm120/run-dsv41-5090.sh                # 4x 5090 + 256 / 128 GB: N from the host
+TP=2 docker/sm120/run-dsv41-5090.sh                                                      # 2x 5090 (GPUS=0,1); TP=1 for one card
+TP=2 ENGRAM_MODE=nvme STORE_DRAM_RECORDS=auto docker/sm120/run-dsv41-5090.sh           # 2x 5090 on a 256 / 128 GB host
 # the dev flow instead: the checkout mounted at /repo, the patcher applied at container start (~60 s), the plain -r23 image
 MODEL_DIR=... STORE=... CACHE_DIR=... BAKED=0 docker/sm120/run-dsv41-5090.sh
 ```
@@ -130,7 +139,7 @@ and `ccd_bw.cpp` (the expert from DRAM vs L3, one CCD's DRAM ceiling), `routing/
 `cpu_tier/ttft_probe.py` (streamed prefill TTFT on disjoint prompts), `cpu_tier/profile_anatomy.py` (the decode step's
 GPU busy / idle anatomy from a torch profile), `cpu_tier/cpu_placement_probe.sh` (who runs on the pool cores).
 
-## One or two GPUs: TP2 / TP1 through virtual ranks (branch `moet-hybrid-tp12`, 2026-11-04)
+## One or two GPUs: TP2 / TP1 through virtual ranks (2026-11-04)
 
 The same hybrid runs on 2× or 1× GPU with `TP=2` / `TP=1` in the launcher. b12x's compact W4A8 path — where the publish / inject
 hooks live and whose numerics the CPU kernel reproduces — exists only at the 576-row TP4 slice, so on one GPU every expert stays its
@@ -150,11 +159,12 @@ placement — `routing/placements/tp12-placement-0.026-uniform.json` for TP1 —
 forces plain ranks; `VRANK_CPUS` / `VRANK_DISPATCHERS` lay the pools out on another CPU geometry (default: TP rank r takes CCDs rV..rV+V−1,
 dispatcher 8g+1 and pool 8g+2..8g+7 per CCD g). `SCRATCH` counts slices (an expert = 4 / TP slots); `DEBUG_COMPACT` needs `SCRATCH ≥ 48 × 4 / TP`.
 `tp4_window.sh` takes `TP` / `GPUS` (the KPI lines of every rank carry their virtual ranks' in-kernel µs). The same image serves every TP
-(`vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-tp12` = this branch's step 43 on the merged `-r23` layers): on it the TP4 path is the
+(the step-43 `-r23-hyb` tag; the virtual-rank code is inert at V = 1): on it the TP4 path is the
 record's (identity 0 mismatches over 19,080 compact calls per rank; 146.6 / 126.2 tok/s, TTFT 0.97 / 3.27 / 6.50 s at 2K / 14K / 30K — a
 sample with the box's `kcompactd0` on a pool core's SMT sibling gave 143 / 121) and TP2 repeats the numbers above (0 mismatches over
 15,160 calls per rank; 46.1 / 47.2 tok/s; TTFT 1.91 / 7.34 s; the compact-path outputs bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
-support and were not measured here: the run book — host requirements, the launcher lines at 96 GB, the window sequence, the expected
+support and were not measured here: the run book — host requirements, the launcher lines at 96 GB (`TP=2 SPARE=160 GPU_MEM_UTIL=0.90
+MAX_MODEL_LEN=262144 MAX_NUM_BATCHED_TOKENS=8192 SCRATCH=128`; `TP=1 SPARE=80 … MAX_MODEL_LEN=131072`), the window sequence, the expected
 numbers from the routing traces (~105–125 tok/s mixed / ~120–145 short at TP2, ~62–70 / ~80–90 at TP1) — is §13 of that note.
 
 ## Hosts with less RAM: Engram v2 and the expert store's NVMe tail (2026-11-04)
@@ -186,8 +196,8 @@ mixed-prompt soak 84.4 tok/s):
 | 256 GB | `+ STORE_NVME=1 STORE_DRAM_RECORDS=230` | **194–200 GB** | **130.5–131.0 / 108.0–109.5** | 1.68 / 6.86 / 12.13 s (2.1–2.2×) | (the N = 110 check covers the path) |
 | 128 GB | `+ STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1` | **106–112 GB** | **111.0–112.4 / 81.5–82.5** | 2.83 / 11.07 / — (3.3–3.6×) | `DEBUG_COMPACT` PASS: 19,080 compact calls per rank, 0 mismatches |
 
-The working notes with every measurement and its command are the branch's handoff files (`engram-v2-2026-11-04.md` in the
-operators' notes, `HANDOFF-moet-hybrid-engram-v2.md`).
+The working notes with every measurement and its command are the operators' notes (`engram-v2-2026-11-04.md`,
+`HANDOFF-moet-hybrid-engram-v2.md`).
 
 **Filling the host: `STORE_DRAM_RECORDS=auto`.** N is continuous — one record per layer costs 4 slices × 40 layers × 4.7 MB = 0.72 GiB — and
 the host's footprint (`free` used, GiB; measured at N = 344 + the full LRU 307, 344 → 278, 280 → 236, 230 → 200, 120 → 120, 110 → 112) is
@@ -207,7 +217,7 @@ single-stream soak, 256-token completions) the full LRU's VRAM hit rate is 0.882
 everything in DRAM + the full LRU (`ENGRAM_MODE=nvme STORE_MODE=all RESIDENT=0 SPARE=110`, 307 GiB); 256 GiB → N ≈ 270 (≈ 229 GiB,
 ~20 GiB free; `auto` gives 279 at the default headroom); 128 GiB → N ≈ 105 with `ENGRAM_CACHE_GIB=1` (≈ 111 GiB; `auto` gives 106).**
 
-### The two together: TP2 / TP1 on hosts with less RAM (branch `moet-hybrid-next`, 2026-11-04)
+### The two together: TP2 / TP1 on hosts with less RAM (2026-11-04)
 
 Both mechanisms compose with the virtual ranks: the store tail is **per slice** — virtual rank v's records come from store rank
 r·V+v through its own DRAM LRU, io_uring fetcher (on its dispatcher thread) and prefill arena (`SCRATCH / V` records per set), so
@@ -219,7 +229,7 @@ NVMe fetches passes at TP1 (4 slices) and TP2 (`DEBUG_COMPACT` 9,184 compact cal
 `TP=2 ENGRAM_MODE=nvme STORE_NVME=1 STORE_DRAM_RECORDS=230` passes `DEBUG_COMPACT` (both ranks 11,280 compact calls, 0 mismatches);
 the compact-path outputs of every configuration below equal the pre-merge boots' at the same TP.
 
-Measured 11-04 on the image built from the branch (`…-r23-hyb-next`, Dockerfile steps 43 + 44; `BAKED=1`, `PREFIX_CACHE=0`; decode
+Measured 11-04 on the steps 43 + 44 image (`…-r23-hyb-engram` / its proof build `…-r23-hyb-next`; `BAKED=1`, `PREFIX_CACHE=0`; decode
 'Hello' / 'def fib(n):' tok/s, TTFT at 2K / 14K / 30K, host RAM `used`; the kernel-speed variance of the box's memory compaction moves
 a default-configuration sample by up to −7 %, the record samples are quoted):
 
@@ -231,7 +241,7 @@ a default-configuration sample by up to −7 %, the record samples are quoted):
 
 The 2× and 1× boxes lose little to the tail (the step is the CPU tier's already, the record reads overlap it): a 2× 5090 box with 256 GB
 serves at ~40 / 43 tok/s, with 128 GB at ~36 / 35; a 1× 5090 box with 128 GB at ~37 / 26. The per-window numbers, the identity checks and
-the commands are in the branch's handoff (`HANDOFF-moet-hybrid-next.md`).
+the commands are in the operators' notes (`HANDOFF-moet-hybrid-next.md`, `tp12-virtual-ranks-2026-11-04.md`, `engram-v2-2026-11-04.md`).
 
 ## Limits and open items
 

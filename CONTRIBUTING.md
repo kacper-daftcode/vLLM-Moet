@@ -5,7 +5,7 @@
 | line | status | where a change goes |
 |---|---|---|
 | DeepSeek-V4.1-Flash on 4× RTX PRO 6000 | active | `tools/dsv41_sm120/` + a step in `Dockerfile.sm120-dsv41-nightly` |
-| MoET hybrid on 4× RTX 5090 | serving on one reference box | `tools/dsv41_5090/` + Dockerfile step 43 |
+| MoET hybrid on 1–4× RTX 5090 | serving; measured on one reference box | `tools/dsv41_5090/` ([index](tools/dsv41_5090/README.md)) + Dockerfile steps 43 (the CPU tier) / 44 (Engram v2) |
 | 2-bit experts on vLLM v0.24.0 | frozen | the fork branch `moet-v0.24.0` of [`kacper-daftcode/vllm-tmp`](https://github.com/kacper-daftcode/vllm-tmp) — **not** `patch/` |
 | Qwen3.8-Flash-Next-FP8 | as built | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` |
 
