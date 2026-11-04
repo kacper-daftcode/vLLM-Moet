@@ -1,5 +1,11 @@
 # Host-side units of the rtxdev2 box (copies; the live files are under /etc)
 
+- `moet-kthread-affinity.service` → `/etc/systemd/system/`, `kthread-affinity.sh` → `/opt/moet/`: at boot, the kernel's
+  memory-management threads (`kcompactd0`, `kswapd0`, `khugepaged`) are pinned to the SMT siblings of the ranks' main / dispatcher
+  cores (32,33,40,41,48,49,56,57), off the CPU-tier pool cores and their siblings — after a few pin / unpin cycles of the hybrid's
+  ~450 GiB, `kcompactd0` grinds against the unmovable pages and, on a pool core's sibling, halves that core (+10–20 % per expert,
+  2026-11-04). `90-moet-compaction.conf` → `/etc/sysctl.d/`: `vm.compaction_proactiveness = 0` for the same reason.
+
 - `gpu-power-cap.service` → `/etc/systemd/system/gpu-power-cap.service`, `gpu-power-cap.default` → `/etc/default/gpu-power-cap`:
   the GPUs' power cap at boot (`CAP_W`, 400 W since 2026-10-25: GPU 0 fell off the PCIe bus twice under four-GPU
   full-power prefill at 430–440 W per card; the RTX 5090's default is 550 W, max 600). Ordered after the older
