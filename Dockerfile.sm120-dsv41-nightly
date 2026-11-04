@@ -1,339 +1,19 @@
-# vLLM-Moet: DeepSeek-V4.1-Flash on SM120 (RTX PRO 6000 Blackwell / RTX 5090) -- vLLM main line.
+# vLLM-Moet: DeepSeek-V4.1-Flash on sm_120 (RTX PRO 6000 Blackwell), the served image.
 #
-# The rebase of Dockerfile.sm120-dsv41 (vllm-openai:deepseekv41-flash-0909 + our patches) onto
-# vllm/vllm-openai:nightly (vLLM main; the recipe marks 0909 "superseded"). Same idea as the 0909 image: the
-# official image plus the sm_120 gaps closed, nothing else. Base: nightly df3bd094 (vLLM main of 2026-10-20,
-# 0.32.1rc1.dev117: torch 2.14 / triton 3.8, FlashInfer 0.7.2, DeepGEMM 727f8470 on torch's stable ABI, the decoder
-# replay starting at the last KV-source layer (vllm#59894), the indexer's TP row sharding (vllm#54951) with its
-# threshold configurable (vllm#61647)); the 49cb2bbf images (vLLM main of 2026-10-16, DeepGEMM a7a92773) came from
-# this file at 213d5fa, and steps 3, 8 and 14 still apply to both. It writes the V4.1 KV records
-# interleaved (vllm#61371, f8460ef236: each token's scales right after its data, for FlashMLA 2026.09.30), while
-# FlashInfer's SM120 DSv4.1 reader (0.7.1, 0.7.2) reads the footer layout (a page's data, then its scales): step 5
-# teaches FlashInfer the interleaved placement first (flashinfer_interleaved/, kv_scale_placement, its
-# sparse_mla_sm120 module rebuilt into data/aot) and the vLLM patch passes it. The 3f1bcfd8 images (nightly
-# 3f1bcfd82b, the last before vllm#61371, FlashInfer 0.7.1, DeepGEMM 6ce1c5ec) came from this file at c17e262.
+# The official vllm/vllm-openai nightly (df3bd094: torch 2.14, FlashInfer 0.7.2, DeepGEMM 727f8470) plus the sm_120
+# changes, numbered as steps: DeepGEMM rebuilt with its SM120 host asserts fixed (1), FlashInfer taught vLLM's
+# interleaved V4.1 KV records (2), anchored patchers on the installed vLLM / FlashInfer and CUDA extensions compiled
+# here so nothing JIT-compiles at boot (3-42). Every step is a build argument (--build-arg VLLM_MOET_<STEP>=0 leaves
+# it out) and lands in a com.vllm-moet.* label the launcher and the tests read. What each step does, its runtime
+# switch and the state production serves: docs/dsv41-sm120.md; the measurements behind it:
+# docs/dsv41-sm120-internals.md; the patchers, kernels and tests by step: tools/dsv41_sm120/README.md.
 #
-#   1. FlashInfer 0.7.2 from the base image (python / cubin / jit-cache + every per-arch AOT provider incl. sm120f):
-#      runtime page-size / head / top-k dispatch for the SM120 sparse MLA (the 0909 image needed our own
-#      instantiations + dispatch hook: tools/dsv41_sm120/patch_flashinfer.py and sparse_mla_sm120_dsv41.cu -- NOT
-#      applied here) and the DSv4.1 dual cache of flashinfer-ai/flashinfer#5197 that reads the 288-B NVFP4
-#      compressed record with the 528-B V4.1 fp8 sliding-window record (`kv_cache_format="fp8_dsv41_fp4_ca"`), so
-#      the fp8_ds_mla scratch/pool of the 0909 image (nvfp4_kv/patch_vllm_packed_kv_sm120.py) is NOT applied
-#      either. Step 5 patches its DSv4.1 reader for the interleaved records and installs the rebuilt
-#      sparse_mla_sm120 module as data/aot/, which FlashInfer loads before the sm120f provider's copy.
-#      FlashInfer loads its other sm_120 modules AOT from the sm120f provider; only its autotuner's delay kernel
-#      (trtllm_utils, AOT for sm90 / sm100 / sm103 only) JIT-compiles while it autotunes (4 s, first start of a
-#      FlashInfer version).
-#   2. DeepGEMM at the commit vLLM vendors (vllm-project/DeepGEMM a7a92773): SM120 FP8 and MXFP4 paged MQA logits
-#      accept the 128-row indexer pages of the compress_ratio=1 layers - the kernels take the page size and run
-#      64-row tiles inside it, the launchers get 128 admitted and their TMA boxes / smem stages / warp groups
-#      sized by the tile - and the SM120 per-group BLOCK_M of the contiguous grouped layout is restored (the
-#      fork's port of the SM120 kernels kept upstream's SM100-only heuristic: vLLM padded every routed expert to
-#      128 rows and the MoE grouped GEMM took 2x at decode) (tools/dsv41_sm120/patch_deepgemm.py); the
-#      _C_extension is rebuilt INSIDE the official image. vLLM's sm_10x-only gate on the MXFP4 indexer cache is
-#      lifted (patch_vllm_indexer_fp4_sm120.py).
-#   3. Decode-shaped dense MXFP8 GEMMs (M <= 16) on the vLLM-Moet tensor-core GEMV and the grouped
-#      o-projection wo_a in MXFP8 on the same kernel (patch_vllm_mxfp8_gemv.py, patch_vllm_wo_a_sm120.py;
-#      VLLM_MOET_SM120_GEMV=0 / VLLM_MOET_SM120_GEMV_BMM=0 revert); DeepGEMM MoE glue at decode token
-#      counts (patch_vllm_moe_glue_sm120.py).
-#   4. Reasoning effort: since vllm#58316 vLLM's table holds the released checkpoint's tiers (low 50 / high 75 /
-#      max 100, default high) plus xhigh at high's 75; patch_vllm_reasoning_effort.py adds the OpenAI-vocabulary
-#      aliases as served before the rebase - minimal 25 and medium 62 (the chat protocol accepts them, vLLM's
-#      tokenizer wrapper answered HTTP 400) and xhigh 87 - so the table is the -engram image's; the build fails
-#      unless test_reasoning_effort_encoding.py finds exactly that table and the default thinking request renders
-#      budget 75. (vLLM's opt-in Rust frontend, VLLM_USE_RUST_FRONTEND=1, keeps its own table.)
-#   5. `--kv-cache-dtype nvfp4_ds_mla` on sm_120 through FlashInfer (nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py
-#      = our vLLM PR, internal/upstream-dsv41-sm120-nvfp4-PR.md, until it is merged): the compressed
-#      cache in the checkpoint's FP4 record, the SWA cache in the V4.1 fp8 record; fp8_ds_mla keeps the
-#      V4 record and FlashInfer's DSV4 kernels (no keyword passed).
-#   6. KV offload keeps one host copy of the TP-replicated V4.1 KV instead of one per rank
-#      (patch_vllm_offload_replicated_mla.py: vllm#57652's replicated-layout gate, kv_tp_replicas == tp, also
-#      admits the offloaded groups when they are all single-head MLA - V4.1's own compressed MLA / indexer
-#      caches and compressor ring declare no max_tp_shards, so upstream keeps one copy per rank; the build
-#      fails unless test_offload_replicated_mla.py passes on the V4.1 cache layout).
-#   7. (upstream) The decoder side of the report's SWA bounded replay is vLLM main's own since vllm#58132:
-#      CacheConfig.swa_bounded_replay / --swa-bounded-replay, default on (model runner V2); our
-#      patch_vllm_decoder_replay.py is no longer applied. --no-swa-bounded-replay turns it off (it also takes
-#      the SWA KV back into prefix caching: the upstream flag covers both sides of the replay); the decoder-only
-#      switch of the -ced .. -pdl images (VLLM_MOET_DECODER_REPLAY=0) has no equivalent here. Upstream trims in
-#      eager steps only, which with --max-cudagraph-capture-size 64 (below the 128-token window) are all the steps
-#      that can trim.
-#   8. The MoE input quantization fused with the permutation into DeepGEMM's grouped layout at decode
-#      token counts (patch_vllm_moe_quant_scatter_sm120.py + moe_quant_scatter/): one launch instead of
-#      the seven vLLM runs per MoE layer between the router and FC1, bit-identical fp8 rows / UE8M0
-#      scales written straight into DeepGEMM's packed layout; VLLM_MOET_MOE_QUANT_SCATTER=0 turns it off
-#      at runtime (quantization back in prepare()). Prefill keeps vLLM's kernels.
-#   9. (upstream) vllm#57679, the fused q/kv RMSNorm + MXFP8 quantization of the query, is in vLLM main;
-#      patch_vllm_query_quant_gate.py is no longer applied.
-#  10. The mHC sublayer boundary off the decode critical path (patch_vllm_mhc_overlap_sm120.py + mhc_overlap/):
-#      upstream's side-stream design (`mhc_pre_delayed_overlap`, SM100-only) enabled on sm_120 with our
-#      kernels - post-mix + collapse + RMSNorm + draft aux in one launch on the model stream, the fn
-#      projection (one CTA per split x 4 tokens) and the Sinkhorn coefficients on the side stream behind
-#      the sublayer, the sublayer's all-reduce moved in front of the kernel (upstream's fuse_mhc_all_reduce;
-#      a plain all-reduce here - upstream's CuTe DSL AllReduceMHC and its deferred MoE finalize are SM100-only,
-#      init_mhc_all_reduce builds nothing on sm_120); bit-identical to the TileLang pair (test_mhc_post_norm_sm120.py,
-#      test_mhc_overlap_integration.py, also on 21d93d0d); served since 2026-09-25. One step kind differs from the
-#      unfused path, as served since then: an eager prefill step that trims (step 7) all-reduces the cut layer's FFN
-#      output on the replay rows only, and NCCL rounds ~30 % of their elements differently (1-2 ulp).
-#      VLLM_MOET_MHC_OVERLAP=0 turns it off at runtime, VLLM_MOET_MHC_FUSE_ALLREDUCE=0 only the all-reduce move.
-#      The DSpark drafter's three layers are the same decoder layer but were built without the stream, so its
-#      graph kept the TileLang pair (~10 us x 6 boundaries, plus the first layer's TF32 prenorm GEMM).
-#      patch_vllm_dspark_mhc_stream_sm120.py passes the drafter its own stream under the same switches, and
-#      all-reduces the last layer's FFN output in front of the drafter's final post-mix (with fuse_mhc_all_reduce
-#      the layers leave it unreduced; the target's _collapse does the same) - test_dspark_mhc_stream.py. Window 9
-#      (2026-10-14, image -side, not kept): the drafter graph 1,031 -> 988 us per step as predicted, but the start
-#      profiled 0.06 GiB more peak activation and 0.06 GiB more graph memory (KV 3,380,873 -> 3,331,199 tokens,
-#      -1.5 %). The A/B the same night (the image with VLLM_MOET_MOE_FC2_DISCARD_SIDE=0 = the drafter's stream
-#      alone): KV 3,374,600 (-0.19 %), so the side-stream discard cost the rest; the build-arg below leaves even
-#      the drafter's stream out.
-#  11. The small-M BF16 GEMMs of the decode step with cuBLAS's bits from one launch (patch_vllm_bf16_gemm_sm120.py
-#      + bf16_gemm/): the indexer's weights_proj (cuBLAS ran it on 2 CTAs; the main stream waited ~26 us for it in
-#      every index-source layer), the indexer's wk and the MoE router; the compressor projection optionally
-#      (VLLM_MOET_BF16_GEMM_SITES). cuBLAS's split-K slice width per shape and token count is calibrated against
-#      cuBLAS at load time, so the results are bit-identical (test_bf16_replica_gemm_sm120.py,
-#      test_bf16_gemm_integration.py); served since 2026-10-01 (decode graph 10,707 -> 10,518 us per step).
-#      VLLM_MOET_BF16_GEMM=0 turns it off at runtime.
-#  12. Engram's wkv (MXFP8 6144 -> 25600, 157 MB, layers 1 and 14) split by output columns over the TP ranks at
-#      decode token counts (patch_vllm_engram_wkv_tp.py). vLLM main makes it a ColumnParallelLinear with
-#      gather_output (vllm#58678): the output all-gather at every token count costs prefill +1.8 ms per Engram
-#      layer per 4096-token chunk on this PCIe host, so the patch builds it as a ReplicatedLinear again (the
-#      layout the served images had, every rank streaming the whole weight: 123 us per layer in the served decode
-#      graph before the split); up to 64 tokens a rank now runs the same kernel on its
-#      6400 rows of the loaded weight and an all-gather rebuilds the output - bit-identical (test_engram_wkv_tp.py,
-#      test_engram_wkv_tp4.py). Above that the all-gather costs more than it saves, so prefill and the weights stay
-#      as they were; served since 2026-10-02 (decode graph 10,518 -> 10,437 us per step). VLLM_MOET_ENGRAM_WKV_TP=0
-#      turns it off at runtime.
-#  13. NCCL's serialEvent record nodes reduced to the last one per event in every captured graph
-#      (nccl_graph/patch_vllm_nccl_graph_records.py + nccl_graph_records.py): with graph mixing on (NCCL's default)
-#      NCCL records its communicator's event after every captured collective, and the graph executor starts each
-#      NCCL kernel ~2.8 us after its predecessor, on another stream (80 all-reduces per decode step). Only the last
-#      record matters, so the GPU model runner's FULL graphs, the breakable PIECEWISE segments and CUDAGraphWrapper
-#      are captured with keep_graph=True, rewritten and instantiated - NCCL's default mode and semantics,
-#      bit-identical (test_nccl_graph_records_tp4.py). VLLM_MOET_NCCL_GRAPH_RECORDS=0 captures as before.
-#  14. FC2's padding rows out of L2 without a write-back at decode token counts (patch_vllm_moe_fc2_discard_sm120.py
-#      + moe_l2/): DeepGEMM's grouped FC2 writes whole 64-row tiles, so at 6 tokens ~2268 of its 2304 output rows
-#      (23 MB per MoE layer) are padding nobody reads, and the next FC1 paid for their write-back. Right after FC2
-#      their lines are invalidated (discard.global.L2) - bit-identical (test_moe_l2_discard_sm120.py); 2..64 tokens
-#      (VLLM_MOET_MOE_FC2_DISCARD_MIN_TOKENS / _MAX_TOKENS). VLLM_MOET_MOE_FC2_DISCARD=0 turns it off at runtime.
-#      Opt-in since 2026-10-14 (VLLM_MOET_MOE_FC2_DISCARD_SIDE=1): the discard on a side stream forked after FC2 and
-#      joined after the gather (disjoint lines: the gather reads only real rows) - another -3.7 us per MoE layer at
-#      6 tokens in the bench graph on 4x RTX PRO 6000, but in the served decode graph (window 9) the gather next to
-#      the discard took 6.5 us instead of 3.3 and every FFN segment +1.7 us; the default stays the inline launch.
-#  15. Dual-batch overlap of the prefill's TP all-reduces (patch_vllm_prefill_dbo_sm120.py + prefill_dbo/): a
-#      4096-token chunk spends a third of its time in two [4096, 5120] bf16 all-reduces per non-trimmed layer (1.6 ms
-#      each on the PCIe ring, 180 SMs idle). With `vllm serve ... --enable-dbo` an eager step of >= the prefill
-#      threshold splits into two microbatches on two threads (vLLM's own ubatching, V2 runner) that hand the GPU to
-#      each other at every TP all-reduce (mhc_shifted_post_pre, the Engram boundary, the final collapse) and Engram
-#      all-gather, so one half's collective runs on a high-priority comm stream behind the other half's GEMMs
-#      (measured without the model: 80-97 % of the all-reduce hidden, nccl_graph/nccl_overlap_bench.py). Made to
-#      work without DP / EP and with Engram (hashes and rows fetched once per step), the DSpark drafter (merged aux
-#      states), the decoder SWA bounded replay (a replay batch per microbatch) and the row-indexed top-k / candidate
-#      buffers (one storage per microbatch). Not bit-identical (half-size ring chunks). Off without --enable-dbo;
-#      decode steps stay one batch (--dbo-decode-token-threshold above the capture size). NOT SERVED: on the 1/5-scale
-#      dummy-weight model (tools/dsv41_sm120/mini_model/) the split step is 2.4x slower - two microbatches are two Python
-#      forwards, ~1.2-1.5 ms of host enqueue per sublayer each, against ~1 ms of GPU work per half-chunk sublayer in the
-#      full model whose single-batch prefill already keeps the CPU 68 % busy; the step is paced by the host (port doc).
-#      Written for vLLM 21d93d0d; on 3f1bcfd82b and 49cb2bbf (ubatching.py, the replay of vllm#59894 / #59532, model_state.py) its
-#      anchors do not fit yet, so the build-arg defaults to 0 here.
-#  16. (backport) vllm#61647: the indexer's TP row sharding (vllm#54951, in the base) engages from
-#      AttentionConfig.indexer_tp_shard_min_rows rows (patch_vllm_indexer_shard_rows.py) instead of the constant
-#      16,384 x TP, which a 4096-token prefill chunk never reaches. The default stays 65,536 (= upstream at TP4,
-#      nothing changes); docker/sm120/run-dsv41.sh INDEXER_TP_SHARD_MIN_ROWS lowers it. Skips itself on a vLLM
-#      that has the field (df3bd094 has it).
-#  17. `--moe-backend b12x` (FlashInfer 0.7.2's b12x W4A8 MoE: MXFP4 weights x MXFP8 activations) works at TP4:
-#      vLLM binds the TPMoEScratchPlan it plans through the tensor-based API, and at 576 intermediate rows per rank
-#      (576 % 128 == 64) b12x runs the compact N64 micro kernels, whose launchers only the canonical preparation path
-#      attached - the first decode-sized call stopped with "compact W4A8 execution requires its prepared native
-#      launchers". patch_flashinfer_b12x_compact_bind.py compiles them on a plan's first bind (outside graph capture)
-#      and attaches them. Measured 2026-10-20 on 4x RTX PRO 6000 at 300 W against DeepGEMM in the same image: decode
-#      C1 +22-23 %, C8 +38-43 % (the MoE kernels no longer compute 64-row padding, so the power-capped clocks rise),
-#      163K prefill +1 %, GPU KV 3.80M -> 9.90M tokens; GSM8K-200 194 vs 193, needle / tools / vision unchanged.
-#      Serve with EXTRA_ARGS="--moe-backend b12x" plus "moe_backend":"b12x" in the DSpark config.
-#  18. The DSpark drafter's lm_head at <= 16 rows as an MXFP8 GEMV on step 3's kernel (patch_vllm_dspark_lm_head_mxfp8_sm120.py):
-#      the drafter aliases the target's BF16 lm_head ([32320, 5120] per TP4 rank), which cuBLAS streamed in ~210 us per decode
-#      step; an MXFP8 copy (+170 MB per GPU) takes ~104 us at 5 rows. Only the drafts change - the target's logits stay BF16.
-#      Measured 2026-10-20 with step 17's b12x MoE: 104.7 -> 106.1 steps/s on Fraser Price's LocalMaxxing prompt, code-v1
-#      103.5 -> 105.2, acceptance 0.728 -> 0.723 and 0.687 -> 0.693 (inside the run-to-run spread), GPU KV -1.2 %.
-#      VLLM_MOET_DRAFTER_LM_HEAD_MXFP8=0 turns it off at runtime.
-#  19. The MoE router's top-6 (sqrt-softplus + correction bias, noaux_tc) in a CUDA kernel bit-identical to vLLM's Triton
-#      dsv4_topk, launched without PDL (patch_vllm_dsv4_topk_sm120.py, dsv4_topk/): behind the router GEMM's early PDL
-#      trigger the Triton top-k ended ~8 us after the router in the served decode graph (~2 us alone); the plain launch
-#      ends it 4.45 us after the router and the b12x MoE input quantization 1.47 instead of 3.33 us after the top-k.
-#      Measured 2026-10-20 on the served model (r1 + this step, bind-mounted): the decode graph's critical path -136 us
-#      (7,367 -> 7,231 us, rank-0 DAG over 24 replays), the graph outside the MoE kernels -93 / -222 us (prose / code);
-#      bits: 3000 randomized cases and 24.3M router rows of the served model identical to Triton. VLLM_MOET_DSV4_TOPK=0
-#      restores the Triton kernel, VLLM_MOET_DSV4_TOPK_PDL=1 the PDL launch.
-#  20. DSpark's sequential Markov sampling as one launch per draft step (patch_vllm_dspark_fused_markov_sm120.py): vLLM's
-#      gfx942 kernels (models/deepseek_v41/amd/ops/fused_markov.py, Triton) on sm_120 through the draft model's
-#      sample_sequential hook. Per draft step vLLM's loop runs the bias GEMV over the whole vocabulary (markov_w2, 66 MB)
-#      and ~7 small kernels - 158 us of the drafter graph per decode step on the served model; the fused launch adds the
-#      bias's 256 products in another order, so a bias can differ in its last bf16 bit and a draft token with it: only the
-#      drafts change, the target's outputs do not. Full-depth dummy-weight model (325 W, memory +5000 MHz): the drafter
-#      graph's DAG span 767 -> 707 us per decode step (five launches, 36.6 us cold + 4 x 12.9 us from L2, replace the
-#      five bias GEMMs' 103 us and their small kernels: 145 kernels instead of 180), step period 9,324 -> 9,227 us.
-#      VLLM_MOET_FUSED_MARKOV=0 keeps vLLM's loop.
-#  21. The target's lm_head at <= 16 rows as an MXFP8 GEMV on step 3's kernel (patch_vllm_target_lm_head_mxfp8_sm120.py; the
-#      target-side twin of step 18, sharing the MXFP8 copy with the drafter through a cache keyed by the weight's address):
-#      the BF16 lm_head runs once per decode step outside the CUDA graphs and streamed in ~214 us (torch profile
-#      run30_df3b_b12x_c1); the GEMV takes ~104-136 us, 6-7 rows are padded to 8. Unlike step 18 this changes the target's
-#      logits (~3.8 % relative error on random data, top-5 overlap 0.96) and therefore the outputs - owner's decision
-#      2026-10-20, gated by GSM8K-200 / needle / tools in the serving window. Full-depth dummy-weight model (325 W, memory
-#      +5000 MHz, C1): kernels outside the graphs 378 -> 297 us, step period 9,487 -> 9,393 us (-1.0 %).
-#      Built in but OFF by default: VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 at runtime turns it on.
-#  22. FC2 of b12x's compact W4A8 micro MoE path grouped by expert (patch_flashinfer_b12x_fc2_grouped_sm120.py +
-#      b12x_fc2/): b12x's direct phase 2 computes each (token, expert) pair of a decode step in its own CTAs, so an
-#      expert chosen by several of the step's tokens has its w2 tile read once per pair; the grouped kernel computes all
-#      pairs of an expert in one CTA per 128-column tile with b12x's MMA sequence and epilogue, so route_output keeps its
-#      bits (GPU test: the same bits at 6-36 distinct experts, and the patched MoE's outputs equal b12x's). On routing
-#      recorded from the served model (160 decode-step layers, 22.5 distinct experts of 36 pairs; 325 W, memory +5000)
-#      FC2 takes 22.6 instead of 27.6 us per layer: -199 us per decode step; served model (window 2026-10-21, r6 vs r5):
-#      FC2 on the decode graph's critical path 1,085 -> 905 us, Fraser 123.6 vs 117.8 steps/s on the same-state baseline (r5:
-#      +2.5 %). Pairs of padding tokens (id -1) get zeros, as from b12x. VLLM_MOET_B12X_FC2_GROUPED=0 keeps b12x's phase 2.
-#  23. The decode step's TP4 all-reduces on a push over PCIe P2P (patch_vllm_p2p_allreduce_sm120.py + p2p_ar/): the three
-#      all-reduce sites of the overlap path (boundary in front of mhc_post_norm, Engram layers, last layer). Two-shot
-#      (reduce-scatter + all-gather, every phase to one peer at a time - on this host a kernel writing to several peers
-#      concurrently is ~16x slower) for 17..64 rows, NCCL otherwise; one-shot push for small rows is built in but off (neutral
-#      in the full C1 graph: both sit on the rank-skew + flag floor). The four contributions are added in NCCL's own order
-#      with NCCL's bf16 rounding after every add, so the result has NCCL's bits: that order (ring chunks, channels and LL
-#      steps, i.e. per position of the element) is measured at start-up on the TP group's NCCL communicator for every row
-#      count 1-64, each row count is then checked against NCCL on random data, and one that does not reproduce NCCL bit for
-#      bit stays on NCCL. Test: one-shot and two-shot == NCCL for 16 row counts 1-64; served dummy-weight model: 64 of 64.
-#      4x RTX PRO 6000 (325 W, memory +5000), 80 all-reduces from a graph: [48, 5120] 23.5 vs NCCL 69.8 us; full-depth
-#      dummy model at C8: step 29,864 -> 28,959 us (-3.0 %), all-reduce on the critical path 80 x 47 -> 80 x 39 us.
-#      Built in but OFF by default: VLLM_MOET_P2P_AR=1 at runtime turns it on (VLLM_MOET_P2P_AR_MAX_ROWS,
-#      VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS tune the ranges).
-#  24. The all-reduce consumer fused into the boundary kernel (same patcher as 23; mhc_overlap/mhc_post_norm_sm120.cu template
-#      kAR): for <= VLLM_MOET_P2P_AR_FUSED_MAX_ROWS rows (default 0 = off) the push is issued and mhc_post_norm waits for the
-#      three peers' flags, adds the four partials in NCCL's order (step 23's measured order: NCCL's bits) before the
-#      post-mix and hands the reduced x to the side stream's projection. Full-depth dummy model, C1: step 9,482 -> 9,363 us
-#      (-1.25 %); per boundary push 5.7 + fused kernel 7.7 us instead of NCCL 11.8 + post_norm 3.9 (graph of 77 boundaries
-#      2026-10-21: 12.5 vs 14.4 us at 6 rows, but 20.0 vs 18.9 at 12 and 24.9 vs 21.4 at 16). Test: every output equals
-#      NCCL's all-reduce + the plain boundary kernel at 1-16 rows. VLLM_MOET_P2P_AR=1 plus VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=16
-#      at runtime turns it on.
-#  25. The vocab all-gather of the MXFP8 lm_head helpers (steps 18 and 21) on the P2P push (same patcher; bit-exact - a gather
-#      moves bytes). On the real per-rank shape ([rows, 32320] bf16, 64 KB rows) it is only marginally ahead of NCCL's
-#      all-gather ([6, 32320] 54.6 vs 62.1 us from a graph: 1.16 MB egress per rank, bandwidth-bound) - about 15 us per decode
-#      step - so it is built in but off. VLLM_MOET_P2P_AG=1 at runtime turns it on.
-#  26. A deterministic top-k for the DSA indexer (patch_vllm_det_topk_sm120.py + det_topk/): on sm_120 vLLM takes the
-#      indexer's top-512 with top_k_per_row_prefill (prefill) and persistent_topk (decode); both return the right values
-#      but break ties and order their output differently from run to run (30 runs on identical tied logits: a different
-#      order every time, a different set on tied rows; persistent_topk's sampled path is approximate on long rows), and
-#      FlashInfer's sparse MLA - deterministic for identical inputs - gives different bits for the same indices in another
-#      order. The served model therefore answered the same prompt (same nonce, fresh prefill, b12x det on) with different
-#      text from the 2nd token on. det_topk_sm120.cu: exact (radix select over order-preserving keys, integer histograms),
-#      ties to the lower column, the selected columns in ascending order, -1 fill; decode rows on a cluster of up to 16
-#      CTAs each (slice histograms combined through distributed shared memory). Bit-exact against a torch reference on
-#      1215 cases (bf16-valued, tied, -inf-masked, NaN / +-0 rows, short rows, strided outputs, prefill and decode row
-#      forms, every cluster size, up to 512K columns), identical over 30 runs and from a CUDA graph. 6 rows, bf16-valued:
-#      4K columns 4.9 us vs persistent_topk 7.4, 32K 7.8 vs 15.5, 131K 9.4 vs 15.1, 300K 12.7 vs 15.8, 512K 20.5 vs 29.4
-#      (faster at every width 1K-512K); prefill (long rows read twice) 4096 x 2K 28 vs 21 us, x 32K 174 vs 153 (tied rows
-#      29 vs 288 and 206 vs 403). Built in but OFF by default
-#      (it changes which tied positions the indexer keeps): VLLM_MOET_DET_TOPK=1 at runtime turns it on.
-#  27. The decode MoE of b12x's compact W4A8 micro path in one persistent kernel (patch_flashinfer_b12x_moe_fused_sm120.py
-#      + b12x_moe_fused/): FC1 (gate/up projection) -> SwiGLU + MXFP8 activation -> FC2 (down projection) from one grid,
-#      with the same bits as b12x's three kernels (and step 22's FC2) in projections, intermediate and route_output; b12x's
-#      rows-quant before and TopKSum after stay. FC1 items (expert x 10 tiles, one stream per SM, 8-stage cp.async ring +
-#      L2 prefetch) then FC2 items (expert x 160 64-column blocks, double-buffered) in the order the experts become ready;
-#      the CTA finishing a K128 slice's second tile activates the slice; the last CTA resets the control block (graph
-#      replay). On 160 recorded C1 routings (22.5 distinct experts) 65.9 us vs projection 41.9 + activation 1.8 + grouped
-#      FC2 23.8; the served MoE path in a CUDA graph 73.2 vs 75.7 us per layer (two nodes fewer): about -100 us per C1
-#      decode step; 36 distinct experts 95.4 vs 99.5 us. Slower with few distinct experts (6 / 12: +4 / +3 us), so the
-#      kernel asks for >= 32 pairs per launch (the drafter's MoE stays on b12x). Built in but OFF by default:
-#      VLLM_MOET_B12X_MOE_FUSED=1 at runtime turns it on.
-#  28. The DeepSeek-V4.1 sparse MLA decode with its candidate rows gathered by plain loads, the fp4 -> fp8 conversion
-#      shared by the two producer groups, the first tile's index words loaded before the candidate lengths, the softmax /
-#      P-quantization / XV section with 4 barriers per tile instead of 20, and a merge whose loads are issued up front
-#      (patch_flashinfer_sparse_mla_ldg_sm120.py + sparse_mla_ldg/): FlashInfer's own decode kernel text, copied from
-#      the installed header at build time (gen_spec_kernel.py: two insertions and one block replacement, each verified
-#      against the header; the replaced block pinned by hash), compiled with FlashInfer's flags and instantiated with a
-#      gather schedule whose 128 threads load the 32 rows of a tile as 16-byte words (one DRAM round trip) instead of
-#      the gather warp's 32-64 cp.async.bulk copies the TMA unit works off one by one (~2.5 us per tile), then convert
-#      their half of the tile while the next tile's index is in flight. The restructured section keeps every expression
-#      and its order (values the original passed through shared memory pass through an empty asm) and quantizes the P x
-#      V-scale operand of all 16 scale groups before one barrier instead of one group per step; each step owns its
-#      accumulator, so the sums are unchanged. Output, LSE and the split scratch keep their bits (175 random mixed-cache
-#      shapes, partial lists, graph replay). The merge kernel is FlashInfer's expression by expression with the partial
-#      rows and the attention sink loaded before the LSE reductions. Served C1 shape (6 tokens, 128 SWA + 512 compressed
-#      candidates, 10 splits, cold L2, CUDA graph): decode 10.5 -> 7.5 us, merge 2.6-2.9 -> 2.1 us per layer (r13's first
-#      round: 8.2 / 2.1; pb-deep: decode 10.08 -> 8.75 us, critical path -50 us per step). Built in but OFF by default:
-#      VLLM_MOET_SPARSE_MLA_LDG=1 at runtime turns it on (VLLM_MOET_SPARSE_MLA_LDG_MERGE=0 keeps FlashInfer's merge);
-#      SWA-only layers, prefill and NVFP4 plans stay on FlashInfer's execute.
-#  29. GEMV v3 units per round: every R now launched with PDL + evict-first (before, R = 2 / 4 ran without both) and a
-#      per-shape table (sm120_gemv/mxfp8_gemv_sm120.cu, in step 3's extension) that keeps R = 1 everywhere: in a graph of
-#      back-to-back GEMVs R = 2 / 4 won on two shapes (7.13 -> 6.54, 4.96 -> 3.79 us, same bits for every R), in the served
-#      decode graph they lost (critical path +27 us per step). VLLM_MOET_GEMV_V3_R=1|2|4 forces one R (0 = table).
-#  30. The DSpark / DFlash drafter's input preparation in one launch for all draft KV-cache groups
-#      (patch_vllm_dflash_prepare_groups_sm120.py): the original Triton kernel with the per-group part (context / query
-#      slot mappings, their padding) instantiated for up to three groups, the shared outputs written once by the same
-#      expressions - every buffer bit-identical (96 random cases incl. padded tails); 3 launches x 9.4 us outside the
-#      graphs per decode step -> one: eager 45.2 -> 18.6 us per step. OFF by default: VLLM_MOET_DFLASH_PREP_GROUPS=1.
-#  31. The DSA candidate-block selection on the deterministic top-k (patch_vllm_candidate_short_sm120.py): the
-#      candidate-source indexer (layer 20) picks its top 2048 blocks of 8 positions per decode row through torch.topk
-#      over the static max_model_len-wide score row (no DeepSelect on sm_120): ~20 launches, ~45 us per step on the
-#      critical path, inside the FULL decode graph. torch.topk's set - the k largest, equal values to the lower index,
-#      NaN above +inf - is what step 26's det_topk kernel computes on [0, valid blocks) of the score row (one cluster
-#      launch per row count: graph-safe for every context length); a small kernel then applies the original's -inf ->
-#      -1 rule to the selected blocks. 72 random cases incl. long contexts with ties straddling the k-th place: the
-#      same sets and bit-identical logits after apply_candidate_mask; served shape in a graph 41.3 -> 3.2 us (2.7K
-#      context) / 39.8 -> 10.2 us (60K). OFF by default: VLLM_MOET_CANDIDATE_DET_TOPK=1.
-#  32. Each SWA metadata builder's decode build in one launch (patch_vllm_swa_decode_build_sm120.py): the eight
-#      builders of the target model ran torch.ge(slot_mapping, 0), a fill of the lens tail and
-#      _compute_swa_indices_and_lens_kernel per decode step outside the graphs (24 launches); one kernel per builder
-#      now computes the validity from the slot mapping, stores it, runs the original row body unchanged and zeroes the
-#      lens tail - every byte the three operations wrote, with the same value (96 random cases). Eight builders at
-#      the served step, eager: 175.9 -> 100.3 us. OFF by default: VLLM_MOET_SWA_DECODE_BUILD=1.
-#  33. The shared-expert add fused into b12x's top-k sum (patch_vllm_moe_topksum_add_sm120.py): every MoE layer ended
-#      with W4A16TopKSumKernel (fp32 adds of the token's routed rows in route order, one bf16 rounding) followed by
-#      vLLM's shared_output + fused_output (bf16(float(a) + float(b))): 40 adds of 1.2 us and 40 graph nodes per step
-#      on the critical path. One Triton launch computes the same sum (unrouted entries add +0.0 through the load mask:
-#      acc is never -0.0, so the value is the same), rounds it to bf16 as the kernel did and adds the shared row as
-#      torch did; the runner publishes the layer's shared-experts helper, the fused launch waits on its aux-stream
-#      event where the runner would have, and the runner skips its add. 48 random cases bit-identical; served shape
-#      in a graph 1.80 -> 1.03 us per layer. OFF by default: VLLM_MOET_MOE_TOPKSUM_ADD=1.
-#  34. The decode MoE's rows quantization off the critical path (patch_vllm_moe_prequant_sm120.py): b12x's prepared
-#      MXFP8 rows quantize ran on the main stream between the router's top-k and the fused MoE kernel (1.2 us + a gap
-#      per layer) although it depends on neither; the runner now launches the same kernel on a side stream before
-#      select_experts into vllm-moet-owned buffers of the scratch layout, and the compact-micro launcher hands those
-#      to the fused MoE after joining the side stream (same kernel, same input, same bytes; any mismatch quantizes as
-#      before). pb-deep C1 (r18, det switches): greedy outputs of six prompts identical with and without, the quant's
-#      27.6 us per step leave the critical path, period 9,885 -> 9,803 us. OFF by default: VLLM_MOET_MOE_PREQUANT=1.
-#  35. The router's spread GEMM and DeepSeek-V4's routing top-6 in one launch (bf16_gemm/bf16_replica_gemm_sm120.cu
-#      spread_topk_kernel + dsv4_topk_sm120.py): replica_mm keeps the router GEMM pending and the top-k takes it;
-#      the tile reducers compute the routing scores of their columns, the CTA finishing the last tile selects the
-#      top-6 (two rows per warp, interleaved) - GEMM and top-k arithmetic unchanged, 96 random cases bit-identical,
-#      pb-deep greedy outputs identical. Measured and NOT worth it: isolated 6.45 vs 6.56 us (PDL), in the served
-#      graph 10.7 us vs spread 6.6 + top-k 3.9 - the serial selection tail costs what the top-k launch cost; the
-#      critical path did not move (8,271 -> 8,260 us). OFF by default (VLLM_MOET_ROUTER_TOPK_FUSED=1); kept for the
-#      MoE-sublayer megakernel, where the routing phase runs on all CTAs.
-#  Since the -pdl tag the kernels of steps 3, 8, 10 and 11 also launch with programmatic dependent launch where it
-#  pays - the dense / grouped MXFP8 GEMVs (VLLM_MOET_GEMV_PDL, plus VLLM_MOET_GEMV_EVICT_FIRST for v3's weights), the
-#  MoE router (VLLM_MOET_BF16_GEMM_PDL, default router), moe_quant_scatter (VLLM_MOET_MOE_QUANT_SCATTER_PDL); the mHC
-#  boundary kernel's PDL variant (VLLM_MOET_MHC_PDL) reads only its norm weight before griddepcontrol.wait - and the
-#  indexer's one-slice chain has an opt-in ring variant (VLLM_MOET_BF16_CHAIN=v2). All bit-identical; =0 restores
-#  the plain launches.
-#  Every vLLM-file step has a build-arg (=0 leaves it out) so a step whose patcher does not fit a newer vLLM yet
-#  can be built around: VLLM_MOET_REASONING_EFFORT (4), VLLM_MOET_NVFP4_KV (2's indexer gate + 5),
-#  VLLM_MOET_OFFLOAD_DEDUP (6), VLLM_MOET_MHC_OVERLAP (10; VLLM_MOET_DSPARK_MHC_STREAM for the drafter's stream alone),
-#  VLLM_MOET_BF16_GEMM (11), VLLM_MOET_ENGRAM_WKV_TP (12), VLLM_MOET_NCCL_GRAPH_RECORDS (13), VLLM_MOET_MOE_FC2_DISCARD (14),
-#  VLLM_MOET_PREFILL_DBO (15, default 0 on this base), VLLM_MOET_INDEXER_SHARD_ROWS (16), VLLM_MOET_B12X_COMPACT_BIND (17),
-#  VLLM_MOET_DRAFTER_LM_HEAD_MXFP8 (18), VLLM_MOET_DSV4_TOPK (19), VLLM_MOET_FUSED_MARKOV (20),
-#  VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH (21), VLLM_MOET_B12X_FC2_GROUPED (22), VLLM_MOET_DET_TOPK_PATCH (26),
-#  VLLM_MOET_B12X_MOE_FUSED_PATCH (27), VLLM_MOET_SPARSE_MLA_LDG_PATCH (28), VLLM_MOET_DFLASH_PREP_GROUPS_PATCH (30),
-#  VLLM_MOET_CANDIDATE_DET_TOPK_PATCH (31), VLLM_MOET_SWA_DECODE_BUILD_PATCH (32), VLLM_MOET_MOE_TOPKSUM_ADD_PATCH (33),
-#  VLLM_MOET_MOE_PREQUANT_PATCH (34).
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r23 .
+#   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 SERVED=1 docker/sm120/run-dsv41.sh      # docker/sm120/run-dsv41.sh
 #
-# Build (repo root):
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> .
-#   The 21d93d0d images came from this file at 59a0136 (base vllm-openai:nightly-21d93d0d + FlashInfer 0.7.1rc2 installed
-#   over the base's 0.7.0.post1 + DeepGEMM e1f418c2): -pdl (steps 1-14, served since 2026-10-13 16:27Z, window 8) and
-#   -side (6aafbb6, window 9 on 2026-10-14, not kept, see the port doc). The images on vllm-openai:nightly 0961bbae with
-#   FlashInfer 0.7.0.dev20260922 came from it before that: -pdl at c066be9, -engram (steps 1-12) at f7cc6d9, and with
-#   fewer steps -bf16, -mhc, -moeqs, -ced, -kvdedup and dsv41-nightly-20260923 (git log).
-# Serve: docker/sm120/run-dsv41.sh with IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-<tag> KV_MODE=upstream
-#   (KV_RECORD=nvfp4 -> --kv-cache-dtype nvfp4_ds_mla, fp8_ds_mla -> --kv-cache-dtype fp8_ds_mla). A new FlashInfer
-#   version starts with an empty FlashInfer autotune cache (vLLM keys it by FlashInfer's version / arch dir): the
-#   first start autotunes again (GPU_MEM_UTIL 0.92 for that start, as for any empty autotune cache).
-# Validation: docs/dsv41-sm120-port.md; op-level tests: tools/dsv41_sm120/README.md.
+# Steps 7 and 9 (the SWA bounded replay, the fused query-norm + quantization gate) and 24, 25, 29, 35 are vLLM's own
+# in this base or folded into neighbouring steps; the numbers are kept stable because they are the build arguments'
+# names. Step 15 (prefill DBO) and 37 (MoE mega kernel) default to 0: measured slower on this host.
 
 ARG BASE_IMAGE=vllm/vllm-openai:nightly-df3bd094aeea829f27baa0a5282830464f601d9f@sha256:b91d90a63b75d00e780287e4236123a281ee3d29122c864a7044a19a680fdf9d
 
@@ -376,7 +56,7 @@ COPY --from=deepgemm-builder /deepgemm/deep_gemm/_C_extension.abi3.so \
 RUN python3 -c "import importlib.metadata as md, inspect, flashinfer.mla as m; from flashinfer.jit import env; from flashinfer.decode import trtllm_batch_decode_sparse_mla_dsv4 as f; assert hasattr(m, 'dsv41_fp4_quantize_pack_sparse_mla_cache'); assert 'fp8_dsv41_fp4_ca' in str(inspect.signature(f).parameters['kv_cache_format'].annotation); p = {x.provider_id: x for x in env.FLASHINFER_AOT_PROVIDERS}; assert {'sparse_mla_sm120', 'mxfp8_gemm_cutlass_sm120'} <= p['sm120f'].modules, p; v = {md.version(d).split('+')[0] for d in ('flashinfer-python', 'flashinfer-cubin', 'flashinfer-jit-cache', 'flashinfer-jit-cache-sm120f')}; assert len(v) == 1, v; print('flashinfer', *v, 'aot', sorted(p), len(p['sm120f'].modules), 'sm120f modules')" \
     && python3 -c "import torch, vllm.third_party.deep_gemm as dg; s = str(torch.ops.deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout.default._schema); assert 'num_groups' in s, s; print('deep_gemm', dg.__version__, s)"
 
-# 3. The vLLM-side patches (see header). patch_vllm_indexer_sm120.py (varlen indexer / adaptive
+# 3. The vLLM-side patches. patch_vllm_indexer_sm120.py (varlen indexer / adaptive
 #    verification) stays NOT applied: measured as a net loss on 2026-09-18 and 2026-09-22.
 COPY tools/dsv41_sm120/ /opt/vllm-moet/dsv41_sm120/
 ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
@@ -386,12 +66,12 @@ RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mxfp8_gemv.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sm120_gemv'); import mxfp8_gemv_sm120 as g; e = g._ext(); assert hasattr(e, 'mxfp8_gemv_grouped'); print('sm120 gemv extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mxfp8_gemv_sm120/*.so
 
-# 4. Reasoning-effort tiers (header).
+# 4. Reasoning-effort tiers.
 ARG VLLM_MOET_REASONING_EFFORT=1
 RUN if [ "$VLLM_MOET_REASONING_EFFORT" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_reasoning_effort.py \
     && python3 /opt/vllm-moet/dsv41_sm120/test_reasoning_effort_encoding.py; fi
 
-# 5. nvfp4_ds_mla on sm_120 through FlashInfer's DSv4.1 dual cache + the MXFP4 indexer cache gate (header). On a
+# 5. nvfp4_ds_mla on sm_120 through FlashInfer's DSv4.1 dual cache + the MXFP4 indexer cache gate. On a
 #    vLLM that writes the V4.1 records interleaved (vllm#61371) FlashInfer first learns kv_scale_placement and its
 #    sparse_mla_sm120 module is rebuilt into data/aot (flashinfer_interleaved/, ~1 min).
 #    VLLM_MOET_V41_KV_RECORDS names the base's placement for the image label the launcher reads (the KV offload's disk
@@ -409,18 +89,18 @@ RUN records=footer; grep -q "The V4.1 records are interleaved" /usr/local/lib/py
       python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_fp4_sm120.py \
       && python3 /opt/vllm-moet/dsv41_sm120/nvfp4_kv/patch_vllm_nvfp4_sm120_upstream.py; fi
 
-# 6. Single-copy KV offload of the TP-replicated V4.1 KV (header).
+# 6. Single-copy KV offload of the TP-replicated V4.1 KV.
 ARG VLLM_MOET_OFFLOAD_DEDUP=1
 RUN if [ "$VLLM_MOET_OFFLOAD_DEDUP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_offload_replicated_mla.py \
     && python3 /opt/vllm-moet/dsv41_sm120/test_offload_replicated_mla.py; fi
 
-# 8. MoE input quantization + DeepGEMM grouped-layout permutation in one kernel at decode shapes (header);
+# 8. MoE input quantization + DeepGEMM grouped-layout permutation in one kernel at decode shapes;
 #    the extension is compiled here so nothing JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
 RUN python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_quant_scatter_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/moe_quant_scatter'); import moe_quant_scatter_sm120 as q; e = q._ext(); assert hasattr(e, 'moe_quant_scatter'); print('sm120 moe quant+scatter extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_quant_scatter_sm120/*.so
 
-# 10. The mHC boundary off the decode critical path (header); the extension is compiled here so nothing
+# 10. The mHC boundary off the decode critical path; the extension is compiled here so nothing
 #     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md. VLLM_MOET_DSPARK_MHC_STREAM=0 leaves the
 #     drafter's layers without the stream (the served wiring; an image for the KV-capacity A/B of window 9).
 ARG VLLM_MOET_MHC_OVERLAP=1
@@ -432,24 +112,24 @@ RUN if [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm1
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert hasattr(e, 'mhc_post_norm') and hasattr(e, 'mhc_proj'); print('sm120 mhc overlap extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_mhc_post_norm_sm120/*.so; fi
 
-# 11. The small-M BF16 GEMMs with cuBLAS's bits (header); the extension is compiled here so nothing JIT-compiles at
+# 11. The small-M BF16 GEMMs with cuBLAS's bits; the extension is compiled here so nothing JIT-compiles at
 #     boot. GPU tests: tools/dsv41_sm120/README.md.
 ARG VLLM_MOET_BF16_GEMM=1
 RUN if [ "$VLLM_MOET_BF16_GEMM" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_bf16_gemm_sm120.py \
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/bf16_gemm'); import bf16_replica_gemm_sm120 as b; e = b._ext(); assert hasattr(e, 'chain_out') and hasattr(e, 'spread_out'); print('sm120 bf16 gemm extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_bf16_replica_gemm_sm120/*.so; fi
 
-# 12. Engram's wkv split by output columns (header); no extension. GPU test: tools/dsv41_sm120/README.md.
+# 12. Engram's wkv split by output columns; no extension. GPU test: tools/dsv41_sm120/README.md.
 ARG VLLM_MOET_ENGRAM_WKV_TP=1
 RUN if [ "$VLLM_MOET_ENGRAM_WKV_TP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_engram_wkv_tp.py \
     && python3 -c "import vllm.models.deepseek_v41.common.engram as e; assert hasattr(e, '_moet_engram_wkv'); print('engram wkv split patched')"; fi
 
-# 13. NCCL's per-collective serialEvent record nodes reduced to the last one in every captured graph (header); no extension.
+# 13. NCCL's per-collective serialEvent record nodes reduced to the last one in every captured graph; no extension.
 ARG VLLM_MOET_NCCL_GRAPH_RECORDS=1
 RUN if [ "$VLLM_MOET_NCCL_GRAPH_RECORDS" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/nccl_graph/patch_vllm_nccl_graph_records.py \
     && python3 -c "import vllm.v1.worker.gpu.cudagraph_utils as c, vllm.compilation.breakable_cudagraph as b, vllm.compilation.cuda_graph as w; assert all(hasattr(m, '_moet_nccl') for m in (c, b, w)); print('nccl graph records patched')"; fi
 
-# 14. FC2's padding rows out of L2 at decode token counts (header); the extension is compiled here so nothing
+# 14. FC2's padding rows out of L2 at decode token counts; the extension is compiled here so nothing
 #     JIT-compiles at boot. GPU tests: tools/dsv41_sm120/README.md.
 ARG VLLM_MOET_MOE_FC2_DISCARD=1
 RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_fc2_discard_sm120.py \
@@ -457,15 +137,15 @@ RUN if [ "$VLLM_MOET_MOE_FC2_DISCARD" = "1" ]; then python3 /opt/vllm-moet/dsv41
     && python3 -c "import vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe as d; import inspect; assert hasattr(d, '_moet_drop_padding_rows') and hasattr(d, '_moet_l2_side_stream') and 'wait_stream(_moet_l2_side)' in inspect.getsource(d.DeepGemmFP4Experts.apply); print('moe fc2 discard patched')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_moe_l2_discard_sm120/*.so; fi
 
-# 15. Dual-batch overlap of the prefill's TP all-reduces (header); no extension, off unless `vllm serve` gets
+# 15. Dual-batch overlap of the prefill's TP all-reduces; no extension, off unless `vllm serve` gets
 #     --enable-dbo (docker/sm120/run-dsv41.sh PREFILL_DBO=1). Needs step 10's fused all-reduce. GPU test:
-#     tools/dsv41_sm120/README.md (prefill_dbo/test_prefill_dbo_tp4.py). Not ported to vLLM 3f1bcfd82b / 49cb2bbf yet (header).
+#     tools/dsv41_sm120/README.md (prefill_dbo/test_prefill_dbo_tp4.py). Not ported to vLLM 3f1bcfd82b / 49cb2bbf yet.
 ARG VLLM_MOET_PREFILL_DBO=0
 RUN if [ "$VLLM_MOET_PREFILL_DBO" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_dbo_sm120.py \
     && python3 -c "import vllm.v1.worker.moet_prefill_dbo as d, vllm.v1.worker.gpu.ubatch_utils as u, vllm.v1.worker.gpu.dp_utils as p, vllm.models.deepseek_v41.nvidia.model_state as s; import inspect; assert hasattr(u, '_moet_dbo') and 'check_ubatch_thresholds(parallel_config, num_tokens, uniform_decode)' in inspect.getsource(p.dispatch_cg_and_sync_dp) and '_moet_num_ubatches' in inspect.getsource(s.DeepseekV41ModelState); print('prefill dbo patched')"; fi
 
 # 16. (backport) vllm#61647: the indexer's TP row-sharding threshold as AttentionConfig.indexer_tp_shard_min_rows
-#     (header); default unchanged, docker/sm120/run-dsv41.sh INDEXER_TP_SHARD_MIN_ROWS sets it.
+#    ; default unchanged, docker/sm120/run-dsv41.sh INDEXER_TP_SHARD_MIN_ROWS sets it.
 ARG VLLM_MOET_INDEXER_SHARD_ROWS=1
 RUN if [ "$VLLM_MOET_INDEXER_SHARD_ROWS" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_indexer_shard_rows.py \
     && python3 -c "from vllm.config.attention import AttentionConfig as A; import inspect, vllm.v1.attention.backends.mla.indexer as i; assert A().indexer_tp_shard_min_rows == 65536 and 'min_rows' in inspect.signature(i.balanced_prefill_row_shard).parameters; print('indexer shard rows configurable')"; fi
@@ -479,13 +159,13 @@ RUN if [ "$VLLM_MOET_B12X_COMPACT_BIND" = "1" ]; then python3 /opt/vllm-moet/dsv
     && grep -q "_moet_compact_launches(self)" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_impl.py \
     && echo "b12x compact bind patched"; fi
 
-# 18. The DSpark drafter's lm_head at decode row counts on the MXFP8 GEMV (header); needs step 3's patched linear kernel.
+# 18. The DSpark drafter's lm_head at decode row counts on the MXFP8 GEMV; needs step 3's patched linear kernel.
 ARG VLLM_MOET_DRAFTER_LM_HEAD_MXFP8=1
 RUN if [ "$VLLM_MOET_DRAFTER_LM_HEAD_MXFP8" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_lm_head_mxfp8_sm120.py \
     && grep -q "_moet_mxfp8_lm_head(self, normed)" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/dspark.py \
     && echo "drafter lm_head mxfp8 patched"; fi
 
-# 19. The MoE router's top-6 bit-identical to the Triton dsv4_topk in a plain-launched CUDA kernel (header); the extension
+# 19. The MoE router's top-6 bit-identical to the Triton dsv4_topk in a plain-launched CUDA kernel; the extension
 #     is compiled here so nothing JIT-compiles at boot. GPU test: tools/dsv41_sm120/dsv4_topk/test_dsv4_topk_sm120.py.
 ARG VLLM_MOET_DSV4_TOPK=1
 RUN if [ "$VLLM_MOET_DSV4_TOPK" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dsv4_topk_sm120.py \
@@ -493,7 +173,7 @@ RUN if [ "$VLLM_MOET_DSV4_TOPK" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120
     && grep -q "_moet_topk(gating_output)" /usr/local/lib/python3.12/dist-packages/vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_dsv4_topk_sm120/*.so; fi
 
-# 20. DSpark's Markov sampling in one launch per draft step on sm_120 (header); Triton, compiled at the first eager call.
+# 20. DSpark's Markov sampling in one launch per draft step on sm_120; Triton, compiled at the first eager call.
 #     GPU test: tools/dsv41_sm120/fused_markov/test_fused_markov_sm120.py.
 ARG VLLM_MOET_FUSED_MARKOV=1
 RUN if [ "$VLLM_MOET_FUSED_MARKOV" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_dspark_fused_markov_sm120.py \
@@ -504,7 +184,7 @@ ARG VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH=1
 RUN if [ "$VLLM_MOET_TARGET_LM_HEAD_MXFP8_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_target_lm_head_mxfp8_sm120.py \
     && python3 -c "import vllm.models.deepseek_v41.nvidia.model as m; assert hasattr(m, '_moet_target_mxfp8_lm_head'); print('target lm_head mxfp8 patched')"; fi
 
-# 22. FC2 of b12x's compact W4A8 MoE path grouped by expert (header); the extension is compiled here.
+# 22. FC2 of b12x's compact W4A8 MoE path grouped by expert; the extension is compiled here.
 #     GPU test: tools/dsv41_sm120/b12x_fc2/test_b12x_fc2_grouped_sm120.py.
 ARG VLLM_MOET_B12X_FC2_GROUPED=1
 RUN if [ "$VLLM_MOET_B12X_FC2_GROUPED" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer_b12x_fc2_grouped_sm120.py \
@@ -535,6 +215,15 @@ RUN if [ "$VLLM_MOET_B12X_MOE_FUSED_PATCH" = "1" ]; then python3 /opt/vllm-moet/
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_fused'); import b12x_moe_fused_sm120 as f; e = f._ext(); assert hasattr(e, 'moe_fused'); print('sm120 b12x fused MoE extension built')" \
     && grep -q "_moet_moe_fused_on" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_fused_sm120/*.so; fi
+# 27a. Deterministic MoE output above the fused kernel's 8 tokens: b12x's `dynamic` backend (11+ tokens in the decode graphs,
+#      every prefill) sums the experts' FC2 contributions into the [M, K] output with atomics by default ("Atomic scatter
+#      writes directly into the caller-owned output" in its _impl.py), so identical requests of 9+ rows returned different
+#      logits (top-20 jitter ~2 nats, top-1 flips at high-entropy positions; measured 2026-10-26..28, GLM on upstream vLLM
+#      bit-identical). B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 selects b12x's plan with one bf16 row per (token, expert) pair
+#      and a fixed-order top-k reduction: bit-identical repeats at 9 / 12 / 128 rows, step period unchanged at one and two
+#      users and 3 % shorter at four (RTX PRO 6000, TP4, r21). Below 9 tokens the fused kernel (step 27) is deterministic by
+#      construction. -e B12X_DYNAMIC_DETERMINISTIC_OUTPUT=0 restores the atomic path.
+ENV B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
 
 # 28. The sparse MLA decode's rows gathered by plain loads, shared conversion, speculative index loads, the softmax / XV
 #     section with 4 barriers per tile + the merge with its loads issued up front (runtime switch VLLM_MOET_SPARSE_MLA_LDG=1,
@@ -579,9 +268,66 @@ ARG VLLM_MOET_MOE_PREQUANT_PATCH=1
 RUN if [ "$VLLM_MOET_MOE_PREQUANT_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_moe_prequant_sm120.py \
     && python3 -c "import vllm.model_executor.layers.fused_moe.runner.moe_runner as r, flashinfer.experimental.b12x.moe._shared.kernels.w4a8_compact_micro as m; assert hasattr(r, '_moet_prequant_begin') and hasattr(r, '_moet_prequant_take') and hasattr(m, '_moet_prequant_take'); print('MoE rows quantization off the critical path patched')"; fi
 
-# Marker the launcher reads through `docker image inspect` to pick the upstream KV plumbing.
+# 36. The DSpark drafter's non-causal SWA metadata update (validity + token -> request map + indices) in one Triton
+#     launch instead of three, per SWA builder inside the drafter's graph (runtime switch VLLM_MOET_SWA_DRAFT_BUILD=1,
+#     default off). GPU test: tools/dsv41_sm120/swa_draft_build/test_swa_draft_build_sm120.py.
+ARG VLLM_MOET_SWA_DRAFT_BUILD_PATCH=1
+RUN if [ "$VLLM_MOET_SWA_DRAFT_BUILD_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_swa_draft_build_sm120.py \
+    && python3 -c "import vllm.v1.attention.backends.mla.sparse_swa as s; assert hasattr(s, '_moet_swa_draft_build_kernel') and hasattr(s, '_moet_swa_draft_build'); print('SWA draft build in one launch patched')"; fi
+
+# 37. The MoE sublayer's routing (router spread GEMM + DeepSeek-V4 top-6) folded into the fused decode MoE launch: one
+#     persistent kernel from the router's input to route_output (runtime switch VLLM_MOET_MOE_MEGA=1; the deferral in
+#     dsv4_topk_sm120 / bf16_gemm, the launch site in w4a8_compact_micro.py on top of steps 27 and 34). Measured slower
+#     in the served graph (docs/dsv41-sm120-internals.md) - opt-in: the default 0 leaves it out of the image; =1 patches the launch site
+#     and compiles the extension here. GPU test: tools/dsv41_sm120/b12x_moe_mega/test_b12x_moe_mega_sm120.py.
+ARG VLLM_MOET_MOE_MEGA_PATCH=0
+RUN if [ "$VLLM_MOET_MOE_MEGA_PATCH" = "1" ] && [ "$VLLM_MOET_B12X_MOE_FUSED_PATCH" = "1" ] && [ "$VLLM_MOET_MOE_PREQUANT_PATCH" = "1" ]; then \
+    python3 /opt/vllm-moet/dsv41_sm120/patch_flashinfer_b12x_moe_mega_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_mega'); import b12x_moe_mega_sm120 as f; e = f._ext(); assert hasattr(e, 'moe_mega'); print('sm120 b12x MoE sublayer megakernel extension built')" \
+    && grep -q "_moet_mega_take" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_mega_sm120/*.so; fi
+
+# 38. The MXFP8 linear kernel takes the mHC boundary kernel's MXFP8 copy of its input (runtime switch
+#     VLLM_MOET_MHC_MXFP8=1, default off; the kernel side is step 10's extension). GPU test:
+#     tools/dsv41_sm120/mhc_overlap/test_mhc_post_norm_mxfp8_sm120.py.
+ARG VLLM_MOET_MHC_MXFP8_PATCH=1
+RUN if [ "$VLLM_MOET_MHC_MXFP8_PATCH" = "1" ] && [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_mxfp8_consumer_sm120.py \
+    && grep -q "_moet_mxfp8" /usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/mhc_overlap'); import mhc_post_norm_sm120 as m; e = m._ext(); assert 'q_data' in e.mhc_post_norm.__doc__; print('mHC boundary MXFP8 consumer patched')"; fi
+
+# 39. The attention boundary's model-stream chain first in capture order (runtime switch VLLM_MOET_MHC_SIDE_DEFER=1,
+#     default off). Depends on steps 10 and 23 (anchors in the installed ops/mhc.py).
+ARG VLLM_MOET_MHC_SIDE_DEFER_PATCH=1
+RUN if [ "$VLLM_MOET_MHC_SIDE_DEFER_PATCH" = "1" ] && [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_mhc_side_defer_sm120.py \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.ops.mhc as h, vllm.models.deepseek_v41.attention as a; assert hasattr(h, '_moet_mhc_run_deferred') and hasattr(a, '_moet_mhc_run_deferred_side'); print('mHC side-stream deferral patched')"; fi
+
+# 40. Sparse-MLA prefill through the full-BF16 route (runtime switch VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1, default off).
+ARG VLLM_MOET_SPARSE_MLA_PREFILL_BF16_PATCH=1
+RUN if [ "$VLLM_MOET_SPARSE_MLA_PREFILL_BF16_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_sparse_mla_prefill_bf16_sm120.py \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.flashinfer_sparse as f; assert hasattr(f, '_moet_prefill_bf16_wrapper'); print('sparse-MLA prefill BF16 route patched')"; fi
+
+# 41. Sequence-parallel mHC boundaries of the eager prefill steps (runtime switch VLLM_MOET_PREFILL_SP=1, default off;
+#     VLLM_MOET_PREFILL_SP_MIN_TOKENS, VLLM_MOET_PREFILL_SP_AUX, VLLM_MOET_PREFILL_SP_RS). Anchored after steps 10, 23
+#     and 39 (the boundary glue and the attention's deferred side stream); no extension. GPU test (four GPUs):
+#     torchrun --nproc_per_node=4 /opt/vllm-moet/dsv41_sm120/sp_boundary/test_prefill_sp_tp4.py
+ARG VLLM_MOET_PREFILL_SP_PATCH=1
+RUN if [ "$VLLM_MOET_PREFILL_SP_PATCH" = "1" ] && [ "$VLLM_MOET_MHC_OVERLAP" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_sp_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_sp_sm120.py --check \
+    && python3 -c "import vllm.models.deepseek_v41.nvidia.model as m, vllm.models.deepseek_v41.attention as a, vllm.model_executor.kernels.mhc.warmup as w; assert hasattr(m, '_moet_sp_reduce_scatter') and hasattr(m, '_moet_sp_pin') and hasattr(a, '_moet_sp_input_projections'); print('prefill SP boundaries patched')"; fi
+
+# 42. The prefill MoE of b12x's dynamic path on our pipelined FC1 / FC2 kernels, bit-identical (runtime switch
+#     VLLM_MOET_B12X_MOE_PREFILL_FAST=1, default off; the extension is compiled here, sm_120a). GPU test (one GPU, with the
+#     served dumps): tools/dsv41_sm120/b12x_moe_prefill_fast/test_b12x_moe_prefill_fast_sm120.py --dumps DIR
+ARG VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH=1
+RUN if [ "$VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_b12x_moe_prefill_fast_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_b12x_moe_prefill_fast_sm120.py --check \
+    && grep -q "_moet_prefill_fast_launch" /usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_impl.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_prefill_fast'); import b12x_moe_prefill_fast_sm120 as f; e = f._ext(); assert hasattr(e, 'moe_prefill_fast'); print('sm120 fast prefill MoE extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_prefill_fast_sm120/*.so; fi
+
+# Labels: the launcher reads kv-mode and v41-kv-records; the tests and docs read the step flags.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
-      org.opencontainers.image.description="vllm/vllm-openai:nightly df3bd094 (FlashInfer 0.7.2: DSv4.1 dual-cache sparse MLA, runtime dispatch, sm120f AOT modules; its reader taught the interleaved V4.1 records) + DeepGEMM 727f8470 with 128-row paged MQA logits and the per-group BLOCK_M on sm_120 + nvfp4_ds_mla on sm_120 through FlashInfer + MXFP8 decode GEMV + official reasoning-effort tiers + single-copy KV offload + fused MoE quant+scatter + mHC boundary off the critical path + cuBLAS-bit-identical small-M BF16 GEMMs + Engram wkv split over the TP ranks at decode + PDL in our decode kernels + NCCL graph event records reduced to one + FC2 padding rows out of L2 + the indexer row-sharding threshold (vllm#61647) + b12x compact W4A8 MoE launchers for --moe-backend b12x + the DSpark drafter's lm_head on the MXFP8 GEMV + the MoE router's top-6 in a plain-launched CUDA kernel bit-identical to Triton's + DSpark's Markov sampling in one launch per draft step + the target's lm_head on the MXFP8 GEMV (runtime switch) + b12x's MoE FC2 grouped by expert + a deterministic DSA indexer top-k (runtime switch) + b12x's decode MoE in one persistent kernel (runtime switch) + the sparse MLA decode's rows gathered by plain loads, its softmax / XV section with four barriers per tile and its merge with hoisted loads (runtime switch) + the drafter's input preparation in one launch for all draft KV groups (runtime switch) + the DSA candidate-block selection on the deterministic top-k (runtime switch) + the SWA builders' decode build in one launch (runtime switch) + the shared-expert add fused into the MoE top-k sum (runtime switch) + the MoE rows quantization on a side stream before the router (runtime switch)" \
+      org.opencontainers.image.description="DeepSeek-V4.1-Flash on sm_120: vllm/vllm-openai nightly df3bd094 with the sm_120 gaps closed and the decode / prefill kernels of vLLM-Moet (docs/dsv41-sm120.md)" \
       com.vllm-moet.kv-mode="upstream" \
       com.vllm-moet.flashinfer="base" \
       com.vllm-moet.decoder-replay="upstream" \
@@ -610,4 +356,11 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.swa-decode-build="${VLLM_MOET_SWA_DECODE_BUILD_PATCH}" \
       com.vllm-moet.moe-topksum-add="${VLLM_MOET_MOE_TOPKSUM_ADD_PATCH}" \
       com.vllm-moet.moe-prequant="${VLLM_MOET_MOE_PREQUANT_PATCH}" \
+      com.vllm-moet.swa-draft-build="${VLLM_MOET_SWA_DRAFT_BUILD_PATCH}" \
+      com.vllm-moet.moe-mega="${VLLM_MOET_MOE_MEGA_PATCH}" \
+      com.vllm-moet.mhc-mxfp8="${VLLM_MOET_MHC_MXFP8_PATCH}" \
+      com.vllm-moet.mhc-side-defer="${VLLM_MOET_MHC_SIDE_DEFER_PATCH}" \
+      com.vllm-moet.sparse-mla-prefill-bf16="${VLLM_MOET_SPARSE_MLA_PREFILL_BF16_PATCH}" \
+      com.vllm-moet.prefill-sp="${VLLM_MOET_PREFILL_SP_PATCH}" \
+      com.vllm-moet.b12x-moe-prefill-fast="${VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"

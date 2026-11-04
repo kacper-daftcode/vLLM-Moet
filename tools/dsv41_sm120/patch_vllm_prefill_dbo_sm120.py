@@ -2,8 +2,8 @@
 """Dual-batch overlap of the TP all-reduces in the DeepSeek-V4.1 prefill on sm_120 (TP4, no DP / EP).
 
 A 4096-token prefill chunk on 4x RTX PRO 6000 spends a third of its time in NCCL: two [4096, 5120] bf16
-all-reduces per non-trimmed layer, 1.6 ms each on the PCIe ring, with 180 SMs idle (docs/dsv41-sm120-port.md,
-"Where a 163K-token prefill spends its 9 s"). vLLM's dual-batch overlap (`--enable-dbo`) splits a step into two
+all-reduces per non-trimmed layer, 1.6 ms each on the PCIe ring, with 180 SMs idle (docs/dsv41-sm120-internals.md,
+"Where the time goes"). vLLM's dual-batch overlap (`--enable-dbo`) splits a step into two
 microbatches on two threads that hand the GPU to each other at the collectives, so one half's all-reduce runs on a
 comm stream behind the other half's GEMMs - measured on this host without the model at 80-97 % of the all-reduce
 hidden (nccl_graph/nccl_overlap_bench.py). In vLLM main 21d93d0d that machinery exists for DP + EP on the V2 runner

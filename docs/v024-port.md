@@ -188,54 +188,7 @@ single‑stream (per‑step confidence sync) and the replays at τ=0.60 were thr
 on top of that (FP4 re‑decides lift MTP acceptance enough to pay for themselves); τ=0.75
 costs ~5% more.
 
-## Benchmarks (2026‑07‑08)
+## Benchmarks
 
-Official FP4 checkpoint, `VLLM_MOE_W2=1`, FP4 delta 1 GiB, MTP k=2, cudagraphs
-FULL_AND_PIECEWISE, fp8 KV, block 256, `max_num_seqs` 4, mnbt 1024; PRO 6000 runs at
-24576 ctx, 5090 runs at 16384 ctx. Tools: `tools/bench_tok.py` (single‑stream decode,
-512 tok, median of 5) and a unique‑prefix prefill probe (8k tokens, median of ≥3; unique
-prefixes defeat the prefix cache). MTP acceptance ~2.6 tok/step in every config.
-
-| config | decode | prefill 8k | decode conc‑3 (aggregate) |
-|---|---:|---:|---:|
-| 1× RTX PRO 6000 | **161.2 tok/s** | **4 847 tok/s** | ~289 tok/s |
-| 2× RTX PRO 6000 TP2 | **209.6 tok/s** | **5 791 tok/s** | ~380 tok/s |
-| 4× RTX 5090 TP4 | **214.4 tok/s** | **5 561 tok/s** | ~430 tok/s |
-
-**2026‑07‑09 — AFRAG prefill kernels ship and default on** (fragment‑major activations;
-bit‑identical outputs, 1.30×/1.27× on the K=4096/K=2048 prefill GEMMs). Same 8k‑unique‑prompt
-probe, median of 5: 1× PRO 6000 **4 777 → 5 340 tok/s (+11.8%)**; 4× 5090 TP4 (median of 3)
-5 987 → 6 101 tok/s (+1.9% — the 1024‑token chunks shard per‑rank GEMM work too thin for the
-full kernel win). TP2 has **not** been re‑measured with AFRAG yet — the tables carry its
-2026‑07‑08 pre‑AFRAG figure (5 791), which is conservative. Opt out with
-`VLLM_MOE_W2_AFRAG=0`.
-
-Prefill rides upstream's FlashInfer SM120 sparse‑MLA path — which also makes a custom cubit
-MLA‑prefill kernel unnecessary on this base.
-
-**Batch scaling** (same knobs but `--max-num-seqs 32 --max-num-batched-tokens 2048`;
-N identical‑length greedy requests, 384 tok each, aggregate decode tok/s, median of 5):
-
-| concurrency | 1 | 4 | 8 | 16 | 32 |
-|---|---:|---:|---:|---:|---:|
-| 1× RTX PRO 6000 | 156 | 290 | 493 | 659 | **933** |
-| 4× RTX 5090 (TP4) | 198 | 460 | 762 | 1 006 | **1 560** |
-
-6–8× aggregate from batch 1→32 — the 2‑bit expert reads amortize well across the batch
-(decode stays HBM‑bound; the per‑step expert working set grows sublinearly with batch).
-At 32 streams each request still gets ~29 tok/s (PRO 6000) / ~49 tok/s (TP4).
-
-**The former 512K single-card DS4 mode is retired.** It obtained KV headroom by setting
-`VLLM_MOE_W2_DELTA_GB=0`, which disables FP4 recovery and serves bare 2-bit experts.
-Needle retrieval alone did not establish native-grade model quality. Supported DS4 recipes
-must retain a positive FP4 recovery pool; maximum context is therefore the value validated
-by the selected recipe, not the old 512K capacity probe.
-
-**Delta pool auto‑sizing.** `VLLM_MOE_W2_DELTA_GB=auto` resolves the delta‑vs‑KV trade
-automatically: the pool allocation is deferred until after the KV cache is allocated
-(and before cudagraph capture — the graphs bake the pool pointer), then sized as
-`free VRAM − VLLM_MOE_W2_DELTA_RESERVE_GB` (default 3, capture/workspace headroom),
-optionally capped by `VLLM_MOE_W2_DELTA_MAX_GB`. At extreme context it lands at 0 slots
-(a capacity-only bare-2bit mode, unsupported for DS4 serving); at 24K ctx / util 0.95 it
-recovers a ~1.6 GiB pool (133 slots) and benches at 166 tok/s single‑stream
-(1× PRO 6000, MTP k=2, graphs).
+The release tables are rendered from `bench/results/` into [v024-2bit.md](v024-2bit.md); the
+per-release reports are in [benchmarks/](benchmarks/) and the process in [`bench/README.md`](../bench/README.md).

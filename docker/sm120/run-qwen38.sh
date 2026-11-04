@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Qwen3.8-Flash-Next-FP8 on 4x RTX PRO 6000 (sm_120), TP4, MTP k=3 -- the validated deployment
-# (docs/sm120-deploy.md, tools/qwen38_sm120/README.md). Image: Dockerfile.sm120-qwen38.
+# (docs/qwen38-sm120.md, tools/qwen38_sm120/README.md). Image: Dockerfile.sm120-qwen38.
 #
 # Required:  MODEL_DIR   directory with the Qwen3.8-Flash-Next-FP8 checkpoint
 # Optional:  IMAGE (vllm-moet-sm120:qwen38-20073)  NAME (qwen38)  GPUS (0,1,2,3)  TP (4)  PORT (8000)

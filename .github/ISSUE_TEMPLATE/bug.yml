@@ -1,0 +1,51 @@
+name: Bug
+description: Something in a vLLM-Moet image or tool does not behave as documented.
+labels: ["bug"]
+body:
+  - type: dropdown
+    id: line
+    attributes:
+      label: Line
+      options:
+        - DeepSeek-V4.1-Flash on 4x RTX PRO 6000 (Dockerfile.sm120-dsv41-nightly)
+        - MoET hybrid on 4x RTX 5090 (moet-hybrid)
+        - Qwen3.8-Flash-Next-FP8 (Dockerfile.sm120-qwen38)
+        - 2-bit experts on vLLM v0.24.0 (frozen - fixes only, as PRs against the fork branch)
+        - Tools / docs
+    validations:
+      required: true
+  - type: input
+    id: image
+    attributes:
+      label: Image tag and commit
+      description: The exact tag you built (`docker image inspect` labels help) and the repository commit.
+      placeholder: vllm-moet-sm120:dsv41-nightly-df3bd094-r23 @ 1824cfb
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      placeholder: 4x RTX PRO 6000 Blackwell 96 GB, PCIe, driver 580.xx, host RAM 512 GB
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Launcher command and environment
+      description: The exact `docker/sm120/run-*.sh` invocation (or `docker run`), including every `VLLM_MOET_*` switch you set.
+      render: bash
+    validations:
+      required: true
+  - type: textarea
+    id: observed
+    attributes:
+      label: What happens, what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Log
+      description: The relevant part of `docker logs` (the first error and the lines before it).
+      render: text

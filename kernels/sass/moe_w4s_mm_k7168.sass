@@ -28,7 +28,7 @@
     // desc = d_desc + pair*64 ; {a, as, base, ref, bs, c, m_rows, pad}
     LDC.64 R2, c[0x0][0x380] ;               // d_desc
     IMAD R0, R92, 0x40, RZ ;
-    IMAD.WIDE.U32 R2, R0, 0x1, R2 ;
+    IMAD.WIDE.U32 R2, PT, R0, 0x1, R2 ;
     LDG.E.128 R4, desc[UR4][R2.64] ;         // a_lo,a_hi,as_lo,as_hi
     LDG.E.128 R8, desc[UR4][R2.64+0x10] ;    // base_lo,hi, ref_lo,hi
     LDG.E.128 R12, desc[UR4][R2.64+0x20] ;   // bs_lo,hi, c_lo,hi
@@ -57,8 +57,8 @@
     SHF.L.U32 R0, R0, 0x8, RZ ;              // *256B per (nb,k64,32 lanes)
     SHF.L.U32 R1, R86, 0x3, RZ ;             // lane*8
     IADD3 R0, PT, PT, R0, R1, RZ ;
-    IMAD.WIDE.U32 R8, R0, 0x1, R68 ;         // -> R8: base plane ptr
-    IMAD.WIDE.U32 R70, R0, 0x1, R70 ;        // -> R70: ref plane ptr
+    IMAD.WIDE.U32 R8, PT, R0, 0x1, R68 ;         // -> R8: base plane ptr
+    IMAD.WIDE.U32 R70, PT, R0, 0x1, R70 ;        // -> R70: ref plane ptr
 
     // Bs plane ptr: ((nb*(K/32) + wid*(KSLICE/32))*16 + g
     SHF.R.U32.HI R0, RZ, 0x5, R82 ;          // K/32
@@ -66,16 +66,16 @@
     IMAD R1, R85, 0x1c, R1 ;
     SHF.L.U32 R1, R1, 0x4, RZ ;              // *16
     IADD3 R1, PT, PT, R1, R87, RZ ;          // + g
-    IMAD.WIDE.U32 R74, R1, 0x1, R74 ;        // -> R74: lane's sbyte ptr
+    IMAD.WIDE.U32 R74, PT, R1, 0x1, R74 ;        // -> R74: lane's sbyte ptr
 
     // A row ptr (row g, direct fp8) + As ptr (f32 [M, K/128])
-    IMAD.WIDE.U32 R64, R87, R82, R64 ;       // + g*K
-    IMAD.WIDE.U32 R64, R89, 0x1, R64 ;       // + 4t
+    IMAD.WIDE.U32 R64, PT, R87, R82, R64 ;       // + g*K
+    IMAD.WIDE.U32 R64, PT, R89, 0x1, R64 ;       // + 4t
     IMAD R0, R85, 0x380, RZ ;
-    IMAD.WIDE.U32 R64, R0, 0x1, R64 ;        // + wid K-slice
+    IMAD.WIDE.U32 R64, PT, R0, 0x1, R64 ;        // + wid K-slice
     SHF.L.U32 R0, R84, 0x2, RZ ;             // As row stride = n_kb128*4
-    IMAD.WIDE.U32 R66, R87, R0, R66 ;        // + g*stride
-    IMAD.WIDE.U32 R66, R85, 0x1c, R66 ;
+    IMAD.WIDE.U32 R66, PT, R87, R0, R66 ;        // + g*stride
+    IMAD.WIDE.U32 R66, PT, R85, 0x1c, R66 ;
 
     // constants: pad A words zero, pools, neutral sfa, kb accs zero
     MOV R28, 0x7f7f7f7f ;                    // sfa neutral
@@ -301,10 +301,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 1 (kb128 0) ----
     LDG.E.64 R24, desc[UR4][R8.64+0x100] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0x100] ;    // ref codes 8B
@@ -494,10 +494,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 0: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;
@@ -695,10 +695,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 3 (kb128 1) ----
     LDG.E.64 R24, desc[UR4][R8.64+0x300] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0x300] ;    // ref codes 8B
@@ -888,10 +888,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 1: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;
@@ -1089,10 +1089,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 5 (kb128 2) ----
     LDG.E.64 R24, desc[UR4][R8.64+0x500] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0x500] ;    // ref codes 8B
@@ -1282,10 +1282,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 2: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;
@@ -1483,10 +1483,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 7 (kb128 3) ----
     LDG.E.64 R24, desc[UR4][R8.64+0x700] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0x700] ;    // ref codes 8B
@@ -1676,10 +1676,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 3: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;
@@ -1877,10 +1877,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 9 (kb128 4) ----
     LDG.E.64 R24, desc[UR4][R8.64+0x900] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0x900] ;    // ref codes 8B
@@ -2070,10 +2070,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 4: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;
@@ -2271,10 +2271,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 11 (kb128 5) ----
     LDG.E.64 R24, desc[UR4][R8.64+0xb00] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0xb00] ;    // ref codes 8B
@@ -2464,10 +2464,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 5: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;
@@ -2665,10 +2665,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // ---- k64 13 (kb128 6) ----
     LDG.E.64 R24, desc[UR4][R8.64+0xd00] ;     // base codes 8B
     LDG.E.64 R12, desc[UR4][R70.64+0xd00] ;    // ref codes 8B
@@ -2858,10 +2858,10 @@
     PRMT R3, R90, R18, RZ ;                  // sign bytes (80/00)
     LOP3.LUT R39, R2, R3, RZ, 0xfc, !PT ; // OR signs
     // QMMA per k32; sfb = the lane's COLUMN row scale (tile-exact)
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4.ROW, R32.COL, R40, R28, R26, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4.ROW, R36.COL, R44, R28, R29, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20.ROW, R34.COL, R40, R28, R56, UR6 ;
-    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20.ROW, R38.COL, R44, R28, R57, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R4, R32, R40, R28, R26, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R4, R36, R44, R28, R29, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R40, R20, R34, R40, R28, R56, UR6 ;
+    QMMA.SF.16832.F32.E4M3.E4M3.E8 R44, R20, R38, R44, R28, R57, UR6 ;
     // fold kb128 6: master += acc_kb * As (B scale already in SF)
     FFMA R48, R40, R30, R48 ;
     FFMA R49, R41, R30, R49 ;

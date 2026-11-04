@@ -16,7 +16,7 @@ load_timeout_s: 2400
 # 2-bit planes (~36.4 GiB/rank) + NON-SPLIT FP4 need-pool 12 GiB/rank
 # (4096 slots >= the FIRE FLOOR 2692 at 2 seqs x FP-loop growth 1.7 —
 # measured: 12 GiB pinned 2048/2048 + 542 denied on GPQA C=2, 66-68%
-# vs 72.2% here; split is quality-banned: internal/SPLIT_FP4_ZERO_*).
+# vs 72.2% here; split is quality-banned by the zero-sign finding).
 # Gate tau 0.60 and unlimited MAX_PROMOTE are the code defaults.
 env:
   VLLM_MOE_W2: "1"

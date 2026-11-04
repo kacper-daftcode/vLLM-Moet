@@ -13,10 +13,9 @@ import time
 
 import torch
 import torch.distributed as dist
-from torch.utils.cpp_extension import load
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from p2p_allreduce_sm120 import nccl_order_tables  # noqa: E402
+from p2p_allreduce_sm120 import H, _build, nccl_order_tables  # noqa: E402  (H: VLLM_MOET_P2P_AR_H, default 5120)
 from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator  # noqa: E402
 
 ap = argparse.ArgumentParser()
@@ -32,9 +31,10 @@ rank, ws = dist.get_rank(), dist.get_world_size()
 assert ws == 4
 torch.cuda.set_device(rank)
 dev = torch.device("cuda", rank)
-H, M_MAX = 5120, 64
-ext = load(name="p2p_allreduce_sm120", sources=[os.path.join(os.path.dirname(os.path.abspath(__file__)), "p2p_allreduce_sm120.cu")],
-           extra_cuda_cflags=["-O3", "-gencode=arch=compute_120a,code=sm_120a"], verbose=rank == 0)
+M_MAX = 64
+ext = _build()  # the module's build: name p2p_allreduce_sm120 for H = 5120, p2p_allreduce_sm120_h<H> with -DH=<H> otherwise
+if rank == 0:
+    print(f"H = {H} (VLLM_MOET_P2P_AR_H)")
 
 NSLOTS = 4
 data = ext.alloc_shared(NSLOTS * 4 * M_MAX * H * 2)

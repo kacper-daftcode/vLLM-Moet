@@ -292,9 +292,12 @@ _PENDING_LATE = [0]
 
 
 def router_topk_fused() -> bool:
+    """Defer the router's spread launch to its consumer: the routing top-6 (step 35) or the MoE launch (step 37)."""
     global _ROUTER_TOPK_FUSED
     if _ROUTER_TOPK_FUSED is None:
-        _ROUTER_TOPK_FUSED = os.environ.get("VLLM_MOET_ROUTER_TOPK_FUSED", "0") == "1"
+        _ROUTER_TOPK_FUSED = (
+            os.environ.get("VLLM_MOET_ROUTER_TOPK_FUSED", "0") == "1" or os.environ.get("VLLM_MOET_MOE_MEGA", "0") == "1"
+        )
     return _ROUTER_TOPK_FUSED
 
 

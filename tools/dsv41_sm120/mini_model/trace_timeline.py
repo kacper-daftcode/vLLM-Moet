@@ -4,7 +4,7 @@ much of it ran concurrently with other kernels, the CPU side (op time per thread
 behind the host launches), and the handoffs between microbatch threads.
 
 usage: trace_timeline.py TRACE.json[.gz] [--nccl-hist]
-Written for the prefill DBO work (docs/dsv41-sm120-port.md, "Dual-batch overlap of the prefill all-reduces"): on the
+Written for the prefill DBO work (docs/dsv41-sm120-internals.md; step 15): on the
 dummy-weight model the two-microbatch step showed 0-29 ms of 165-176 ms of NCCL overlapped with compute and the
 all-reduces spinning for peers whose host threads had not launched yet."""
 

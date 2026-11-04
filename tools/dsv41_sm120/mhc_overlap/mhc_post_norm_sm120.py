@@ -35,6 +35,24 @@ POST_MIX_MODE = 1
 # only start during it when it is PDL-launched (it releases them right after its wait): 0.8 us per
 # attention boundary, 0.4 per FFN boundary. VLLM_MOET_MHC_PDL=0 turns it off.
 PDL_DEFAULT = os.environ.get("VLLM_MOET_MHC_PDL", "1") == "1"
+# The MXFP8 copy of layer_input for the sublayer's first linear (fused_wqa_wkv, the shared experts' /
+# dense MLPs' w13): the kernel writes the e4m3 bytes and the F8_128x4 swizzled ue8m0 scales FlashInfer's
+# standalone quantization kernel would produce from the same bf16 tensor, and the wrapper hangs them on
+# the returned layer_input as `_moet_mxfp8 = (data, scale)`; the MXFP8 linear kernel's apply_weights
+# (patch_vllm_mhc_mxfp8_consumer_sm120.py) takes them instead of quantizing. VLLM_MOET_MHC_MXFP8=1
+# turns it on (off by default until measured in the served graph).
+MXFP8_DEFAULT = os.environ.get("VLLM_MOET_MHC_MXFP8", "0") == "1"
+MXFP8_ATTR = "_moet_mxfp8"
+
+
+def mxfp8_buffers(T: int, H: int, device) -> tuple[torch.Tensor, torch.Tensor]:
+    """(data float8_e4m3fn [T, H], scale uint8 [ceil(T/128)*128 * H/32]) - the shapes mxfp8_e4m3_quantize(x,
+    is_sf_swizzled_layout=True) returns for a [T, H] activation (H % 128 == 0)."""
+    rows = (T + 127) // 128 * 128
+    return (
+        torch.empty(T, H, dtype=torch.float8_e4m3fn, device=device),
+        torch.empty(rows * (H // 32), dtype=torch.uint8, device=device),
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -85,6 +103,7 @@ def mhc_post_norm(
     pdl: bool | None = None,
     out: tuple[torch.Tensor, torch.Tensor, torch.Tensor | None] | None = None,
     ar: dict | None = None,
+    quant_out: tuple[torch.Tensor, torch.Tensor] | bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Returns (residual_out [T, hc, H] bf16, layer_input [T, H] bf16, aux [T or 0, H] bf16).
 
@@ -92,6 +111,9 @@ def mhc_post_norm(
     p2p_allreduce_sm120.push_for_fused(x): x is then this rank's partial sum and the kernel adds the three peers'
     partials in NCCL's order with NCCL's bf16 rounding (NCCL's bits) before the post-mix; a fourth tensor, the reduced
     x [T, H], is then returned too (the side stream's projection reads it).
+
+    quant_out: the MXFP8 copy of layer_input - mxfp8_buffers(T, H, device) to fill (or True to allocate them; None =
+    MXFP8_DEFAULT). When produced, the pair is attached to layer_input as `layer_input._moet_mxfp8` for the consumer.
     """
     if pdl is None:
         pdl = PDL_DEFAULT
@@ -103,11 +125,16 @@ def mhc_post_norm(
     else:
         residual_out, layer_input, aux_ = out
         aux = aux_ if aux_ is not None else torch.empty(0, H, dtype=torch.bfloat16, device=residual.device)
+    if quant_out is None:
+        quant_out = MXFP8_DEFAULT
+    if quant_out is True:
+        quant_out = mxfp8_buffers(T, H, residual.device)
+    q_data, q_scale = quant_out if quant_out else (None, None)
     if ar is None:
         _ext().mhc_post_norm(
             x, residual, post_layer_mix.reshape(T, hc).contiguous(), comb_res_mix.contiguous(), pre_mix.contiguous(),
             norm_weight.contiguous(), residual_out, layer_input, aux if capture_aux else None, float(norm_eps), int(mode),
-            bool(pdl),
+            bool(pdl), q_data=q_data, q_scale=q_scale,
         )
     else:
         x_out = torch.empty_like(x)
@@ -115,7 +142,11 @@ def mhc_post_norm(
             x, residual, post_layer_mix.reshape(T, hc).contiguous(), comb_res_mix.contiguous(), pre_mix.contiguous(),
             norm_weight.contiguous(), residual_out, layer_input, aux if capture_aux else None, float(norm_eps), int(mode),
             bool(pdl), ar["data"], ar["flags"], ar["ctrl"], int(ar["rank"]), int(ar["m_max"]), x_out, ar["order"],
+            q_data=q_data, q_scale=q_scale,
         )
+    if q_data is not None:
+        setattr(layer_input, MXFP8_ATTR, (q_data, q_scale))
+    if ar is not None:
         return residual_out, layer_input, aux, x_out
     return residual_out, layer_input, aux
 

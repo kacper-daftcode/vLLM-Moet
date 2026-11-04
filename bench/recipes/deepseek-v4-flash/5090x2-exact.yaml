@@ -20,7 +20,7 @@ load_timeout_s: 2400
 # GiB FP4 slot pool (530 slots >= the 256 experts of one broad prefill layer)
 # and KV - which is why this cell reaches the model's full context on 64 GB.
 #
-# QUALITY (session F, 2026-07-28, first full-model TP2 exact boot; runtime
+# QUALITY (2026-07-28, first full-model TP2 exact boot; runtime
 # branch exact-layer-streaming-2026-07-27 over db13b2e9c), paired against the
 # geometry-matched native anchor native-c1-nospec32-gpqa198 (142/198):
 #   - GPQA-198 non-think C=1: 147/198 (74.24%), delta +2.53 pp, McNemar
@@ -31,7 +31,7 @@ load_timeout_s: 2400
 #   - GSM8K-20 19/20 == native subset; deterministic smoke byte-identical 2/2;
 #   - 18,142 zero-miss layer-stream telemetry lines over ~7 h, zero violations.
 #
-# OPERATIONAL (session I, 2026-07-28, this serve geometry, artifacts under
+# OPERATIONAL (2026-07-28, this serve geometry, artifacts under
 # /root/logs/bench/i-audit/i-5090x2-exact.audit.txt):
 #   - canonical single-user C=1 decode: 4.8 tok/s (short prompt, 512
 #     ignore_eos tokens, median of 3) - about 1.4x the 1x5090 exact lane;

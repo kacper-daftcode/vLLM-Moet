@@ -14,7 +14,7 @@
 //
 // Numerics (per output element the same MMA instructions, operands, K order and epilogue as b12x; verified against the
 // served b12x path by test_b12x_moe_fused_sm120.py and, on 160 routings recorded from the served model, in
-// internal/ tooling):
+// the recorded-routing harness):
 //   FC1: per K32 block a zero-C block-scaled QMMA (e4m3 x e2m1, ue8m0 scales) added to the fp32 accumulator with
 //        fadd.rn, K in order; alpha1[e] * input_scale * acc -> cvt.rn.bf16 into projections[pair][gate | up].
 //   activation: b12x's compact activation (clamp with limit, ex2.approx/rcp.approx sigmoid, bf16 boundary, amax over

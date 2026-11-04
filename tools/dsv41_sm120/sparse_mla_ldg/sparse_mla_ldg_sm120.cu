@@ -248,6 +248,29 @@ struct LdgMixedCacheDecodeSchedule : kernels::dsv41_fp8::Dsv41MixedCacheDecodeRe
 
 // FlashInfer's decode kernel with the speculative index loads (generated from the installed header, see
 // gen_spec_kernel.py): sparse_mla_decode_dsv4_spec_kernel<MT, NUM_HEADS, GatherSchedule>.
+
+// Both adjacent B fragments come from one aligned 32-by-16 transposed load.
+// Each output retains W-as-A, its K-step order, and its own FP32 accumulator.
+template <int KV_STRIDE, int W_STRIDE, int KSTEPS>
+__device__ __forceinline__ void pv_fp8_b_transpose_pair_16x16(
+    float (&acc)[2][4], const uint8_t* w, const uint8_t* v, int dim, int lane) {
+#pragma unroll
+  for (int ks = 0; ks < KSTEPS; ks++) {
+    uint32_t a0, a1, a2, a3, d0, d1, d2, d3;
+    ldmatrix_load_a_packed_16x32_bytes_layout<false>(
+        a0, a1, a2, a3, w + ks * 32, W_STRIDE, lane);
+    ldmatrix_load_a_packed_16x32_bytes_trans<KV_STRIDE>(
+        d0, d1, d2, d3, v, ks * 32, dim, lane);
+    MmaFp8Result lo = mma_fp8_m16n8k32(
+        a0, a1, a2, a3, d0, d2, acc[0][0], acc[0][1], acc[0][2], acc[0][3]);
+    MmaFp8Result hi = mma_fp8_m16n8k32(
+        a0, a1, a2, a3, d1, d3, acc[1][0], acc[1][1], acc[1][2], acc[1][3]);
+    acc[0][0] = lo.d0; acc[0][1] = lo.d1;
+    acc[0][2] = lo.d2; acc[0][3] = lo.d3;
+    acc[1][0] = hi.d0; acc[1][1] = hi.d1;
+    acc[1][2] = hi.d2; acc[1][3] = hi.d3;
+  }
+}
 #include "sparse_mla_spec_kernel.inc"
 
 // FlashInfer's merge kernel (execution/merge.cuh) with its memory traffic re-scheduled: all splits' partial rows and
