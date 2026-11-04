@@ -8,6 +8,14 @@
 // dispatcher walks (step, layer) in that order and polls one mailbox at a time. The step numbers come from a device
 // counter bumped in-graph at the start of every step; the dispatcher expects first_step, first_step + 1, ...
 // KPIs per (step, layer) go to a ring the engine can read without touching the device.
+//
+// The store tail (2026-11-04, the 256 / 128 GB tiers): with cpu_tier_store_tail_init() only a DRAM LRU of records
+// per layer is pinned; an expert marked cold (cpu_tier_set_record_cold) is read from the store file on a miss - an
+// io_uring O_DIRECT read of the whole 4.7 MB record into a spare arena slot, the DRAM-resident experts of the request
+// computed while it is in flight, the record computed on arrival (the same kernel, the same bytes: bit-identical rows)
+// and inserted into the layer's LRU (the slot swap evicts the layer's least recently served record). Promotions and
+// the prefill streaming take their host pointers through cpu_tier_record_acquire (a pin until the copy is done; a cold
+// record is read synchronously) / the prefill arena (cpu_tier_prefill_fetch).
 #include <fcntl.h>
 #include <immintrin.h>
 #include <pthread.h>
@@ -18,11 +26,15 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "cpu_tier_abi.h"
+#include "uring.h"   // ../engram_v2/uring.h (build.sh: -I../engram_v2; the patcher copies it next to this file)
 
 extern "C" {
 void* moe_b12x_pool_create(int nthreads, const int* cpu_ids);
@@ -52,11 +64,47 @@ struct Use {
     int16_t ids[CPU_TIER_MAX_PAIRS];
 };
 
+constexpr int64_t REC = 4700160;   // one expert record (build_store.py), 512-B aligned in the store files and the arena
+
 struct Layer {
     CpuTierRequest* req = nullptr;
     CpuTierAck* ack = nullptr;
     uint16_t* staging = nullptr;
-    std::vector<const uint8_t*> records;  // [n_experts]
+    std::vector<const uint8_t*> records;  // [n_experts] host pointer, or nullptr (cold / not in the store)
+    // the store tail
+    std::vector<uint8_t> cold;            // [n_experts] 1 = in the store file, fetchable
+    std::vector<int32_t> slot_of;         // [n_experts] the LRU slot holding the record, -1 = none
+    int fd = -1;                          // the layer's store file (O_DIRECT)
+    int lru_head = -1, lru_tail = -1;     // the layer's resident slots: head = least recently served, tail = most
+    int n_resident = 0;
+};
+
+// one arena slot of the store tail (pinned host memory, REC bytes)
+struct Slot {
+    int32_t expert = -1;
+    int32_t layer = -1;
+    int32_t prev = -1, next = -1;         // the layer's LRU list
+    uint32_t pins = 0;                    // promotions / debug copies holding the pointer: not evictable
+};
+
+struct Tail {
+    bool on = false;
+    std::string dir;
+    int rank = 0;
+    uint8_t* arena = nullptr;
+    int64_t n_slots = 0;
+    int per_layer = 0;                    // N: resident records per layer
+    unsigned qd = 8;
+    std::vector<Slot> slots;
+    std::vector<int32_t> free_slots;      // spare slots (read targets)
+    std::mutex mu;                        // the LRU / pins: the dispatcher and the engine thread (acquire / release)
+    uring::Ring ring;                     // the dispatcher's
+    std::vector<uint8_t*> prefill;        // the prefill arena: n_prefill_sets x prefill_set_slots pinned records
+    int prefill_sets = 0, prefill_set_slots = 0;
+    uint8_t* prefill_arena = nullptr;
+    // totals
+    std::atomic<int64_t> fetches{0}, fetch_ns{0}, fetch_wait_ns{0}, sync_fetches{0}, prefill_fetches{0}, prefill_ns{0},
+        io_errors{0}, evictions{0}, resident_serves{0};
 };
 
 struct Tier {
@@ -80,6 +128,12 @@ struct Tier {
     std::atomic<int64_t> miss_n{0};
     Use uses[USE_RING];
     std::atomic<int64_t> use_n{0};
+    Tail tail;
+    // a poll hook the dispatcher calls once per loop iteration (the Engram v2 fetcher in its polled mode: its mailboxes
+    // and io_uring completions are served from this thread's dedicated core)
+    std::atomic<void (*)(void*)> poll_fn{nullptr};
+    std::atomic<void*> poll_arg{nullptr};
+    std::atomic<bool> polling{false};
 };
 
 static inline int64_t now_ns() {
@@ -94,6 +148,75 @@ static void pin_to_cpu(int cpu) {
     CPU_ZERO(&set);
     CPU_SET(cpu, &set);
     pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+
+// ---- the store tail's LRU (callers hold T.tail.mu) --------------------------------------------------------------
+static void lru_unlink(Tier& T, Layer& L, int s) {
+    Slot& S = T.tail.slots[s];
+    if (S.prev >= 0) T.tail.slots[S.prev].next = S.next; else L.lru_head = S.next;
+    if (S.next >= 0) T.tail.slots[S.next].prev = S.prev; else L.lru_tail = S.prev;
+    S.prev = S.next = -1;
+}
+
+static void lru_push_tail(Tier& T, Layer& L, int s) {   // most recently served
+    Slot& S = T.tail.slots[s];
+    S.prev = L.lru_tail; S.next = -1;
+    if (L.lru_tail >= 0) T.tail.slots[L.lru_tail].next = s; else L.lru_head = s;
+    L.lru_tail = s;
+}
+
+// slot s (a spare slot now holding expert e's record) becomes resident in layer l; the layer's least recently served
+// unpinned record is evicted when the layer is at capacity (its slot returns to the spares). A record that became
+// resident meanwhile (a concurrent fetch) keeps the first copy: s returns to the spares.
+// evict the layer's least recently served unpinned records while it holds more than N (their slots return to the
+// spares). Pinned slots (a request being computed, a promotion's copy, a prefill round) are skipped, so a layer may hold
+// more than N for as long as the pins last; the callers that drop pins trim again.
+static void lru_trim(Tier& T, Layer& L) {
+    Tail& X = T.tail;
+    while (L.n_resident > X.per_layer) {
+        int victim = -1;
+        for (int v = L.lru_head; v >= 0; v = X.slots[v].next)
+            if (X.slots[v].pins == 0) { victim = v; break; }
+        if (victim < 0) return;
+        Slot& V = X.slots[victim];
+        lru_unlink(T, L, victim);
+        L.slot_of[V.expert] = -1;
+        L.records[V.expert] = nullptr;
+        V.expert = -1; V.layer = -1;
+        --L.n_resident;
+        X.evictions.fetch_add(1, std::memory_order_relaxed);
+        X.free_slots.push_back(victim);
+    }
+}
+
+static void lru_insert(Tier& T, int l, int e, int s) {
+    Layer& L = T.layers[l];
+    Tail& X = T.tail;
+    if (L.slot_of[e] >= 0) { X.free_slots.push_back(s); return; }
+    Slot& S = X.slots[s];
+    S.expert = e; S.layer = l; S.pins = 1;   // pinned by the inserter until it is done with the record (it unpins)
+    L.slot_of[e] = s;
+    L.records[e] = X.arena + (int64_t)s * REC;
+    lru_push_tail(T, L, s);
+    ++L.n_resident;
+    lru_trim(T, L);
+    S.pins = 0;
+}
+
+// the subset {idx} of the grouped request arrays -> one kernel call
+static int forward_subset(Tier& T, Layer& L, const CpuTierRequest* req, const int* idx, int n_idx, const uint8_t* const* recs,
+                          const int* m_per, const int* off, const int* tok, const float* pw, const int* orow, int n_tokens) {
+    const uint8_t* r2[CPU_TIER_MAX_PAIRS];
+    int m2[CPU_TIER_MAX_PAIRS], tok2[CPU_TIER_MAX_PAIRS], orow2[CPU_TIER_MAX_PAIRS];
+    float pw2[CPU_TIER_MAX_PAIRS];
+    int k = 0;
+    for (int i = 0; i < n_idx; ++i) {
+        const int x = idx[i];
+        r2[i] = recs[x]; m2[i] = m_per[x];
+        for (int j = 0; j < m_per[x]; ++j) { tok2[k] = tok[off[x] + j]; pw2[k] = pw[off[x] + j]; orow2[k] = orow[off[x] + j]; ++k; }
+    }
+    return moe_b12x_experts_forward(T.pool, n_idx, r2, m2, tok2, pw2, orow2, n_tokens, &req->a_values[0][0], &req->a_scales[0][0],
+                                    L.staging, CPU_TIER_HID, T.vs1, T.vs2, nullptr, nullptr, nullptr);
 }
 
 static void serve(Tier& T, int layer, uint32_t step) {
@@ -124,17 +247,34 @@ static void serve(Tier& T, int layer, uint32_t step) {
             order[j + 1] = v;
         }
         const uint8_t* recs[CPU_TIER_MAX_PAIRS];
-        int m_per[CPU_TIER_MAX_PAIRS], tok[CPU_TIER_MAX_PAIRS], orow[CPU_TIER_MAX_PAIRS];
+        int m_per[CPU_TIER_MAX_PAIRS], off[CPU_TIER_MAX_PAIRS], tok[CPU_TIER_MAX_PAIRS], orow[CPU_TIER_MAX_PAIRS], eid[CPU_TIER_MAX_PAIRS];
         float pw[CPU_TIER_MAX_PAIRS];
+        int cold_idx[CPU_TIER_MAX_PAIRS], n_cold = 0;
+        int res_idx[CPU_TIER_MAX_PAIRS], n_res = 0;
+        int pinned[CPU_TIER_MAX_PAIRS], n_pinned = 0;
         int last_e = -1;
+        Tail& X = T.tail;
+        if (X.on) X.mu.lock();
         for (int k = 0; k < n; ++k) {
             const CpuTierPair& p = req->pairs[order[k]];
             if (p.expert != last_e) {
                 last_e = p.expert;
                 const uint8_t* r = p.expert < L.records.size() ? L.records[p.expert] : nullptr;
-                if (!r) { status = 2; break; }  // not in the store
+                if (!r) {
+                    if (X.on && p.expert < L.cold.size() && L.cold[p.expert]) {
+                        cold_idx[n_cold++] = n_experts;   // fetched below
+                    } else { status = 2; break; }       // not in the store
+                } else {
+                    res_idx[n_res++] = n_experts;
+                    if (X.on) {   // keep the record where it is until the kernel has read it
+                        const int s = L.slot_of[p.expert];
+                        if (s >= 0) { ++X.slots[s].pins; pinned[n_pinned++] = s; lru_unlink(T, L, s); lru_push_tail(T, L, s); }
+                    }
+                }
                 recs[n_experts] = r;
+                eid[n_experts] = p.expert;
                 m_per[n_experts] = 0;
+                off[n_experts] = k;
                 ++n_experts;
             }
             m_per[n_experts - 1] += 1;
@@ -142,18 +282,108 @@ static void serve(Tier& T, int layer, uint32_t step) {
             pw[k] = p.weight;
             orow[k] = order[k];
         }
-        if (status == 0) {
+        if (X.on) X.mu.unlock();
+        if (status == 0 && n_cold == 0) {
             const int rc = moe_b12x_experts_forward(T.pool, n_experts, recs, m_per, tok, pw, orow, n_tokens,
                                                     &req->a_values[0][0], &req->a_scales[0][0], L.staging,
                                                     CPU_TIER_HID, T.vs1, T.vs2, nullptr, nullptr, nullptr);
             if (rc != 0) status = 4;
+            if (X.on) X.resident_serves.fetch_add(n_res, std::memory_order_relaxed);
+        } else if (status == 0) {
+            // the store tail: the cold records' reads first (io_uring, one 4.7 MB read each into a spare slot), the
+            // resident experts computed while they are in flight, each cold expert computed as its record lands
+            const int64_t t_issue = now_ns();
+            int slot_of_cold[CPU_TIER_MAX_PAIRS];
+            int issued = 0, landed = 0;
+            static const bool dbg = getenv("CPU_TIER_TAIL_DEBUG") != nullptr;
+            if (dbg) fprintf(stderr, "[cpu_tier tail] layer %d step %u: %d experts, %d resident, %d cold, free slots %zu, ring space %u in_flight %u\n",
+                             layer, step, n_experts, n_res, n_cold, X.free_slots.size(), X.ring.space(), X.ring.in_flight);
+            auto issue_some = [&]() {
+                std::lock_guard<std::mutex> g(X.mu);
+                while (issued < n_cold && !X.free_slots.empty() && X.ring.space() > 0) {
+                    const int s = X.free_slots.back();
+                    X.free_slots.pop_back();
+                    slot_of_cold[issued] = s;
+                    X.ring.prep_read(L.fd, X.arena + (int64_t)s * REC, (unsigned)REC, (uint64_t)eid[cold_idx[issued]] * REC, (uint64_t)issued);
+                    ++issued;
+                }
+            };
+            issue_some();
+            int r = X.ring.submit(0);
+            if (dbg) fprintf(stderr, "[cpu_tier tail]   issued %d, submit -> %d, in_flight %u\n", issued, r, X.ring.in_flight);
+            if (r < 0) { status = 5; X.io_errors.fetch_add(1); }
+            if (status == 0 && n_res > 0) {
+                if (forward_subset(T, L, req, res_idx, n_res, recs, m_per, off, tok, pw, orow, n_tokens) != 0) status = 4;
+                X.resident_serves.fetch_add(n_res, std::memory_order_relaxed);
+            }
+            {   // the resident records are read: unpin them now (evictable again - a request with more cold experts than
+                // spare slots needs the evictions to make progress)
+                std::lock_guard<std::mutex> g(X.mu);
+                for (int i = 0; i < n_pinned; ++i) if (X.slots[pinned[i]].pins) --X.slots[pinned[i]].pins;
+                n_pinned = 0;
+                lru_trim(T, L);
+            }
+            int batch[CPU_TIER_MAX_PAIRS];
+            while (status == 0 && landed < n_cold) {
+                if (X.ring.in_flight == 0 && issued < n_cold) { issue_some(); r = X.ring.submit(0); if (r < 0) { status = 5; break; } }
+                if (X.ring.in_flight == 0) { _mm_pause(); continue; }   // no spare slot yet (the engine thread holds them): wait for one
+                if (!X.ring.cq_ready()) { X.ring.wait(1); }
+                int nb = 0;
+                uint64_t ud; int res;
+                while (X.ring.reap(&ud, &res)) {
+                    const int c = (int)ud;
+                    const int s = slot_of_cold[c];
+                    if (dbg) fprintf(stderr, "[cpu_tier tail]   landed cold #%d (expert %d) res %d slot %d\n", c, eid[cold_idx[c]], res, s);
+                    if (res != (int)REC) { status = 5; X.io_errors.fetch_add(1); std::lock_guard<std::mutex> g(X.mu); X.free_slots.push_back(s); continue; }
+                    {
+                        std::lock_guard<std::mutex> g(X.mu);
+                        lru_insert(T, layer, eid[cold_idx[c]], s);
+                        const int s2 = L.slot_of[eid[cold_idx[c]]];
+                        ++X.slots[s2].pins; pinned[n_pinned++] = s2;
+                        recs[cold_idx[c]] = X.arena + (int64_t)s2 * REC;
+                    }
+                    batch[nb++] = cold_idx[c];
+                    ++landed;
+                    X.fetches.fetch_add(1, std::memory_order_relaxed);
+                }
+                if (issued < n_cold) { issue_some(); r = X.ring.submit(0); if (r < 0) { status = 5; break; } }
+                if (nb && status == 0) {
+                    if (forward_subset(T, L, req, batch, nb, recs, m_per, off, tok, pw, orow, n_tokens) != 0) status = 4;
+                }
+                if (n_pinned) {   // the landed records are computed: unpin, trim
+                    std::lock_guard<std::mutex> g(X.mu);
+                    for (int i = 0; i < n_pinned; ++i) if (X.slots[pinned[i]].pins) --X.slots[pinned[i]].pins;
+                    n_pinned = 0;
+                    lru_trim(T, L);
+                }
+            }
+            if (status != 0) {
+                // fail-closed exit: drain the reads still in flight so that no completion of this request leaks into
+                // the next one (the slots return to the spares; the step fails on the ack's status anyway)
+                while (X.ring.in_flight) {
+                    X.ring.wait(1);
+                    uint64_t ud; int res;
+                    while (X.ring.reap(&ud, &res)) {
+                        std::lock_guard<std::mutex> g(X.mu);
+                        X.free_slots.push_back(slot_of_cold[(int)ud]);
+                    }
+                }
+            }
+            const int64_t t_land = now_ns();
+            X.fetch_ns.fetch_add(t_land - t_issue, std::memory_order_relaxed);
+            X.fetch_wait_ns.fetch_add(std::max<int64_t>(0, (t_land - t_issue) - (int64_t)n_res * 130000), std::memory_order_relaxed);
+        }
+        if (X.on && n_pinned) {
+            std::lock_guard<std::mutex> g(X.mu);
+            for (int i = 0; i < n_pinned; ++i) if (X.slots[pinned[i]].pins) --X.slots[pinned[i]].pins;
+            lru_trim(T, L);
+        }
+        if (status == 0 || status == 4 || status == 5) {
             // the miss log (per distinct expert), for the placement manager
-            int k = 0;
             for (int i = 0; i < n_experts; ++i) {
                 const int64_t mi = T.miss_n.fetch_add(1, std::memory_order_relaxed);
                 Miss& M = T.misses[mi % MISS_RING];
-                M.step = (int32_t)step; M.layer = layer; M.expert = req->pairs[order[k]].expert; M.m = m_per[i];
-                k += m_per[i];
+                M.step = (int32_t)step; M.layer = layer; M.expert = eid[i]; M.m = m_per[i];
             }
         }
     }
@@ -200,6 +430,14 @@ static void dispatcher_main(Tier* T) {
             T->expected_seq[layer] = s;
         }
         if (++layer == T->n_layers) layer = 0;
+        {
+            void (*fn)(void*) = T->poll_fn.load(std::memory_order_acquire);
+            if (fn) {
+                T->polling.store(true, std::memory_order_release);
+                if (T->poll_fn.load(std::memory_order_acquire) == fn) fn(T->poll_arg.load(std::memory_order_relaxed));
+                T->polling.store(false, std::memory_order_release);
+            }
+        }
         _mm_pause();
     }
     T->running.store(false);
@@ -229,7 +467,11 @@ void* cpu_tier_create(const CpuTierConfig* cfg) {
     T->pool = moe_b12x_pool_create(cfg->n_cpus, cfg->cpu_ids);
     if (!T->pool) { delete T; return nullptr; }
     T->layers.resize(cfg->n_layers);
-    for (auto& L : T->layers) L.records.assign(cfg->n_experts, nullptr);
+    for (auto& L : T->layers) {
+        L.records.assign(cfg->n_experts, nullptr);
+        L.cold.assign(cfg->n_experts, 0);
+        L.slot_of.assign(cfg->n_experts, -1);
+    }
     return T;
 }
 
@@ -240,8 +482,217 @@ void cpu_tier_destroy(void* tier) {
         T->stop.store(true);
         T->thread.join();
     }
+    if (T->tail.on) {
+        T->tail.ring.close();
+        for (auto& L : T->layers) if (L.fd >= 0) close(L.fd);
+    }
     moe_b12x_pool_destroy(T->pool);
     delete T;
+}
+
+// ---- the store tail ------------------------------------------------------------------------------------------------
+// arena: n_slots pinned records (the first ones may already hold records: cpu_tier_set_record() with pointers into the
+// arena registers them as resident; the rest are spares); per_layer = N resident records per layer; prefill_arena:
+// prefill_sets x prefill_set_slots pinned records for the prefill streaming's cold records (may be null: no prefill)
+// file_layer: the store file index of every tier layer (null = the tier's layer index = the model layer)
+int cpu_tier_store_tail_init(void* tier, const char* dir, int rank, uint8_t* arena, int64_t n_slots, int per_layer, int qd,
+                             uint8_t* prefill_arena, int prefill_sets, int prefill_set_slots, const int32_t* file_layer) {
+    Tier* T = (Tier*)tier;
+    if (!T || !arena || n_slots < 1 || per_layer < 1) return -1;
+    Tail& X = T->tail;
+    X.dir = dir; X.rank = rank; X.arena = arena; X.n_slots = n_slots; X.per_layer = per_layer; X.qd = (unsigned)std::max(1, qd);
+    X.slots.assign((size_t)n_slots, Slot());
+    X.free_slots.clear();
+    for (int64_t s = n_slots - 1; s >= 0; --s) X.free_slots.push_back((int32_t)s);
+    for (int l = 0; l < T->n_layers; ++l) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/rank%d/layer%02d.bin", dir, rank, file_layer ? file_layer[l] : l);
+        T->layers[l].fd = open(path, O_RDONLY | O_CLOEXEC | O_DIRECT);
+        if (T->layers[l].fd < 0) { fprintf(stderr, "[cpu_tier] store tail: open %s failed: %s\n", path, strerror(errno)); return -2; }
+    }
+    const int r = X.ring.init(X.qd * 2);
+    if (r != 0) { fprintf(stderr, "[cpu_tier] store tail: io_uring_setup failed: %s (docker seccomp? docker/sm120/seccomp-io_uring.json)\n", strerror(-r)); return -3; }
+    X.prefill_arena = prefill_arena; X.prefill_sets = prefill_sets; X.prefill_set_slots = prefill_set_slots;
+    X.on = true;
+    return 0;
+}
+
+// expert e of layer l lives in the store file only (read on a miss); the pointer table entry stays null until it is
+// fetched. A record already registered with a pointer into the arena becomes the layer's resident slot.
+int cpu_tier_set_record_cold(void* tier, int layer, int expert) {
+    Tier* T = (Tier*)tier;
+    if (!T || !T->tail.on || layer < 0 || layer >= T->n_layers || expert < 0 || expert >= T->n_experts) return -1;
+    T->layers[layer].cold[expert] = 1;
+    return 0;
+}
+
+// after the warm records were registered with cpu_tier_set_record(): adopt every pointer into the arena as a resident
+// LRU slot of its layer (load order = LRU order); returns the number adopted
+int64_t cpu_tier_store_tail_adopt(void* tier) {
+    Tier* T = (Tier*)tier;
+    if (!T || !T->tail.on) return -1;
+    Tail& X = T->tail;
+    std::lock_guard<std::mutex> g(X.mu);
+    std::vector<uint8_t> used((size_t)X.n_slots, 0);
+    int64_t n = 0;
+    for (int l = 0; l < T->n_layers; ++l) {
+        Layer& L = T->layers[l];
+        for (int e = 0; e < T->n_experts; ++e) {
+            const uint8_t* p = L.records[e];
+            if (!p) continue;
+            const int64_t off = p - X.arena;
+            if (off < 0 || off % REC != 0 || off / REC >= X.n_slots) continue;   // not an arena record (dummy mode)
+            const int s = (int)(off / REC);
+            Slot& S = X.slots[s];
+            S.expert = e; S.layer = l; S.pins = 0;
+            L.slot_of[e] = s;
+            L.cold[e] = 1;   // evictable: it can come back from the file
+            lru_push_tail(*T, L, s);
+            ++L.n_resident;
+            used[s] = 1;
+            ++n;
+        }
+    }
+    X.free_slots.clear();
+    for (int64_t s = X.n_slots - 1; s >= 0; --s) if (!used[s]) X.free_slots.push_back((int32_t)s);
+    return n;
+}
+
+// the record's pinned host pointer for a copy (promotion, debug reference): resident -> pinned; cold -> read now
+// (pread, O_DIRECT) into a spare slot, inserted and pinned. 0 = not available. Release with cpu_tier_record_release
+// once the copy is done.
+int64_t cpu_tier_record_acquire(void* tier, int layer, int expert) {
+    Tier* T = (Tier*)tier;
+    if (!T || layer < 0 || layer >= T->n_layers || expert < 0 || expert >= T->n_experts) return 0;
+    Layer& L = T->layers[layer];
+    if (!T->tail.on) return (int64_t)(uintptr_t)L.records[expert];
+    Tail& X = T->tail;
+    int s = -1;
+    {
+        std::lock_guard<std::mutex> g(X.mu);
+        s = L.slot_of[expert];
+        if (s >= 0) { ++X.slots[s].pins; return (int64_t)(uintptr_t)(X.arena + (int64_t)s * REC); }
+        if (!L.cold[expert] || X.free_slots.empty()) return 0;
+        s = X.free_slots.back();
+        X.free_slots.pop_back();
+    }
+    uint8_t* dst = X.arena + (int64_t)s * REC;
+    int64_t done = 0;
+    const int64_t t0 = now_ns();
+    while (done < REC) {
+        const ssize_t r = pread(L.fd, dst + done, (size_t)(REC - done), (int64_t)expert * REC + done);
+        if (r <= 0) break;
+        done += r;
+    }
+    std::lock_guard<std::mutex> g(X.mu);
+    if (done != REC) { X.io_errors.fetch_add(1); X.free_slots.push_back(s); return 0; }
+    X.sync_fetches.fetch_add(1);
+    X.fetch_ns.fetch_add(now_ns() - t0);
+    lru_insert(*T, layer, expert, s);
+    const int s2 = L.slot_of[expert];
+    ++X.slots[s2].pins;
+    return (int64_t)(uintptr_t)(X.arena + (int64_t)s2 * REC);
+}
+
+void cpu_tier_record_release(void* tier, int layer, int expert) {
+    Tier* T = (Tier*)tier;
+    if (!T || !T->tail.on || layer < 0 || layer >= T->n_layers || expert < 0 || expert >= T->n_experts) return;
+    Tail& X = T->tail;
+    std::lock_guard<std::mutex> g(X.mu);
+    const int s = T->layers[layer].slot_of[expert];
+    if (s >= 0 && X.slots[s].pins) --X.slots[s].pins;
+    lru_trim(*T, T->layers[layer]);
+}
+
+// the prefill streaming's host pointers for `n` experts of `layer`: resident records pinned in place (released by
+// cpu_tier_prefill_release(set)), cold records read (pread, O_DIRECT, `nthreads` readers) into the prefill arena's set
+// `set` (slots 0..n-1 of the set; n <= prefill_set_slots). Blocking. Returns the number read from NVMe, or < 0.
+int64_t cpu_tier_prefill_fetch(void* tier, int layer, const int32_t* experts, int n, int set, int64_t* out_ptrs, int nthreads) {
+    Tier* T = (Tier*)tier;
+    if (!T || !T->tail.on || layer < 0 || layer >= T->n_layers || n < 0) return -1;
+    Tail& X = T->tail;
+    if (!X.prefill_arena || set < 0 || set >= X.prefill_sets || n > X.prefill_set_slots) return -2;
+    Layer& L = T->layers[layer];
+    std::vector<int> cold_i;
+    {
+        std::lock_guard<std::mutex> g(X.mu);
+        for (int i = 0; i < n; ++i) {
+            const int e = experts[i];
+            if (e < 0 || e >= T->n_experts) return -3;
+            const int s = L.slot_of[e];
+            if (s >= 0) { ++X.slots[s].pins; out_ptrs[i] = (int64_t)(uintptr_t)(X.arena + (int64_t)s * REC); }
+            else if (L.cold[e]) { out_ptrs[i] = 0; cold_i.push_back(i); }
+            else return -4;
+        }
+    }
+    const int64_t t0 = now_ns();
+    std::atomic<int64_t> next{0}, failed{0};
+    std::vector<std::thread> th;
+    const int nt = std::max(1, std::min(nthreads, 16));
+    uint8_t* base = X.prefill_arena + ((int64_t)set * X.prefill_set_slots) * REC;
+    for (int t = 0; t < nt; ++t) {
+        th.emplace_back([&]() {
+            for (;;) {
+                const int64_t k = next.fetch_add(1);
+                if (k >= (int64_t)cold_i.size()) break;
+                const int i = cold_i[(size_t)k];
+                uint8_t* dst = base + (int64_t)i * REC;
+                int64_t done = 0;
+                while (done < REC) {
+                    const ssize_t r = pread(L.fd, dst + done, (size_t)(REC - done), (int64_t)experts[i] * REC + done);
+                    if (r <= 0) { failed.fetch_add(1); break; }
+                    done += r;
+                }
+                out_ptrs[i] = (int64_t)(uintptr_t)dst;
+            }
+        });
+    }
+    for (auto& x : th) x.join();
+    X.prefill_fetches.fetch_add((int64_t)cold_i.size());
+    X.prefill_ns.fetch_add(now_ns() - t0);
+    if (failed.load()) { X.io_errors.fetch_add(failed.load()); return -5; }
+    return (int64_t)cold_i.size();
+}
+
+// unpin the resident records a prefill round of `layer` used (cpu_tier_prefill_fetch pinned them)
+void cpu_tier_prefill_release(void* tier, int layer, const int32_t* experts, int n) {
+    Tier* T = (Tier*)tier;
+    if (!T || !T->tail.on || layer < 0 || layer >= T->n_layers) return;
+    Tail& X = T->tail;
+    Layer& L = T->layers[layer];
+    std::lock_guard<std::mutex> g(X.mu);
+    for (int i = 0; i < n; ++i) {
+        const int e = experts[i];
+        if (e < 0 || e >= T->n_experts) continue;
+        const int s = L.slot_of[e];
+        if (s >= 0 && X.slots[s].pins) --X.slots[s].pins;
+    }
+    lru_trim(*T, L);
+}
+
+// is the record of (layer, expert) in DRAM right now (1), cold (0) or absent (-1)
+int cpu_tier_record_state(void* tier, int layer, int expert) {
+    Tier* T = (Tier*)tier;
+    if (!T || layer < 0 || layer >= T->n_layers || expert < 0 || expert >= T->n_experts) return -1;
+    Layer& L = T->layers[layer];
+    if (L.records[expert]) return 1;
+    return (T->tail.on && L.cold[expert]) ? 0 : -1;
+}
+
+// [0] fetches (dispatcher, async) [1] fetch ns (sum, issue -> last landing per request) [2] fetch wait ns beyond the
+// resident compute [3] sync fetches (acquire) [4] prefill fetches [5] prefill ns [6] io errors [7] evictions
+// [8] resident serves [9] resident records now [10] spare slots now
+void cpu_tier_tail_stats(void* tier, int64_t* out, int reset) {
+    Tier* T = (Tier*)tier;
+    if (!T) return;
+    Tail& X = T->tail;
+    std::atomic<int64_t>* f[] = {&X.fetches, &X.fetch_ns, &X.fetch_wait_ns, &X.sync_fetches, &X.prefill_fetches, &X.prefill_ns, &X.io_errors, &X.evictions, &X.resident_serves};
+    for (int i = 0; i < 9; ++i) out[i] = reset ? f[i]->exchange(0) : f[i]->load();
+    int64_t res = 0;
+    for (auto& L : T->layers) res += L.n_resident;
+    out[9] = res;
+    std::lock_guard<std::mutex> g(X.mu);
+    out[10] = (int64_t)X.free_slots.size();
 }
 
 int cpu_tier_set_mailboxes(void* tier, int layer, void* req, void* ack, void* staging) {
@@ -410,6 +861,18 @@ int64_t cpu_tier_store_load(const char* dir, int rank, int n_layers, int n_exper
     for (auto& x : th) x.join();
     if (failed.load()) return -2;
     return (int64_t)jobs.size();
+}
+
+// install (fn != null) or clear (null) the dispatcher's poll hook; the caller stops the previous owner of `arg` first
+int cpu_tier_set_poll_hook(void* tier, void (*fn)(void*), void* arg) {
+    Tier* T = (Tier*)tier;
+    if (!T) return -1;
+    T->poll_fn.store(fn, std::memory_order_release);
+    T->poll_arg.store(arg, std::memory_order_release);
+    if (!fn) {   // a call in progress returns before the caller frees `arg`
+        while (T->polling.load(std::memory_order_acquire)) _mm_pause();
+    }
+    return 0;
 }
 
 int64_t cpu_tier_request_bytes(void) { return (int64_t)sizeof(CpuTierRequest); }

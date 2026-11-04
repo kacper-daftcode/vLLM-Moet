@@ -11,7 +11,8 @@
      rows a target layer gets (store mode: the resident slots only; the layer's loader maps experts to slots).
    - vllm/model_executor/layers/fused_moe/b12x.py: process_weights_after_loading hands the layer's experts to the
      tier (records into pinned RAM or from the store, the resident rows back for prepare_weights); apply() announces
-     the layer to the tier and gets the ids the kernels run with.
+     the layer to the tier and gets the ids and weights the kernels run with (expanded to K x V (token, slice) pairs
+     with virtual ranks, TP2 / TP1); workspace_shapes() and warmup_launches() size their plans for that top-k.
    - flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py: after b12x's rows quant the tier
      publishes the step's missing pairs and remaps the ids (missing -> -1) for the compact kernel (and the grouped /
      fused FC2 of the sm120 image); before the route rows go to TopKSum the tier's rows are injected.
@@ -60,11 +61,27 @@ B12X_PREP_NEW = ("        self._refresh_quant_config(layer)\n"
                  "            w1=_moet_w1,\n"
                  "            w2=_moet_w2,\n")
 B12X_APPLY_OLD = ("        prepared = self._prepared()\n"
-                  "        topk_ids = _normalize_topk_ids(topk_ids)\n")
+                  "        topk_ids = _normalize_topk_ids(topk_ids)\n"
+                  "        topk_weights = _normalize_topk_weights(topk_weights)\n")
 B12X_APPLY_NEW = ("        prepared = self._prepared()\n"
                   "        topk_ids = _normalize_topk_ids(topk_ids)\n"
-                  f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}\n"
-                  "            topk_ids = _moet_cpu_tier.on_apply(self, hidden_states, topk_ids)\n")
+                  "        topk_weights = _normalize_topk_weights(topk_weights)\n"
+                  f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}: the routing the run gets (expanded with virtual ranks)\n"
+                  "            topk_ids, topk_weights = _moet_cpu_tier.on_apply(self, hidden_states, topk_ids, topk_weights)\n")
+# virtual ranks (TP2 / TP1, 2026-11-04): the plans / workspaces / warmup launches of a hybrid layer are sized for the
+# expanded top-k (K x V) that on_apply hands to the run
+B12X_WS_OLD = ("        del N, global_num_experts, local_num_experts, expert_tokens_meta\n"
+               "        plan = self._plan(\n"
+               "            tokens=M,\n")
+B12X_WS_NEW = ("        del N, global_num_experts, local_num_experts, expert_tokens_meta\n"
+               f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}: K x V with virtual ranks\n"
+               "            topk = _moet_cpu_tier.plan_topk(self, topk)\n"
+               "        plan = self._plan(\n"
+               "            tokens=M,\n")
+B12X_WARM_OLD = "        topk = int(self.moe_config.experts_per_token)\n"
+B12X_WARM_NEW = ("        topk = int(self.moe_config.experts_per_token)\n"
+                 f"        if _moet_cpu_tier is not None and _moet_cpu_tier.ENABLED:  # {MARK}: K x V with virtual ranks\n"
+                 "            topk = _moet_cpu_tier.plan_topk(self, topk)\n")
 B12X_APPLY_END_OLD = ("            output=output,\n"
                       "            unit_scale_contract=self._quant_mode == \"w4a16\",\n"
                       "        )\n"
@@ -179,6 +196,12 @@ RUNNER_TAIL = ("\n\n# " + MARK + ": the placement manager's hooks around a live 
 
 def patch_text(src: str, pairs: list[tuple[str, str]], name: str) -> str:
     if MARK in src:
+        # already patched - but by this patcher's generation? (11-04: on_apply returns (ids, weights) and the plans are
+        # sized through plan_topk; a file patched by the older patcher would call the runtime with the old contract)
+        for _, new in pairs:
+            if "plan_topk" in new and "plan_topk" not in src:
+                raise SystemExit(f"{name}: patched by an older cpu-tier patcher (no plan_topk hook); re-patch from a clean "
+                                 f"image (BAKED=0 on ...-hyb1) or rebuild the baked image from this worktree")
         return src
     for old, _ in pairs:
         n = src.count(old)
@@ -202,7 +225,7 @@ def main() -> int:
                   [(MX_IMPORT_OLD, MX_IMPORT_NEW), (MX_CREATE_OLD, MX_CREATE_NEW)]),
         "b12x": (site / "vllm/model_executor/layers/fused_moe/b12x.py",
                  [(B12X_IMPORT_OLD, B12X_IMPORT_NEW), (B12X_PREP_OLD, B12X_PREP_NEW), (B12X_APPLY_OLD, B12X_APPLY_NEW),
-                  (B12X_APPLY_END_OLD, B12X_APPLY_END_NEW)]),
+                  (B12X_APPLY_END_OLD, B12X_APPLY_END_NEW), (B12X_WS_OLD, B12X_WS_NEW), (B12X_WARM_OLD, B12X_WARM_NEW)]),
         "compact_micro": (site / "flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py",
                           [(CM_IMPORT_OLD, CM_IMPORT_NEW), (CM_FUSED_OLD, CM_FUSED_NEW), (CM_IDS_OLD, CM_IDS_NEW), (CM_RET_OLD, CM_RET_NEW)]),
     }
@@ -233,6 +256,7 @@ def main() -> int:
     inst.mkdir(parents=True, exist_ok=True)
     for f in FILES_RUNTIME:
         shutil.copy2(HERE / f, inst / f)
+    shutil.copy2(HERE.parent / "engram_v2" / "uring.h", inst / "uring.h")   # the store tail's io_uring wrapper
     (inst / "cpu_moe").mkdir(exist_ok=True)
     shutil.copy2(HERE.parent / "cpu_moe" / "cpu_moe_b12x.cpp", inst / "cpu_moe" / "cpu_moe_b12x.cpp")
     env = dict(os.environ, ARCH=args.arch, OUT=str(inst / "libcpu_tier.so"), KERNEL_SRC=str(inst / "cpu_moe" / "cpu_moe_b12x.cpp"))

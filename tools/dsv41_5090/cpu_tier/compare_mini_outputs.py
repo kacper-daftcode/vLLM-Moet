@@ -31,11 +31,15 @@ def post(port: int, path: str, body: dict, timeout: float = 600.0) -> dict:
         return json.load(r)
 
 
-def wait_ready(port: int, timeout: float = 1800.0, container: str = "") -> None:
+def wait_ready(port: int, timeout: float = 1800.0, container: str = "", queue_timeout: float = 12 * 3600.0) -> None:
+    """Waits for /v1/models. With --container the boot timeout counts from the container's first appearance (the serve
+    may sit in a GPU flock queue for an hour behind another line's window - 11-04: the client gave up at 30 min while the
+    serve was still queued, then the serve came up with nobody to stop it); queue_timeout bounds the wait for it."""
     import subprocess
     t0 = time.time()
+    t_seen = None
     gone, seen = 0, False
-    while time.time() - t0 < timeout:
+    while True:
         try:
             with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=5) as r:
                 if r.status == 200:
@@ -44,12 +48,18 @@ def wait_ready(port: int, timeout: float = 1800.0, container: str = "") -> None:
             pass
         if container:
             up = subprocess.run(["docker", "ps", "-q", "-f", f"name=^{container}$"], capture_output=True, text=True).stdout.strip()
-            seen = seen or bool(up)
+            if up and not seen:
+                seen, t_seen = True, time.time()
             gone = gone + 1 if (seen and not up) else 0
             if gone >= 6:   # 30 s without the container after it had been up: it died
                 raise SystemExit(f"server not ready: container {container} is gone")
+            if not seen and time.time() - t0 > queue_timeout:
+                raise SystemExit(f"server not ready: container {container} never appeared in {queue_timeout:.0f} s")
+            if seen and time.time() - t_seen > timeout:
+                raise SystemExit(f"server not ready {timeout:.0f} s after container {container} came up")
+        elif time.time() - t0 > timeout:
+            raise SystemExit("server not ready")
         time.sleep(5)
-    raise SystemExit("server not ready")
 
 
 def main():

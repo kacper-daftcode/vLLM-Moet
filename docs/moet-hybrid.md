@@ -92,7 +92,7 @@ MODEL_DIR=... STORE=... CACHE_DIR=... BAKED=0 docker/sm120/run-dsv41-5090.sh
 ```
 
 `docker/sm120/run-dsv41-5090.sh` boots the measured serving configuration by default; its header lists every knob
-(`PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `PREFILL_OVERLAP`, `POOL_THREADS`, `POOL_SPIN_*`, `GPU_MEM_UTIL`,
+(`TP`, `PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `PREFILL_OVERLAP`, `POOL_THREADS`, `POOL_SPIN_*`, `GPU_MEM_UTIL`,
 `MAX_MODEL_LEN`, `SPEC_TOKENS`, `BAKED`, …). The static placement ships in `tools/dsv41_5090/routing/placements/`
 (`routing/placement.py` derives one from routing traces, `routing/collect_routes.py`). The hybrid's own switches arrive
 in the container as `VLLM_MOET_CPU_TIER_*` (documented at the top of `tools/dsv41_5090/cpu_tier/vllm_moet_cpu_tier.py`);
@@ -129,6 +129,109 @@ and `ccd_bw.cpp` (the expert from DRAM vs L3, one CCD's DRAM ceiling), `routing/
 (layer L+1's router on layer L's input: top-6 precision 0.33 — the prefetch-by-prediction lever is closed),
 `cpu_tier/ttft_probe.py` (streamed prefill TTFT on disjoint prompts), `cpu_tier/profile_anatomy.py` (the decode step's
 GPU busy / idle anatomy from a torch profile), `cpu_tier/cpu_placement_probe.sh` (who runs on the pool cores).
+
+## One or two GPUs: TP2 / TP1 through virtual ranks (branch `moet-hybrid-tp12`, 2026-11-04)
+
+The same hybrid runs on 2× or 1× GPU with `TP=2` / `TP=1` in the launcher. b12x's compact W4A8 path — where the publish / inject
+hooks live and whose numerics the CPU kernel reproduces — exists only at the 576-row TP4 slice, so on one GPU every expert stays its
+4 / TP slices of 576 rows ("virtual ranks"): the store's per-rank records are the slices, b12x prepares them as R × V slice-experts
+and runs the same compact kernels at N = 576, the router's top-6 becomes 6 × V (token, slice) pairs, one CPU pool (CCD) + mailbox
+set per slice computes the misses with the unchanged kernel, and the compact TopKSum adds a token's 6V rows in a fixed order
+(k-major, slice-minor; fp32, one bf16 rounding — the role NCCL's bf16 ring plays at TP4). Bit-identity with the all-resident path
+holds within each configuration (`DEBUG_COMPACT`: 0 mismatches over 15,160 compact calls per rank at TP2 and 19,040 at TP1 on the
+full model, 11-04); the TP4 code paths are untouched (V = 1). Measured on 32 GB cards (the slots per layer follow the VRAM: 46 at
+TP2, 16 at TP1): **TP2 on 2× 5090: 45.9 / 47.1 tok/s** on 'Hello' / 'def fib(n):', TTFT 1.9 s at 2K and 7.4 s at 14K; **TP1 on 1× 5090:
+39.8 / 33.5 tok/s**, TTFT 3.8 / 15.2 s (chunk 4096) — the step is the CPU tier (hit rate 0.54 / 0.44 at those slot counts: 3–4 misses
+per layer-step); host RAM is the same ~450 GB (+23 GB at TP1 for the 9-static placement's records). The design, budgets and every
+measurement: the private note `tp12-virtual-ranks-2026-11-04.md` (the hybrid's handoff directory).
+
+Running it: the launcher's `TP=2` / `TP=1` set the 32 GB-card defaults (GPUS 0,1 / 0; `SPARE` 6 / 7 with the 40-static / 9-static
+placement — `routing/placements/tp12-placement-0.026-uniform.json` for TP1 — `MAX_MODEL_LEN` 65536 / 32768, `PROMOTIONS` 4 / 1); `VRANKS=1`
+forces plain ranks; `VRANK_CPUS` / `VRANK_DISPATCHERS` lay the pools out on another CPU geometry (default: TP rank r takes CCDs rV..rV+V−1,
+dispatcher 8g+1 and pool 8g+2..8g+7 per CCD g). `SCRATCH` counts slices (an expert = 4 / TP slots); `DEBUG_COMPACT` needs `SCRATCH ≥ 48 × 4 / TP`.
+`tp4_window.sh` takes `TP` / `GPUS` (the KPI lines of every rank carry their virtual ranks' in-kernel µs). The same image serves every TP
+(`vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-tp12` = this branch's step 43 on the merged `-r23` layers): on it the TP4 path is the
+record's (identity 0 mismatches over 19,080 compact calls per rank; 146.6 / 126.2 tok/s, TTFT 0.97 / 3.27 / 6.50 s at 2K / 14K / 30K — a
+sample with the box's `kcompactd0` on a pool core's SMT sibling gave 143 / 121) and TP2 repeats the numbers above (0 mismatches over
+15,160 calls per rank; 46.1 / 47.2 tok/s; TTFT 1.91 / 7.34 s; the compact-path outputs bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
+support and were not measured here: the run book — host requirements, the launcher lines at 96 GB, the window sequence, the expected
+numbers from the routing traces (~105–125 tok/s mixed / ~120–145 short at TP2, ~62–70 / ~80–90 at TP1) — is §13 of that note.
+
+## Hosts with less RAM: Engram v2 and the expert store's NVMe tail (2026-11-04)
+
+The serving configuration above pins ~457 GB (the expert store 241 GiB + the Engram tables 189 GiB). Two opt-in mechanisms, inert at the
+launcher's defaults, bring that down for smaller hosts ("slow is acceptable, but it must run"). They ship in the image built with
+`--build-arg VLLM_MOET_CPU_TIER_PATCH=1 --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1` (Dockerfile step 44; the `-hyb-engram` tags) and need
+`docker/sm120/seccomp-io_uring.json` on `docker run` (docker's default profile denies io_uring) — the launcher adds both when a knob is on.
+
+- **`ENGRAM_MODE=nvme` — Engram v2 (384 GB hosts).** The Engram tables stay in the checkpoint's safetensors shards on NVMe; the loader never
+  reads them. Per TP rank, the rows of every step are served from a 2 GiB DRAM row cache (`ENGRAM_CACHE_GIB`) or from NVMe (io_uring,
+  512-B O_DIRECT reads of the values; the 8-B scales stay resident, 1.5 GB per rank, `ENGRAM_RESIDENT_SCALES`) by a fetcher that runs on
+  the CPU tier's dispatcher thread; the rows reach the GPU through a mapped mailbox, a bounded in-stream wait and a device landing buffer
+  that **vLLM's own lookup kernel** dequantizes — bit-identical to the pinned tables (the same bytes, the same kernel; verified at
+  T = 1..4096). A decode step's rows are requested at the hash kernel and consumed ~176 µs later at layer 1 (2.5 ms at layer 14); a
+  prompt's first chunk waits ~20–50 ms for its rows, later chunks are warm through the host-side lookahead (the prompt's hashes = vLLM's
+  kernel; its tokenizer is built at load — built lazily it cost the first long prompt 0.45 s of TTFT). Code: `tools/dsv41_5090/engram_v2/`.
+- **`STORE_NVME=1 STORE_DRAM_RECORDS=N` — the store tail (256 GB hosts at N ≈ 230, 128 GB at N ≈ 110).** Only N records per layer per
+  rank stay pinned (an LRU the CPU tier's dispatcher keeps); a cold record is read from the store file on a miss (one 4.7 MB read,
+  ~0.3–0.5 ms) into a spare slot while the request's resident experts compute — the same kernel on the same bytes. Promotions and the
+  prefill streaming read their cold records the same way (the prefill becomes NVMe-bound).
+
+Measured on the reference box (11-04, TP4, the baseline's sequence; the 512 GB record: 145.4 / 126.0 tok/s, TTFT 0.78 / 3.31 / 6.52 s,
+mixed-prompt soak 84.4 tok/s):
+
+| host | knobs | RAM used | decode 'Hello' / 'def fib(n):' | TTFT 2K / 14K / 30K | identity |
+|---|---|---|---|---|---|
+| 384 GB | `ENGRAM_MODE=nvme` | **272–278 GB** | **145.4 / 126.0** (dev flow), 145.5 / 126.2 (baked); 5-min mixed-prompt soak **85.1** | **0.81–0.90 / 3.30–3.39 / 6.64–6.65 s** (= the pinned-table path's) | the Engram rows bit-identical (harness: 20 cases, 600 graph replays, 0 differences) |
+| 256 GB | `+ STORE_NVME=1 STORE_DRAM_RECORDS=230` | **194–200 GB** | **130.5–131.0 / 108.0–109.5** | 1.68 / 6.86 / 12.13 s (2.1–2.2×) | (the N = 110 check covers the path) |
+| 128 GB | `+ STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1` | **106–112 GB** | **111.0–112.4 / 81.5–82.5** | 2.83 / 11.07 / — (3.3–3.6×) | `DEBUG_COMPACT` PASS: 19,080 compact calls per rank, 0 mismatches |
+
+The working notes with every measurement and its command are the branch's handoff files (`engram-v2-2026-11-04.md` in the
+operators' notes, `HANDOFF-moet-hybrid-engram-v2.md`).
+
+**Filling the host: `STORE_DRAM_RECORDS=auto`.** N is continuous — one record per layer costs 4 slices × 40 layers × 4.7 MB = 0.72 GiB — and
+the host's footprint (`free` used, GiB; measured at N = 344 + the full LRU 307, 344 → 278, 280 → 236, 230 → 200, 120 → 120, 110 → 112) is
+**≈ base + 0.72 GiB × N**, base = **35 GiB** with Engram v2 at TP4 (workers / engine / kernel, the resident scales, the prefill arenas and
+the default 2 GiB row cache per process; `+ 4 × (ENGRAM_CACHE_GIB − 2)` for another cache size; −5 GiB per worker process fewer: 25 at
+TP2, 20 at TP1) or 216 GiB with the pinned tables (`ENGRAM_MODE=ram`; −3 per process fewer). The launcher's `STORE_DRAM_RECORDS=auto` computes `N = floor((MemTotal − HEADROOM_GIB(20) − base) / 0.72)` at boot
+(`STORE_DRAM_GIB=<budget>` uses that budget instead of the host's memory); N at or above the store's records per layer (344 with the
+40-static placement, 375 with TP1's 9-static one, 384 with `STORE_MODE=all`) turns the tail off — everything in DRAM — and the runtime
+applies the same rule to any N. The launcher logs the computed N and the expected footprint. It holds at TP2 / TP1 too (an expert's four
+slices are in DRAM whatever the GPU count): `STORE_DRAM_GIB=220` gave N = 256 at every TP (10,240 records per store rank) and a footprint of 219 / 209 / 202 GiB at TP4 / TP2 /
+TP1 — the 184 GiB of records are the same, the base shrinks with the processes (hence the −5 GiB per process in the model).
+Measured at the thresholds that fill a host (11-04, TP4): N = 280 → 236 GiB, 137.6 / 119.6 tok/s, TTFT 1.29 / 4.85 / 9.17 s (1.4–1.5×);
+N = 120 with `ENGRAM_CACHE_GIB=1` → 120 GiB, 114.0 / 81.4, 2.70 / 10.37 / 19.71 s (3.0–3.1×); Engram v2 + the full LRU
+(`STORE_MODE=all RESIDENT=0 SPARE=110`, all 384 records in DRAM) → 307 GiB, 147.4 / 125.1, TTFT unchanged; on mixed prompts (a
+single-stream soak, 256-token completions) the full LRU's VRAM hit rate is 0.882 against the Engram-only tier's 0.867 and its aggregate
+87.1 tok/s over a 6-min sample against 83.6 over the same minutes (84.1 over the full 10 min) — the +2–4 % the traces predicted. **Per host: 384 GiB →
+everything in DRAM + the full LRU (`ENGRAM_MODE=nvme STORE_MODE=all RESIDENT=0 SPARE=110`, 307 GiB); 256 GiB → N ≈ 270 (≈ 229 GiB,
+~20 GiB free; `auto` gives 279 at the default headroom); 128 GiB → N ≈ 105 with `ENGRAM_CACHE_GIB=1` (≈ 111 GiB; `auto` gives 106).**
+
+### The two together: TP2 / TP1 on hosts with less RAM (branch `moet-hybrid-next`, 2026-11-04)
+
+Both mechanisms compose with the virtual ranks: the store tail is **per slice** — virtual rank v's records come from store rank
+r·V+v through its own DRAM LRU, io_uring fetcher (on its dispatcher thread) and prefill arena (`SCRATCH / V` records per set), so
+`STORE_DRAM_RECORDS=N` pins N × 4.7 MB × 40 × V per process (the same host RAM per GPU card as at TP4), and a cold expert costs V
+concurrent record reads (one per slice, as the TP4 ranks' do); promotions pin / read their V slice records; Engram v2 is per vLLM
+TP rank (its heads / row range come from vLLM's own TP sharding: 12 heads at TP2, all 24 at TP1) with one fetcher per process,
+polled by virtual rank 0's dispatcher. Identity holds with everything on: the mini-real identity with the per-slice tail forcing
+NVMe fetches passes at TP1 (4 slices) and TP2 (`DEBUG_COMPACT` 9,184 compact calls, 0 mismatches each), and on the full model
+`TP=2 ENGRAM_MODE=nvme STORE_NVME=1 STORE_DRAM_RECORDS=230` passes `DEBUG_COMPACT` (both ranks 11,280 compact calls, 0 mismatches);
+the compact-path outputs of every configuration below equal the pre-merge boots' at the same TP.
+
+Measured 11-04 on the image built from the branch (`…-r23-hyb-next`, Dockerfile steps 43 + 44; `BAKED=1`, `PREFIX_CACHE=0`; decode
+'Hello' / 'def fib(n):' tok/s, TTFT at 2K / 14K / 30K, host RAM `used`; the kernel-speed variance of the box's memory compaction moves
+a default-configuration sample by up to −7 %, the record samples are quoted):
+
+| GPUs | 512 GB (defaults) | 384 GB (`ENGRAM_MODE=nvme`) | 256 GB (+ `STORE_NVME=1 STORE_DRAM_RECORDS=230`) | 128 GB (`STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1`) |
+|---|---|---|---|---|
+| 4× 5090 | 146.1 / 126.3; 0.90 / 3.40 / 6.72 s; 457 GB | 145.3 / 125.7; 0.90 / 3.34 / 6.50 s; 278 GB | 131.6 / 109.2; 1.65 / 6.30 / — s; 200 GB | 112 / 82; 2.8 / 11.1 / — s; 106–112 GB (the engram-v2 branch's image) |
+| 2× 5090 (`TP=2`) | 46 / 47; 1.93 / 7.3 s; 450 GB | 44.9 / 46.6; 1.95 / 7.44 s; 269 GB | 39.6 / 42.6; 2.23 / 8.57 s; 190 GB | 36.4 / 35.3; 3.44 / 13.42 s; 103 GB |
+| 1× 5090 (`TP=1`) | 39.8 / 33.5; 3.8 / 15.2 s; ~470 GB | 42.5 / 36.3; 3.92 s; 285 GB | 39.9 / 32.0; 4.13 s; 184 GB | 37.5 / 26.2; 4.80 s; 98 GB |
+
+The 2× and 1× boxes lose little to the tail (the step is the CPU tier's already, the record reads overlap it): a 2× 5090 box with 256 GB
+serves at ~40 / 43 tok/s, with 128 GB at ~36 / 35; a 1× 5090 box with 128 GB at ~37 / 26. The per-window numbers, the identity checks and
+the commands are in the branch's handoff (`HANDOFF-moet-hybrid-next.md`).
 
 ## Limits and open items
 
