@@ -188,6 +188,8 @@ def synthetic(k, dev, do_time: bool, pool_log2: int, quick: bool = False) -> boo
 def dumps(k, dev, paths) -> bool:
     ok = True
     for p in paths:
+        if p.endswith(".ref.pt"):   # the spec-B references written by replay_specB_dumps.py match attn_*.pt too
+            continue
         d = torch.load(p, map_location="cpu", weights_only=False)
         ref_path = p[:-3] + ".ref.pt"
         has_extra = "extra_cache" in d
