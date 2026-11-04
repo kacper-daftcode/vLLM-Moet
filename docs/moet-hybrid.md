@@ -201,7 +201,9 @@ slices are in DRAM whatever the GPU count): `STORE_DRAM_GIB=220` gave N = 256 at
 TP1 — the 184 GiB of records are the same, the base shrinks with the processes (hence the −5 GiB per process in the model).
 Measured at the thresholds that fill a host (11-04, TP4): N = 280 → 236 GiB, 137.6 / 119.6 tok/s, TTFT 1.29 / 4.85 / 9.17 s (1.4–1.5×);
 N = 120 with `ENGRAM_CACHE_GIB=1` → 120 GiB, 114.0 / 81.4, 2.70 / 10.37 / 19.71 s (3.0–3.1×); Engram v2 + the full LRU
-(`STORE_MODE=all RESIDENT=0 SPARE=110`, all 384 records in DRAM) → 307 GiB, 147.4 / 125.1, TTFT unchanged. **Per host: 384 GiB →
+(`STORE_MODE=all RESIDENT=0 SPARE=110`, all 384 records in DRAM) → 307 GiB, 147.4 / 125.1, TTFT unchanged; on mixed prompts (a
+single-stream soak, 256-token completions) the full LRU's VRAM hit rate is 0.882 against the Engram-only tier's 0.867 and its aggregate
+87.1 tok/s over a 6-min sample against 83.6 over the same minutes (84.1 over the full 10 min) — the +2–4 % the traces predicted. **Per host: 384 GiB →
 everything in DRAM + the full LRU (`ENGRAM_MODE=nvme STORE_MODE=all RESIDENT=0 SPARE=110`, 307 GiB); 256 GiB → N ≈ 270 (≈ 229 GiB,
 ~20 GiB free; `auto` gives 279 at the default headroom); 128 GiB → N ≈ 105 with `ENGRAM_CACHE_GIB=1` (≈ 111 GiB; `auto` gives 106).**
 
