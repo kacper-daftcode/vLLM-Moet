@@ -19,6 +19,7 @@ What the patched engram.py calls:
 Environment:
   VLLM_MOET_ENGRAM_MODE=nvme            on (default ram = inert: vLLM's pinned host tables)
   VLLM_MOET_ENGRAM_CACHE_GIB=2          DRAM row cache per rank (plain memory, split evenly over the Engram layers)
+  VLLM_MOET_ENGRAM_RESIDENT_SCALES=1    this rank's ue8m0 scales stay in RAM (768 MB per rank): one NVMe read per row, not two
   VLLM_MOET_ENGRAM_POLLED=1             the CPU tier's dispatcher thread polls the fetcher from its dedicated core (default; the
                                         fetcher's own thread runs only until the tier is created, and alone without the tier)
   VLLM_MOET_ENGRAM_FETCH_CPU=<int>      the fetcher thread's CPU when it has one (default 8*rank+33: the dispatcher core's SMT
@@ -60,6 +61,9 @@ LOOKAHEAD_CHUNKS = int(os.environ.get("VLLM_MOET_ENGRAM_LOOKAHEAD_CHUNKS", "4"))
 # VLLM_MOET_ENGRAM_POLLED=1 (default): the CPU tier's dispatcher thread polls the fetcher (its dedicated spinning core);
 # 0 = the fetcher keeps its own thread on VLLM_MOET_ENGRAM_FETCH_CPU
 POLLED_BY_TIER = os.environ.get("VLLM_MOET_ENGRAM_POLLED", "1") == "1"
+# VLLM_MOET_ENGRAM_RESIDENT_SCALES=1 (default): this rank's ue8m0 scales (8 B per row, 768 MB per rank of plain memory) stay in
+# RAM, so a row costs one NVMe read (its 256 values) instead of two - Fraser Price's recipe does the same; 0 = read both
+RESIDENT_SCALES = os.environ.get("VLLM_MOET_ENGRAM_RESIDENT_SCALES", "1") == "1"
 ROW_VALUES, ROW_SCALES = 256, 8
 # the weight iterator skips the tables (patch_vllm_engram_v2.py patches should_skip_weight to honour this regex)
 SKIP_WEIGHT_RE = r"(^|\.)engram\.embed\.(weight|scale)$"
@@ -189,7 +193,7 @@ def _create(device: torch.device) -> None:
                            vocab_start=int(T.emb.vocab_start_idx), vocab_end=int(T.emb.vocab_end_idx), max_rows=T.max_rows)
                       for T in tables],
                      cache_bytes=int(CACHE_GIB * 2**30), fetch_cpu=fetch_cpu, queue_depth=QD, direct=DIRECT, device=device,
-                     timeout_ms=TIMEOUT_MS)
+                     timeout_ms=TIMEOUT_MS, resident_scales=RESIDENT_SCALES)
     for i, T in enumerate(tables):
         L = S.eng.layers[i]
         T.req, T.ack, T.st_values, T.st_scales = L.req, L.ack, L.st_values, L.st_scales
@@ -219,7 +223,8 @@ def _create(device: torch.device) -> None:
     atexit.register(_shutdown)
     _log(f"fetcher started: {len(tables)} tables, row cache {CACHE_GIB:.1f} GiB per rank "
          f"({S.eng.cache_rows()} rows), io_uring depth {QD}, {'O_DIRECT' if DIRECT else 'buffered'}, fetch CPU {fetch_cpu}, "
-         f"wait timeout {TIMEOUT_MS:.0f} ms, lookahead {'on' if S.lookahead else 'off'}")
+         f"wait timeout {TIMEOUT_MS:.0f} ms, lookahead {'on' if S.lookahead else 'off'}, "
+         f"resident scales {'on (' + str(S.eng.stats()['resident_scale_bytes'] // 2**20) + ' MiB)' if RESIDENT_SCALES else 'off'}")
     # the CPU tier's dispatcher polls the fetcher from its dedicated core when the tier exists (else the tier attaches
     # us when it is created: vllm_moet_cpu_tier._create_tier_if_needed -> attach_dispatcher)
     if POLLED_BY_TIER:

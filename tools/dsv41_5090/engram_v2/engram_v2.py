@@ -24,7 +24,7 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 ROW_VALUES, ROW_SCALES, ROW_BYTES = 256, 8, 264
-STATS_N = 34
+STATS_N = 35
 
 
 @functools.lru_cache(maxsize=None)
@@ -44,7 +44,7 @@ class _LayerCfg(ctypes.Structure):
 class _Config(ctypes.Structure):
     _fields_ = [("n_layers", ctypes.c_int), ("layers", ctypes.POINTER(_LayerCfg)), ("cache_bytes", ctypes.c_int64),
                 ("fetch_cpu", ctypes.c_int), ("queue_depth", ctypes.c_int), ("direct", ctypes.c_int), ("max_rows", ctypes.c_int),
-                ("prefetch_batch", ctypes.c_int)]
+                ("prefetch_batch", ctypes.c_int), ("resident_scales", ctypes.c_int)]
 
 
 @functools.lru_cache(maxsize=None)
@@ -80,14 +80,14 @@ STAT_NAMES = ["requests", "rows", "hits", "misses", "reads", "bytes", "io_errors
               "small_serve_ns", "small_serve_max_ns", "big_requests", "big_serve_ns", "big_serve_max_ns", "prefetch_rows",
               "prefetch_reads", "prefetch_hits", "resyncs", "zero_rows", "dup_rows", "prefetch_queued",
               "h50", "h100", "h200", "h300", "h500", "h1000", "h5000", "hmore", "cache_filled", "cache_evictions", "cache_capacity",
-              "ring_err"]
+              "ring_err", "resident_scale_bytes"]
 
 
 class HostFetcher:
     """The fetcher of one rank without any CUDA (tests, benches): plain host memory for the mailboxes and staging."""
 
     def __init__(self, layers: list[dict], cache_bytes: int, fetch_cpu: int = -1, queue_depth: int = 64, direct: bool = True,
-                 prefetch_batch: int = 0, lib=None):
+                 prefetch_batch: int = 0, lib=None, resident_scales: bool = False):
         self.lib = lib or host_lib()
         self.layers_cfg = layers
         self.max_rows = max(int(l["max_rows"]) for l in layers)
@@ -97,7 +97,7 @@ class HostFetcher:
             arr[i] = _LayerCfg(self._paths[i], int(l["values_off"]), int(l["scales_off"]), int(l["n_rows"]), int(l["vocab_start"]),
                                int(l["vocab_end"]))
         self._cfg = _Config(len(layers), arr, int(cache_bytes), int(fetch_cpu), int(queue_depth), 1 if direct else 0, self.max_rows,
-                            int(prefetch_batch))
+                            int(prefetch_batch), 1 if resident_scales else 0)
         self._arr = arr
         self.handle = self.lib.engram_v2_create(ctypes.byref(self._cfg))
         if not self.handle:
@@ -175,7 +175,7 @@ class HostFetcher:
                 f"hist(<=50/100/200/300/500/1000/5000/>us) {hist}; big ({s['big_requests']}) mean {s['big_serve_ns'] / big / 1e6:.1f} ms "
                 f"max {s['big_serve_max_ns'] / 1e6:.1f} ms; prefetch rows {s['prefetch_rows']} reads {s['prefetch_reads']} "
                 f"hits {s['prefetch_hits']} queued {s['prefetch_queued']}; cache {s['cache_filled']}/{s['cache_capacity']} rows, "
-                f"evictions {s['cache_evictions']}; resyncs {s['resyncs']}"
+                f"evictions {s['cache_evictions']}; resident scales {s['resident_scale_bytes'] / 2**20:.0f} MiB; resyncs {s['resyncs']}"
                 + (f"; RING ERROR {s['ring_err']}" if s["ring_err"] else ""))
 
 
@@ -187,12 +187,12 @@ class EngramV2:
     """The fetcher + the GPU-visible mailboxes, staging and landing of every Engram layer of this rank."""
 
     def __init__(self, layers: list[dict], cache_bytes: int, fetch_cpu: int, queue_depth: int, direct: bool, device: torch.device,
-                 timeout_ms: float = 2000.0, lib_path: str | None = None):
+                 timeout_ms: float = 2000.0, lib_path: str | None = None, resident_scales: bool = False):
         self.ext = cuda_ext()
         self.lib = host_lib(lib_path)
         self.device = device
         self.timeout_ns = int(timeout_ms * 1e6)
-        self.fetcher = HostFetcher(layers, cache_bytes, fetch_cpu, queue_depth, direct, lib=self.lib)
+        self.fetcher = HostFetcher(layers, cache_bytes, fetch_cpu, queue_depth, direct, lib=self.lib, resident_scales=resident_scales)
         assert self.fetcher.request_bytes() == self.ext.request_bytes(self.fetcher.max_rows)
         assert self.fetcher.ack_bytes() == self.ext.ack_bytes()
         self.layers: list[_Layer] = []

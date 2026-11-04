@@ -68,7 +68,11 @@
 #                        per rank (tools/dsv41_5090/engram_v2/), vLLM's own lookup kernel dequantizes them from a device landing
 #                        buffer (bit-identical rows). Measured 11-04: 457 -> 271 GB used, decode unchanged, TTFT +0.1-0.5 s
 #            ENGRAM_CACHE_GIB (2)    the DRAM row cache per rank (plain memory, split over the two Engram layers)
-#            ENGRAM_QD (64)          io_uring depth per rank;  ENGRAM_TIMEOUT_MS (2000) the in-stream wait's bound (fail-closed)
+#            ENGRAM_QD (64)          io_uring depth per rank (128 equal, 256 slower in this implementation);  ENGRAM_TIMEOUT_MS (2000)
+#                        the in-stream wait's bound (fail-closed)
+#            ENGRAM_RESIDENT_SCALES (1)  this rank's ue8m0 scales stay in RAM (8 B per row: 1.5 GB per rank for the two tables), so a
+#                        row costs one NVMe read instead of two - Fraser Price's BRRR recipe does the same (bench: a decode step's
+#                        rows 133 -> 92 us median, a cold 4096-token chunk 101 -> 46 ms); 0 on the tightest hosts
 #            ENGRAM_POLLED (1)       the fetcher runs on the CPU tier's dispatcher thread (its dedicated core); 0 = a thread of its own
 #                        on ENGRAM_FETCH_CPU ("" = 8*rank+33)
 #            ENGRAM_LOOKAHEAD (1)    the prompt's rows hashed on the host and the next ENGRAM_LOOKAHEAD_CHUNKS (4) chunks' rows prefetched
@@ -98,6 +102,7 @@ ENGRAM_FETCH_CPU="${ENGRAM_FETCH_CPU:-}"
 ENGRAM_QD="${ENGRAM_QD:-64}"
 ENGRAM_TIMEOUT_MS="${ENGRAM_TIMEOUT_MS:-2000}"
 ENGRAM_POLLED="${ENGRAM_POLLED:-1}"
+ENGRAM_RESIDENT_SCALES="${ENGRAM_RESIDENT_SCALES:-1}"
 ENGRAM_LOOKAHEAD="${ENGRAM_LOOKAHEAD:-1}"
 ENGRAM_LOOKAHEAD_CHUNKS="${ENGRAM_LOOKAHEAD_CHUNKS:-4}"
 STORE_NVME="${STORE_NVME:-0}"
@@ -192,7 +197,7 @@ if [[ "$ENGRAM_MODE" == "nvme" ]]; then
              -e VLLM_MOET_ENGRAM_MODE=nvme -e VLLM_MOET_ENGRAM_CACHE_GIB="$ENGRAM_CACHE_GIB" -e VLLM_MOET_ENGRAM_QD="$ENGRAM_QD"
              -e VLLM_MOET_ENGRAM_TIMEOUT_MS="$ENGRAM_TIMEOUT_MS" -e VLLM_MOET_ENGRAM_MODEL_DIR=/model -e VLLM_MOET_ENGRAM_LOG=1
              -e VLLM_MOET_ENGRAM_LOG_EVERY="$LOG_EVERY" -e VLLM_MOET_ENGRAM_POLLED="$ENGRAM_POLLED" -e VLLM_MOET_ENGRAM_LOOKAHEAD="$ENGRAM_LOOKAHEAD"
-             -e VLLM_MOET_ENGRAM_LOOKAHEAD_CHUNKS="$ENGRAM_LOOKAHEAD_CHUNKS")
+             -e VLLM_MOET_ENGRAM_LOOKAHEAD_CHUNKS="$ENGRAM_LOOKAHEAD_CHUNKS" -e VLLM_MOET_ENGRAM_RESIDENT_SCALES="$ENGRAM_RESIDENT_SCALES")
   [[ -n "$ENGRAM_FETCH_CPU" ]] && TIER_ENV+=(-e VLLM_MOET_ENGRAM_FETCH_CPU="$ENGRAM_FETCH_CPU")
 fi
 if [[ "$STORE_NVME" == "1" ]]; then

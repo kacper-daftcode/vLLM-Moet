@@ -135,6 +135,7 @@ struct LayerCfg {
 struct Layer {
     LayerCfg cfg;
     int fd = -1;
+    uint8_t* scales_res = nullptr;   // resident ue8m0 scales of this rank's rows (8 B each; 768 MB per rank), or null
     EngramV2Req* req = nullptr;
     EngramV2Ack* ack = nullptr;
     uint8_t* st_values = nullptr;
@@ -236,12 +237,17 @@ static int alloc_entry(Fetcher& F) {
 
 // issue the two reads of entry e (values, scales); returns false when no slot is free (the caller retries later)
 static bool issue_entry(Fetcher& F, int e) {
-    if (F.free_slots.size() < 2) return false;
     Entry& E = F.entries[e];
     Layer& L = F.layers[E.layer];
+    const int n_reads = L.scales_res ? 1 : 2;   // resident scales (Fraser Price's recipe keeps them in RAM): the values only
+    if ((int)F.free_slots.size() < n_reads) return false;
+    if (L.scales_res) {
+        memcpy(E.row + ENGRAM_V2_ROW_VALUES, L.scales_res + (int64_t)(E.id - L.cfg.vocab_start) * ENGRAM_V2_ROW_SCALES, ENGRAM_V2_ROW_SCALES);
+        E.halves |= 2;
+    }
     const int64_t offs[2] = {L.cfg.values_off + (int64_t)E.id * ENGRAM_V2_ROW_VALUES, L.cfg.scales_off + (int64_t)E.id * ENGRAM_V2_ROW_SCALES};
     const uint32_t wants[2] = {ENGRAM_V2_ROW_VALUES, ENGRAM_V2_ROW_SCALES};
-    for (int h = 0; h < 2; ++h) {
+    for (int h = 0; h < n_reads; ++h) {
         const int s = F.free_slots.back();
         F.free_slots.pop_back();
         Slot& S = F.slots[s];
@@ -507,6 +513,7 @@ struct EngramV2Config {
     int direct;               // O_DIRECT (0 = buffered: tmpfs test files)
     int max_rows;             // staging rows per layer
     int prefetch_batch;       // reads per background batch (0 = default 16)
+    int resident_scales;      // 1 = keep this rank's 8-B scales in RAM (768 MB per rank): one NVMe read per row instead of two
 };
 
 void* engram_v2_create(const EngramV2Config* cfg) {
@@ -534,6 +541,20 @@ void* engram_v2_create(const EngramV2Config* cfg) {
             delete F; return nullptr;
         }
         L.cache.init(cfg->cache_bytes / cfg->n_layers);
+        if (cfg->resident_scales) {
+            // the scales of this rank's rows, read once through a buffered fd (the range is not sector-aligned; ~1 s per GB)
+            const int64_t n = (c.vocab_end - c.vocab_start) * ENGRAM_V2_ROW_SCALES;
+            L.scales_res = (uint8_t*)malloc((size_t)std::max<int64_t>(n, 1));
+            int bfd = open(c.path, O_RDONLY | O_CLOEXEC);
+            int64_t done = 0;
+            while (bfd >= 0 && done < n) {
+                const ssize_t r = pread(bfd, L.scales_res + done, (size_t)std::min<int64_t>(n - done, 64 << 20), c.scales_off + c.vocab_start * ENGRAM_V2_ROW_SCALES + done);
+                if (r <= 0) break;
+                done += r;
+            }
+            if (bfd >= 0) close(bfd);
+            if (done != n) { fprintf(stderr, "[engram_v2] %s: reading the resident scales failed at %lld of %lld\n", c.path, (long long)done, (long long)n); delete F; return nullptr; }
+        }
     }
     // the ring and the bounce buffers (the fetcher thread owns them; created here so a failure is reported)
     const int r = F->ring.init(F->qd);
@@ -601,7 +622,7 @@ void engram_v2_destroy(void* h) {
     if (!F) return;
     if (F->running.load()) { F->stop.store(true); F->thread.join(); }
     F->ring.close();
-    for (auto& L : F->layers) if (L.fd >= 0) close(L.fd);
+    for (auto& L : F->layers) { if (L.fd >= 0) close(L.fd); free(L.scales_res); }
     if (!F->slots.empty()) free(F->slots[0].buf);
     delete F;
 }
@@ -635,7 +656,7 @@ void engram_v2_prefetch_clear(void* h) {
 // [9] small_requests [10] small_serve_ns [11] small_serve_max_ns [12] big_requests [13] big_serve_ns [14] big_serve_max_ns
 // [15] prefetch_rows [16] prefetch_reads [17] prefetch_hits [18] resyncs [19] zero_rows [20] dup_rows [21] prefetch_queued
 // [22..29] small histogram (<=50 100 200 300 500 1000 5000 > us) [30] cache rows filled (sum over layers)
-// [31] cache evictions [32] cache capacity rows [33] ring error (errno); reset != 0 clears the counters
+// [31] cache evictions [32] cache capacity rows [33] ring error (errno) [34] resident scale bytes; reset != 0 clears the counters
 void engram_v2_stats(void* h, int64_t* out, int reset) {
     Fetcher* F = (Fetcher*)h;
     if (!F) return;
@@ -649,6 +670,9 @@ void engram_v2_stats(void* h, int64_t* out, int reset) {
     int64_t filled = 0, ev = 0, cap = 0;
     for (auto& L : F->layers) { filled += L.cache.filled(); ev += L.cache.evictions(); cap += L.cache.capacity_rows(); }
     out[30] = filled; out[31] = ev; out[32] = cap; out[33] = F->ring_err;
+    int64_t res = 0;
+    for (auto& L : F->layers) if (L.scales_res) res += (L.cfg.vocab_end - L.cfg.vocab_start) * ENGRAM_V2_ROW_SCALES;
+    out[34] = res;
 }
 
 int64_t engram_v2_now_ns(void) { return now_ns(); }

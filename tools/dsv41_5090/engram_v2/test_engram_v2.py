@@ -90,7 +90,7 @@ def expect_rows(values, scales, ids, lo, hi) -> np.ndarray:
     return out
 
 
-def test_synthetic(scratch: str, cpu: int) -> None:
+def test_synthetic(scratch: str, cpu: int, resident_scales: bool = False) -> None:
     n_rows = 20000
     f0 = os.path.join(scratch, "table0.bin")
     f1 = os.path.join(scratch, "table1.bin")
@@ -101,7 +101,8 @@ def test_synthetic(scratch: str, cpu: int) -> None:
               dict(path=f1, values_off=4096, scales_off=4096 + n_rows * ROW_VALUES + 512, n_rows=n_rows, vocab_start=0, vocab_end=n_rows, max_rows=max_rows)]
     # a tiny ring (8 entries = 4 rows in flight) so that big requests exercise the issue loop's wait path; a cache of
     # 1 MiB per layer (~ 4K rows: fewer than the 20K-row table, so the sweep below evicts)
-    F = HostFetcher(layers, cache_bytes=2 * 1024 * 1024, fetch_cpu=cpu, queue_depth=8, direct=True)
+    F = HostFetcher(layers, cache_bytes=2 * 1024 * 1024, fetch_cpu=cpu, queue_depth=8, direct=True, resident_scales=resident_scales)
+    per_row = 1 if resident_scales else 2   # NVMe reads per missed row
     M = [Mailbox(F, 0, max_rows), Mailbox(F, 1, max_rows)]
     F.start()
     rng = np.random.default_rng(7)
@@ -112,7 +113,7 @@ def test_synthetic(scratch: str, cpu: int) -> None:
     got = M[0].rows(12)
     assert np.array_equal(got, expect_rows(v0, s0, ids, 1000, 19000)), "synthetic layer 0: rows differ from the file"
     assert M[0].ack_status.value == 0 and M[0].ack_misses.value == 12 and M[0].ack_hits.value == 0, (M[0].ack_misses.value, M[0].ack_hits.value)
-    assert M[0].ack_reads.value == 24, M[0].ack_reads.value
+    assert M[0].ack_reads.value == 12 * per_row, M[0].ack_reads.value
     # 2. the same ids again: hits, no reads
     seq = M[0].publish(ids)
     M[0].wait(seq)
@@ -230,7 +231,7 @@ def tensor_location(model_dir: str, name: str):
     return path, 8 + n + ent["data_offsets"][0], ent["shape"]
 
 
-def test_real(model_dir: str, cpu: int, perf_steps: int) -> None:
+def test_real(model_dir: str, cpu: int, perf_steps: int, resident_scales: bool = False, qd: int = 64) -> None:
     layers = []
     for lid in (1, 14):
         pw, bw, shw = tensor_location(model_dir, f"layers.{lid}.engram.embed.weight")
@@ -239,7 +240,8 @@ def test_real(model_dir: str, cpu: int, perf_steps: int) -> None:
         n = shw[0]
         # rank 0 of TP4 owns the first 6 of the 24 hash columns: rows [0, sum of the first 6 primes) - use a quarter
         layers.append(dict(path=pw, values_off=bw, scales_off=bs, n_rows=n, vocab_start=0, vocab_end=n // 4, max_rows=4096 * 6))
-    F = HostFetcher(layers, cache_bytes=256 << 20, fetch_cpu=cpu, queue_depth=64, direct=True)
+    F = HostFetcher(layers, cache_bytes=256 << 20, fetch_cpu=cpu, queue_depth=qd, direct=True, resident_scales=resident_scales)
+    print(f"  resident scales {'on' if resident_scales else 'off'} ({F.stats()['resident_scale_bytes'] / 2**20:.0f} MiB), io_uring depth {qd}")
     M = [Mailbox(F, 0, 4096 * 6), Mailbox(F, 1, 4096 * 6)]
     F.start()
     rng = np.random.default_rng(11)
@@ -300,13 +302,18 @@ def main() -> int:
     ap.add_argument("--cpu", type=int, default=33)
     ap.add_argument("--no-real", action="store_true")
     ap.add_argument("--perf-steps", type=int, default=400)
+    ap.add_argument("--resident-scales", type=int, default=-1, help="1 / 0; -1 = both")
+    ap.add_argument("--qd", type=int, default=64)
     args = ap.parse_args()
     os.makedirs(args.scratch, exist_ok=True)
-    print("synthetic tables:")
-    test_synthetic(args.scratch, args.cpu)
+    modes = [False, True] if args.resident_scales < 0 else [bool(args.resident_scales)]
+    for rs in modes:
+        print(f"synthetic tables (resident scales {'on' if rs else 'off'}):")
+        test_synthetic(args.scratch, args.cpu, resident_scales=rs)
     if not args.no_real and os.path.isfile(os.path.join(args.model_dir, "model.safetensors.index.json")):
-        print("real tables:")
-        test_real(args.model_dir, args.cpu, args.perf_steps)
+        for rs in modes:
+            print(f"real tables (resident scales {'on' if rs else 'off'}):")
+            test_real(args.model_dir, args.cpu, args.perf_steps, resident_scales=rs, qd=args.qd)
     print("ALL PASS")
     return 0
 
