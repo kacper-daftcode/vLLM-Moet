@@ -6,7 +6,7 @@
      e4m3 subnormals and the FC2 truncation paths): the kernel's projections, intermediate codes + scale bytes and
      route_output rows must equal the scalar reference bit for bit; m = 1..6 per expert, several experts per job,
      permuted output rows, non-unit vs1 / vs2.
-  2. real expert slices from the checkpoint with the recorded hidden states (internal/.../parity/inputs.npz) and
+  2. real expert slices from the checkpoint with the recorded hidden states (<parity dir>/inputs.npz) and
      synthetic ones: the same identity, and a cosine check against fp32 math on the dequantized operands.
   3. timing: experts at m = 1 and m = 6 on one CCD (expert bytes per second).
 The GPU parity (b12x itself) is gpu_parity_b12x.py; this test does not need a GPU.

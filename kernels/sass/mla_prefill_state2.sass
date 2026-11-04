@@ -83,8 +83,8 @@ stage_cand:
     SHF.R.U32.HI R31, RZ, R57, R30 ;                                         // page = slot >> log2bs
     LOP3.LUT R32, R30, R59, RZ, 0xc0, !PT ;                                  // off  = slot & bsmask
     LDC.64 R34, c[0x0][0x388] ;
-    IMAD.WIDE.U32 R34, R31, R77, R34 ;
-    IMAD.WIDE.U32 R38, R32, 0x240, R34 ;                                     // td
+    IMAD.WIDE.U32 R34, PT, R31, R77, R34 ;
+    IMAD.WIDE.U32 R38, PT, R32, 0x240, R34 ;                                     // td
     SHF.L.U32 R36, R32, 0x3, RZ ; IADD3 R36, PT, PT, R36, R63, RZ ; MOV R37, RZ ; IADD.64 R40, R34, R36 ;  // scbase = page_base + off*8 + scale_base(bs*576)
     SHF.L.U32 R36, R74, 0x4, RZ ; MOV R37, RZ ; IADD.64 R48, R38, R36 ;      // NoPE src = td + 16*lane
     @P2 LDG.E.128 R44, desc[UR4][R48.64] ;
@@ -173,9 +173,9 @@ qk_rope:
     LDC R11, c[0x0][0x3b0] ;
     IMAD R38, R77, 0x40, RZ ; MOV R39, RZ ;
     IADD3 R38, PT, PT, R38, R68, RZ ;
-    LDC.64 R12, c[0x0][0x398] ; IMAD.WIDE.U32 R12, R10, 0x4, R12 ; IADD.64 R12, R12, R38 ;
+    LDC.64 R12, c[0x0][0x398] ; IMAD.WIDE.U32 R12, PT, R10, 0x4, R12 ; IADD.64 R12, R12, R38 ;
     LDG.E R14, desc[UR4][R12.64] ;
-    LDC.64 R16, c[0x0][0x3a0] ; IMAD.WIDE.U32 R16, R10, 0x4, R16 ; IADD.64 R16, R16, R38 ;
+    LDC.64 R16, c[0x0][0x3a0] ; IMAD.WIDE.U32 R16, PT, R10, 0x4, R16 ; IADD.64 R16, R16, R38 ;
     LDG.E R15, desc[UR4][R16.64] ;
     MOV R20, 0x3fb8aa3b ; FMUL R14, R14, R20 ;
     MOV R26, 0xff800000 ;

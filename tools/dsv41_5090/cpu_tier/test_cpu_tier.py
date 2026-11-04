@@ -3,7 +3,7 @@ wait + inject, eagerly and from one CUDA graph per step, against the b12x-exact 
 
 In the serving image (torch 2.14 + CUDA 13, nvcc for the extension), one sm_120 GPU under its lock, e.g.
     flock -w 3600 /tmp/exl3diff-gpu1.lock docker run --rm --gpus '"device=1"' --name moet-tier-test \
-      -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache -v /mnt/nvme/vLLM-Moet-cpu:/repo -v <parity dir>:/parity \
+      -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache -v <checkout>:/repo -v <parity dir>:/parity \
       --entrypoint python3 <image> /repo/tools/dsv41_5090/cpu_tier/test_cpu_tier.py --records /parity/b12x_inputs_l1.npz \
       --tables /parity --layers 4 --steps 300 --cpus 8-15 --dispatcher-cpu 40
 

@@ -7,11 +7,13 @@
 #   e.g. ... tp4_window.sh static SPARE=0 PROMOTIONS=0
 #        ... tp4_window.sh promote SPARE=13 PROMOTIONS=4
 # Outputs: /tmp/ds41-hyb-<TAG>.log (container log), /tmp/ds41-hyb-<TAG>-outputs.json (the identity client's run),
-# /tmp/ds41-hyb-<TAG>-summary.txt. Appends start / end lines to /root/work/GPU-BOARD.md.
+# /tmp/ds41-hyb-<TAG>-summary.txt. With BOARD=<file> it appends start / end lines to that shared GPU board.
 set -u
 # bash reads a script lazily: an edit of this file while a window runs kills the window mid-measurement (10-26 08:3x,
 # 10-28 19:12 - both ours). The window therefore runs from a private copy; the source may change under it.
 if [[ -z "${TP4_WINDOW_COPY:-}" ]]; then
+  # the checkout is resolved from the ORIGINAL location before the copy (the copy lives in /tmp) and travels in the environment
+  export REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
   _copy="/tmp/tp4_window.$$.sh"
   cp "${BASH_SOURCE[0]}" "$_copy" || exit 1
   TP4_WINDOW_COPY="$_copy" exec bash "$_copy" "$@"
@@ -19,8 +21,8 @@ fi
 TAG="${1:?tag}"
 shift
 for kv in "$@"; do export "$kv"; done
-REPO="${REPO:-/mnt/nvme/vLLM-Moet-cpu}"
-PY=/root/work/venv/bin/python
+REPO="${REPO:?REPO (the vLLM-Moet checkout) is required when running from a copy}"
+PY="${PY:-python3}"
 NAME="${NAME:-ds41-hyb}"
 # TP=2 / TP=1 (11-04, virtual ranks): the window takes the launcher's TP / GPUS (locks 0,1 / 0 held by the caller), checks
 # only its GPUs for foreign processes and reads the KPI lines of TP ranks (each rank's line carries its virtual ranks)
@@ -33,14 +35,15 @@ READY_TIMEOUT="${READY_TIMEOUT:-2400}"
 GEN_TOKENS="${GEN_TOKENS:-256}"
 LOG=/tmp/ds41-hyb-$TAG.log
 SUMMARY=/tmp/ds41-hyb-$TAG-summary.txt
-BOARD=/root/work/GPU-BOARD.md
+BOARD="${BOARD:-}"   # optional: a shared GPU board file the window announces itself on
 WHO="${WHO:-MoET hybrid}"   # the board lines' author (an agent on a side branch sets its own)
-export MODEL_DIR="${MODEL_DIR:-/mnt/nvme/models/DeepSeek-V4.1-Flash}"
+: "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
+export MODEL_DIR
 
 note() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$SUMMARY"; }
 : > "$SUMMARY"
 # /tmp is tmpfs (three reboots on 10-25 took the day's logs): the window's artefacts are copied to NVMe at the end
-KEEP="${KEEP_DIR:-$REPO/internal/dsv41-5090-cpu/handoff/boots}"
+KEEP="${KEEP_DIR:-${CACHE_DIR:-$PWD/cache-$NAME}/boots}"
 keep_artefacts() {
   mkdir -p "$KEEP" 2>/dev/null || return 0
   for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-needle.json" "/tmp/ds41-hyb-$TAG-soak.json" "/tmp/ds41-hyb-$TAG-placement.txt" "/tmp/ds41-hyb-$TAG-thermal.txt"; do
@@ -56,7 +59,7 @@ cleanup() {
     docker logs "$NAME" > "$LOG" 2>&1
     docker stop -t 20 "$NAME" > /dev/null 2>&1
     docker rm -f "$NAME" > /dev/null 2>&1
-    echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"
+    if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"; fi
   fi
   keep_artefacts
   rm -f "${TP4_WINDOW_COPY:-/nonexistent}"
@@ -88,7 +91,7 @@ avail_gb=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
 if (( avail_gb < ${RAM_MIN_GB:-465} )); then
   note "ABORT: MemAvailable ${avail_gb} GB < ${RAM_MIN_GB:-465} GB needed for the boot; top RSS: $(ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<5 {printf "%s %.0f GB; ", $2, $1/1048576}')"; exit 2
 fi
-echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: **${TP}-GPU window started** (TP$TP boot \`$TAG\` on GPUs $GPUS: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"
+if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: **${TP}-GPU window started** (TP$TP boot \`$TAG\` on GPUs $GPUS: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"; fi
 note "window start: boot $TAG ($*); MemAvailable ${avail_gb} GB; GPU power limits: $(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | awk '{printf "%d ", $1}')W (cap $( (. /etc/default/gpu-power-cap 2>/dev/null; echo "${CAP_W:-400}") ) W, re-applied by the launcher if above)"
 # the box's memory-management activity across the window (compaction / page migration -> TLB shootdowns on the workers'
 # cores; kcompactd / khugepaged CPU time): snapshots at start, ready, end
@@ -113,10 +116,10 @@ if [[ "${DROP_CACHES:-0}" == "1" ]]; then
 fi
 
 # 1b. BAKED=1 (the launcher's default since 10-28) runs the image's copy of tools/dsv41_5090: warn when it is not the worktree's
-# (a change committed or not, without `docker build` of the hyb2 image) - the window would measure stale code
+# (a change committed or not, without `docker build` of the image) - the window would measure stale code
 cd "$REPO" || exit 1
 if [[ "${BAKED:-1}" == "1" ]]; then
-  img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2}"
+  img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"   # = the launcher's BAKED=1 default
   files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py'
   stale=$(diff <(docker run --rm --entrypoint bash "$img" -c "cd /opt/vllm-moet/dsv41_5090 && md5sum $files 2>/dev/null" 2>/dev/null) \
                <(cd tools/dsv41_5090 && eval md5sum $files 2>/dev/null) | grep '^>' | awk '{print $3}' | tr '\n' ' ')
@@ -130,7 +133,7 @@ fi
 # 2. boot
 # PROFILE_STEPS=N: vLLM's torch profiler in the serve (traces under $CACHE_DIR/dot-cache/prof = /root/.cache/prof in the
 # container), used after the decode measurements: N steps of one 'def fib(n):' request, analysed by profile_anatomy.py
-PROF_DIR="${CACHE_DIR:-/mnt/nvme/cache/ds41}/dot-cache/prof"
+PROF_DIR="${CACHE_DIR:-$PWD/cache-$NAME}/dot-cache/prof"
 if [[ -n "${PROFILE_STEPS:-}" ]]; then
   mkdir -p "$PROF_DIR"
   export EXTRA_ARGS="${EXTRA_ARGS:-} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/root/.cache/prof"
@@ -158,7 +161,7 @@ if (( ready == 0 )); then
   note "NOT READY after $(( $(date +%s) - t0 )) s; last log lines:"
   grep -v "it/s\]" "$LOG" | tail -40 | tee -a "$SUMMARY"
   docker stop -t 30 "$NAME" > /dev/null 2>&1; docker logs "$NAME" > "$LOG" 2>&1; docker rm -f "$NAME" > /dev/null 2>&1
-  echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` did not come up; GPUs released)." >> "$BOARD"
+  if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` did not come up; GPUs released)." >> "$BOARD"; fi
   exit 1
 fi
 note "ready after $(( $(date +%s) - t0 )) s"
@@ -257,11 +260,10 @@ EOF
   done
   mkdir -p "$KEEP" 2>/dev/null && cp -f "$PROF_DIR"/*"$TAG"* "$KEEP/" 2>/dev/null
 fi
-# optional (phase 3, G3): HARD_PROBE=humaneval,math500 - the W2 line's hard_probe.py (copied to internal/…/probe/ with the
-# native fin01 references): greedy, thinking off; HumanEval executed (164 items), MATH-500 level 5 (60 items); paired
+# optional: HARD_PROBE=humaneval,math500 - hard_probe.py from PROBE_DIR (with the native references next to it): greedy, thinking off; HumanEval executed (164 items), MATH-500 level 5 (60 items); paired
 # comparison against native (McNemar). ~8 + ~12 min at ~100 tok/s; decode-dominated (prompts of a few hundred tokens)
 if [[ -n "${HARD_PROBE:-}" ]]; then
-  PROBE=$REPO/internal/dsv41-5090-cpu/probe
+  PROBE="${PROBE_DIR:?PROBE_DIR (directory with hard_probe.py and the native references) is required for HARD_PROBE}"
   for suite in ${HARD_PROBE//,/ }; do
     # math500: the native fin01 reference = the first 60 level-5 items at --max-tokens 2500 (the probe's default 1200
     # truncates a third of them: 10-26); humaneval: all 164 at the default 768
@@ -338,5 +340,5 @@ docker stop -t 60 "$NAME" > /dev/null 2>&1
 docker logs "$NAME" > "$LOG" 2>&1
 docker rm -f "$NAME" > /dev/null 2>&1
 note "window end: $TAG stopped; log $LOG"
-echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped; GPUs released; summary $SUMMARY)." >> "$BOARD"
+if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped; GPUs released; summary $SUMMARY)." >> "$BOARD"; fi
 exit 0

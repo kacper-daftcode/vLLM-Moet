@@ -1,175 +1,132 @@
 #!/usr/bin/env bash
-# DeepSeek-V4.1-Flash on 4x RTX 5090 (sm_120), TP4, as the MoET hybrid: the resident experts (a static placement
-# from routing frequencies, plus promote-on-miss into spare slots) in VRAM through b12x's compact W4A8 path, every
-# other routed expert of a decode step computed on the CPU from the pinned expert store, bit-identical to the
-# all-resident b12x path (tools/dsv41_5090/cpu_tier/, /root/work/HANDOFF-moet-hybrid.md). Defaults = the serving
-# configuration measured 2026-10-25 (40 static + 80 LRU expert slots per layer per rank, promotion admission window
-# 12, exact-size Engram tables, the streamed prefill in 4096-token chunks through a 64-slot scratch pool, no DSpark):
-# decode 143 / 120 tok/s on short prompts, prefill 2.1-2.4K tok/s at 2K and 3.9K tok/s at 14K, MemAvailable ~45 GB while up,
-# boot ~6 min; HumanEval 159 vs native 160, MATH-500 L5 55 vs 55 (paired).
+# DeepSeek-V4.1-Flash on 4x RTX 5090 (sm_120), TP4, as the MoET hybrid: the resident experts (a static placement from
+# routing frequencies plus promote-on-miss into spare slots) in VRAM through b12x's compact W4A8 path, every other
+# routed expert of a decode step computed on the CPU from the pinned expert store, bit-identical to the all-resident
+# b12x path (tools/dsv41_5090/, docs/moet-hybrid.md). Defaults = the serving configuration.
 #
-# TP=2 / TP=1 (2026-11-04, branch moet-hybrid-tp12 - 2x / 1x 5090 now, 2x / 1x RTX PRO 6000 later; handoff §11): the same
-# hybrid on fewer GPUs through VIRTUAL RANKS - on one GPU every expert stays its 4 / TP slices of 576 rows (the TP4 rank
-# slices the store holds), b12x's compact W4A8 path runs on the slices at N = 576 as at TP4, one CPU pool (CCD) + mailbox
-# set per slice computes the misses with kernel v2 unchanged, the router's top-6 becomes 6 x (4 / TP) (token, slice)
-# pairs and the compact TopKSum adds a token's rows in route order (fp32, one bf16 rounding - the fixed order that
-# replaces TP4's NCCL ring). The store files are the same (rank r's process pins store ranks r*V .. r*V+V-1), the
-# host RAM is the same ~450 GB, the expert slots per layer follow the VRAM: ~50 on 2x 32 GB, ~13 on 1x 32 GB
-# (~210-235 / ~100 on 2x / 1x 96 GB). The TP-dependent defaults below (GPUS, SPARE, PLACEMENT, MAX_MODEL_LEN,
-# MAX_NUM_BATCHED_TOKENS, SCRATCH) are the 32 GB-card settings; every one of them is a knob. TP2 takes GPU locks 0
-# and 1 (ascending), TP1 lock 0 - announced on the board like the TP4 windows. The runtime derives the slices from
-# the layer geometry (VLLM_MOET_CPU_TIER_VRANKS=auto); the CPU layout of a process with V pools is automatic
-# (process r: main thread on core 8rV, per CCD g = rV+v: dispatcher 8g+1, pool 8g+2..8g+7).
+# TP=2 / TP=1 (2x / 1x GPU; docs/moet-hybrid.md "One or two GPUs"): the same hybrid through VIRTUAL RANKS - on one GPU every
+# expert stays its 4 / TP slices of 576 rows (the TP4 rank slices the store holds), b12x's compact W4A8 path runs on the
+# slices at N = 576 as at TP4, one CPU pool (CCD) + mailbox set per slice computes the misses with kernel v2 unchanged,
+# the router's top-6 becomes 6 x (4 / TP) (token, slice) pairs and the compact TopKSum adds a token's rows in route order
+# (fp32, one bf16 rounding - the fixed order that replaces TP4's NCCL ring). The store files are the same (rank r's
+# process pins store ranks r*V .. r*V+V-1), the host RAM is the same ~450 GB, the expert slots per layer follow the
+# VRAM (one slot = 4 / TP slices): 46 on 2x 32 GB, 16 on 1x 32 GB; ~210-235 / ~100 on 2x / 1x 96 GB. The TP-dependent
+# defaults below (GPUS, SPARE, PLACEMENT, MAX_MODEL_LEN, PROMOTIONS) are the 32 GB-card settings; every one is a knob.
+# The runtime derives the slices from the layer geometry (VLLM_MOET_CPU_TIER_VRANKS=auto; VRANKS=1 forces plain ranks);
+# the CPU layout of a process with V pools is automatic (process r: main thread on core 8rV, per CCD g = rV+v: dispatcher
+# 8g+1, pool 8g+2..8g+7; VLLM_MOET_CPU_TIER_VRANK_CPUS / _VRANK_DISPATCHERS override it for another CCD geometry).
 #
 # Required:  MODEL_DIR   the official DeepSeek-V4.1-Flash checkpoint
-# Optional:  IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2: the hybrid baked in, see BAKED)  NAME (ds41-hyb)  PORT (8041)
-#            TP (4)                  1 | 2 | 4 GPUs (see above);  GPUS (0,1,2,3 / 0,1 / 0 by TP)
-#            BIND (127.0.0.1:)       CACHE_DIR (/mnt/nvme/cache/ds41)  REPO (/mnt/nvme/vLLM-Moet-cpu: patcher + runtime)
-#            STORE (/mnt/nvme/packs/dsv41-hybrid)   cpu_moe/build_store.py's files (269 GB on NVMe)
-#            STORE_MODE (nonresident)  which records the tier pins: nonresident (65 GB per rank with 40 static) or all (72 GB per rank)
-#            STORE_EARLY (0)         1 = pin the records at the last MoE layer's create_weights, i.e. before the weights are
-#                        loaded (needs PLACEMENT). Measured 10-28 (k0-baked-early2): it boots, but the loader then streams
-#                        290 GB of shards through the ~45 GB of page cache the pinned memory leaves - boot 527 s against
-#                        348-394 with the late pin + the window script's two cache drops; more compaction afterwards. Off.
-#            PLACEMENT ($REPO/internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json = 40 static experts per layer;
-#                        0.28 = 107, 0.2526 = 97)  routing/placement.py's file;
-#                        RESIDENT=<int> instead = the first N experts of every layer (a test placement)
-#            SPARE (70)              LRU slots per layer for promote-on-miss (40 + 70 = 110 slots since 11-03: ten slots = 1.75 GiB
-#                        per card traded for the 512K context's KV - short-prompt decode 144.7 / 125.3 tok/s, inside the
-#                        120-slot band; 40 + 80 = 120 was the default 10-25 .. 11-03);  PROMOTIONS (4) per layer per step.
-#                        TP2 (2x 32 GB): SPARE 6 with the 40-static placement = 46 slots per layer (every expert costs 9.4 MB per
-#                        card there: measured 11-04, 45 slots + a 0.6 GB scratch leave KV 1.88 GiB at util 0.90 / 64K, 50 slots
-#                        left none - the boot refused; traces: 40+10 -> hit 0.565, 20+30 -> 0.658, 0+50 -> 0.708 - the all-LRU split is better
-#                        but every static expert made dynamic adds its record to the pinned store: +14 GiB for 20 static, +28
-#                        for 0, which this 498 GB box does not have next to the Engram tables; a 512 GB+ box can take it)
-#                        TP1 (1x 32 GB): SPARE 7 with the 9-static placement tp12-placement-0.026-uniform.json = 16 slots
-#                        (18.8 MB per expert per card: measured 11-04, 14 slots + a 1.2 GB scratch leave KV 2.53 GiB at util 0.90 /
-#                        32K, i.e. ~1 GiB at 16 slots with the 0.6 GB default scratch; traces: hit 0.40, ~145 CPU experts per step;
-#                        the host RAM is +23 GB over the 40-static store: MemAvailable 30 GB while up) and PROMOTIONS 1: a promotion
-#                        moves 4 / TP records (18.8 MB at TP1), the traces give the same hit rate at cap 1 as at cap 4 (0.420
-#                        vs 0.426) for 31 instead of 53 promotions per step (0.58 instead of 1.0 GB of H2D per step)
+#            STORE       cpu_moe/build_store.py's expert store (269 GB on NVMe; manifest.json inside)
+#
+# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb: built with --build-arg VLLM_MOET_CPU_TIER_PATCH=1)
+#            NAME (ds41-hyb)  TP (4: 1 | 2 | 4 GPUs)  GPUS (0,1,2,3 / 0,1 / 0 by TP)  PORT (8041)  BIND (127.0.0.1:)
+#            VRANKS ("" = VLLM_MOET_CPU_TIER_VRANKS auto: 4 / TP slices per expert; 1 = plain ranks, the TP4 path)
+#            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results, the kernel tables (below), profiles
+#            REPO (this checkout)    mounted at /repo with BAKED=0
+#            BAKED (1)               1 = the image's own copy of the hybrid (Dockerfile step 43: patched packages, runtime,
+#                        libcpu_tier.so). 0 = the dev flow: the checkout mounted at /repo, the patcher re-run at start (~60 s)
+#            STORE_ROOT ("")         a second read-only mount for a store of symlinks into another store (the mini-real tests)
+#            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
+#
+# Experts:   PLACEMENT ($REPO/tools/dsv41_5090/routing/placements/placement-0.1042-uniform.json)  routing/placement.py's file:
+#                        the static experts per layer (40 at 0.1042); RESIDENT=<int> instead = the first N experts of every
+#                        layer (a test placement). TP1: tp12-placement-0.026-uniform.json (9 static per layer) from the same
+#                        directory
+#            SPARE (70)              LRU slots per layer for promote-on-miss (40 + 70 = 110 slots at GPU_MEM_UTIL 0.90, 512K)
+#                        TP2 (2x 32 GB): 6 = 46 slots with the 40-static placement (an expert costs 9.4 MB per card there:
+#                        measured 11-04, 50 slots left no KV at util 0.90 / 64K and the boot refused; traces: 40+10 -> hit
+#                        0.565, 20+30 -> 0.658, 0+50 -> 0.708 - the all-LRU split is better, but every static expert made
+#                        dynamic adds its record to the pinned store: +14 GiB for 20 static, +28 for 0 - a 512 GB+ box)
+#                        TP1 (1x 32 GB): 7 = 16 slots with the 9-static placement (18.8 MB per expert; KV ~2 GiB at util 0.90 /
+#                        32K; traces: hit 0.42, ~145 CPU experts per step; the host RAM is +23 GB over the 40-static store)
+#            PROMOTIONS (4)          promotions per layer per step;  PROMOTE_WINDOW (12)  admission: a missed expert is
+#                        promoted only if its previous miss was <= W steps ago (0 = every miss). TP1: 1 - a promotion moves
+#                        4 / TP records (18.8 MB at TP1) and the traces give the same hit rate at cap 1 as at cap 4 (0.420 vs
+#                        0.426) for 31 instead of 53 promotions per step
+#            STORE_MODE (nonresident) which records the tier pins: nonresident (65 GB per rank with 40 static) or all (72 GB)
+#            STORE_EARLY (0)         1 = pin the records at the last MoE layer's create_weights, before the weights are loaded
+#                        (measured slower: the loader then streams the shards through the page cache the pinned memory leaves)
+#            CPU_TIER_TABLES ($CACHE_DIR/cpu-tier-tables)  the kernel tables: cpu_moe/qmma_probe --tables DIR and
+#                        cpu_tier/b12x_layout_probe.py --out DIR, once per GPU model (docs/moet-hybrid.md)
 #            TIMEOUT_MS (500)        the in-graph wait's bound (fail-closed)
+#            SCRATCH (64)            slots of the prefill scratch pool (64 = 0.6 GB per rank; 0 = the missing experts of
+#                        > 8-token calls are not computed: decode-only diagnostics). With virtual ranks a slot holds one
+#                        SLICE (an expert takes 4 / TP slots): 64 = 32 experts per round at TP2, 16 at TP1; DEBUG_COMPACT
+#                        needs SCRATCH >= the routed experts of a compact call x slices (8 x 6 = 48 -> 96 at TP2, 192 at TP1)
+#            PREFILL_OVERLAP (1)     a second scratch set + a side stream: the next round's records staged during the current
+#                        run, bit-identical to the serial path (TTFT -15 %); costs SCRATCH x 4.7 MB x 2 of VRAM. 0 = off;
+#                        DEBUG_OVERLAP=1 re-runs every call serially and compares bit for bit
+#
+# CPU pool:  POOL_THREADS (6)        kernel pool threads per rank = cores of its CCD (6, 7 or 8)
+#            POOL_SPIN_US (5000)     the pool's spin before it sleeps on the futex (-1 = spin forever); 5000 spins through a
+#                        decode step's gaps and sleeps when the API is idle
+#            POOL_SPIN_HOT (1)       the idle spin: 1 = ALU work instead of `pause` (keeps the cores' clock up), 2 = also a
+#                        private 32 MB DRAM stream per worker (faster per expert, but heats the memory side until it
+#                        throttles after ~18 min of load), 0 = pause;  SPIN_TOUCH_STRIDE ("") its stride for mode 2
+#            PREFETCH (1)            the kernel's software prefetch of the next rows;  PREFETCH_HINT (1 = L2)
+#            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded
+#
+# Engine:    MAX_MODEL_LEN (524288; TP2 65536, TP1 32768: the KV and the indexer's buffers compete with the expert slots on
+#                        32 GB cards)  MAX_NUM_SEQS (1: several streams are correct but slow - every stream brings its own
+#                        misses)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; at TP1 on 32 GB its workspaces cost ~0.6 GB
+#                        of KV against 2048, but a 14K prompt prefills at 944 against 576 tok/s)  CAPTURE_SIZE (8)
+#            GPU_MEM_UTIL (0.90)     INDEXER_LOGITS_MB (256: VLLM_SPARSE_INDEXER_MAX_LOGITS_MB; the indexer OOMed at 0.94 on
+#                        the 4th chunk of a 128K prompt)
+#            MOE_DETERMINISTIC (0)   B12X_DYNAMIC_DETERMINISTIC_OUTPUT for the > 8-token (prefill) MoE calls. The image bakes 1
+#                        (step 27a, the 4x PRO 6000 line's choice: identical logits at any batch size); the hybrid's measured
+#                        serving path is 0: on the -r23-hyb image the 30K-token prefill takes 6.5 s with 0 and 6.8 s with 1
+#                        (+4 %), 14K / 2K unchanged, decode unchanged (k0-merge vs k0-merge-det0, 2026-11-04). The debug checks
+#                        of the streamed prefill (DEBUG_OVERLAP, DEBUG_PREFILL) need 1
 #            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
-#            GPU_MEM_UTIL (0.90 since 11-03 with SPARE=70: KV 1.28 GiB = 1.98 x a 512K request and ~1.3 GiB outside the budget for the
-#                        indexer's runtime peak; 0.94 from 10-29 to 11-03 with 120 slots and the 64K max-model-len; 0.92 before)
-#            MAX_MODEL_LEN (524288 since 11-03: needle 3/3 at 512-519K, cold prefill 4.3-4.6K tok/s = TTFT ~2 min, decode 82 tok/s behind
-#                        512K; 65536 before; TP2: 65536, TP1: 32768 - the KV and the indexer's buffers compete with the expert
-#                        slots on 32 GB cards)  INDEXER_LOGITS_MB (256)  VLLM_SPARSE_INDEXER_MAX_LOGITS_MB: the sparse-attention indexer's
-#                        prefill logits budget (vLLM default 512) - with the 512K max-model-len at util 0.94 the indexer OOMed on the 4th
-#                        chunk of a 128K prompt (its runtime peak is ~2x the budget: DeepGEMM output + fp32 upcast + top-k, and the
-#                        per-request buffers sized by max_model_len eat the ~190 MiB outside the budget); 256 + util 0.90 ran 128K / 256K /
-#                        512K prompts and the 512K needles clean
-#            MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts prefill at 3.9K tok/s against 2.2K with 2048;
-#                        at TP1 on 32 GB the 4096 chunk's workspaces (the 24-route plan) cost ~0.6 GB of KV against 2048 - measured 11-04:
-#                        15 slots + chunk 4096 -> KV 2.07 GiB, 16 + 2048 -> 2.68; a 14K prompt prefills at 944 tok/s against 576, so 4096 stays;
-#                        16K would need a 96 GB card)
-#            CAPTURE_SIZE (8)
-#            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
-#            SCRATCH (64)            slots of the prefill scratch pool (phase 2.5; 64 = 0.6 GB per rank, 128 = 1.2; 0 = the missing
-#                        experts of > 8-token calls are not computed: decode-only diagnostics). With virtual ranks a slot holds
-#                        one SLICE (an expert takes 4 / TP slots): 64 = 16 experts per round at TP1, 32 at TP2; DEBUG_COMPACT needs
-#                        SCRATCH >= the routed experts of a compact call x slices (8 tokens x 6 = 48 experts -> 192 at TP1, 96 at TP2)
+#            ENGRAM_THP (1)          --engram-config {"use_thp":true}: exact-size mmap for the Engram tables instead of torch's
+#                        pinned allocator, which rounds each 24.6 GB table to 32 GiB; needs free, unfragmented memory at boot
+#            PREFIX_CACHE (1)        0 = --no-enable-prefix-caching (for measurements)
+#            NCCL_P2P_LEVEL (SYS)  NCCL_P2P_DISABLE (0)  NCCL_CHANNELS ("" = NCCL's choice; a pin gives bit-identity across
+#                        boots - the all-reduce decomposition changes the outputs by ulps)
+#
+# Diagnostics: LOG_EVERY (100)  KPI line period (steps);  TIER_DEBUG (0)
 #            DEBUG_COMPACT (0)       1 + EXTRA_ARGS="--enforce-eager" + SCRATCH >= 64: every compact call recomputed with all
 #                        its routed experts in the scratch pool and compared bit for bit (the within-boot identity check)
 #            DEBUG_PREFILL (0)       1: the same for the > 8-token calls (SCRATCH >= the call's distinct experts)
-#            ENGRAM_THP (1)          1 = --engram-config {"use_thp":true}: vLLM backs the Engram tables with an exact-size mmap
-#                        (+ MADV_HUGEPAGE, prefaulted, cudaHostRegister) instead of torch's pinned allocator, which rounds
-#                        each 24.6 GB table up to 32 GiB (10-25: 2 tables x 4 ranks = ~80 GB of host RAM lost); needs free,
-#                        unfragmented memory at boot (DROP_CACHES=1 on the window script)
-#            PREFIX_CACHE (1)        0 = --no-enable-prefix-caching (measurements: repeated / shared-prefix prompts would hit
-#                        vLLM's prefix cache and skip the prefill)
-#            PROMOTE_WINDOW (12)     promotion admission: 0 = every miss; W > 0 = only an expert whose previous miss was <= W
-#                        steps ago (the traces: W = 8-16 keeps the hit rate within 0.6 pt at a quarter of the promotions / DMA)
-#            POOL_THREADS (6)        kernel pool threads per rank = cores of its CCD: 6 (8r+2..8r+7), 7 (8r+1..8r+7, the dispatcher on
-#                        main's SMT sibling) or 8 (the whole CCD; main + dispatcher on siblings) - 10-28: the GPU waits
-#                        ~2.6 ms per decode step for the tier, the bench kernel is 14-17 % faster on 8 threads than on 6
-#            POOL_SPIN_HOT (1)       the kernel pool's idle spin: 1 = ALU work instead of `pause` (keeps the cores' clock up between
-#                        a step's jobs: +3 % decode on 10-25); 2 = also every idle worker streams a private 32 MB buffer from
-#                        DRAM (SPIN_TOUCH_STRIDE 64) - the kernel's after-a-gap penalty is a per-core memory-path state that
-#                        only continuous DRAM-missing loads keep away (note §20.2): in situ -8 % per expert on every rank in
-#                        10-min windows (k0-pf-touch, k0-new-touch: 128-138 -> 113-134 us, decode 148 / 129 -> 150 / 132) -
-#                        BUT NOT FOR LONG: in a 30-min single-stream soak the kernel jumps 118 -> 158 us after ~18 min and the
-#                        stream's per-stream tok/s ends 14 % below the plain spin's (k0-therm-new vs k0-therm-cool, note §20.11:
-#                        ~77 GB/s of idle DRAM reads heat the memory side until it throttles; the plain spin is flat). 2 was the
-#                        default 10-30..11-03; 1 again since 11-03. 0 = pause
-#            HOST_EMPTY_CACHE (0)    1 = torch._C._host_emptyCache() after the weights are loaded (the RAM item: the loader's
-#                        pinned staging blocks), with MemAvailable logged before / after
-#            POOL_SPIN_US (5000)     the kernel pool's spin before it sleeps on the futex (the pool's own default is 500; the
-#                        cores then drop into C2 and the kernel runs up to 2x slower after ms-long gaps; 5000 spins through
-#                        a decode step's gaps and sleeps only when the API is idle; -1 = spin forever). 5000 since 10-29
-#                        (k0-pf, with PREFETCH=1: decode 148 / 129), back to 500 for a day while the 11-02 thermal pair was
-#                        read - the cliff after 18 min was the DRAM stream of POOL_SPIN_HOT=2, not the spin: k0-therm-spin
-#                        (11-03, 5000 + POOL_SPIN_HOT=1, a 30-min single-stream soak with the thermal trace) is as flat as
-#                        k0-therm-cool (500): the kernel 127-132 us per expert throughout, per-minute tok/s -0.1 % first vs
-#                        second half, Tctl max 85 C, and decode 148.7 / 129.3 vs 145.4 / 124.2 at the start (note §20.12;
-#                        the soak aggregates 86.3 vs 87.6 tok/s are inside the +-3.5 % boot-to-boot band and on a different
-#                        prompt mix). Under load both settings sit at the socket's 350 W PPT; idle, the pool sleeps after 5 ms
-#            PREFETCH (1)            MOE_B12X_PREFETCH: the kernel's software prefetch, D rows / row-groups ahead (the expert
-#                        from DRAM costs 119 us in-kernel against 69 from L3; bits untouched by construction, parity PASS);
-#                        PREFETCH_HINT (1 = L2). Default since 10-29 (k0-pf, see POOL_SPIN_US); 0 = off
-#            PREFILL_OVERLAP (1)     a second prefill scratch set + a side stream: a non-compact call's round 0 is staged
-#                        during the stock b12x run and round r + 1 during round r's extra run - bit-identical to the
-#                        serial path (mini-real A/B), TTFT -15 % at 2K / 14K / 30K (k0-pfill vs k0-pfill-base 10-29: 0.94 ->
-#                        0.80 s, 3.8 -> 3.25 s, 7.7 -> 6.4 s; 0.12 -> 0.09 ms per streamed expert). Costs SCRATCH x 4.7 MB x 2
-#                        of VRAM - hence GPU_MEM_UTIL 0.94 (0.92 would leave the KV at the 64K minimum). 0 = off;
-#                        DEBUG_OVERLAP=1 re-runs every call serially and compares bit for bit
-#            SPIN_TOUCH_STRIDE ("")  MOE_B12X_POOL_SPIN_TOUCH_STRIDE for POOL_SPIN_HOT=2 (the kernel's default is 64 since
-#                        10-29 = every worker streams its 32 MB buffer sequentially while idle; 4160 = the old page stride,
-#                        which lost in situ on 10-29)
-#            NCCL_P2P_LEVEL (SYS)    NCCL_P2P_DISABLE (0)   NCCL_CHANNELS ("" = NCCL's choice; 4 pins NCCL_MIN/MAX_NCHANNELS: on
-#                        this box NCCL picks 2 or 4 channels per boot, and the all-reduce decomposition changes the
-#                        outputs by ulps -> bit-identity across boots needs the pin)
-#            BAKED (1)               1 = run the image's own copy of the hybrid (Dockerfile step 28: patched packages, runtime,
-#                        libcpu_tier.so) without mounting the worktree or re-running the patcher at start (IMAGE must have the
-#                        layer: vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2; verified in the TP4 boot k0-baked-early2, 10-28).
-#                        After a change under tools/dsv41_5090/ rebuild the image (layer cache, seconds):
-#                          DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly \
-#                            --label com.vllm-moet.cpu-tier-commit=$(git rev-parse --short HEAD) -t vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2 .
-#                        0 = the dev flow (IMAGE …-hyb1 or the base, the worktree mounted at /repo, the patcher at start, ~60 s)
-#            POWER_CAP_W (CAP_W of /etc/default/gpu-power-cap, else 400)  the GPUs' power limit this launcher re-applies before
-#                        the boot when a card sits above it (the box's cap after GPU 0 fell off the bus twice under full
-#                        power, 2026-10-25; gpu-power-cap.service sets it at boot); POWER_CAP_W=0 skips the check
-#            EXTRA_ARGS / EXTRA_DOCKER_ARGS appended to `vllm serve` / `docker run`
-# GPU protocol: this script does NOT take the locks - run it as
-#   flock -w 3600 /tmp/exl3diff-gpu0.lock flock -w 3600 /tmp/exl3diff-gpu1.lock flock -w 3600 /tmp/exl3diff-gpu2.lock \
-#     flock -w 3600 /tmp/exl3diff-gpu3.lock bash -c 'MODEL_DIR=... docker/sm120/run-dsv41-5090.sh && docker wait ds41-hyb'
-# and announce the window on /root/work/GPU-BOARD.md.
+#            POWER_CAP_W (CAP_W of /etc/default/gpu-power-cap, else 400)  the GPUs' power limit re-applied before the boot
+#                        when a card sits above it (docker/sm120/host/); 0 skips the check
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
+: "${STORE:?STORE (the expert store written by tools/dsv41_5090/cpu_moe/build_store.py) is required}"
 BAKED="${BAKED:-1}"
-# the baked image by default; the dev flow (BAKED=0) defaults to the image without step 28 (the patcher runs at start)
+# the baked image by default (Dockerfile step 43 built in); the dev flow (BAKED=0) mounts the checkout and runs the patcher at start
 if [[ "$BAKED" == "1" ]]; then
-  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb2}"
+  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
 else
-  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1}"
+  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
 fi
 NAME="${NAME:-ds41-hyb}"
 TP="${TP:-4}"
-# the TP-dependent defaults (virtual ranks on 32 GB cards; see the header): GPUs, slots, context, chunk
+# the TP-dependent defaults (virtual ranks on 32 GB cards; see the header): GPUs, slots, placement, context, promotions
 case "$TP" in
-  4) D_GPUS=0,1,2,3; D_SPARE=70; D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=524288; D_CHUNK=4096; D_PROMOTIONS=4 ;;
-  2) D_GPUS=0,1;     D_SPARE=6;  D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=65536;  D_CHUNK=4096; D_PROMOTIONS=4 ;;
-  1) D_GPUS=0;       D_SPARE=7;  D_PLACEMENT=tp12-placement-0.026-uniform.json; D_MAX_MODEL_LEN=32768; D_CHUNK=4096; D_PROMOTIONS=1 ;;
+  4) D_GPUS=0,1,2,3; D_SPARE=70; D_PLACEMENT=placement-0.1042-uniform.json;      D_MAX_MODEL_LEN=524288; D_PROMOTIONS=4 ;;
+  2) D_GPUS=0,1;     D_SPARE=6;  D_PLACEMENT=placement-0.1042-uniform.json;      D_MAX_MODEL_LEN=65536;  D_PROMOTIONS=4 ;;
+  1) D_GPUS=0;       D_SPARE=7;  D_PLACEMENT=tp12-placement-0.026-uniform.json; D_MAX_MODEL_LEN=32768;  D_PROMOTIONS=1 ;;
   *) echo "TP=$TP is not 1, 2 or 4" >&2; exit 1 ;;
 esac
 GPUS="${GPUS:-$D_GPUS}"
-PORT="${PORT:-8041}"
-BIND="${BIND-127.0.0.1:}"
-CACHE_DIR="${CACHE_DIR:-/mnt/nvme/cache/ds41}"
-REPO="${REPO:-/mnt/nvme/vLLM-Moet-cpu}"
-STORE="${STORE:-/mnt/nvme/packs/dsv41-hybrid}"
-STORE_MODE="${STORE_MODE:-nonresident}"
-STORE_EARLY="${STORE_EARLY:-0}"
-PLACEMENT="${PLACEMENT:-$REPO/internal/dsv41-5090-cpu/routes/$D_PLACEMENT}"
-RESIDENT="${RESIDENT:-}"
-SPARE="${SPARE:-$D_SPARE}"
-MAX_MODEL_LEN="${MAX_MODEL_LEN:-$D_MAX_MODEL_LEN}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$D_CHUNK}"
-if [[ "$TP" != "4" && $(echo "$GPUS" | tr ',' '\n' | wc -l) != "$TP" ]]; then
+if [[ $(echo "$GPUS" | tr ',' '\n' | wc -l) != "$TP" ]]; then
   echo "GPUS=$GPUS does not list $TP GPUs for TP=$TP" >&2; exit 1
 fi
+PORT="${PORT:-8041}"
+BIND="${BIND-127.0.0.1:}"
+CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+STORE_ROOT="${STORE_ROOT:-}"
+STORE_MODE="${STORE_MODE:-nonresident}"
+STORE_EARLY="${STORE_EARLY:-0}"
+PLACEMENT="${PLACEMENT:-$REPO/tools/dsv41_5090/routing/placements/$D_PLACEMENT}"
+RESIDENT="${RESIDENT:-}"
+SPARE="${SPARE:-$D_SPARE}"
 PROMOTIONS="${PROMOTIONS:-$D_PROMOTIONS}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-$D_MAX_MODEL_LEN}"
 TIMEOUT_MS="${TIMEOUT_MS:-500}"
 LOG_EVERY="${LOG_EVERY:-100}"
 TIER_DEBUG="${TIER_DEBUG:-0}"
@@ -194,11 +151,11 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 [[ "$ENGRAM_THP" == "1" ]] && EXTRA_ARGS="--engram-config {\"use_thp\":true} $EXTRA_ARGS"
 [[ "$PREFIX_CACHE" == "1" ]] || EXTRA_ARGS="--no-enable-prefix-caching $EXTRA_ARGS"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
-TABLES="$REPO/internal/dsv41-5090-cpu/parity"
+TABLES="${CPU_TIER_TABLES:-$CACHE_DIR/cpu-tier-tables}"
 
 [[ -f "$MODEL_DIR/config.json" ]] || { echo "no config.json in MODEL_DIR=$MODEL_DIR" >&2; exit 1; }
 [[ -f "$STORE/manifest.json" ]] || { echo "no manifest.json in STORE=$STORE (cpu_moe/build_store.py)" >&2; exit 1; }
-[[ -f "$TABLES/b12x_act_m_limit10.f32" && -f "$TABLES/b12x_layout_w13.npy" ]] || { echo "kernel tables missing in $TABLES" >&2; exit 1; }
+[[ -f "$TABLES/b12x_act_m_limit10.f32" && -f "$TABLES/b12x_layout_w13.npy" ]] || { echo "kernel tables missing in $TABLES (CPU_TIER_TABLES; cpu_moe/qmma_probe --tables + cpu_tier/b12x_layout_probe.py --out, docs/moet-hybrid.md)" >&2; exit 1; }
 mkdir -p "$CACHE_DIR/dot-cache"
 
 TIER_ENV=(-e VLLM_MOET_MOE_CPU_TIER=1 -e VLLM_MOET_CPU_TIER_STORE=/store -e VLLM_MOET_CPU_TIER_STORE_MODE="$STORE_MODE" -e VLLM_MOET_CPU_TIER_STORE_EARLY="$STORE_EARLY"
@@ -217,8 +174,8 @@ else
   MOUNTS+=(-v "$REPO:/repo:ro")
   ENTRY=/repo/tools/dsv41_5090/cpu_tier/serve_hybrid.sh
 fi
-# the store may be a directory of symlinks into another store (the mini-real test): mount the packs root too
-MOUNTS+=(-v /mnt/nvme/packs:/mnt/nvme/packs:ro)
+# the store may be a directory of symlinks into another store (the mini-real test): STORE_ROOT mounts that root too
+[[ -n "$STORE_ROOT" ]] && MOUNTS+=(-v "$STORE_ROOT:$STORE_ROOT:ro")
 if [[ -n "$RESIDENT" ]]; then
   TIER_ENV+=(-e VLLM_MOET_CPU_TIER_RESIDENT="$RESIDENT")
 else
@@ -259,8 +216,8 @@ docker run -d --name "$NAME" --restart no \
   ${SPIN_TOUCH_STRIDE:+-e MOE_B12X_POOL_SPIN_TOUCH_STRIDE=$SPIN_TOUCH_STRIDE} \
   -e VLLM_MOET_CPU_TIER_PREFILL_OVERLAP="$PREFILL_OVERLAP" -e VLLM_MOET_CPU_TIER_DEBUG_OVERLAP="$DEBUG_OVERLAP" \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}" -e MAX_MODEL_LEN="$MAX_MODEL_LEN" \
-  -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${INDEXER_LOGITS_MB:-256}" \
-  -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
+  -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${INDEXER_LOGITS_MB:-256}" -e B12X_DYNAMIC_DETERMINISTIC_OUTPUT="${MOE_DETERMINISTIC:-0}" \
+  -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   ${VRANKS:+-e VLLM_MOET_CPU_TIER_VRANKS=$VRANKS} \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \

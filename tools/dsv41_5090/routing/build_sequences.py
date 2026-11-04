@@ -23,7 +23,7 @@ import os
 import sys
 
 MODEL_DIR = os.environ.get("DSV41_MODEL_DIR", "/mnt/nvme/models/DeepSeek-V4.1-Flash")
-INTERNAL = "/mnt/nvme/vLLM-Moet/internal"
+INTERNAL = os.environ.get("DSV41_NOTES_DIR", "notes")  # where the prompt corpora used for the traces live
 sys.path.insert(0, INTERNAL)
 
 BOS = "<｜begin▁of▁sentence｜>"

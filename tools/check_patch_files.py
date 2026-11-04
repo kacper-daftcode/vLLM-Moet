@@ -163,7 +163,7 @@ def check_source(fork: str | None) -> int:
         print(f"patch source: recorded commit {sha[:12]} is unknown in the "
               f"fork clone at {fork} - fetch the fork remotes and retry")
         return 1
-    regen = git(fork, "diff", BASE_TAG, sha).stdout
+    regen = git(fork, "diff", BASE_TAG, sha, "--").stdout
     if normalized(regen) == normalized(open(PATCH, "rb").read()):
         print(f"patch source OK: byte-identical to "
               f"`git diff {BASE_TAG} {sha[:12]}` in {fork}")
@@ -212,7 +212,10 @@ def update(fork: str | None) -> int:
     patch_was_dirty = git(ROOT, "diff", "--quiet", "--",
                           os.path.relpath(PATCH, ROOT),
                           check=False).returncode != 0
-    diff = git(fork, "diff", BASE_TAG, new).stdout
+    # `--` ends the revision list: a path named like the tag (a `v0.24.0`
+    # checkout directory next to the clone) otherwise makes git refuse the
+    # ambiguous argument (issue #14).
+    diff = git(fork, "diff", BASE_TAG, new, "--").stdout
     if b"diff --git" not in diff:
         sys.exit(f"refusing: `git diff {BASE_TAG} {BRANCH}` came back "
                  "empty - wrong clone or branch?")

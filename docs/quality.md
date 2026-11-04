@@ -1,6 +1,6 @@
 # Quality — methodology, ablation, and delta recovery
 
-The headline tables are in the [README](../README.md). This is the detailed companion.
+The headline tables are in [v024-2bit.md](v024-2bit.md). This is the detailed companion.
 
 ## What we read and compare to
 Baseline = the **untouched official DeepSeek‑V4‑Flash checkpoint** (~149 GiB), verified from its

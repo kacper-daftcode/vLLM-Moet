@@ -58,6 +58,11 @@ __device__ __forceinline__ float ldcg(const float* p) {
   asm volatile("ld.global.cg.f32 %0, [%1];\n" : "=f"(v) : "l"(p));
   return v;
 }
+__device__ __forceinline__ unsigned ldcg_u32(const unsigned* p) {
+  unsigned v;
+  asm volatile("ld.global.cg.u32 %0, [%1];\n" : "=r"(v) : "l"(p));
+  return v;
+}
 
 // PDL: wait for the kernels this grid depends on (complete, memory visible), then let this grid's dependents start
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
@@ -265,6 +270,249 @@ spread_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16*
     store_out<OUT_F32>(out, (size_t)(e >> 3) * N + n0 + (e & 7), acc);
   }
   if (threadIdx.x == 0) cnt[tile] = 0;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// spread_topk_kernel (step 35): spread_kernel<STEPS, HI=false, OUT_F32=true, PBF16=false> (the MoE router's gate GEMM,
+// M <= 8, fp32 logits) with DeepSeek-V4's routing top-6 run by the CTA that finishes the last tile - the arithmetic
+// of dsv4_topk/dsv4_topk_sm120.cu (bit-identical to vLLM's Triton _dsv4_topk_kernel) instruction for instruction:
+// e = ex2.approx(x * log2e), l = logf(1 + e) (libdevice), w = sqrt.approx.ftz(x > 20 ? x : l), score = w + bias
+// (NaN -> -1e30), six (redux.max key, redux.min index) selections, Triton's butterfly sum, weight = div.full(scale,
+// sum > 0 ? sum : 1) * w. The tile counters live in cnt[0..N/8), the tile-completion counter in cnt[N/8]; both are
+// zero again when the kernel ends. The logits are read back through L2 (ld.global.cg) after the counter handshake.
+// ---------------------------------------------------------------------------------------------------------------
+struct TopkArgs {
+  const float* bias;        // [E]
+  const bool* is_padding;   // [M] or nullptr
+  float* out_w;             // [M, 6]
+  int32_t* out_i32;         // [M, 6] or nullptr
+  int64_t* out_i64;         // [M, 6] or nullptr
+  const int32_t* ids32;     // input ids (image-token test) or nullptr
+  const int64_t* ids64;
+  const float* bias_vl;     // [E] or nullptr
+  long long image_lo;
+  float scale;
+};
+
+__device__ __forceinline__ float tk_ex2_approx(float x) {
+  float y;
+  asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float tk_sqrt_approx_ftz(float x) {
+  float y;
+  asm("sqrt.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+  return y;
+}
+__device__ __forceinline__ float tk_div_full(float a, float b) {
+  float y;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+  return y;
+}
+__device__ __forceinline__ float tk_mul_rn(float a, float b) {
+  float y;
+  asm("mul.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+  return y;
+}
+__device__ __forceinline__ float tk_add_rn(float a, float b) {
+  float y;
+  asm("add.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b));
+  return y;
+}
+// order-preserving key of a non-NaN float; +0 and -0 map to the same key
+__device__ __forceinline__ unsigned tk_key_of(float f) {
+  if (f == 0.0f) f = 0.0f;
+  const unsigned b = __float_as_uint(f);
+  return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+}
+
+// the per-expert score of one logit: w = sqrt-softplus(x), key = order key of w + bias (NaN -> -1e30)
+__device__ __forceinline__ void tk_score(float x, float bias, float& w, unsigned& key) {
+  const float e = tk_ex2_approx(tk_mul_rn(x, 1.44269502162933349609375f));  // 0x3FB8AA3B
+  const float l = logf(tk_add_rn(e, 1.0f));
+  w = tk_sqrt_approx_ftz(x > 20.0f ? x : l);
+  float sc = tk_add_rn(w, bias);
+  if (!(sc == sc)) sc = -1e30f;
+  key = tk_key_of(sc);
+}
+
+// the bias row of a token: bias_vl for the five image-sentinel tokens, bias otherwise
+__device__ __forceinline__ const float* tk_bias_row(const TopkArgs& ta, int row) {
+  if (ta.bias_vl != nullptr && ta.image_lo > 0) {
+    const long long tok = ta.ids32 != nullptr ? (long long)ta.ids32[row] : (long long)ta.ids64[row];
+    if (tok >= ta.image_lo && tok < ta.image_lo + 5) return ta.bias_vl;
+  }
+  return ta.bias;
+}
+
+// the selection over precomputed scores (wk_w / wk_k [M][E], written by the tile reducers): two rows per warp,
+// their instruction streams interleaved; rowB < 0 = none. The same six (redux.max key, redux.min index) selections,
+// butterfly sum, div.full and mul as dsv4_topk_sm120.cu.
+template <int E>
+__device__ __forceinline__ void topk_rows2(const float* __restrict__ wk_w, const unsigned* __restrict__ wk_k, int rowA,
+                                           int rowB, int lane, const TopkArgs& ta) {
+  constexpr int PER = E / 32;
+  const bool two = rowB >= 0;
+  const int rowBB = two ? rowB : rowA;
+  float wA[PER], wB[PER];
+  unsigned kA[PER], kB[PER];
+#pragma unroll
+  for (int j = 0; j < PER; ++j) {
+    wA[j] = ldcg(wk_w + (size_t)rowA * E + lane + 32 * j);
+    wB[j] = ldcg(wk_w + (size_t)rowBB * E + lane + 32 * j);
+    kA[j] = ldcg_u32(wk_k + (size_t)rowA * E + lane + 32 * j);
+    kB[j] = ldcg_u32(wk_k + (size_t)rowBB * E + lane + 32 * j);
+  }
+  float selA = 0.0f, selB = 0.0f;
+  int idA = 0, idB = 0;
+#pragma unroll
+  for (int s = 0; s < 6; ++s) {
+    unsigned mA = 0, mB = 0;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+      mA = kA[j] > mA ? kA[j] : mA;
+      mB = kB[j] > mB ? kB[j] : mB;
+    }
+    mA = __reduce_max_sync(0xffffffffu, mA);
+    mB = __reduce_max_sync(0xffffffffu, mB);
+    unsigned cA = E, cB = E;
+#pragma unroll
+    for (int j = PER - 1; j >= 0; --j) {
+      if (kA[j] == mA) cA = lane + 32 * j;
+      if (kB[j] == mB) cB = lane + 32 * j;
+    }
+    const unsigned iA = __reduce_min_sync(0xffffffffu, cA);
+    const unsigned iB = __reduce_min_sync(0xffffffffu, cB);
+    const int oA = iA & 31, jA = iA >> 5, oB = iB & 31, jB = iB >> 5;
+    float mineA = 0.0f, mineB = 0.0f;
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+      if (j == jA) mineA = wA[j];
+      if (j == jB) mineB = wB[j];
+    }
+    const float wsA = __shfl_sync(0xffffffffu, mineA, oA);
+    const float wsB = __shfl_sync(0xffffffffu, mineB, oB);
+    if (lane == oA) {
+#pragma unroll
+      for (int j = 0; j < PER; ++j)
+        if (j == jA) kA[j] = 0;
+    }
+    if (lane == oB) {
+#pragma unroll
+      for (int j = 0; j < PER; ++j)
+        if (j == jB) kB[j] = 0;
+    }
+    if (lane == s) {
+      selA = wsA;
+      idA = (int)iA;
+      selB = wsB;
+      idB = (int)iB;
+    }
+  }
+  const float a0 = __shfl_sync(0xffffffffu, selA, 0), a1 = __shfl_sync(0xffffffffu, selA, 1);
+  const float a2 = __shfl_sync(0xffffffffu, selA, 2), a3 = __shfl_sync(0xffffffffu, selA, 3);
+  const float a4 = __shfl_sync(0xffffffffu, selA, 4), a5 = __shfl_sync(0xffffffffu, selA, 5);
+  const float b0 = __shfl_sync(0xffffffffu, selB, 0), b1 = __shfl_sync(0xffffffffu, selB, 1);
+  const float b2 = __shfl_sync(0xffffffffu, selB, 2), b3 = __shfl_sync(0xffffffffu, selB, 3);
+  const float b4 = __shfl_sync(0xffffffffu, selB, 4), b5 = __shfl_sync(0xffffffffu, selB, 5);
+  const float sumA = tk_add_rn(tk_add_rn(tk_add_rn(a0, a4), a2), tk_add_rn(tk_add_rn(a1, a5), a3));
+  const float sumB = tk_add_rn(tk_add_rn(tk_add_rn(b0, b4), b2), tk_add_rn(tk_add_rn(b1, b5), b3));
+  const float fA = tk_div_full(ta.scale, sumA > 0.0f ? sumA : 1.0f);
+  const float fB = tk_div_full(ta.scale, sumB > 0.0f ? sumB : 1.0f);
+  float outA = tk_mul_rn(fA, selA), outB = tk_mul_rn(fB, selB);
+  int oidA = idA, oidB = idB;
+  if (ta.is_padding != nullptr) {
+    if (ta.is_padding[rowA]) { outA = 0.0f; oidA = -1; }
+    if (two && ta.is_padding[rowB]) { outB = 0.0f; oidB = -1; }
+  }
+  if (lane < 6) {
+    ta.out_w[(size_t)rowA * 6 + lane] = outA;
+    if (ta.out_i32 != nullptr) ta.out_i32[(size_t)rowA * 6 + lane] = oidA;
+    else ta.out_i64[(size_t)rowA * 6 + lane] = (int64_t)oidA;
+    if (two) {
+      ta.out_w[(size_t)rowB * 6 + lane] = outB;
+      if (ta.out_i32 != nullptr) ta.out_i32[(size_t)rowB * 6 + lane] = oidB;
+      else ta.out_i64[(size_t)rowB * 6 + lane] = (int64_t)oidB;
+    }
+  }
+}
+
+template <int STEPS, int E, bool PDL>
+__global__ void __launch_bounds__(128, 1)
+spread_topk_kernel(const __nv_bfloat16* __restrict__ x, int ldx, const __nv_bfloat16* __restrict__ w,
+                   float* __restrict__ out, float* __restrict__ ws, int* __restrict__ cnt, int M, int N, int K, int step,
+                   int S, TopkArgs ta) {
+  __shared__ int last;
+  const int W = blockDim.x >> 5;
+  const int lane = threadIdx.x & 31, wl = threadIdx.x >> 5;
+  const int s = blockIdx.x * W + wl;
+  const int tile = blockIdx.y;
+  const int g = lane >> 2, t = lane & 3;
+  const int n0 = tile * 8;
+  if constexpr (PDL) {
+    const int kb = s * step;
+    uint2 b[STEPS];
+    if (s < S) slice_weights<STEPS>(b, w, K, n0, kb, min(K - kb, step) >> 4, g, t);
+    pdl_wait();
+    pdl_launch_dependents();
+    if (s < S) {
+      float c[4];
+      slice_mma<STEPS, false>(c, b, x, ldx, M, kb, min(K - kb, step) >> 4, g, t);
+      float* p = ws + ((size_t)tile * S + s) * 128;
+      *reinterpret_cast<float2*>(p + g * 8 + t * 2) = make_float2(c[0], c[1]);
+      *reinterpret_cast<float2*>(p + (g + 8) * 8 + t * 2) = make_float2(c[2], c[3]);
+    }
+  } else {
+    if (s < S) {
+      const int kb = s * step;
+      float c[4];
+      slice_chain<STEPS, false>(c, x, ldx, w, M, K, n0, kb, min(K - kb, step) >> 4, g, t);
+      float* p = ws + ((size_t)tile * S + s) * 128;
+      *reinterpret_cast<float2*>(p + g * 8 + t * 2) = make_float2(c[0], c[1]);
+      *reinterpret_cast<float2*>(p + (g + 8) * 8 + t * 2) = make_float2(c[2], c[3]);
+    }
+  }
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) last = atomicAdd(cnt + tile, 1) == (int)gridDim.x - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  const float* p = ws + (size_t)tile * S * 128;
+  float* wk_w = ws + (size_t)(N >> 3) * S * 128;      // [M][E] scores w, after the partials
+  unsigned* wk_k = reinterpret_cast<unsigned*>(wk_w + (size_t)16 * E);  // [M][E] order keys
+  for (int e = threadIdx.x; e < M * 8; e += blockDim.x) {
+    float v[32];
+#pragma unroll
+    for (int q = 0; q < 32; ++q)
+      if (q < S) v[q] = ldcg(p + q * 128 + e);
+    float acc = 0.f;
+#pragma unroll
+    for (int q = 0; q < 32; ++q) {
+      if (q < S) {
+        const float u = partial_value<false>(v[q]);
+        acc = (q == 0) ? u : acc + u;
+      }
+    }
+    const int row = e >> 3, col = n0 + (e & 7);
+    store_out<true>(out, (size_t)row * N + col, acc);
+    // the routing score of this logit (elementwise: the same value whichever CTA computes it)
+    float sw;
+    unsigned sk;
+    tk_score(acc, tk_bias_row(ta, row)[col], sw, sk);
+    wk_w[(size_t)row * E + col] = sw;
+    wk_k[(size_t)row * E + col] = sk;
+  }
+  if (threadIdx.x == 0) cnt[tile] = 0;
+  // the tile's logits and scores are out; the CTA that completes the last tile selects the top-6 of every row
+  __threadfence();
+  __syncthreads();
+  if (threadIdx.x == 0) last = atomicAdd(cnt + (N >> 3), 1) == (int)gridDim.y - 1;
+  __syncthreads();
+  if (!last) return;
+  __threadfence();
+  for (int row = wl; row < M; row += 2 * W) topk_rows2<E>(wk_w, wk_k, row, (row + W < M) ? row + W : -1, lane, ta);
+  if (threadIdx.x == 0) cnt[N >> 3] = 0;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -618,7 +866,83 @@ void spread_any(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::T
   }
 }
 
+template <int STEPS, bool PDL>
+void launch_spread_topk(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& ws, at::Tensor& cnt,
+                        int step, int S, int W, const TopkArgs& ta, cudaStream_t st) {
+  const int M = x.size(0), K = x.size(1), N = w.size(0);
+  launch<PDL>(spread_topk_kernel<STEPS, 384, PDL>, dim3((S + W - 1) / W, N / 8), dim3(W * 32), 0, st,
+              reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), (int)x.stride(0),
+              reinterpret_cast<const __nv_bfloat16*>(w.data_ptr()), out.data_ptr<float>(), ws.data_ptr<float>(),
+              cnt.data_ptr<int>(), M, N, K, step, S, ta);
+}
+
+template <bool PDL>
+void dispatch_spread_topk(const at::Tensor& x, const at::Tensor& w, at::Tensor& out, at::Tensor& ws, at::Tensor& cnt,
+                          int step, int S, int W, const TopkArgs& ta, cudaStream_t st) {
+  switch (step / 16) {
+    case 8: launch_spread_topk<8, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 12: launch_spread_topk<12, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 16: launch_spread_topk<16, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 20: launch_spread_topk<20, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 24: launch_spread_topk<24, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 28: launch_spread_topk<28, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 32: launch_spread_topk<32, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 36: launch_spread_topk<36, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    case 40: launch_spread_topk<40, PDL>(x, w, out, ws, cnt, step, S, W, ta, st); return;
+    default: break;
+  }
+  TORCH_CHECK(false, "spread_topk: unsupported slice width ", step);
+}
+
 }  // namespace
+
+// Step 35: spread (fp32 out, M <= 8, N == 384) + DeepSeek-V4 routing top-6 in one launch. cnt int32 >= N/8 + 1 (the
+// last one is the tile-completion counter; zero before the first call, zero again after). out_w [M, 6] fp32, out_ids
+// [M, 6] int32 / int64; is_padding / input_ids / bias_vl optional (None).
+void spread_topk_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, int64_t step, torch::Tensor ws,
+                     torch::Tensor cnt, int64_t W, bool pdl, torch::Tensor bias, c10::optional<torch::Tensor> is_padding,
+                     torch::Tensor out_w, torch::Tensor out_ids, double scale, c10::optional<torch::Tensor> input_ids,
+                     c10::optional<torch::Tensor> bias_vl, int64_t image_lo) {
+  check_operands(x, w, out);
+  const int M = x.size(0), K = x.size(1), N = w.size(0);
+  TORCH_CHECK(M <= 8 && N == 384 && out.scalar_type() == at::kFloat, "spread_topk: M <= 8, N == 384, fp32 logits");
+  TORCH_CHECK(spread_supported(M, N, K, step), "spread_topk: unsupported M=", M, " N=", N, " K=", K, " step=", step);
+  const int S = num_slices(K, step);
+  TORCH_CHECK(ws.is_cuda() && ws.scalar_type() == at::kFloat && ws.is_contiguous() &&
+                  ws.numel() >= (int64_t)(N / 8) * S * 128 + 2 * 16 * N,
+              "ws: fp32 [N/8 * S * 128 + 2 * 16 * N] (partials, then the scores and keys)");
+  TORCH_CHECK(cnt.is_cuda() && cnt.scalar_type() == at::kInt && cnt.is_contiguous() && cnt.numel() >= N / 8 + 1,
+              "cnt: int32 [N/8 + 1]");
+  TORCH_CHECK(W >= 1 && W <= 4, "W in 1..4");
+  TORCH_CHECK(bias.is_cuda() && bias.scalar_type() == at::kFloat && bias.is_contiguous() && bias.numel() == N, "bias fp32 [N]");
+  TORCH_CHECK(out_w.is_cuda() && out_w.scalar_type() == at::kFloat && out_w.is_contiguous() && out_w.numel() >= M * 6, "out_w fp32 [M, 6]");
+  TORCH_CHECK(out_ids.is_cuda() && out_ids.is_contiguous() && out_ids.numel() >= M * 6 &&
+                  (out_ids.scalar_type() == at::kInt || out_ids.scalar_type() == at::kLong),
+              "out_ids int32/int64 [M, 6]");
+  TopkArgs ta{};
+  ta.bias = bias.data_ptr<float>();
+  ta.is_padding = is_padding.has_value() ? is_padding->data_ptr<bool>() : nullptr;
+  ta.out_w = out_w.data_ptr<float>();
+  ta.out_i32 = out_ids.scalar_type() == at::kInt ? out_ids.data_ptr<int32_t>() : nullptr;
+  ta.out_i64 = out_ids.scalar_type() == at::kLong ? out_ids.data_ptr<int64_t>() : nullptr;
+  ta.scale = (float)scale;
+  ta.image_lo = 0;
+  ta.bias_vl = nullptr;
+  ta.ids32 = nullptr;
+  ta.ids64 = nullptr;
+  if (bias_vl.has_value() && image_lo > 0) {
+    TORCH_CHECK(input_ids.has_value(), "bias_vl routing requires input_ids");
+    TORCH_CHECK(bias_vl->scalar_type() == at::kFloat && bias_vl->is_contiguous() && bias_vl->numel() == N, "bias_vl fp32 [N]");
+    ta.bias_vl = bias_vl->data_ptr<float>();
+    ta.image_lo = image_lo;
+    if (input_ids->scalar_type() == at::kInt) ta.ids32 = input_ids->data_ptr<int32_t>();
+    else ta.ids64 = input_ids->data_ptr<int64_t>();
+  }
+  const c10::cuda::CUDAGuard guard(x.device());
+  cudaStream_t st = c10::cuda::getCurrentCUDAStream(x.get_device()).stream();
+  if (pdl) dispatch_spread_topk<true>(x, w, out, ws, cnt, step, S, (int)W, ta, st);
+  else dispatch_spread_topk<false>(x, w, out, ws, cnt, step, S, (int)W, ta, st);
+}
 
 // One slice (cuBLAS without split-K); ring: chain_ring_kernel instead of chain_kernel.
 void chain_out(torch::Tensor x, torch::Tensor w, torch::Tensor out, bool ring, bool pdl) {
@@ -677,6 +1001,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("spread_out", &spread_out, "split-K slices over all SMs, last CTA reduces", py::arg("x"), py::arg("w"),
         py::arg("out"), py::arg("step"), py::arg("pbf16"), py::arg("ws"), py::arg("cnt"), py::arg("W"),
         py::arg("pdl") = false);
+  m.def("spread_topk_out", &spread_topk_out, "spread + DeepSeek-V4 routing top-6 in one launch (step 35)", py::arg("x"),
+        py::arg("w"), py::arg("out"), py::arg("step"), py::arg("ws"), py::arg("cnt"), py::arg("W"), py::arg("pdl"),
+        py::arg("bias"), py::arg("is_padding"), py::arg("out_w"), py::arg("out_ids"), py::arg("scale"),
+        py::arg("input_ids"), py::arg("bias_vl"), py::arg("image_lo"));
   m.def("chain_supported", &chain_supported);
   m.def("split_supported", &split_supported);
   m.def("spread_supported", &spread_supported);

@@ -11,8 +11,8 @@ requires:
 context: 32768
 load_timeout_s: 2400
 
-# Native pseudo-recipe for the C1/32k anchor family (session I,
-# 2026-07-29/30): the serve-args are the anchor container's, verbatim.
+# Native pseudo-recipe for the C1/32k anchor family (2026-07-29/30):
+# the serve-args are the anchor container's, verbatim.
 # MTP-1, eager (pre graphs-rule anchor; measured 2026-07-29).
 env:
   VLLM_MOE_W2: "0"

@@ -21,7 +21,8 @@
 // later CTAs' counters before one last barrier; each CTA then writes its slice's columns at their final places. The
 // first pass keeps the slice's keys in shared memory when they fit (the later passes and the compaction read them
 // there). Rows of at most `small` columns are done by the cluster's first CTA alone (no cluster barrier).
-// Many rows (prefill): one CTA of 256 threads per row.
+// Many rows (prefill): one CTA of 256 threads per row; rows of at least DET_TOPK_GATHER_MIN columns are read twice
+// instead of four times (topk_gather: the threshold's entries collected in column order in shared memory).
 
 #include <torch/extension.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -35,6 +36,12 @@ namespace cg = cooperative_groups;
 
 #ifndef DET_TOPK_UNROLL
 #define DET_TOPK_UNROLL 1  // float4s per thread per histogram step; deeper unrolling was slower for every row length
+#endif
+#ifndef DET_TOPK_GATHER_CAP
+#define DET_TOPK_GATHER_CAP 1536  // topk_gather's entries (columns above the k-th key's top digit and on it); 0: off
+#endif
+#ifndef DET_TOPK_GATHER_MIN
+#define DET_TOPK_GATHER_MIN 4096  // rows of fewer columns stay on topk_one_cta (its four reads cost less there)
 #endif
 
 namespace {
@@ -287,19 +294,53 @@ __device__ __forceinline__ void compact(const float* __restrict__ row, int64_t s
     }
 }
 
+// Digit d with (keys of a higher digit) < k_rem <= (keys with digit >= d), bins scanned from the top, into s_vals:
+// [0] d, [1] k_rem left for bin d, [2] done (bin d taken whole, or - given lowor - its keys agree in the bits below as
+// well, as they do for bf16-valued logits; ties then go to the lower columns), [3] the count of bin d. Read s_vals
+// after a barrier.
+template <int THREADS>
+__device__ __forceinline__ void select_digit(const uint32_t* hist, int nbins, uint32_t k_rem, uint32_t* ws,
+                                             uint32_t* s_vals, const uint32_t* lowor) {
+    constexpr int kPer = kBins / THREADS > 0 ? kBins / THREADS : 1;
+    const int per = nbins / THREADS > 0 ? nbins / THREADS : 1;
+    uint32_t cnt[kPer];
+    uint32_t c = 0;
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        const int d = nbins - 1 - (threadIdx.x * per + j);
+        cnt[j] = (j < per && d >= 0) ? hist[d] : 0u;
+        c += cnt[j];
+    }
+    uint32_t tot;
+    uint32_t above = block_exclusive_scan<THREADS>(c, ws, &tot);
+#pragma unroll
+    for (int j = 0; j < kPer; ++j) {
+        if (j < per && above < k_rem && k_rem <= above + cnt[j]) {
+            const int d = nbins - 1 - (threadIdx.x * per + j);
+            s_vals[0] = static_cast<uint32_t>(d);
+            s_vals[1] = k_rem - above;
+            s_vals[2] = cnt[j] == k_rem - above || (lowor != nullptr && ((lowor[d >> 5] >> (d & 31)) & 1u) == 0u);
+            s_vals[3] = cnt[j];
+        }
+        above += cnt[j];
+    }
+}
+
 // The whole row in one CTA (n > k). With skeys (shared memory for cap keys) and n <= cap the first pass keeps the keys
-// there and the later passes and the compaction read them instead of the row. lowor: kGroups words.
+// there and the later passes and the compaction read them instead of the row. lowor: kGroups words. With from_d0 the
+// first pass is already done: digit d0 of the top 11 bits, k0 still to take from it, done0 as select_digit's [2].
 template <int THREADS>
 __device__ void topk_one_cta(const float* __restrict__ row, int64_t stride1, bool vec, int64_t n,
                              int32_t* __restrict__ orow, int32_t col_base, int k, uint32_t* hist, uint32_t* lowor,
-                             uint32_t* ws, uint32_t* s_vals, uint32_t* skeys = nullptr, int64_t cap = 0) {
-    const bool cache = skeys != nullptr && n <= cap;
-    uint32_t prefix = 0, pmask = 0;
-    uint32_t k_rem = static_cast<uint32_t>(k);
-    bool done = false;
-    int shift = 32;
+                             uint32_t* ws, uint32_t* s_vals, uint32_t* skeys = nullptr, int64_t cap = 0,
+                             bool from_d0 = false, uint32_t d0 = 0, uint32_t k0 = 0, bool done0 = false) {
+    const bool cache = !from_d0 && skeys != nullptr && n <= cap;  // the keys are kept by the first pass
+    uint32_t prefix = from_d0 ? d0 << 21 : 0u, pmask = from_d0 ? 0x7ffu << 21 : 0u;
+    uint32_t k_rem = from_d0 ? k0 : static_cast<uint32_t>(k);
+    bool done = from_d0 && done0;
+    int shift = from_d0 ? 21 : 32;
     const int widths[3] = {11, 11, 10};
-    for (int p = 0; p < 3 && !done; ++p) {
+    for (int p = from_d0 ? 1 : 0; p < 3 && !done; ++p) {
         const int w = widths[p];
         shift -= w;
         const uint32_t dmask = (1u << w) - 1u;
@@ -312,31 +353,7 @@ __device__ void topk_one_cta(const float* __restrict__ row, int64_t stride1, boo
                                             cache && p == 0, cache && p > 0, p == 1 ? lowor : nullptr,
                                             (1u << shift) - 1u);
         __syncthreads();
-        // Digit d with (keys of a higher digit) < k_rem <= (keys with digit >= d), bins scanned from the top.
-        constexpr int kPer = kBins / THREADS > 0 ? kBins / THREADS : 1;
-        const int per = nbins / THREADS > 0 ? nbins / THREADS : 1;
-        uint32_t cnt[kPer];
-        uint32_t c = 0;
-#pragma unroll
-        for (int j = 0; j < kPer; ++j) {
-            const int d = nbins - 1 - (threadIdx.x * per + j);
-            cnt[j] = (j < per && d >= 0) ? hist[d] : 0u;
-            c += cnt[j];
-        }
-        uint32_t tot;
-        uint32_t above = block_exclusive_scan<THREADS>(c, ws, &tot);
-#pragma unroll
-        for (int j = 0; j < kPer; ++j) {
-            if (j < per && above < k_rem && k_rem <= above + cnt[j]) {
-                const int d = nbins - 1 - (threadIdx.x * per + j);
-                s_vals[0] = static_cast<uint32_t>(d);
-                s_vals[1] = k_rem - above;
-                // Done when the bucket is taken whole or (second pass: lowor) its keys agree in the bits below as well,
-                // as they do for bf16-valued logits; ties then go to the lower columns in the compaction.
-                s_vals[2] = cnt[j] == k_rem - above || (p == 1 && ((lowor[d >> 5] >> (d & 31)) & 1u) == 0u);
-            }
-            above += cnt[j];
-        }
+        select_digit<THREADS>(hist, nbins, k_rem, ws, s_vals, p == 1 ? lowor : nullptr);
         __syncthreads();
         prefix |= s_vals[0] << shift;
         pmask |= dmask << shift;
@@ -348,18 +365,194 @@ __device__ void topk_one_cta(const float* __restrict__ row, int64_t stride1, boo
                      cache ? skeys : nullptr);
 }
 
+// The row in one CTA with two full reads of it (topk_one_cta reads it four times). The first histograms the top 11
+// bits of the keys: digit d0 of the k-th key. In the second each warp walks a contiguous segment in column order and
+// appends, in that order, every column with a higher digit (taken) or with digit d0 (a candidate) to its region of
+// e: bit 31 = taken, bits 20..30 = the candidate's next 11 bits, bits 0..19 = the column (rows up to 2^20 columns), and
+// the candidates' next 11 bits are histogrammed. The regions in warp order are the entries in column order, so the
+// threshold's ties go to the first entries and the output needs no sort; only the candidates in the threshold's
+// 11-bit bucket are read again (their last 10 bits) when a third digit is needed. Rows with more entries than CAP (or
+// one region's share), k > CAP or more than 2^20 columns continue in topk_one_cta.
+template <int THREADS, int CAP>
+__device__ void topk_gather(const float* __restrict__ row, int64_t stride1, bool vec, int64_t n,
+                            int32_t* __restrict__ orow, int32_t col_base, int k, uint32_t* hist, uint32_t* lowor,
+                            uint32_t* ws, uint32_t* s_vals, uint32_t* e) {
+    constexpr int kWarps = THREADS / 32;
+    constexpr int kRegion = CAP / kWarps;
+    constexpr int kPerT = CAP / THREADS;
+    static_assert(CAP % THREADS == 0, "CAP: whole per-thread chunks");
+    if (k > CAP || n > (1 << 20)) {
+        topk_one_cta<THREADS>(row, stride1, vec, n, orow, col_base, k, hist, lowor, ws, s_vals);
+        return;
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int i = threadIdx.x; i < kBins; i += THREADS) hist[i] = 0;
+    __syncthreads();
+    histogram<THREADS, DET_TOPK_UNROLL>(row, stride1, vec, n, 0u, 0u, 21, 0x7ffu, hist);
+    __syncthreads();
+    select_digit<THREADS>(hist, kBins, static_cast<uint32_t>(k), ws, s_vals, nullptr);
+    __syncthreads();
+    const uint32_t d0 = s_vals[0], k0 = s_vals[1], c0 = s_vals[3];
+    const bool done0 = s_vals[2] != 0;
+    __syncthreads();
+    if (static_cast<uint32_t>(k) - k0 + c0 > static_cast<uint32_t>(CAP)) {
+        topk_one_cta<THREADS>(row, stride1, vec, n, orow, col_base, k, hist, lowor, ws, s_vals, nullptr, 0, true, d0, k0,
+                              done0);
+        return;
+    }
+
+    for (int i = threadIdx.x; i < kBins; i += THREADS) hist[i] = 0;
+    for (int i = threadIdx.x; i < kGroups; i += THREADS) lowor[i] = 0;
+    if (threadIdx.x == 0) s_vals[4] = 0;  // a region overflowed
+    __syncthreads();
+    const int64_t seg = ((n + kWarps - 1) / kWarps + 32 * kVec - 1) & ~static_cast<int64_t>(32 * kVec - 1);
+    const int64_t w0 = min(n, warp * seg), w1 = min(n, w0 + seg);
+    uint32_t* reg = e + warp * kRegion;
+    uint32_t off = 0;  // warp-uniform
+    bool full = false;
+    for (int64_t b0 = w0; b0 < w1; b0 += 32 * kVec) {  // warp-uniform bounds: warp-wide scans below
+        const int64_t c0 = b0 + kVec * lane;
+        uint32_t key[kVec];
+        bool valid[kVec];
+        load_keys4(row, stride1, vec, w1, c0, key, valid);
+        uint32_t ent[kVec], take = 0;
+#pragma unroll
+        for (int v = 0; v < kVec; ++v) {
+            const uint32_t dg = key[v] >> 21, d1 = (key[v] >> 10) & 0x7ffu;
+            ent[v] = (dg > d0 ? 0x80000000u : d1 << 20) | static_cast<uint32_t>(c0 + v);
+            if (valid[v] && dg >= d0) {
+                take |= 1u << v;
+                if (dg == d0 && !done0) {
+                    atomicAdd(&hist[d1], 1u);
+                    if (key[v] & 0x3ffu) atomicOr(&lowor[d1 >> 5], 1u << (d1 & 31));
+                }
+            }
+        }
+        const uint32_t cnt = __popc(take);
+        const uint32_t incl = warp_inclusive_scan(cnt);
+        const uint32_t tot = __shfl_sync(0xffffffffu, incl, 31);
+        if (off + tot > static_cast<uint32_t>(kRegion)) {
+            full = true;  // the whole row goes to topk_one_cta: no need to read on
+            break;
+        }
+        uint32_t pos = off + incl - cnt;
+#pragma unroll
+        for (int v = 0; v < kVec; ++v)
+            if (take & (1u << v)) reg[pos++] = ent[v];
+        off += tot;
+    }
+    if (lane == 0) {
+        ws[warp] = off;
+        if (full) s_vals[4] = 1;
+    }
+    __syncthreads();
+    if (s_vals[4] != 0) {
+        __syncthreads();
+        topk_one_cta<THREADS>(row, stride1, vec, n, orow, col_base, k, hist, lowor, ws, s_vals, nullptr, 0, true, d0, k0,
+                              done0);
+        return;
+    }
+    // Region starts in the concatenation (column order).
+    uint32_t* s_off = ws + kWarps;
+    if (threadIdx.x < 32) {
+        const uint32_t c = lane < kWarps ? ws[lane] : 0u;
+        const uint32_t x = warp_inclusive_scan(c);
+        if (lane < kWarps) s_off[lane] = x - c;
+        if (lane == kWarps - 1) s_vals[5] = x;  // entries
+    }
+    __syncthreads();
+    const uint32_t entries = s_vals[5];
+
+    // The threshold: taken when above (gt), its ties (eq) by column order. Level 0: the candidates are the ties (all
+    // taken: done0); level 1: their next 11 bits against d1; level 2: then their last 10 bits against d2.
+    uint32_t d1 = 0, d2 = 0, k_rem = k0;
+    int level = 0;
+    if (!done0) {
+        select_digit<THREADS>(hist, kBins, k0, ws + 2 * kWarps, s_vals, lowor);
+        __syncthreads();
+        d1 = s_vals[0];
+        k_rem = s_vals[1];
+        level = s_vals[2] != 0 ? 1 : 2;
+        __syncthreads();
+        if (level == 2) {
+            for (int i = threadIdx.x; i < 1024; i += THREADS) hist[i] = 0;
+            __syncthreads();
+            for (uint32_t g = threadIdx.x; g < entries; g += THREADS) {
+                int r = 0;
+                while (r + 1 < kWarps && s_off[r + 1] <= g) ++r;
+                const uint32_t en = e[r * kRegion + (g - s_off[r])];
+                if (!(en >> 31) && ((en >> 20) & 0x7ffu) == d1)
+                    atomicAdd(&hist[key_of(row[static_cast<int64_t>(en & 0xfffffu) * stride1]) & 0x3ffu], 1u);
+            }
+            __syncthreads();
+            select_digit<THREADS>(hist, 1024, k_rem, ws + 2 * kWarps, s_vals, nullptr);
+            __syncthreads();
+            d2 = s_vals[0];
+            k_rem = s_vals[1];
+            __syncthreads();
+        }
+    }
+    // Each thread a contiguous chunk of the entries: gt / eq counts, one block scan, then the writes at
+    // gt_before + min(eq_before, k_rem) (compact's placement).
+    uint32_t cls[kPerT];  // 2: above, 1: on the threshold, 0: below / none
+    uint32_t col[kPerT];
+    uint32_t cg = 0, ce = 0;
+#pragma unroll
+    for (int j = 0; j < kPerT; ++j) {
+        const uint32_t g = threadIdx.x * kPerT + j;
+        cls[j] = 0u;
+        col[j] = 0u;
+        if (g < entries) {
+            int r = 0;
+            while (r + 1 < kWarps && s_off[r + 1] <= g) ++r;
+            const uint32_t en = e[r * kRegion + (g - s_off[r])];
+            col[j] = en & 0xfffffu;
+            const uint32_t dd = (en >> 20) & 0x7ffu;
+            if ((en >> 31) || level == 0) {
+                cls[j] = (en >> 31) ? 2u : 1u;
+            } else if (dd != d1) {
+                cls[j] = dd > d1 ? 2u : 0u;
+            } else if (level == 1) {
+                cls[j] = 1u;
+            } else {
+                const uint32_t lo = key_of(row[static_cast<int64_t>(col[j]) * stride1]) & 0x3ffu;
+                cls[j] = lo > d2 ? 2u : lo == d2 ? 1u : 0u;
+            }
+            cg += cls[j] == 2u;
+            ce += cls[j] == 1u;
+        }
+    }
+    uint32_t tot;
+    const uint32_t ex = block_exclusive_scan<THREADS>((cg << 16) | ce, ws + 2 * kWarps, &tot);
+    uint32_t gt_before = ex >> 16, eq_before = ex & 0xffffu;
+#pragma unroll
+    for (int j = 0; j < kPerT; ++j) {
+        if (cls[j] == 2u) {
+            orow[gt_before + min(eq_before, k_rem)] = col_base + static_cast<int32_t>(col[j]);
+            ++gt_before;
+        } else if (cls[j] == 1u) {
+            if (eq_before < k_rem) orow[gt_before + eq_before] = col_base + static_cast<int32_t>(col[j]);
+            ++eq_before;
+        }
+    }
+}
+
 __device__ __forceinline__ void fill_short(int64_t n, int k, int32_t* orow, int32_t col_base, int threads) {
     for (int64_t i = threadIdx.x; i < k; i += threads) orow[i] = i < n ? col_base + static_cast<int32_t>(i) : -1;
 }
 
-template <int THREADS>
+// GATHER: rows of at least DET_TOPK_GATHER_MIN columns take topk_gather (a separate instance: its shared memory and
+// registers would cost the launches of short rows occupancy).
+template <int THREADS, bool GATHER>
 __global__ void __launch_bounds__(THREADS) det_topk_kernel(const float* logits, int64_t stride0, int64_t stride1,
                                                            RowBounds bounds, int32_t* out, int64_t out_stride0, int k,
                                                            bool relative) {
     __shared__ uint32_t hist[kBins];
     __shared__ uint32_t lowor[kGroups];
-    __shared__ uint32_t ws[2 * (THREADS / 32) + 1];
-    __shared__ uint32_t s_vals[3];
+    __shared__ uint32_t ws[3 * (THREADS / 32) + 1];  // topk_gather: per-warp counts, region offsets, a block scan
+    __shared__ uint32_t s_vals[8];
+    constexpr int kCap = !GATHER ? 1 : THREADS >= 1024 ? 2048 : (DET_TOPK_GATHER_CAP > 0 ? DET_TOPK_GATHER_CAP : THREADS);
+    __shared__ uint32_t e[kCap];
     const int64_t r = blockIdx.x;
     int64_t start, end;
     row_bounds(bounds, r, &start, &end);
@@ -371,6 +564,12 @@ __global__ void __launch_bounds__(THREADS) det_topk_kernel(const float* logits, 
     if (n <= k) {
         fill_short(n, k, orow, col_base, THREADS);
         return;
+    }
+    if constexpr (GATHER) {
+        if (n >= DET_TOPK_GATHER_MIN) {
+            topk_gather<THREADS, kCap>(row, stride1, vec, n, orow, col_base, k, hist, lowor, ws, s_vals, e);
+            return;
+        }
     }
     topk_one_cta<THREADS>(row, stride1, vec, n, orow, col_base, k, hist, lowor, ws, s_vals);
 }
@@ -638,14 +837,19 @@ void launch(const torch::Tensor& logits, const RowBounds& b, torch::Tensor& out,
         launch_cluster<4>(logits, b, out, k, relative, small, stream);
     } else if (cluster == 2) {
         launch_cluster<2>(logits, b, out, k, relative, small, stream);
-    } else if (b.num_rows <= 256) {
-        det_topk_kernel<1024><<<b.num_rows, 1024, 0, stream>>>(logits.data_ptr<float>(), logits.stride(0),
-                                                               logits.stride(1), b, out.data_ptr<int32_t>(),
-                                                               out.stride(0), static_cast<int>(k), relative);
     } else {
-        det_topk_kernel<256><<<b.num_rows, 256, 0, stream>>>(logits.data_ptr<float>(), logits.stride(0),
-                                                             logits.stride(1), b, out.data_ptr<int32_t>(),
-                                                             out.stride(0), static_cast<int>(k), relative);
+        auto launch = [&](auto kernel, int threads) {
+            kernel<<<b.num_rows, threads, 0, stream>>>(logits.data_ptr<float>(), logits.stride(0), logits.stride(1), b,
+                                                       out.data_ptr<int32_t>(), out.stride(0), static_cast<int>(k),
+                                                       relative);
+        };
+        // by the widest row (a prefill chunk's rows spread up to it): below twice the row threshold too few rows take
+        // topk_gather to pay for its instance
+        const bool gather = DET_TOPK_GATHER_CAP > 0 && b.width >= 2 * DET_TOPK_GATHER_MIN;
+        if (b.num_rows <= 256)
+            gather ? launch(det_topk_kernel<1024, true>, 1024) : launch(det_topk_kernel<1024, false>, 1024);
+        else
+            gather ? launch(det_topk_kernel<256, true>, 256) : launch(det_topk_kernel<256, false>, 256);
     }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

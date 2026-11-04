@@ -54,7 +54,7 @@ def main() -> int:
     t["engram_num_embeddings"] = []
     json.dump(cfg, open(os.path.join(args.out, "config.json"), "w"), indent=2)
     # the real placement (routing/placement.py) renumbered to the mini layers, for tests at the full per-layer scale
-    pl_path = os.environ.get("REAL_PLACEMENT", "/mnt/nvme/vLLM-Moet-cpu/internal/dsv41-5090-cpu/routes/placement-0.28-uniform.json")
+    pl_path = os.environ.get("REAL_PLACEMENT", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "routing", "placements", "placement-0.28-uniform.json"))
     if os.path.exists(pl_path):
         P = json.load(open(pl_path))
         mini = dict(source=pl_path, real_layers=real_layers,

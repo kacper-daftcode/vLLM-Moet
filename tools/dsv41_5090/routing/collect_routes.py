@@ -1,11 +1,11 @@
 """Record the native routing of the sequences through the W2 server (PLAN-dsv41-5090-cpu 1.2).
 
 Server: ds41-w2 relaunched on the dev-loop overlay with the recorder + native prefill, e.g.
-  cd /mnt/nvme/vLLM-Moet && IMAGE=vllm-moet-sm120:dsv41-0909 W2_OVERLAY_DIR=/mnt/nvme/w2-overlay \
-    CUBIT_DIR=/mnt/nvme/vLLM-Moet/kernels/cubins-sm120 \
-    EXTRA_DOCKER_ARGS="-v /mnt/nvme/vLLM-Moet-cpu/internal/dsv41-5090-cpu/routes:/dump" \
+  cd <checkout> && IMAGE=vllm-moet-sm120:dsv41-0909 W2_OVERLAY_DIR=<w2 overlay> \
+    CUBIT_DIR=<checkout>/kernels/cubins-sm120 \
+    EXTRA_DOCKER_ARGS="-v <routes dir>:/dump" \
     EXTRA_ARGS="--no-enable-prefix-caching" \
-    internal/relaunch_w2.sh 46-routes GPU_MEM_UTIL=0.93 W2_BASE_CACHE_GB=8 W2_DELTA_GB=12 SPEC_TOKENS=0 \
+    <the W2 launcher> 46-routes GPU_MEM_UTIL=0.93 W2_BASE_CACHE_GB=8 W2_DELTA_GB=12 SPEC_TOKENS=0 \
       MAX_NUM_SEQS=1 MAX_NUM_BATCHED_TOKENS=2048 \
       W2_EXTRA_ENV="VLLM_MOE_W2_PREFILL_FP4=ensure VLLM_MOE_W2_DELTA_POLICY=need VLLM_MOE_W2_ROUTE_DUMP=/dump/route.bin VLLM_MOE_W2_KPI_EVERY=100"
 Then:
