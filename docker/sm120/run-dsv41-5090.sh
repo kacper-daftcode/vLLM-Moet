@@ -47,6 +47,11 @@
 #                        misses)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk)  CAPTURE_SIZE (8)
 #            GPU_MEM_UTIL (0.90)     INDEXER_LOGITS_MB (256: VLLM_SPARSE_INDEXER_MAX_LOGITS_MB; the indexer OOMed at 0.94 on
 #                        the 4th chunk of a 128K prompt)
+#            MOE_DETERMINISTIC (0)   B12X_DYNAMIC_DETERMINISTIC_OUTPUT for the > 8-token (prefill) MoE calls. The image bakes 1
+#                        (step 27a, the 4x PRO 6000 line's choice: identical logits at any batch size); the hybrid's measured
+#                        serving path is 0: on the -r23-hyb image the 30K-token prefill takes 6.5 s with 0 and 6.8 s with 1
+#                        (+4 %), 14K / 2K unchanged, decode unchanged (k0-merge vs k0-merge-det0, 2026-11-04). The debug checks
+#                        of the streamed prefill (DEBUG_OVERLAP, DEBUG_PREFILL) need 1
 #            SPEC_TOKENS (0)         DSpark draft tokens (0 = no drafter: k = 5 is CPU-bound with the m > 1 kernel)
 #            ENGRAM_THP (1)          --engram-config {"use_thp":true}: exact-size mmap for the Engram tables instead of torch's
 #                        pinned allocator, which rounds each 24.6 GB table to 32 GiB; needs free, unfragmented memory at boot
@@ -174,7 +179,7 @@ docker run -d --name "$NAME" --restart no \
   ${SPIN_TOUCH_STRIDE:+-e MOE_B12X_POOL_SPIN_TOUCH_STRIDE=$SPIN_TOUCH_STRIDE} \
   -e VLLM_MOET_CPU_TIER_PREFILL_OVERLAP="$PREFILL_OVERLAP" -e VLLM_MOET_CPU_TIER_DEBUG_OVERLAP="$DEBUG_OVERLAP" \
   -e TP="$TP" -e SPEC_TOKENS="${SPEC_TOKENS:-0}" -e GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.90}" -e MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}" \
-  -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${INDEXER_LOGITS_MB:-256}" \
+  -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${INDEXER_LOGITS_MB:-256}" -e B12X_DYNAMIC_DETERMINISTIC_OUTPUT="${MOE_DETERMINISTIC:-0}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
