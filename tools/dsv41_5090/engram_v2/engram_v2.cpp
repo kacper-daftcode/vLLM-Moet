@@ -441,11 +441,21 @@ static void prefetch_step(Fetcher& F) {
 static void fetcher_main(Fetcher* Fp) {
     Fetcher& F = *Fp;
     pin_to_cpu(F.fetch_cpu);
+    uint32_t iter = 0;
     while (!F.stop.load(std::memory_order_acquire)) {
+        // the CPU tier's _pin_process re-pins every thread of the worker to its "other" CPUs when the tier starts (after
+        // this thread exists): re-assert the affinity now and then (cheap; ~every 50 ms of spinning)
+        if ((++iter & 0xFFFFF) == 0) pin_to_cpu(F.fetch_cpu);
         bool busy = false;
         for (size_t l = 0; l < F.layers.size(); ++l) {
             Layer& L = F.layers[l];
             if (!L.req) continue;
+            // priority by layer: the two Engram layers' requests are published back to back, but layer 1's rows are
+            // consumed ~200 us after the hashes and layer 14's ~2.5 ms after - its reads wait until layer 1's job is
+            // done (24 + 24 reads at once would push layer 1's completion from ~131 to ~195 us)
+            bool earlier_active = false;
+            for (size_t k = 0; k < l; ++k) earlier_active |= F.jobs[k].active;
+            if (earlier_active) continue;
             const uint32_t s = __atomic_load_n(&L.req->step, __ATOMIC_ACQUIRE);
             if (s == L.expected && !F.jobs[l].active) {
                 begin_job(F, (int)l, s);
