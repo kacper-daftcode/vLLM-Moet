@@ -26,7 +26,9 @@
 #                        clients apart and revoking one of them.
 #            CACHE_DIR   host dir with two subdirs mounted at /root/.cache and /root/.deep_gemm (FlashInfer JIT,
 #                        torch.compile, vLLM and DeepGEMM caches; later starts reuse them)
-#            SERVED_NAME (moonshotai/Kimi-K3 or moonshotai/Kimi-K3.1-Pro, by the model family)
+#            SERVED_NAME (moonshotai/Kimi-K3 or moonshotai/Kimi-K3.1-Pro, by the model family)  one or more names,
+#                        space-separated: the first is the name in responses, the others are aliases (a gateway whose
+#                        deployment still asks for moonshotai/Kimi-K3 keeps working while K3.1 is served)
 #            MAX_MODEL_LEN (1048576)  MAX_NUM_SEQS (128)  MAX_NUM_BATCHED_TOKENS (8192)
 #            PREFIX_MATCH_UNIT (128) --prefix-match-unit: the prefix-cache hash unit; every prefix-cacheable KV group's
 #                        block must be a multiple of it (K3 at TP8: 1664-token blocks; K3.1's packed DSA row is sized
@@ -128,6 +130,8 @@ API_KEY_FILE="${API_KEY_FILE:-}"
 API_KEYS_FILE="${API_KEYS_FILE:-}"
 CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
 SERVED_NAME="${SERVED_NAME:-$DEFAULT_SERVED_NAME}"
+# shellcheck disable=SC2206
+SERVED_NAMES=($SERVED_NAME)
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
@@ -322,7 +326,7 @@ docker run -d --name "$NAME" --restart no \
   -e VLLM_USE_RUST_FRONTEND="$RUST_FRONTEND" \
   ${EXTRA_DOCKER_ARGS} \
   "$IMAGE" \
-  --model /model --served-model-name "$SERVED_NAME" \
+  --model /model --served-model-name "${SERVED_NAMES[@]}" \
   --trust-remote-code \
   --tensor-parallel-size 8 \
   --load-format "$LOAD_FORMAT" \
