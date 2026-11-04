@@ -61,7 +61,9 @@ def ensure_lib(args):
     if os.environ.get("CPU_TIER_LIB"):
         return
     out = os.path.join(args.build_dir, "libcpu_tier.so")
-    if not os.path.exists(out) or args.rebuild:
+    srcs = [os.path.join(_HERE, "cpu_tier.cpp"), os.path.join(_HERE, "..", "cpu_moe", "cpu_moe_b12x.cpp"), os.path.join(_HERE, "..", "engram_v2", "uring.h")]
+    stale = not os.path.exists(out) or any(os.path.getmtime(f) > os.path.getmtime(out) for f in srcs)
+    if stale or args.rebuild:   # a stale /tmp/libcpu_tier.so from an earlier build cost a wrong verdict once (11-04)
         subprocess.run(["bash", os.path.join(_HERE, "build.sh")], check=True, env=dict(os.environ, ARCH=args.arch, OUT=out))
     os.environ["CPU_TIER_LIB"] = out
     os.environ["DSV41_B12X_LIB"] = out
