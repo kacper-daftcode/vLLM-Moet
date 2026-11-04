@@ -196,8 +196,24 @@ r·V+v through its own DRAM LRU, io_uring fetcher (on its dispatcher thread) and
 `STORE_DRAM_RECORDS=N` pins N × 4.7 MB × 40 × V per process (the same host RAM per GPU card as at TP4), and a cold expert costs V
 concurrent record reads (one per slice, as the TP4 ranks' do); promotions pin / read their V slice records; Engram v2 is per vLLM
 TP rank (its heads / row range come from vLLM's own TP sharding: 12 heads at TP2, all 24 at TP1) with one fetcher per process,
-polled by virtual rank 0's dispatcher. The measurements of the combinations (2× / 1× 5090 at 384 / 256 GB) are in the branch's
-handoff (`HANDOFF-moet-hybrid-next.md`).
+polled by virtual rank 0's dispatcher. Identity holds with everything on: the mini-real identity with the per-slice tail forcing
+NVMe fetches passes at TP1 (4 slices) and TP2 (`DEBUG_COMPACT` 9,184 compact calls, 0 mismatches each), and on the full model
+`TP=2 ENGRAM_MODE=nvme STORE_NVME=1 STORE_DRAM_RECORDS=230` passes `DEBUG_COMPACT` (both ranks 11,280 compact calls, 0 mismatches);
+the compact-path outputs of every configuration below equal the pre-merge boots' at the same TP.
+
+Measured 11-04 on the image built from the branch (`…-r23-hyb-next`, Dockerfile steps 43 + 44; `BAKED=1`, `PREFIX_CACHE=0`; decode
+'Hello' / 'def fib(n):' tok/s, TTFT at 2K / 14K / 30K, host RAM `used`; the kernel-speed variance of the box's memory compaction moves
+a default-configuration sample by up to −7 %, the record samples are quoted):
+
+| GPUs | 512 GB (defaults) | 384 GB (`ENGRAM_MODE=nvme`) | 256 GB (+ `STORE_NVME=1 STORE_DRAM_RECORDS=230`) | 128 GB (`STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1`) |
+|---|---|---|---|---|
+| 4× 5090 | 146.1 / 126.3; 0.90 / 3.40 / 6.72 s; 457 GB | 145.3 / 125.7; 0.90 / 3.34 / 6.50 s; 278 GB | 131.6 / 109.2; 1.65 / 6.30 / — s; 200 GB | 112 / 82; 2.8 / 11.1 / — s; 106–112 GB (the engram-v2 branch's image) |
+| 2× 5090 (`TP=2`) | 46 / 47; 1.93 / 7.3 s; 450 GB | 44.9 / 46.6; 1.95 / 7.44 s; 269 GB | 39.6 / 42.6; 2.23 / 8.57 s; 190 GB | 36.4 / 35.3; 3.44 / 13.42 s; 103 GB |
+| 1× 5090 (`TP=1`) | 39.8 / 33.5; 3.8 / 15.2 s; ~470 GB | 42.5 / 36.3; 3.92 s; 285 GB | 39.9 / 32.0; 4.13 s; 184 GB | 37.5 / 26.2; 4.80 s; 98 GB |
+
+The 2× and 1× boxes lose little to the tail (the step is the CPU tier's already, the record reads overlap it): a 2× 5090 box with 256 GB
+serves at ~40 / 43 tok/s, with 128 GB at ~36 / 35; a 1× 5090 box with 128 GB at ~37 / 26. The per-window numbers, the identity checks and
+the commands are in the branch's handoff (`HANDOFF-moet-hybrid-next.md`).
 
 ## Limits and open items
 
