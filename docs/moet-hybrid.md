@@ -191,13 +191,14 @@ operators' notes, `HANDOFF-moet-hybrid-engram-v2.md`).
 
 **Filling the host: `STORE_DRAM_RECORDS=auto`.** N is continuous — one record per layer costs 4 slices × 40 layers × 4.7 MB = 0.72 GiB — and
 the host's footprint (`free` used, GiB; measured at N = 344 + the full LRU 307, 344 → 278, 280 → 236, 230 → 200, 120 → 120, 110 → 112) is
-**≈ base + 0.72 GiB × N**, base = **35 GiB** with Engram v2 (workers / engine / kernel, the resident scales, the prefill arenas and the
-default 2 GiB row cache per store rank; `+ 4 × (ENGRAM_CACHE_GIB − 2)` for another cache size) or 216 GiB with the pinned tables
-(`ENGRAM_MODE=ram`). The launcher's `STORE_DRAM_RECORDS=auto` computes `N = floor((MemTotal − HEADROOM_GIB(20) − base) / 0.72)` at boot
+**≈ base + 0.72 GiB × N**, base = **35 GiB** with Engram v2 at TP4 (workers / engine / kernel, the resident scales, the prefill arenas and
+the default 2 GiB row cache per process; `+ 4 × (ENGRAM_CACHE_GIB − 2)` for another cache size; −5 GiB per worker process fewer: 25 at
+TP2, 20 at TP1) or 216 GiB with the pinned tables (`ENGRAM_MODE=ram`; −3 per process fewer). The launcher's `STORE_DRAM_RECORDS=auto` computes `N = floor((MemTotal − HEADROOM_GIB(20) − base) / 0.72)` at boot
 (`STORE_DRAM_GIB=<budget>` uses that budget instead of the host's memory); N at or above the store's records per layer (344 with the
 40-static placement, 375 with TP1's 9-static one, 384 with `STORE_MODE=all`) turns the tail off — everything in DRAM — and the runtime
 applies the same rule to any N. The launcher logs the computed N and the expected footprint. It holds at TP2 / TP1 too (an expert's four
-slices are in DRAM whatever the GPU count): `STORE_DRAM_GIB=220` gave N = 256 and a footprint of AUTO_TP4 / AUTO_TP2 / AUTO_TP1 GiB at TP4 / TP2 / TP1 (expected 219).
+slices are in DRAM whatever the GPU count): `STORE_DRAM_GIB=220` gave N = 256 at every TP (10,240 records per store rank) and a footprint of 219 / 209 / 202 GiB at TP4 / TP2 /
+TP1 — the 184 GiB of records are the same, the base shrinks with the processes (hence the −5 GiB per process in the model).
 Measured at the thresholds that fill a host (11-04, TP4): N = 280 → 236 GiB, 137.6 / 119.6 tok/s, TTFT 1.29 / 4.85 / 9.17 s (1.4–1.5×);
 N = 120 with `ENGRAM_CACHE_GIB=1` → 120 GiB, 114.0 / 81.4, 2.70 / 10.37 / 19.71 s (3.0–3.1×); Engram v2 + the full LRU
 (`STORE_MODE=all RESIDENT=0 SPARE=110`, all 384 records in DRAM) → 307 GiB, 147.4 / 125.1, TTFT unchanged. **Per host: 384 GiB →

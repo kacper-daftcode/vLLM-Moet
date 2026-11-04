@@ -116,12 +116,14 @@
 #                        per layer (344 with the 40-static placement, 384 with STORE_MODE=all) turns the tail off (everything in DRAM)
 #            STORE_DRAM_GIB ("")     the budget in GiB instead of the host's memory (implies auto): N = floor((budget - base) / 0.72)
 #            HEADROOM_GIB (20)       what auto leaves free of MemTotal (the loader's page cache, the API server; the 512 GiB box runs with 41)
-#                        The footprint model (measured 11-04 on 4x 5090, `free` used in GiB, the same at TP2 / TP1 - the 4 slices of an
-#                        expert are in DRAM whatever the GPU count): footprint = base + 0.72 GiB x N, one record per layer = 4 slices x 40
-#                        layers x 4.7 MB; base = 35 GiB with Engram v2 (workers / engine / kernel, the resident scales, the prefill arenas,
-#                        the 2 GiB row cache per store rank; +4 x (ENGRAM_CACHE_GIB - 2) for another cache size) or 216 GiB with the
-#                        pinned Engram tables (ENGRAM_MODE=ram: +181). Measured points: N = 344 + the full LRU 307 GiB, 344 -> 278,
-#                        280 -> 236, 230 -> 200, 120 (cache 1) -> 120, 110 (cache 1) -> 112. Per host: 384 GiB -> everything in DRAM + the
+#                        The footprint model (measured 11-04 on 4x 5090, `free` used in GiB; the per-N term is the same at TP2 / TP1 - the
+#                        4 slices of an expert are in DRAM whatever the GPU count): footprint = base + 0.72 GiB x N, one record per layer
+#                        = 4 slices x 40 layers x 4.7 MB; base = 35 GiB with Engram v2 at TP4 (workers / engine / kernel, the resident
+#                        scales, the prefill arenas, the 2 GiB row cache per process; +4 x (ENGRAM_CACHE_GIB - 2) for another cache size,
+#                        -5 GiB per process fewer: 25 at TP2, 20 at TP1 - measured 219 / 209 / 202 GiB for N = 256) or 216 GiB with the
+#                        pinned Engram tables (ENGRAM_MODE=ram: +181; -3 per process fewer). Measured points (TP4): N = 344 + the full
+#                        LRU 307 GiB, 344 -> 278, 280 -> 236, 256 -> 219, 230 -> 200, 120 (cache 1) -> 120, 110 (cache 1) -> 112. Per
+#                        host: 384 GiB -> everything in DRAM + the
 #                        full LRU (ENGRAM_MODE=nvme STORE_MODE=all RESIDENT=0 SPARE=110: 307 GiB, 147.4 / 125.1 tok/s, TTFT unchanged);
 #                        256 GiB -> N ~ 270 (~229 GiB, ~20 free; auto gives 279 at HEADROOM 20: 236 GiB, 137.6 / 119.6, TTFT 1.4-1.5x);
 #                        128 GiB -> N ~ 105 with ENGRAM_CACHE_GIB=1 (~111 GiB; auto gives 106: 114 / 81 tok/s, TTFT 3.0-3.1x)
@@ -191,8 +193,10 @@ if [[ "$STORE_DRAM_RECORDS" == "auto" || -n "$STORE_DRAM_GIB" ]]; then
   if [[ "$STORE_MODE" == "all" ]]; then STORE_CAP=384
   elif [[ -n "$RESIDENT" ]]; then STORE_CAP=$((384 - RESIDENT))
   else STORE_CAP=$(python3 -c 'import json, sys; p = json.load(open(sys.argv[1])); print(384 - min(l["count"] for l in p["layers"]))' "$PLACEMENT" 2>/dev/null || echo 344); fi
-  if [[ "$ENGRAM_MODE" == "nvme" ]]; then BASE_GIB=$(awk -v c="$ENGRAM_CACHE_GIB" 'BEGIN {printf "%.1f", 35 + 4 * (c - 2)}'); BASE_SRC="$BASE_GIB GiB with Engram v2 (35 at its default 2 GiB row cache per rank; ENGRAM_CACHE_GIB=$ENGRAM_CACHE_GIB)"
-  else BASE_GIB=216; BASE_SRC="216 GiB with the pinned Engram tables (ENGRAM_MODE=ram)"; fi
+  # the base: measured at TP4 (4 worker processes); a process less takes ~5 GiB with it (its row cache + its anon pages: 219 / 209 / 202
+  # GiB at TP4 / TP2 / TP1 for the same N = 256 on 11-04), ~3 GiB with the pinned tables
+  if [[ "$ENGRAM_MODE" == "nvme" ]]; then BASE_GIB=$(awk -v c="$ENGRAM_CACHE_GIB" -v tp="$TP" 'BEGIN {printf "%.1f", 35 + 4 * (c - 2) - 5 * (4 - tp)}'); BASE_SRC="$BASE_GIB GiB with Engram v2 (35 at TP4 with its default 2 GiB row cache per rank; ENGRAM_CACHE_GIB=$ENGRAM_CACHE_GIB, TP=$TP)"
+  else BASE_GIB=$(awk -v tp="$TP" 'BEGIN {printf "%.0f", 216 - 3 * (4 - tp)}'); BASE_SRC="$BASE_GIB GiB with the pinned Engram tables (ENGRAM_MODE=ram, TP=$TP)"; fi
   N_AUTO=$(awk -v b="$BUDGET_GIB" -v base="$BASE_GIB" 'BEGIN {n = int((b - base) / 0.72); if (n < 0) n = 0; print n}')
   if (( N_AUTO >= STORE_CAP )); then
     echo "STORE_DRAM_RECORDS=auto: $BUDGET_SRC -> budget $BUDGET_GIB GiB; base $BASE_SRC; N = floor(($BUDGET_GIB - $BASE_GIB) / 0.72) = $N_AUTO >= the store's $STORE_CAP records per layer: the tail is OFF, every record in DRAM (expected footprint $(awk -v base="$BASE_GIB" -v n="$STORE_CAP" 'BEGIN {printf "%.0f", base + 0.72 * n}') GiB)"
