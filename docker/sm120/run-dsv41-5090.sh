@@ -111,7 +111,20 @@
 #                        slot; kernel v2 computes from it - bit-identical rows); the prefill streaming and the promotions read their
 #                        cold records the same way. Measured 11-04: N = 230 -> 194 GB used, decode -10 / -14 %, TTFT 2.1-2.2x;
 #                        N = 110 -> 106 GB, -24 / -35 %, TTFT 3.3-3.6x (identity PASS at N = 110)
-#            STORE_DRAM_RECORDS (0)  records per layer per rank kept in DRAM when STORE_NVME=1 (0 = all 344 = today's store)
+#            STORE_DRAM_RECORDS (0)  records per layer per rank kept in DRAM when STORE_NVME=1 (0 = all 344 = today's store); **auto** = fill
+#                        the host: N from the footprint model below with the budget MemTotal - HEADROOM_GIB (20); N >= the store's records
+#                        per layer (344 with the 40-static placement, 384 with STORE_MODE=all) turns the tail off (everything in DRAM)
+#            STORE_DRAM_GIB ("")     the budget in GiB instead of the host's memory (implies auto): N = floor((budget - base) / 0.72)
+#            HEADROOM_GIB (20)       what auto leaves free of MemTotal (the loader's page cache, the API server; the 512 GiB box runs with 41)
+#                        The footprint model (measured 11-04 on 4x 5090, `free` used in GiB, the same at TP2 / TP1 - the 4 slices of an
+#                        expert are in DRAM whatever the GPU count): footprint = base + 0.72 GiB x N, one record per layer = 4 slices x 40
+#                        layers x 4.7 MB; base = 35 GiB with Engram v2 (workers / engine / kernel, the resident scales, the prefill arenas,
+#                        the 2 GiB row cache per store rank; +4 x (ENGRAM_CACHE_GIB - 2) for another cache size) or 216 GiB with the
+#                        pinned Engram tables (ENGRAM_MODE=ram: +181). Measured points: N = 344 + the full LRU 307 GiB, 344 -> 278,
+#                        280 -> 236, 230 -> 200, 120 (cache 1) -> 120, 110 (cache 1) -> 112. Per host: 384 GiB -> everything in DRAM + the
+#                        full LRU (ENGRAM_MODE=nvme STORE_MODE=all RESIDENT=0 SPARE=110: 307 GiB, 147.4 / 125.1 tok/s, TTFT unchanged);
+#                        256 GiB -> N ~ 270 (~229 GiB, ~20 free; auto gives 279 at HEADROOM 20: 236 GiB, 137.6 / 119.6, TTFT 1.4-1.5x);
+#                        128 GiB -> N ~ 105 with ENGRAM_CACHE_GIB=1 (~111 GiB; auto gives 106: 114 / 81 tok/s, TTFT 3.0-3.1x)
 #            STORE_NVME_QD (8)       record reads in flight per rank (also the prefill's reader threads)
 #            With TP=2 / TP=1 both compose with the virtual ranks: the store tail is PER SLICE (STORE_DRAM_RECORDS counts per layer
 #                        per store rank, so a process pins N x 4.7 MB x 40 x (4 / TP) = the same host RAM per GPU card as at TP4; a
@@ -141,19 +154,9 @@ ENGRAM_LOOKAHEAD="${ENGRAM_LOOKAHEAD:-1}"
 ENGRAM_LOOKAHEAD_CHUNKS="${ENGRAM_LOOKAHEAD_CHUNKS:-4}"
 STORE_NVME="${STORE_NVME:-0}"
 STORE_DRAM_RECORDS="${STORE_DRAM_RECORDS:-0}"
+STORE_DRAM_GIB="${STORE_DRAM_GIB:-}"
+HEADROOM_GIB="${HEADROOM_GIB:-20}"
 STORE_NVME_QD="${STORE_NVME_QD:-8}"
-NVME_TIER=0; [[ "$ENGRAM_MODE" == "nvme" || "$STORE_NVME" == "1" ]] && NVME_TIER=1
-# the baked image by default (Dockerfile step 43 built in; the NVMe modes need step 44 too: the -hyb-engram tag); the dev flow
-# (BAKED=0) mounts the checkout and runs the patcher(s) at start
-if [[ "$BAKED" == "1" ]]; then
-  if [[ "$NVME_TIER" == "1" ]]; then
-    IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-engram}"
-  else
-    IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
-  fi
-else
-  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
-fi
 NAME="${NAME:-ds41-hyb}"
 TP="${TP:-4}"
 # the TP-dependent defaults (virtual ranks on 32 GB cards; see the header): GPUs, slots, placement, context, promotions
@@ -176,6 +179,41 @@ STORE_MODE="${STORE_MODE:-nonresident}"
 STORE_EARLY="${STORE_EARLY:-0}"
 PLACEMENT="${PLACEMENT:-$REPO/tools/dsv41_5090/routing/placements/$D_PLACEMENT}"
 RESIDENT="${RESIDENT:-}"
+# STORE_DRAM_RECORDS=auto / STORE_DRAM_GIB=<budget>: N from the footprint model of the header (base + 0.72 GiB x N); the store's
+# records per layer (the cap: everything in DRAM at or above it) from the placement file / RESIDENT / STORE_MODE
+if [[ "$STORE_DRAM_RECORDS" == "auto" || -n "$STORE_DRAM_GIB" ]]; then
+  if [[ -n "$STORE_DRAM_GIB" ]]; then
+    BUDGET_GIB="$STORE_DRAM_GIB"; BUDGET_SRC="STORE_DRAM_GIB=$STORE_DRAM_GIB"
+  else
+    MEM_GIB=$(awk '/^MemTotal:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
+    BUDGET_GIB=$((MEM_GIB - HEADROOM_GIB)); BUDGET_SRC="MemTotal $MEM_GIB GiB - HEADROOM_GIB $HEADROOM_GIB"
+  fi
+  if [[ "$STORE_MODE" == "all" ]]; then STORE_CAP=384
+  elif [[ -n "$RESIDENT" ]]; then STORE_CAP=$((384 - RESIDENT))
+  else STORE_CAP=$(python3 -c 'import json, sys; p = json.load(open(sys.argv[1])); print(384 - min(l["count"] for l in p["layers"]))' "$PLACEMENT" 2>/dev/null || echo 344); fi
+  if [[ "$ENGRAM_MODE" == "nvme" ]]; then BASE_GIB=$(awk -v c="$ENGRAM_CACHE_GIB" 'BEGIN {printf "%.1f", 35 + 4 * (c - 2)}'); BASE_SRC="$BASE_GIB GiB with Engram v2 (35 at its default 2 GiB row cache per rank; ENGRAM_CACHE_GIB=$ENGRAM_CACHE_GIB)"
+  else BASE_GIB=216; BASE_SRC="216 GiB with the pinned Engram tables (ENGRAM_MODE=ram)"; fi
+  N_AUTO=$(awk -v b="$BUDGET_GIB" -v base="$BASE_GIB" 'BEGIN {n = int((b - base) / 0.72); if (n < 0) n = 0; print n}')
+  if (( N_AUTO >= STORE_CAP )); then
+    echo "STORE_DRAM_RECORDS=auto: $BUDGET_SRC -> budget $BUDGET_GIB GiB; base $BASE_SRC; N = floor(($BUDGET_GIB - $BASE_GIB) / 0.72) = $N_AUTO >= the store's $STORE_CAP records per layer: the tail is OFF, every record in DRAM (expected footprint $(awk -v base="$BASE_GIB" -v n="$STORE_CAP" 'BEGIN {printf "%.0f", base + 0.72 * n}') GiB)"
+    STORE_NVME=0; STORE_DRAM_RECORDS=0
+  else
+    echo "STORE_DRAM_RECORDS=auto: $BUDGET_SRC -> budget $BUDGET_GIB GiB; base $BASE_SRC; N = floor(($BUDGET_GIB - $BASE_GIB) / 0.72) = $N_AUTO of the store's $STORE_CAP records per layer in DRAM (expected footprint $(awk -v base="$BASE_GIB" -v n="$N_AUTO" 'BEGIN {printf "%.0f", base + 0.72 * n}') GiB); the tail is on"
+    STORE_NVME=1; STORE_DRAM_RECORDS=$N_AUTO
+  fi
+fi
+NVME_TIER=0; [[ "$ENGRAM_MODE" == "nvme" || "$STORE_NVME" == "1" ]] && NVME_TIER=1
+# the baked image by default (Dockerfile step 43 built in; the NVMe modes need step 44 too: the -hyb-engram tag); the dev flow
+# (BAKED=0) mounts the checkout and runs the patcher(s) at start
+if [[ "$BAKED" == "1" ]]; then
+  if [[ "$NVME_TIER" == "1" ]]; then
+    IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-engram}"
+  else
+    IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
+  fi
+else
+  IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
+fi
 SPARE="${SPARE:-$D_SPARE}"
 PROMOTIONS="${PROMOTIONS:-$D_PROMOTIONS}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-$D_MAX_MODEL_LEN}"

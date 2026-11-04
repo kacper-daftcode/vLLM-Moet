@@ -41,7 +41,9 @@ Environment:
                                         through virtual rank v's own LRU, io_uring fetcher (its dispatcher thread) and
                                         prefill arena (SCRATCH / V records per set); N counts per layer per store rank,
                                         so the DRAM is N x 4.7 MB x 40 x V per process = the same as TP4's per GPU card
-  VLLM_MOET_CPU_TIER_STORE_DRAM_RECORDS=N   records per layer per rank in DRAM (0 = the whole non-resident store, no tail)
+  VLLM_MOET_CPU_TIER_STORE_DRAM_RECORDS=N   records per layer per rank in DRAM (0 = the whole non-resident store, no tail; N >= the
+                                        store's records per layer = no tail either - the launcher's STORE_DRAM_RECORDS=auto /
+                                        STORE_DRAM_GIB compute N from the host's memory with the footprint model in its header)
   VLLM_MOET_CPU_TIER_STORE_NVME_QD=8    reads in flight per rank (also the prefill reader threads; per virtual rank)
   VLLM_MOET_CPU_TIER_DUMMY_WEIGHTS=1    (dummy mode) overwrite the dummy expert weights with seeded sane random MXFP4
                                         bytes (scales 118..126), so that a stock run and a hybrid run see the same experts
@@ -505,10 +507,17 @@ def _ensure_store(early: bool = False) -> None:
     V = S.V
     tail = {}
     if STORE_NVME and STORE_DRAM_RECORDS > 0:
-        # the store tail, per store (= per virtual rank): N records per layer in DRAM, the prefill arena holds one round
-        # of the scratch pool per set - a round is SCRATCH / V experts, one slice record of each in every store
-        tail = dict(dram_records=STORE_DRAM_RECORDS, spare_slots=STORE_NVME_QD + 4, tail_qd=STORE_NVME_QD,
-                    prefill_sets=(2 if PREFILL_OVERLAP else 1) if SCRATCH_SLOTS else 0, prefill_slots=SCRATCH_SLOTS // V)
+        per_layer = int(mask.sum(axis=1).max())   # the store's records per layer (the same in every store rank)
+        if STORE_DRAM_RECORDS >= per_layer:
+            # the launcher's auto / a generous N: every record of the store fits in DRAM - no tail (the plain store, as
+            # STORE_NVME=0; io_uring is not touched)
+            _log(f"store tail: STORE_DRAM_RECORDS={STORE_DRAM_RECORDS} >= the store's {per_layer} records per layer - the tail is off, "
+                 f"every record in DRAM")
+        else:
+            # the store tail, per store (= per virtual rank): N records per layer in DRAM, the prefill arena holds one round
+            # of the scratch pool per set - a round is SCRATCH / V experts, one slice record of each in every store
+            tail = dict(dram_records=STORE_DRAM_RECORDS, spare_slots=STORE_NVME_QD + 4, tail_qd=STORE_NVME_QD,
+                        prefill_sets=(2 if PREFILL_OVERLAP else 1) if SCRATCH_SLOTS else 0, prefill_slots=SCRATCH_SLOTS // V)
     if V == 1:
         S.store = ExpertStore(STORE, _rank(), n_layers, S.E, mask=mask, pinned=True, nthreads=16, **tail)
         S.stores = [S.store]
