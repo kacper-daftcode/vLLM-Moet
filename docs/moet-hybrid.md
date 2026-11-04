@@ -144,7 +144,7 @@ launcher's defaults, bring that down for smaller hosts ("slow is acceptable, but
   that **vLLM's own lookup kernel** dequantizes — bit-identical to the pinned tables (the same bytes, the same kernel; verified at
   T = 1..4096). A decode step's rows are requested at the hash kernel and consumed ~176 µs later at layer 1 (2.5 ms at layer 14); a
   prompt's first chunk waits ~20–50 ms for its rows, later chunks are warm through the host-side lookahead (the prompt's hashes = vLLM's
-  kernel). Code: `tools/dsv41_5090/engram_v2/`.
+  kernel; its tokenizer is built at load — built lazily it cost the first long prompt 0.45 s of TTFT). Code: `tools/dsv41_5090/engram_v2/`.
 - **`STORE_NVME=1 STORE_DRAM_RECORDS=N` — the store tail (256 GB hosts at N ≈ 230, 128 GB at N ≈ 110).** Only N records per layer per
   rank stay pinned (an LRU the CPU tier's dispatcher keeps); a cold record is read from the store file on a miss (one 4.7 MB read,
   ~0.3–0.5 ms) into a spare slot while the request's resident experts compute — the same kernel on the same bytes. Promotions and the
@@ -155,7 +155,7 @@ mixed-prompt soak 84.4 tok/s):
 
 | host | knobs | RAM used | decode 'Hello' / 'def fib(n):' | TTFT 2K / 14K / 30K | identity |
 |---|---|---|---|---|---|
-| 384 GB | `ENGRAM_MODE=nvme` | **272–278 GB** | **145.4 / 126.0** (dev flow), 145.5 / 125.6 (baked); 5-min mixed-prompt soak **84.6** | **0.93 / 3.80 / 6.62 s** | the Engram rows bit-identical (harness: 20 cases, 600 graph replays, 0 differences) |
+| 384 GB | `ENGRAM_MODE=nvme` | **272–278 GB** | **145.4 / 126.0** (dev flow), 145.5 / 126.2 (baked); 5-min mixed-prompt soak **85.1** | **0.81–0.90 / 3.30–3.39 / 6.64–6.65 s** (= the pinned-table path's) | the Engram rows bit-identical (harness: 20 cases, 600 graph replays, 0 differences) |
 | 256 GB | `+ STORE_NVME=1 STORE_DRAM_RECORDS=230` | **194–200 GB** | **130.5–131.0 / 108.0–109.5** | 1.68 / 6.86 / 12.13 s (2.1–2.2×) | (the N = 110 check covers the path) |
 | 128 GB | `+ STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1` | **106–112 GB** | **111.0–112.4 / 81.5–82.5** | 2.83 / 11.07 / — (3.3–3.6×) | `DEBUG_COMPACT` PASS: 19,080 compact calls per rank, 0 mismatches |
 
