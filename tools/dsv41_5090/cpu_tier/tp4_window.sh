@@ -127,8 +127,10 @@ if [[ "${BAKED:-1}" == "1" ]]; then
     img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
     files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py'
   fi
-  stale=$(diff <(docker run --rm --entrypoint bash "$img" -c "cd /opt/vllm-moet/dsv41_5090 && md5sum $files 2>/dev/null" 2>/dev/null) \
-               <(cd tools/dsv41_5090 && eval md5sum $files 2>/dev/null) | grep '^>' | awk '{print $3}' | tr '\n' ' ')
+  # (both lists sorted: the container's C locale and the host's UTF-8 collation order a glob differently - engram_v2.py vs
+  # engram_v2_harness.py - which read as a stale file on 11-04)
+  stale=$(diff <(docker run --rm --entrypoint bash "$img" -c "cd /opt/vllm-moet/dsv41_5090 && md5sum $files 2>/dev/null" 2>/dev/null | sort -k2) \
+               <(cd tools/dsv41_5090 && eval md5sum $files 2>/dev/null | sort -k2) | grep '^>' | awk '{print $3}' | tr '\n' ' ')
   if [[ -n "$stale" ]]; then
     note "WARNING: the baked image $img differs from the worktree in: $stale(rebuild it, or run BAKED=0)"
   else
