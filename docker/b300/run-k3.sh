@@ -28,6 +28,9 @@
 #                        torch.compile, vLLM and DeepGEMM caches; later starts reuse them)
 #            SERVED_NAME (moonshotai/Kimi-K3 or moonshotai/Kimi-K3.1-Pro, by the model family)
 #            MAX_MODEL_LEN (1048576)  MAX_NUM_SEQS (128)  MAX_NUM_BATCHED_TOKENS (8192)
+#            PREFIX_MATCH_UNIT (128) --prefix-match-unit: the prefix-cache hash unit; every prefix-cacheable KV group's
+#                        block must be a multiple of it (K3 at TP8: 1664-token blocks; K3.1's packed DSA row is sized
+#                        in units of 128 at TP8). 64 halves the hit granularity's cost in hashes where 128 does not divide.
 #            GPU_MEM_UTIL (0.93)     the recipe uses 0.95
 #            DCP (8)                 decode context parallel size. TP8 alone replicates the MLA KV on every rank;
 #                        DCP8 shards it, ~8x the tokens per GPU for long agent sessions. 1 = off. On K3.1 DCP
@@ -128,6 +131,7 @@ SERVED_NAME="${SERVED_NAME:-$DEFAULT_SERVED_NAME}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+PREFIX_MATCH_UNIT="${PREFIX_MATCH_UNIT:-128}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.93}"
 DCP="${DCP:-8}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-}"
@@ -182,6 +186,7 @@ if [[ -n "$API_KEYS_FILE" ]]; then
   KEY_ARGS=(--api-key "${API_KEYS[@]}")
 fi
 case "$DCP" in 1|2|4|8) ;; *) echo "DCP must divide TP 8 (1, 2, 4 or 8), got $DCP" >&2; exit 1 ;; esac
+[[ "$PREFIX_MATCH_UNIT" =~ ^[1-9][0-9]*$ ]] || { echo "PREFIX_MATCH_UNIT must be a positive integer, got $PREFIX_MATCH_UNIT" >&2; exit 1; }
 case "$KV_OFFLOAD_PROMPT_ONLY" in 0|1) ;; *) echo "KV_OFFLOAD_PROMPT_ONLY must be 0 or 1, got $KV_OFFLOAD_PROMPT_ONLY" >&2; exit 1 ;; esac
 case "$KV_OFFLOAD" in off|disk|cpu|native) ;; *) echo "KV_OFFLOAD must be off, disk, cpu or native, got $KV_OFFLOAD" >&2; exit 1 ;; esac
 case "$USE_RECOVERSSM" in 0|1) ;; *) echo "USE_RECOVERSSM must be 0 or 1, got $USE_RECOVERSSM" >&2; exit 1 ;; esac
@@ -323,7 +328,7 @@ docker run -d --name "$NAME" --restart no \
   --load-format "$LOAD_FORMAT" \
   --no-enable-flashinfer-autotune \
   --kv-cache-dtype "$KV_CACHE_DTYPE" \
-  --enable-prefix-caching --prefix-match-unit 128 \
+  --enable-prefix-caching --prefix-match-unit "$PREFIX_MATCH_UNIT" \
   --reasoning-parser kimi_k3 \
   --tool-call-parser kimi_k3 --enable-auto-tool-choice \
   --gpu-memory-utilization "$GPU_MEM_UTIL" \
