@@ -5,11 +5,12 @@ usage: gsm8k_probe.py --base URL [--n 100] [--concurrency 16] [--max-tokens 2048
 import argparse, concurrent.futures, json, os, re, time, urllib.request
 
 URL = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-CACHE = "/root/work/k3-test/gsm8k_test.jsonl"
+CACHE = os.environ.get("GSM8K_CACHE", os.path.expanduser("~/.cache/vllm-moet/gsm8k_test.jsonl"))
 
 
 def load(n):
     if not os.path.exists(CACHE):
+        os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         urllib.request.urlretrieve(URL, CACHE)
     rows = [json.loads(l) for l in open(CACHE)]
     return rows[:n]

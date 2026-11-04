@@ -235,7 +235,7 @@ while its producer still decodes hits 20,224 (= prod's position) with CoW copies
 a second turn hits the same boundary; its resend hits its own boundary (21,120); pool accounting balances after
 every request is freed.
 
-**Measured 2026-10-26/27 (`-r3`, `/root/work/k3-test/night-rh5.sh`, k = 5 then k = 4; prod = Inferact k = 4):**
+**Measured 2026-10-26/27 (`-r3`, the unattended night battery, k = 5 then k = 4; prod = Inferact k = 4):**
 
 | | prod Inferact k = 4 | RedHat k = 5 `-r3` | RedHat k = 4 `-r3` |
 | --- | --- | --- | --- |
@@ -251,7 +251,7 @@ every request is freed.
 | GSM8K-200 / needle | 196 / 4/4 | 195 / 4/4 | 196 / 4/4 |
 
 The window's own hits worked (resend, turn 2 after a short answer, turn 4), but the agent session lost turns 2-3.
-The instrumented run of 2026-10-27 (per-group cached positions at every lookup, `/root/work/k3-test/dbg-r3/`)
+The instrumented run of 2026-10-27 (per-group cached positions at every lookup, `VLLM_MOET_DEBUG_HITS=1` on a bind-mounted `-r3`)
 showed the window group complete at every position (`11264P .. 15360P, 16000S, 16384P`: full keys plus the
 secondary partial key after promotion) and the **KDA groups empty**: no prompt-end checkpoint for the 16,006-token
 turn 1, no chunk-end states, and for turn 2 one state keyed at 14,976 that held the state after 14,336 tokens.
