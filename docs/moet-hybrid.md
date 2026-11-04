@@ -119,6 +119,22 @@ thread on a sibling halves the kernel on that core and the job's barrier waits f
 `routing/promo_sim.py` (placement and promotion policies on the routing traces), `cpu_tier/ttft_probe.py` (streamed
 prefill TTFT on disjoint prompts), `cpu_tier/cpu_placement_probe.sh` (who runs on the pool cores).
 
+## One or two GPUs: TP2 / TP1 through virtual ranks (branch `moet-hybrid-tp12`, 2026-11-04)
+
+The same hybrid runs on 2× or 1× GPU with `TP=2` / `TP=1` in the launcher. b12x's compact W4A8 path — where the publish / inject
+hooks live and whose numerics the CPU kernel reproduces — exists only at the 576-row TP4 slice, so on one GPU every expert stays its
+4 / TP slices of 576 rows ("virtual ranks"): the store's per-rank records are the slices, b12x prepares them as R × V slice-experts
+and runs the same compact kernels at N = 576, the router's top-6 becomes 6 × V (token, slice) pairs, one CPU pool (CCD) + mailbox
+set per slice computes the misses with the unchanged kernel, and the compact TopKSum adds a token's 6V rows in a fixed order
+(k-major, slice-minor; fp32, one bf16 rounding — the role NCCL's bf16 ring plays at TP4). Bit-identity with the all-resident path
+holds within each configuration (`DEBUG_COMPACT`: 0 mismatches over 15,160 compact calls per rank at TP2 and 19,040 at TP1 on the
+full model, 11-04); the TP4 code paths are untouched (V = 1). Measured on 32 GB cards (the slots per layer follow the VRAM: 46 at
+TP2, 16 at TP1): **TP2 on 2× 5090: 45.9 / 47.1 tok/s** on 'Hello' / 'def fib(n):', TTFT 1.9 s at 2K and 7.4 s at 14K; **TP1 on 1× 5090:
+39.8 / 33.5 tok/s**, TTFT 3.8 / 15.2 s (chunk 4096) — the step is the CPU tier (hit rate 0.54 / 0.44 at those slot counts: 3–4 misses
+per layer-step); host RAM is the same ~450 GB (+23 GB at TP1 for the 9-static placement's records). The design, budgets and every
+measurement: `internal/dsv41-5090-cpu/handoff/tp12-virtual-ranks-2026-11-04.md`; the 96 GB cards (2× / 1× RTX PRO 6000: ~215 / ~100
+slots per layer) are the target of this support and were not measured here.
+
 ## Limits and open items
 
 - DSpark (k = 5) does not pay for the hybrid: a verify step routes ~5× more distinct experts for 3.6× more tokens and

@@ -60,7 +60,9 @@
 #                        per-request buffers sized by max_model_len eat the ~190 MiB outside the budget); 256 + util 0.90 ran 128K / 256K /
 #                        512K prompts and the 512K needles clean
 #            MAX_NUM_SEQS (1)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 14K prompts prefill at 3.9K tok/s against 2.2K with 2048;
-#                        TP1 on 32 GB: 2048 - the chunk's b12x scratch and the expanded 24-route plan take VRAM from the slots)
+#                        at TP1 on 32 GB the 4096 chunk's workspaces (the 24-route plan) cost ~0.6 GB of KV against 2048 - measured 11-04:
+#                        15 slots + chunk 4096 -> KV 2.07 GiB, 16 + 2048 -> 2.68; a 14K prompt prefills at 944 tok/s against 576, so 4096 stays;
+#                        16K would need a 96 GB card)
 #            CAPTURE_SIZE (8)
 #            LOG_EVERY (100)         KPI line period (steps);  TIER_DEBUG (0)
 #            SCRATCH (64)            slots of the prefill scratch pool (phase 2.5; 64 = 0.6 GB per rank, 128 = 1.2; 0 = the missing
@@ -148,7 +150,7 @@ TP="${TP:-4}"
 case "$TP" in
   4) D_GPUS=0,1,2,3; D_SPARE=70; D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=524288; D_CHUNK=4096; D_PROMOTIONS=4 ;;
   2) D_GPUS=0,1;     D_SPARE=6;  D_PLACEMENT=placement-0.1042-uniform.json; D_MAX_MODEL_LEN=65536;  D_CHUNK=4096; D_PROMOTIONS=4 ;;
-  1) D_GPUS=0;       D_SPARE=7;  D_PLACEMENT=tp12-placement-0.026-uniform.json; D_MAX_MODEL_LEN=32768; D_CHUNK=2048; D_PROMOTIONS=1 ;;
+  1) D_GPUS=0;       D_SPARE=7;  D_PLACEMENT=tp12-placement-0.026-uniform.json; D_MAX_MODEL_LEN=32768; D_CHUNK=4096; D_PROMOTIONS=1 ;;
   *) echo "TP=$TP is not 1, 2 or 4" >&2; exit 1 ;;
 esac
 GPUS="${GPUS:-$D_GPUS}"
