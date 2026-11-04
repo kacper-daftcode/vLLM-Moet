@@ -3,16 +3,17 @@
 #   moet_parity_layer.sh GPU RANK LAYER
 set -u
 GPU="${1:-1}"; RANK="${2:-0}"; LAYER="${3:-0}"
-REPO=/mnt/nvme/vLLM-Moet-cpu
-P=$REPO/internal/dsv41-5090-cpu/parity/sweep
-mkdir -p $P
-PY=/root/work/venv/bin/python
+REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+P="${PARITY_DIR:?PARITY_DIR (output directory for the sweep inputs, GPU outputs and reports) is required}"
+mkdir -p "$P"
+PY="${PY:-python3}"
+CACHE_DIR="${CACHE_DIR:-$PWD/cache-ds41}"
 cd $REPO/tools/dsv41_5090/cpu_moe
 bad=0; sets=0
 for first in $(seq 0 16 368); do
   tag=r${RANK}_l${LAYER}_e${first}
   $PY gpu_parity_b12x_prepare.py --layer $LAYER --rank $RANK --experts 16 --first-expert $first --tokens 8 --seed $((500 + first)) --out $P/in_$tag.npz > $P/prep_$tag.log 2>&1 || { echo "$tag prepare FAILED"; continue; }
-  flock -w 3600 /tmp/exl3diff-gpu$GPU.lock docker run --rm --gpus "\"device=$GPU\"" --name moet-parity-sweep -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache \
+  flock -w 3600 /tmp/exl3diff-gpu$GPU.lock docker run --rm --gpus "\"device=$GPU\"" --name moet-parity-sweep -v "$CACHE_DIR/dot-cache:/root/.cache" \
     -v $PWD:/work:ro -v $P:/parity --entrypoint python3 vllm/vllm-openai:nightly-df3bd094aeea829f27baa0a5282830464f601d9f \
     /work/gpu_parity_b12x_run.py /parity/in_$tag.npz /parity/gpu_$tag.npz > $P/run_$tag.log 2>&1 || { echo "$tag gpu run FAILED: $(tail -2 $P/run_$tag.log)"; continue; }
   $PY gpu_parity_b12x_compare.py --inputs $P/in_$tag.npz --gpu $P/gpu_$tag.npz --report $P/report_$tag.json --cpus 9-15 > $P/cmp_$tag.log 2>&1

@@ -1,4 +1,4 @@
-// handoff_proto.cu — phase 2.0 of HANDOFF-moet-hybrid: the GPU<->CPU handoff of the hybrid inside ONE captured CUDA
+// handoff_proto.cu — the GPU<->CPU handoff of the hybrid inside ONE captured CUDA
 // graph ("graph or death"), measured standalone (no vLLM, no torch).
 //
 // Per decode step the graph runs L layers; per layer:

@@ -9,7 +9,7 @@ Rank 0 prints: configuration, size, us per all-reduce (median of ITERS after 5 w
 allocator is capped at 2 % of the GPU so it runs next to a serving job. Result on 4x RTX PRO 6000 (PCIe Gen5 x16, one
 host bridge), 2026-10-15: the default equals Simple at 1,600 us for 42 MB (26 GB/s payload, 39 GB/s per link and
 direction), LL 3,293, LL128 1,711, Tree 27,800; buffer size, thread count, channel count change nothing
-(docs/dsv41-sm120-port.md, "Where a 163K-token prefill spends its 9 s")."""
+(docs/dsv41-sm120-internals.md, "Where the time goes")."""
 import os, statistics, time
 import torch, torch.distributed as dist
 

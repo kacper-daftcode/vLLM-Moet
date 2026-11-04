@@ -1320,7 +1320,7 @@ __global__ void __launch_bounds__(kThreads) mxfp8_mma_gemv_v3_kernel(const GemvA
   if constexpr (PDL == 2) griddep_launch_dependents();
 }
 
-static int v3_units_per_round() { return env_int("VLLM_MOET_GEMV_V3_R", 1); }
+static int v3_units_per_round() { return env_int("VLLM_MOET_GEMV_V3_R", 0); }  // 0: per shape (step 29)
 
 static int device_sm_count(int device) {
   static std::mutex mu;
@@ -1333,11 +1333,42 @@ static int device_sm_count(int device) {
   return sms[device] = (n > 0 ? n : 128);
 }
 
-template <int PDL>
-static void launch_v3_r1(int ev, const dim3& grid, const GemvArgs& p, const SplitKArgs& sk, cudaStream_t stream) {
-  auto* kfn = ev ? mxfp8_mma_gemv_v3_kernel<1, PDL, 1> : mxfp8_mma_gemv_v3_kernel<1, PDL, 0>;
-  set_dyn_smem(kfn, V3Smem<1>::kBytes);
-  launch_kernel(kfn, grid, dim3(kThreads), V3Smem<1>::kBytes, stream, true, p, sk);
+template <int R, int PDL>
+static void launch_v3_r(int ev, const dim3& grid, const GemvArgs& p, const SplitKArgs& sk, cudaStream_t stream) {
+  auto* kfn = ev ? mxfp8_mma_gemv_v3_kernel<R, PDL, 1> : mxfp8_mma_gemv_v3_kernel<R, PDL, 0>;
+  set_dyn_smem(kfn, V3Smem<R>::kBytes);
+  launch_kernel(kfn, grid, dim3(kThreads), V3Smem<R>::kBytes, stream, true, p, sk);
+}
+template <int R>
+static void launch_v3_pdl(const LaunchMode& m, const dim3& grid, const GemvArgs& p, const SplitKArgs& sk,
+                          cudaStream_t stream) {
+  if (m.pdl == 1) {
+    launch_v3_r<R, 1>(m.ev, grid, p, sk, stream);
+  } else if (m.pdl == 2) {
+    launch_v3_r<R, 2>(m.ev, grid, p, sk, stream);
+  } else if (m.pdl == 3) {
+    launch_v3_r<R, 3>(m.ev, grid, p, sk, stream);
+  } else {
+    auto* kfn = mxfp8_mma_gemv_v3_kernel<R>;
+    set_dyn_smem(kfn, V3Smem<R>::kBytes);
+    kfn<<<grid, dim3(kThreads), V3Smem<R>::kBytes, stream>>>(p, sk);
+  }
+}
+
+// Units per round per shape (step 29). The unit -> warp mapping does not depend on R, so every R
+// gives the same bits; R sets how many 128-byte units a warp requests per round. In a CUDA graph of
+// back-to-back GEMVs with cold L2 (RTX PRO 6000, M = 6, PDL + evict-first for every R) R = 2 made
+// q_b+indexer 8192 <- 1280 7.13 -> 6.54 us and R = 4 the shared w13 1152 <- 5120 4.96 -> 3.79 us,
+// every other served shape being best at R = 1 - but in the served decode graph (pb-deep C1, the
+// GEMVs behind norm / quant kernels, PDL) the same R made those two kernels slower (w13 5.92 -> 6.46,
+// q_b+indexer 8.35 -> 8.61 us; critical path +27 us per step), so the table keeps R = 1 for every
+// shape. VLLM_MOET_GEMV_V3_R=1|2|4 forces one R for every shape (0, the default: the table).
+static int v3_units_per_round_for(int N, int K) {
+  const int forced = v3_units_per_round();
+  if (forced > 0) return forced;
+  (void)N;
+  (void)K;
+  return 1;
 }
 
 // Split K across blocks until the grid holds ~2 blocks per SM (the small-N shapes run 72-224
@@ -1364,29 +1395,15 @@ static void launch_mma_v3(const GemvArgs& p, int device, cudaStream_t stream, co
     }
   }
   const dim3 grid(col_blocks, S);
-  // Units per round (VLLM_MOET_GEMV_V3_R): 1 measured best on every served shape (RTX 5090 and
-  // RTX PRO 6000, M = 6): one 128-byte unit per warp per round keeps the stream steady; 2 and 4
-  // put more bytes in flight per round but pipeline fewer rounds and cost shared memory.
-  int R = v3_units_per_round();
-  if (R <= 0) R = 1;
+  // Units per round: per shape (v3_units_per_round_for), every R launched with the same PDL /
+  // evict-first mode (before step 29 R = 2 / 4 ran without either, which is why they measured slower).
+  const int R = v3_units_per_round_for(p.N, p.K);
   if (R >= 4) {
-    auto* kfn = mxfp8_mma_gemv_v3_kernel<4>;
-    set_dyn_smem(kfn, V3Smem<4>::kBytes);
-    kfn<<<grid, dim3(kThreads), V3Smem<4>::kBytes, stream>>>(p, sk);
+    launch_v3_pdl<4>(m, grid, p, sk, stream);
   } else if (R == 2) {
-    auto* kfn = mxfp8_mma_gemv_v3_kernel<2>;
-    set_dyn_smem(kfn, V3Smem<2>::kBytes);
-    kfn<<<grid, dim3(kThreads), V3Smem<2>::kBytes, stream>>>(p, sk);
-  } else if (m.pdl == 1) {
-    launch_v3_r1<1>(m.ev, grid, p, sk, stream);
-  } else if (m.pdl == 2) {
-    launch_v3_r1<2>(m.ev, grid, p, sk, stream);
-  } else if (m.pdl == 3) {
-    launch_v3_r1<3>(m.ev, grid, p, sk, stream);
+    launch_v3_pdl<2>(m, grid, p, sk, stream);
   } else {
-    auto* kfn = mxfp8_mma_gemv_v3_kernel<1>;
-    set_dyn_smem(kfn, V3Smem<1>::kBytes);
-    kfn<<<grid, dim3(kThreads), V3Smem<1>::kBytes, stream>>>(p, sk);
+    launch_v3_pdl<1>(m, grid, p, sk, stream);
   }
 }
 

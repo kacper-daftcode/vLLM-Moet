@@ -16,10 +16,16 @@ if [ "${HYBRID_PATCH_AT_START:-1}" = "1" ]; then
 else
   python3 -c "import vllm_moet_cpu_tier" || { echo "the image has no baked cpu tier (Dockerfile step 28); set HYBRID_PATCH_AT_START=1 with the worktree mounted"; exit 1; }
 fi
-# Engram v2 (ENGRAM_MODE=nvme in the launcher -> ENGRAM_PATCH_AT_START=1): the engram_v2 patcher from the mounted worktree
-# (idempotent; builds libengram_v2.so, ~5 s; the CUDA extension is JIT-built at the first lookup, cached under /root/.cache)
+# Engram v2 / the store tail (ENGRAM_MODE=nvme in the launcher): with BAKED=0 the engram_v2 patcher runs from the mounted checkout
+# (ENGRAM_PATCH_AT_START=1; idempotent; builds libengram_v2.so, ~5 s; the CUDA extension is JIT-built at the first lookup, cached
+# under /root/.cache); with BAKED=1 the image must carry Dockerfile step 44 (--build-arg VLLM_MOET_ENGRAM_V2_PATCH=1, the -hyb-engram tags)
 if [ "${ENGRAM_PATCH_AT_START:-0}" = "1" ]; then
   python3 "${HYBRID_SRC:-/repo/tools/dsv41_5090}/engram_v2/patch_vllm_engram_v2.py" || exit 1
+elif [ "${VLLM_MOET_ENGRAM_MODE:-ram}" = "nvme" ]; then
+  python3 -c "import vllm_moet_engram_v2" || { echo "the image has no baked Engram v2 (Dockerfile step 44, --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1 -> the -hyb-engram tag); use it, or BAKED=0 with the checkout mounted"; exit 1; }
+fi
+if [ "${VLLM_MOET_CPU_TIER_STORE_NVME:-0}" = "1" ]; then
+  python3 -c "import cpu_tier; assert hasattr(cpu_tier.CpuTier, 'store_tail_init')" 2>/dev/null || { echo "the installed CPU tier has no store tail (an image built before 2026-11-04; the -hyb-engram tag has it)"; exit 1; }
 fi
 ARGS=()
 SPEC_TOKENS="${SPEC_TOKENS:-5}"

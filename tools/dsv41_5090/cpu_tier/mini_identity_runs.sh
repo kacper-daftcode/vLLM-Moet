@@ -23,20 +23,21 @@ RS="${2:-16 8 1}"
 PORT="${3:-8031}"
 shift 3 2>/dev/null || shift $#
 EXTRA="$*"
-# the worktree this script lives in (= /mnt/nvme/vLLM-Moet-cpu in the main worktree)
 REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
-IMG=vllm-moet-sm120:dsv41-nightly-df3bd094-hyb1
-PY=/root/work/venv/bin/python
+IMG="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
+PY="${PY:-python3}"
+CACHE_DIR="${CACHE_DIR:-$PWD/cache-ds41}"
+TABLES="${CPU_TIER_TABLES:?CPU_TIER_TABLES (the kernel tables directory) is required}"
 CLIENT=$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py
 [ "${LONG:-0}" = "1" ] && CLIENT="$CLIENT --long"
-MODEL_DIR="${MODEL_DIR:-/mnt/nvme/models/mini-hyb576}"
+: "${MODEL_DIR:?MODEL_DIR (make_mini_config.py's mini model, or make_mini_real.py's) is required}"
 LOAD_FORMAT="${LOAD_FORMAT:-dummy}"
 STORE="${STORE:-}"
 TAG="${TAG:-}"
 STORE_ARGS=()
 DUMMY_W=1
 if [ -n "$STORE" ]; then
-  STORE_ARGS=(-v /mnt/nvme/packs:/mnt/nvme/packs:ro -e VLLM_MOET_CPU_TIER_STORE=$STORE -e VLLM_MOET_CPU_TIER_STORE_MODE=${STORE_MODE:-nonresident})
+  STORE_ARGS=(-v "${STORE_ROOT:-$STORE}:${STORE_ROOT:-$STORE}:ro" -e VLLM_MOET_CPU_TIER_STORE=$STORE -e VLLM_MOET_CPU_TIER_STORE_MODE=${STORE_MODE:-nonresident})
   DUMMY_W=0
 fi
 for R in $RS; do
@@ -50,8 +51,8 @@ for R in $RS; do
       -e VLLM_MOET_CPU_TIER_TABLES=/parity ${CPUS:+-e VLLM_MOET_CPU_TIER_CPUS=$CPUS} -e VLLM_MOET_CPU_TIER_LOG=1 -e VLLM_MOET_CPU_TIER_LOG_EVERY=${LOG_EVERY:-50} \
       -e VLLM_MOET_DET_TOPK=1 -e DSPARK=${DSPARK:-1} -e LOAD_FORMAT=$LOAD_FORMAT -e GPU_MEM_UTIL=${GPU_MEM_UTIL:-0.3} -e MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-512} -e VLLM_MOET_CPU_TIER_SPARE=${SPARE:-0} \
       -e VLLM_MOET_CPU_TIER_MAX_PROMOTIONS=${PROMOTIONS:-4} -e VLLM_MOET_CPU_TIER_DEBUG=${DEBUG:-0} -e VLLM_MOET_CPU_TIER_SCRATCH=${SCRATCH:-0} -e VLLM_MOET_CPU_TIER_DEBUG_PREFILL=${DEBUG_PREFILL:-0} -e VLLM_MOET_CPU_TIER_DEBUG_COMPACT=${DEBUG_COMPACT:-0} "${STORE_ARGS[@]}" \
-      -v $MODEL_DIR:/model -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache \
-      -v $REPO:/repo:ro -v $REPO/internal/dsv41-5090-cpu/parity:/parity:ro \
+      -v $MODEL_DIR:/model -v "$CACHE_DIR/dot-cache:/root/.cache" \
+      -v $REPO:/repo:ro -v "$TABLES:/parity:ro" \
       -p 127.0.0.1:$PORT:$PORT --entrypoint bash $IMG \
       /repo/tools/dsv41_5090/cpu_tier/serve_mini_hybrid.sh /model $PORT --no-enable-prefix-caching --max-cudagraph-capture-size 8 $EXTRA \
       > /tmp/moet-mini${TAG}-r$R.log 2>&1 ) &

@@ -25,7 +25,7 @@
 #
 # Build (repo root):   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-qwen38 -t vllm-moet-sm120:qwen38-20073 .
 # Serve:               docker/sm120/run-qwen38.sh   (all knobs and the validated arguments)
-# Notes:               tools/qwen38_sm120/README.md, docs/sm120-deploy.md
+# Notes:               tools/qwen38_sm120/README.md, docs/qwen38-sm120.md
 
 ARG BASE_IMAGE=vllm/vllm-openai@sha256:fc120ece0a388cc0aa1caad4a9f1cd92113484ab7ec2fd0efadd62585be05bf8
 FROM ${BASE_IMAGE}

@@ -2,8 +2,8 @@
 on the routing traces: pair hit rate, CPU experts per step, promotions per step (= H2D DMA of 4.7 MB each per rank;
 the promotions' DMA costs the CPU kernel ~15 % in situ, 10-25), and a decode-step estimate.
 
-    python promo_sim.py --routes internal/dsv41-5090-cpu/routes/routes.npz \
-        --placement internal/dsv41-5090-cpu/routes/placement-0.28-uniform.json [--spare 13] [--cap 4] [--k 0]
+    python promo_sim.py --routes <routes dir>/routes.npz \
+        --placement <routes dir>/placement-0.28-uniform.json [--spare 13] [--cap 4] [--k 0]
         [--policies 0,1:8,1:16,1:32,2:16] [--caps 4,2,1] [--trade 0,5,10] [--streams 4]
 
 The test half of the sequences (index parity within kind, as cache_sim.py / placement.py), their decode positions,
