@@ -59,9 +59,12 @@ for R in $RS; do
       -p 127.0.0.1:$PORT:$PORT --entrypoint bash $IMG \
       /repo/tools/dsv41_5090/cpu_tier/serve_mini_hybrid.sh /model $PORT --no-enable-prefix-caching --max-cudagraph-capture-size 8 $EXTRA \
       > /tmp/moet-mini${TAG}-r$R.log 2>&1 ) &
+  BG=$!
   $PY $CLIENT --port $PORT --container $NAME --out /tmp/moet-mini${TAG}-run-r${R}a.json | tail -1 && \
   $PY $CLIENT --port $PORT --container $NAME --out /tmp/moet-mini${TAG}-run-r${R}b.json | tail -1
   grep "moet-cpu-tier\] rank 0: step" /tmp/moet-mini${TAG}-r$R.log | tail -2
+  # the serve may still be queued on the flock (the client gave up): kill the waiter, not a running container's flock
+  docker ps -q -f name="^$NAME$" | grep -q . || { pkill -P $BG 2>/dev/null; kill $BG 2>/dev/null; }
   docker stop -t 20 $NAME > /dev/null 2>&1
   wait
 done
