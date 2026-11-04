@@ -1,0 +1,605 @@
+// cpu_tier_cuda.cu — the GPU side of the CPU expert tier as a torch extension: the step counter bumped in-graph, the
+// publish kernel (split the routing against the resident slot table, hand the missing pairs and the quantized tokens
+// to the host through a mapped mailbox, system-scope release of the step id), and the wait + inject kernel (spin on
+// the host's ack with system-scope acquire loads and a bounded timeout, then copy the host's bf16 rows into
+// route_output; on a timeout arm the error word so that the engine fails the step closed and later waits short-
+// circuit). Everything is capturable: no host syncs, no allocations, the stream's order only.
+#include <cuda_runtime.h>
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <vector>
+
+#include "cpu_tier_abi.h"
+
+namespace {
+
+__device__ __forceinline__ unsigned long long gtimer() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ uint32_t ld_acquire_sys(const volatile uint32_t* p) {
+    uint32_t v;
+    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release_sys(volatile uint32_t* p, uint32_t v) {
+    asm volatile("st.release.sys.global.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+
+__global__ void step_begin_kernel(int* step_dev) {
+    if (threadIdx.x == 0) step_dev[0] += 1;
+}
+
+// one CTA: remap, compact the misses (thread 0, pair order), copy the tokens, release the request under the layer's
+// next sequence number (seq_dev: one int per layer, bumped here, read by the layer's wait kernel; a layer published
+// twice in one forward - a decoder replay - simply gets two requests)
+__global__ void publish_kernel(CpuTierRequest* req, int* seq_dev, const int* ids, const float* wts,
+                               const int* slot, int* remapped, int n_pairs, int topk, const uint8_t* a_values,
+                               const uint8_t* a_scales, int n_tokens) {
+    __shared__ int s_n;
+    const int tid = threadIdx.x;
+    // the slot table is read ONCE per pair: the copy stream may map an expert (slot[e]: -1 -> s) while this kernel
+    // runs (the step after a promotion may or may not see it), and a second read could disagree with the first -
+    // a pair remapped to -1 (the GPU writes a zero row) but absent from the mailbox (no CPU row) would stay zero.
+    // The compaction below therefore uses the remapped ids this CTA just wrote (visible after __syncthreads).
+    for (int p = tid; p < n_pairs; p += blockDim.x) {
+        const int e = ids[p];
+        remapped[p] = e >= 0 ? slot[e] : -1;
+        req->ids[p] = (int16_t)e;  // the use log for the placement manager (hits and misses)
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int n = 0;
+        for (int p = 0; p < n_pairs; ++p) {
+            const int e = ids[p];
+            if (e >= 0 && remapped[p] < 0 && n < CPU_TIER_MAX_PAIRS) {
+                CpuTierPair pr;
+                pr.token = (uint16_t)(p / topk);
+                pr.expert = (uint16_t)e;
+                pr.row = (uint16_t)p;
+                pr.pad = 0;
+                pr.weight = wts[p];
+                req->pairs[n++] = pr;
+            }
+        }
+        s_n = n;
+    }
+    // the tokens' quantized activations (16-B vector stores into host memory)
+    {
+        const uint4* src = reinterpret_cast<const uint4*>(a_values);
+        uint4* dst = reinterpret_cast<uint4*>(&req->a_values[0][0]);
+        const int nv = n_tokens * (CPU_TIER_HID / 16);
+        for (int i = tid; i < nv; i += blockDim.x) dst[i] = src[i];
+        const uint4* ssrc = reinterpret_cast<const uint4*>(a_scales);
+        uint4* sdst = reinterpret_cast<uint4*>(&req->a_scales[0][0]);
+        const int ns = n_tokens * (CPU_TIER_SCALES / 16);
+        for (int i = tid; i < ns; i += blockDim.x) sdst[i] = ssrc[i];
+    }
+    __syncthreads();
+    __threadfence_system();
+    if (tid == 0) {
+        req->n_pairs = (uint32_t)s_n;
+        req->n_tokens = (uint32_t)n_tokens;
+        req->n_all = (uint32_t)n_pairs;
+        req->flags = 0;
+        req->t_publish_ns = gtimer();
+        const int seq = seq_dev[0] + 1;
+        seq_dev[0] = seq;
+        __threadfence_system();
+        st_release_sys(&req->step, (uint32_t)seq);
+    }
+}
+
+// every CTA spins on the ack (thread 0), then copies its share of the rows from the staging area
+__global__ void wait_inject_kernel(const CpuTierAck* ack, const CpuTierRequest* req, const uint16_t* staging,
+                                   const int* seq_dev, uint16_t* route, int route_stride, volatile uint32_t* err,
+                                   long long timeout_ns) {
+    __shared__ int s_n;
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        const uint32_t step = (uint32_t)seq_dev[0];  // the sequence number the layer's publish used
+        int n = 0;
+        if (ld_acquire_sys(err) == 0) {
+            const unsigned long long t0 = gtimer();
+            bool ok = false;
+            for (;;) {
+                const uint32_t a = ld_acquire_sys(&ack->step);
+                if (a == step) { ok = true; break; }
+                if ((long long)(gtimer() - t0) > timeout_ns) break;
+            }
+            if (!ok) {
+                st_release_sys(err, CPU_TIER_ERR_TIMEOUT);
+            } else if (ack->status != 0) {
+                st_release_sys(err, 16u + ack->status);
+            } else {
+                n = (int)req->n_pairs;
+            }
+        }
+        s_n = n;
+    }
+    __syncthreads();
+    __threadfence_system();
+    const int n = s_n;
+    for (int i = blockIdx.x; i < n; i += gridDim.x) {
+        const int row = req->pairs[i].row;
+        const uint4* src = reinterpret_cast<const uint4*>(staging + (size_t)i * CPU_TIER_HID);
+        uint4* dst = reinterpret_cast<uint4*>(route + (size_t)row * route_stride);
+        for (int j = tid; j < CPU_TIER_HID / 8; j += blockDim.x) dst[j] = src[j];
+    }
+}
+
+// ---- virtual ranks (TP2 / TP1 on one GPU, 2026-11-04): on one GPU every expert stays its V = 4 / TP slices of 576
+// rows (the TP4 rank slices the store holds), prepared as "slice-experts" (row s * V + v of the pool = slot s, slice v)
+// and routed as (token, slice) pairs: the router's ids [T, K] are expanded to [T, K * V] with ids_x[t, k * V + v] =
+// ids[t, k] (the same expert id V times, the weight repeated). One mailbox set per virtual rank: slice v's pairs go
+// to request v and are computed by the pool on CCD v from the records of store rank v. One publish launch writes the
+// V requests, one wait launch waits for the V acks and injects every slice's rows into its own route row - the
+// compact TopKSum then adds the K * V rows of a token in route order (k-major, slice-minor), fp32, one bf16 rounding.
+// These kernels run only for V > 1; the V = 1 kernels above are untouched (the TP4 path).
+#define CPU_TIER_MAX_VRANKS 4
+struct VRanks {
+    int n;
+    CpuTierRequest* req[CPU_TIER_MAX_VRANKS];
+    const CpuTierAck* ack[CPU_TIER_MAX_VRANKS];
+    const uint16_t* staging[CPU_TIER_MAX_VRANKS];
+};
+
+// ids / wts: the EXPANDED pairs [n_pairs = T * topk], topk = K * V; pair p -> slice v = p % V, token p / topk
+__global__ void publish_v_kernel(VRanks vr, int* seq_dev, const int* ids, const float* wts, const int* slot,
+                                 int* remapped, int n_pairs, int topk, const uint8_t* a_values,
+                                 const uint8_t* a_scales, int n_tokens) {
+    __shared__ int s_n[CPU_TIER_MAX_VRANKS];
+    const int tid = threadIdx.x;
+    const int V = vr.n;
+    for (int p = tid; p < n_pairs; p += blockDim.x) {
+        const int e = ids[p];
+        const int v = p % V;
+        const int s = e >= 0 ? slot[e] : -1;   // the slot table read ONCE per pair (see publish_kernel)
+        remapped[p] = s >= 0 ? s * V + v : -1;
+        if (v == 0) {
+            // the use log of every virtual rank: one entry per (token, expert) pair, -1 = padding
+            for (int u = 0; u < V; ++u) vr.req[u]->ids[p / V] = (int16_t)e;
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        int n[CPU_TIER_MAX_VRANKS];
+        for (int u = 0; u < V; ++u) n[u] = 0;
+        for (int p = 0; p < n_pairs; ++p) {
+            const int e = ids[p];
+            if (e >= 0 && remapped[p] < 0) {
+                const int v = p % V;
+                if (n[v] < CPU_TIER_MAX_PAIRS) {
+                    CpuTierPair pr;
+                    pr.token = (uint16_t)(p / topk);
+                    pr.expert = (uint16_t)e;
+                    pr.row = (uint16_t)p;
+                    pr.pad = 0;
+                    pr.weight = wts[p];
+                    vr.req[v]->pairs[n[v]++] = pr;
+                }
+            }
+        }
+        for (int u = 0; u < V; ++u) s_n[u] = n[u];
+    }
+    // the tokens' quantized activations into every virtual rank's mailbox
+    {
+        const uint4* src = reinterpret_cast<const uint4*>(a_values);
+        const uint4* ssrc = reinterpret_cast<const uint4*>(a_scales);
+        const int nv = n_tokens * (CPU_TIER_HID / 16);
+        const int ns = n_tokens * (CPU_TIER_SCALES / 16);
+        for (int u = 0; u < V; ++u) {
+            uint4* dst = reinterpret_cast<uint4*>(&vr.req[u]->a_values[0][0]);
+            uint4* sdst = reinterpret_cast<uint4*>(&vr.req[u]->a_scales[0][0]);
+            for (int i = tid; i < nv; i += blockDim.x) dst[i] = src[i];
+            for (int i = tid; i < ns; i += blockDim.x) sdst[i] = ssrc[i];
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    if (tid == 0) {
+        const unsigned long long t = gtimer();
+        const int seq = seq_dev[0] + 1;
+        seq_dev[0] = seq;
+        for (int u = 0; u < V; ++u) {
+            CpuTierRequest* req = vr.req[u];
+            req->n_pairs = (uint32_t)s_n[u];
+            req->n_tokens = (uint32_t)n_tokens;
+            req->n_all = (uint32_t)(n_pairs / V);
+            req->flags = 0;
+            req->t_publish_ns = t;
+        }
+        __threadfence_system();
+        for (int u = 0; u < V; ++u) st_release_sys(&vr.req[u]->step, (uint32_t)seq);
+    }
+}
+
+// thread 0 of every CTA waits for the V acks of the layer's request (one timeout budget for all of them), then the
+// CTAs copy every virtual rank's rows into route_output (row = the expanded pair index the publish wrote)
+__global__ void wait_inject_v_kernel(VRanks vr, const int* seq_dev, uint16_t* route, int route_stride,
+                                     volatile uint32_t* err, long long timeout_ns) {
+    __shared__ int s_n[CPU_TIER_MAX_VRANKS];
+    const int tid = threadIdx.x;
+    const int V = vr.n;
+    if (tid == 0) {
+        const uint32_t step = (uint32_t)seq_dev[0];
+        for (int u = 0; u < V; ++u) s_n[u] = 0;
+        if (ld_acquire_sys(err) == 0) {
+            const unsigned long long t0 = gtimer();
+            bool ok = true;
+            for (int u = 0; u < V && ok; ++u) {
+                const CpuTierAck* ack = vr.ack[u];
+                for (;;) {
+                    const uint32_t a = ld_acquire_sys(&ack->step);
+                    if (a == step) break;
+                    if ((long long)(gtimer() - t0) > timeout_ns) { ok = false; break; }
+                }
+                if (!ok) {
+                    st_release_sys(err, CPU_TIER_ERR_TIMEOUT);
+                } else if (ack->status != 0) {
+                    st_release_sys(err, 16u + ack->status);
+                    ok = false;
+                }
+            }
+            if (ok)
+                for (int u = 0; u < V; ++u) s_n[u] = (int)vr.req[u]->n_pairs;
+        }
+    }
+    __syncthreads();
+    __threadfence_system();
+    for (int u = 0; u < V; ++u) {
+        const int n = s_n[u];
+        const CpuTierRequest* req = vr.req[u];
+        const uint16_t* staging = vr.staging[u];
+        for (int i = blockIdx.x; i < n; i += gridDim.x) {
+            const int row = req->pairs[i].row;
+            const uint4* src = reinterpret_cast<const uint4*>(staging + (size_t)i * CPU_TIER_HID);
+            uint4* dst = reinterpret_cast<uint4*>(route + (size_t)row * route_stride);
+            for (int j = tid; j < CPU_TIER_HID / 8; j += blockDim.x) dst[j] = src[j];
+        }
+    }
+}
+
+// ---- promotion: a checkpoint-layout record -> b12x's prepared layout at pool slot s (the permutations measured by
+// b12x_layout_probe.py). Record: w1n [576][2560] | w1s [576][160] | w3n | w3s | w2n [5120][288] | w2s [5120][18].
+// The w13 input b12x saw is [w1; w3] nibbles (gate rows then up rows), its scales [w1s; w3s] bytes.
+constexpr int64_t REC_W1N = 0, REC_W1S = 1474560, REC_W3N = 1566720, REC_W3S = 3041280, REC_W2N = 3133440, REC_W2S = 4608000;
+constexpr int64_t W13_NIB = 2 * 2949120, W13S_B = 2 * 92160, W2_NIB = 2949120, W2S_B = 92160;
+
+__device__ __forceinline__ uint8_t rec_nibble_w13(const uint8_t* rec, int64_t i) {  // input nibble i of [w1n; w3n]
+    const int64_t byte = i >> 1;
+    const uint8_t b = byte < 1474560 ? rec[REC_W1N + byte] : rec[REC_W3N + byte - 1474560];
+    return (i & 1) ? (b >> 4) : (b & 0xF);
+}
+__device__ __forceinline__ uint8_t rec_nibble_w2(const uint8_t* rec, int64_t i) {
+    const uint8_t b = rec[REC_W2N + (i >> 1)];
+    return (i & 1) ? (b >> 4) : (b & 0xF);
+}
+__device__ __forceinline__ uint8_t rec_scale_w13(const uint8_t* rec, int64_t i) {
+    return i < 92160 ? rec[REC_W1S + i] : rec[REC_W3S + i - 92160];
+}
+
+__global__ void repack_kernel(const uint8_t* rec, const int32_t* idx_w13, const int32_t* idx_w13s, const int32_t* idx_w2,
+                              const int32_t* idx_w2s, uint8_t* out_w13, uint8_t* out_w13s, uint8_t* out_w2, uint8_t* out_w2s) {
+    const int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // output bytes: w13 2,949,120; w2 1,474,560; w13s 184,320; w2s 92,160 — one grid, ranges in that order
+    if (j < W13_NIB / 2) {
+        out_w13[j] = rec_nibble_w13(rec, idx_w13[2 * j]) | (rec_nibble_w13(rec, idx_w13[2 * j + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2) {
+        const int64_t k = j - W13_NIB / 2;
+        out_w2[k] = rec_nibble_w2(rec, idx_w2[2 * k]) | (rec_nibble_w2(rec, idx_w2[2 * k + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2;
+        out_w13s[k] = rec_scale_w13(rec, idx_w13s[k]);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2 - W13S_B;
+        out_w2s[k] = rec[REC_W2S + idx_w2s[k]];
+    }
+}
+
+}  // namespace
+
+// record (device uint8 [4,700,160]) -> slot `slot` of the pool tensors ([R, words] int32 each, b12x's prepared layout)
+void repack_record(torch::Tensor record, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                   torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                   torch::Tensor pool_w2s, int64_t slot) {
+    TORCH_CHECK(record.scalar_type() == torch::kUInt8 && record.numel() == 4700160 && record.is_cuda());
+    TORCH_CHECK(idx_w13.numel() == W13_NIB && idx_w2.numel() == W2_NIB && idx_w13s.numel() == W13S_B && idx_w2s.numel() == W2S_B);
+    TORCH_CHECK(pool_w13.size(1) * (int64_t)pool_w13.element_size() == W13_NIB / 2 && pool_w2.size(1) * (int64_t)pool_w2.element_size() == W2_NIB / 2);
+    TORCH_CHECK(pool_w13s.size(1) * (int64_t)pool_w13s.element_size() == W13S_B && pool_w2s.size(1) * (int64_t)pool_w2s.element_size() == W2S_B);
+    TORCH_CHECK(slot >= 0 && slot < pool_w13.size(0));
+    const int64_t total = W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B;
+    const int threads = 256;
+    const int blocks = (int)((total + threads - 1) / threads);
+    repack_kernel<<<blocks, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        record.data_ptr<uint8_t>(), idx_w13.data_ptr<int32_t>(), idx_w13s.data_ptr<int32_t>(), idx_w2.data_ptr<int32_t>(),
+        idx_w2s.data_ptr<int32_t>(), reinterpret_cast<uint8_t*>(pool_w13.data_ptr()) + slot * (W13_NIB / 2),
+        reinterpret_cast<uint8_t*>(pool_w13s.data_ptr()) + slot * W13S_B, reinterpret_cast<uint8_t*>(pool_w2.data_ptr()) + slot * (W2_NIB / 2),
+        reinterpret_cast<uint8_t*>(pool_w2s.data_ptr()) + slot * W2S_B);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// N records (a device staging [N, 4700160]) into N slots in one launch (blockIdx.y = the record): the prefill's
+// streamed experts (phase 2.5); the per-record repack above is launch/latency-bound at ~100 us
+struct RepackBatch { int n; int slot[256]; };
+
+__global__ void repack_batch_kernel(const uint8_t* staging, const int32_t* idx_w13, const int32_t* idx_w13s,
+                                    const int32_t* idx_w2, const int32_t* idx_w2s, uint8_t* pool_w13, uint8_t* pool_w13s,
+                                    uint8_t* pool_w2, uint8_t* pool_w2s, RepackBatch b) {
+    const int r = blockIdx.y;
+    if (r >= b.n) return;
+    const uint8_t* rec = staging + (int64_t)r * 4700160;
+    const int64_t s = b.slot[r];
+    const int64_t j = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (j < W13_NIB / 2) {
+        pool_w13[s * (W13_NIB / 2) + j] = rec_nibble_w13(rec, idx_w13[2 * j]) | (rec_nibble_w13(rec, idx_w13[2 * j + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2) {
+        const int64_t k = j - W13_NIB / 2;
+        pool_w2[s * (W2_NIB / 2) + k] = rec_nibble_w2(rec, idx_w2[2 * k]) | (rec_nibble_w2(rec, idx_w2[2 * k + 1]) << 4);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2;
+        pool_w13s[s * W13S_B + k] = rec_scale_w13(rec, idx_w13s[k]);
+    } else if (j < W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B) {
+        const int64_t k = j - W13_NIB / 2 - W2_NIB / 2 - W13S_B;
+        pool_w2s[s * W2S_B + k] = rec[REC_W2S + idx_w2s[k]];
+    }
+}
+
+void repack_batch(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                  torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                  torch::Tensor pool_w2s, std::vector<int64_t> slots) {
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.is_cuda() && staging.dim() == 2 && staging.size(1) == 4700160);
+    TORCH_CHECK(slots.size() <= 256 && (int64_t)slots.size() <= staging.size(0));
+    TORCH_CHECK(pool_w13.size(1) * (int64_t)pool_w13.element_size() == W13_NIB / 2 && pool_w2.size(1) * (int64_t)pool_w2.element_size() == W2_NIB / 2);
+    TORCH_CHECK(pool_w13s.size(1) * (int64_t)pool_w13s.element_size() == W13S_B && pool_w2s.size(1) * (int64_t)pool_w2s.element_size() == W2S_B);
+    if (slots.empty()) return;
+    RepackBatch b;
+    b.n = (int)slots.size();
+    for (int i = 0; i < b.n; ++i) {
+        TORCH_CHECK(slots[i] >= 0 && slots[i] < pool_w13.size(0));
+        b.slot[i] = (int)slots[i];
+    }
+    const int64_t total = W13_NIB / 2 + W2_NIB / 2 + W13S_B + W2S_B;
+    const int threads = 256;
+    dim3 grid((unsigned)((total + threads - 1) / threads), (unsigned)b.n);
+    repack_batch_kernel<<<grid, threads, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        staging.data_ptr<uint8_t>(), idx_w13.data_ptr<int32_t>(), idx_w13s.data_ptr<int32_t>(), idx_w2.data_ptr<int32_t>(),
+        idx_w2s.data_ptr<int32_t>(), reinterpret_cast<uint8_t*>(pool_w13.data_ptr()), reinterpret_cast<uint8_t*>(pool_w13s.data_ptr()),
+        reinterpret_cast<uint8_t*>(pool_w2.data_ptr()), reinterpret_cast<uint8_t*>(pool_w2s.data_ptr()), b);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// N pinned host records into a device staging [N, 4700160] (cudaMemcpyAsync each, current stream)
+void stage_records(torch::Tensor staging, std::vector<int64_t> host_ptrs) {
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.is_cuda() && staging.dim() == 2 && staging.size(1) == 4700160);
+    TORCH_CHECK((int64_t)host_ptrs.size() <= staging.size(0));
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    for (size_t i = 0; i < host_ptrs.size(); ++i)
+        TORCH_CHECK(cudaMemcpyAsync(staging.data_ptr<uint8_t>() + i * 4700160, (const void*)(uintptr_t)host_ptrs[i], 4700160,
+                                    cudaMemcpyHostToDevice, stream) == cudaSuccess, "staging H2D failed");
+}
+
+// ---- batched promotions (phase 2.4: the host side of ~30 promotions per step was 20 ms of torch ops) ----------
+struct TableWrites { int n; int e[64]; int v[64]; };
+
+__global__ void table_write_kernel(int* table, TableWrites w) {
+    const int i = threadIdx.x;
+    if (i < w.n) table[w.e[i]] = w.v[i];
+}
+
+// slot_table[experts[i]] = values[i] (<= 64 entries), one launch on the current stream
+void table_write(torch::Tensor slot_table, std::vector<int64_t> experts, std::vector<int64_t> values) {
+    TORCH_CHECK(slot_table.scalar_type() == torch::kInt32 && slot_table.is_cuda());
+    TORCH_CHECK(experts.size() == values.size() && experts.size() <= 64);
+    if (experts.empty()) return;
+    TableWrites w;
+    w.n = (int)experts.size();
+    for (int i = 0; i < w.n; ++i) {
+        TORCH_CHECK(experts[i] >= 0 && experts[i] < slot_table.numel());
+        w.e[i] = (int)experts[i];
+        w.v[i] = (int)values[i];
+    }
+    table_write_kernel<<<1, 64, 0, c10::cuda::getCurrentCUDAStream()>>>(slot_table.data_ptr<int>(), w);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// one layer's promotions on the current stream: for each (host record, expert, slot): H2D into the staging record,
+// repack into the slot, slot_table[expert] = slot (after the repack, in stream order)
+void promote_batch(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                   torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                   torch::Tensor pool_w2s, torch::Tensor slot_table, std::vector<int64_t> host_ptrs,
+                   std::vector<int64_t> experts, std::vector<int64_t> slots) {
+    TORCH_CHECK(host_ptrs.size() == experts.size() && experts.size() == slots.size());
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.numel() == 4700160 && staging.is_cuda());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    for (size_t i = 0; i < experts.size(); ++i) {
+        TORCH_CHECK(cudaMemcpyAsync(staging.data_ptr<uint8_t>(), (const void*)(uintptr_t)host_ptrs[i], 4700160,
+                                    cudaMemcpyHostToDevice, stream) == cudaSuccess, "promotion H2D failed");
+        repack_record(staging, idx_w13, idx_w13s, idx_w2, idx_w2s, pool_w13, pool_w13s, pool_w2, pool_w2s, slots[i]);
+        table_write(slot_table, {experts[i]}, {slots[i]});
+    }
+}
+
+// virtual ranks: one layer's promotions with V slice records per expert (host_ptrs[i * nv + v] = the record of
+// store rank v for experts[i]) into pool rows slots[i] * nv + v; slot_table[experts[i]] = slots[i] after the expert's
+// last repack (stream order). nv = 1 is promote_batch.
+void promote_batch_v(torch::Tensor staging, torch::Tensor idx_w13, torch::Tensor idx_w13s, torch::Tensor idx_w2,
+                     torch::Tensor idx_w2s, torch::Tensor pool_w13, torch::Tensor pool_w13s, torch::Tensor pool_w2,
+                     torch::Tensor pool_w2s, torch::Tensor slot_table, std::vector<int64_t> host_ptrs,
+                     std::vector<int64_t> experts, std::vector<int64_t> slots, int64_t nv) {
+    TORCH_CHECK(nv >= 1 && nv <= CPU_TIER_MAX_VRANKS);
+    TORCH_CHECK(host_ptrs.size() == experts.size() * (size_t)nv && experts.size() == slots.size());
+    TORCH_CHECK(staging.scalar_type() == torch::kUInt8 && staging.numel() == 4700160 && staging.is_cuda());
+    cudaStream_t stream = c10::cuda::getCurrentCUDAStream();
+    for (size_t i = 0; i < experts.size(); ++i) {
+        for (int64_t v = 0; v < nv; ++v) {
+            TORCH_CHECK(cudaMemcpyAsync(staging.data_ptr<uint8_t>(), (const void*)(uintptr_t)host_ptrs[i * nv + v], 4700160,
+                                        cudaMemcpyHostToDevice, stream) == cudaSuccess, "promotion H2D failed");
+            repack_record(staging, idx_w13, idx_w13s, idx_w2, idx_w2s, pool_w13, pool_w13s, pool_w2, pool_w2s, slots[i] * nv + v);
+        }
+        table_write(slot_table, {experts[i]}, {slots[i]});
+    }
+}
+
+// pinned (page-locked, portable) host memory for the expert store: H2D promotions DMA from it; not zeroed.
+// Default cudaHostAlloc (4 KB pages). MOET_CPU_TIER_STORE_THP=1: an anonymous mapping advised to transparent huge
+// pages, registered with the driver (2 MB TLB entries instead of 1,150 4 KB ones per 4.7 MB record) - measured
+// 2026-10-22 on the 498 GB box with the page cache full of the checkpoint: the THP faults stall in direct compaction
+// (~5 huge pages per second per rank, compact_fail 5x compact_success), so it is opt-in until the box reserves
+// huge pages (hugetlbfs) or drops caches before the boot.
+int64_t alloc_pinned(int64_t nbytes) {
+    void* p = nullptr;
+    const char* thp = getenv("MOET_CPU_TIER_STORE_THP");
+    if (thp && thp[0] == '1') {
+        const size_t huge = 2u << 20;
+        const size_t len = ((size_t)nbytes + huge - 1) / huge * huge + huge;  // room to align the start
+        void* raw = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (raw != MAP_FAILED) {
+            uintptr_t a = ((uintptr_t)raw + huge - 1) / huge * huge;
+            p = (void*)a;
+            madvise(p, (size_t)nbytes, MADV_HUGEPAGE);
+            // touch one byte per huge page so that the faults happen under the THP advice (and in this thread's
+            // NUMA policy) before the driver pins the range
+            for (size_t off = 0; off < (size_t)nbytes; off += huge) ((volatile char*)p)[off] = 0;
+            if (cudaHostRegister(p, (size_t)nbytes, cudaHostRegisterPortable) == cudaSuccess) return (int64_t)a;
+            munmap(raw, len);
+            p = nullptr;
+            fprintf(stderr, "[cpu_tier_cuda] cudaHostRegister of the THP store failed; falling back to cudaHostAlloc\n");
+        }
+    }
+    TORCH_CHECK(cudaHostAlloc(&p, (size_t)nbytes, cudaHostAllocPortable) == cudaSuccess, "cudaHostAlloc (pinned) failed");
+    return (int64_t)(uintptr_t)p;
+}
+
+// a CPU uint8 tensor view of host memory (the store's records as copy sources)
+torch::Tensor host_view(int64_t ptr, int64_t nbytes) {
+    return torch::from_blob((void*)(uintptr_t)ptr, {nbytes}, torch::TensorOptions().dtype(torch::kUInt8));
+}
+
+int64_t alloc_mapped(int64_t nbytes) {
+    void* p = nullptr;
+    TORCH_CHECK(cudaHostAlloc(&p, (size_t)nbytes, cudaHostAllocMapped | cudaHostAllocPortable) == cudaSuccess, "cudaHostAlloc failed");
+    memset(p, 0, (size_t)nbytes);
+    return (int64_t)(uintptr_t)p;
+}
+
+void free_mapped(int64_t p) { cudaFreeHost((void*)(uintptr_t)p); }
+
+int64_t device_ptr(int64_t host_ptr) {
+    void* d = nullptr;
+    TORCH_CHECK(cudaHostGetDevicePointer(&d, (void*)(uintptr_t)host_ptr, 0) == cudaSuccess, "cudaHostGetDevicePointer failed");
+    return (int64_t)(uintptr_t)d;
+}
+
+void step_begin(torch::Tensor step_dev) {
+    step_begin_kernel<<<1, 32, 0, c10::cuda::getCurrentCUDAStream()>>>(step_dev.data_ptr<int>());
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+void publish(int64_t req_dev_ptr, torch::Tensor seq_dev, torch::Tensor topk_ids, torch::Tensor topk_weights,
+             torch::Tensor slot_table, torch::Tensor remapped, torch::Tensor a_values, torch::Tensor a_scales,
+             int64_t n_tokens) {
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_weights.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(slot_table.scalar_type() == torch::kInt32 && remapped.scalar_type() == torch::kInt32);
+    TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous() && remapped.is_contiguous());
+    TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_scales.scalar_type() == torch::kUInt8);
+    TORCH_CHECK(n_tokens >= 0 && n_tokens <= CPU_TIER_MAX_TOKENS, "at most CPU_TIER_MAX_TOKENS tokens per step on the CPU tier");
+    const int n_pairs = (int)topk_ids.numel();
+    TORCH_CHECK(n_pairs <= CPU_TIER_MAX_PAIRS && topk_ids.dim() == 2);
+    publish_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        (CpuTierRequest*)(uintptr_t)req_dev_ptr, seq_dev.data_ptr<int>(), topk_ids.data_ptr<int>(),
+        topk_weights.data_ptr<float>(), slot_table.data_ptr<int>(), remapped.data_ptr<int>(), n_pairs,
+        (int)topk_ids.size(1), a_values.data_ptr<uint8_t>(), a_scales.data_ptr<uint8_t>(), (int)n_tokens);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+void wait_inject(int64_t ack_dev_ptr, int64_t req_dev_ptr, int64_t staging_dev_ptr, torch::Tensor seq_dev,
+                 torch::Tensor route_output, int64_t err_dev_ptr, int64_t timeout_ns) {
+    TORCH_CHECK(route_output.scalar_type() == torch::kBFloat16 && route_output.dim() == 2 &&
+                route_output.size(1) == CPU_TIER_HID && route_output.stride(1) == 1);
+    wait_inject_kernel<<<8, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        (const CpuTierAck*)(uintptr_t)ack_dev_ptr, (const CpuTierRequest*)(uintptr_t)req_dev_ptr,
+        (const uint16_t*)(uintptr_t)staging_dev_ptr, seq_dev.data_ptr<int>(),
+        reinterpret_cast<uint16_t*>(route_output.data_ptr()), (int)route_output.stride(0),
+        (volatile uint32_t*)(uintptr_t)err_dev_ptr, timeout_ns);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+// virtual ranks: the V requests of a layer (device pointers of the mapped mailboxes, in slice order) from the expanded
+// routing (topk_ids [T, K * V]); seq_dev = the layer's one sequence number shared by the V mailboxes
+static VRanks make_vranks(const std::vector<int64_t>& req, const std::vector<int64_t>& ack, const std::vector<int64_t>& staging) {
+    TORCH_CHECK(req.size() >= 1 && req.size() <= CPU_TIER_MAX_VRANKS, "1..4 virtual ranks");
+    VRanks vr;
+    vr.n = (int)req.size();
+    for (int u = 0; u < CPU_TIER_MAX_VRANKS; ++u) {
+        vr.req[u] = u < vr.n ? (CpuTierRequest*)(uintptr_t)req[u] : nullptr;
+        vr.ack[u] = u < vr.n && u < (int)ack.size() ? (const CpuTierAck*)(uintptr_t)ack[u] : nullptr;
+        vr.staging[u] = u < vr.n && u < (int)staging.size() ? (const uint16_t*)(uintptr_t)staging[u] : nullptr;
+    }
+    return vr;
+}
+
+void publish_v(std::vector<int64_t> req_dev_ptrs, torch::Tensor seq_dev, torch::Tensor topk_ids, torch::Tensor topk_weights,
+               torch::Tensor slot_table, torch::Tensor remapped, torch::Tensor a_values, torch::Tensor a_scales,
+               int64_t n_tokens) {
+    TORCH_CHECK(topk_ids.scalar_type() == torch::kInt32 && topk_weights.scalar_type() == torch::kFloat32);
+    TORCH_CHECK(slot_table.scalar_type() == torch::kInt32 && remapped.scalar_type() == torch::kInt32);
+    TORCH_CHECK(topk_ids.is_contiguous() && topk_weights.is_contiguous() && remapped.is_contiguous());
+    TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_scales.scalar_type() == torch::kUInt8);
+    TORCH_CHECK(n_tokens >= 0 && n_tokens <= CPU_TIER_MAX_TOKENS, "at most CPU_TIER_MAX_TOKENS tokens per step on the CPU tier");
+    const VRanks vr = make_vranks(req_dev_ptrs, {}, {});
+    const int n_pairs = (int)topk_ids.numel();
+    TORCH_CHECK(topk_ids.dim() == 2 && (int)topk_ids.size(1) % vr.n == 0 && n_pairs / vr.n <= CPU_TIER_MAX_PAIRS,
+                "the expanded routing must be [T, K * V] with T * K <= CPU_TIER_MAX_PAIRS");
+    TORCH_CHECK(remapped.numel() >= n_pairs);
+    publish_v_kernel<<<1, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        vr, seq_dev.data_ptr<int>(), topk_ids.data_ptr<int>(), topk_weights.data_ptr<float>(), slot_table.data_ptr<int>(),
+        remapped.data_ptr<int>(), n_pairs, (int)topk_ids.size(1), a_values.data_ptr<uint8_t>(), a_scales.data_ptr<uint8_t>(),
+        (int)n_tokens);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+void wait_inject_v(std::vector<int64_t> ack_dev_ptrs, std::vector<int64_t> req_dev_ptrs, std::vector<int64_t> staging_dev_ptrs,
+                   torch::Tensor seq_dev, torch::Tensor route_output, int64_t err_dev_ptr, int64_t timeout_ns) {
+    TORCH_CHECK(route_output.scalar_type() == torch::kBFloat16 && route_output.dim() == 2 &&
+                route_output.size(1) == CPU_TIER_HID && route_output.stride(1) == 1);
+    TORCH_CHECK(ack_dev_ptrs.size() == req_dev_ptrs.size() && staging_dev_ptrs.size() == req_dev_ptrs.size());
+    const VRanks vr = make_vranks(req_dev_ptrs, ack_dev_ptrs, staging_dev_ptrs);
+    wait_inject_v_kernel<<<8, 256, 0, c10::cuda::getCurrentCUDAStream()>>>(
+        vr, seq_dev.data_ptr<int>(), reinterpret_cast<uint16_t*>(route_output.data_ptr()), (int)route_output.stride(0),
+        (volatile uint32_t*)(uintptr_t)err_dev_ptr, timeout_ns);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+}
+
+int64_t request_bytes() { return (int64_t)sizeof(CpuTierRequest); }
+int64_t ack_bytes() { return (int64_t)sizeof(CpuTierAck); }
+int64_t staging_bytes() { return (int64_t)CPU_TIER_MAX_PAIRS * CPU_TIER_HID * 2; }
+int64_t max_vranks() { return CPU_TIER_MAX_VRANKS; }
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("publish_v", &publish_v);
+    m.def("wait_inject_v", &wait_inject_v);
+    m.def("promote_batch_v", &promote_batch_v);
+    m.def("max_vranks", &max_vranks);
+    m.def("alloc_mapped", &alloc_mapped);
+    m.def("alloc_pinned", &alloc_pinned);
+    m.def("host_view", &host_view);
+    m.def("free_mapped", &free_mapped);
+    m.def("device_ptr", &device_ptr);
+    m.def("step_begin", &step_begin);
+    m.def("publish", &publish);
+    m.def("wait_inject", &wait_inject);
+    m.def("repack_record", &repack_record);
+    m.def("table_write", &table_write);
+    m.def("promote_batch", &promote_batch);
+    m.def("repack_batch", &repack_batch);
+    m.def("stage_records", &stage_records);
+    m.def("request_bytes", &request_bytes);
+    m.def("ack_bytes", &ack_bytes);
+    m.def("staging_bytes", &staging_bytes);
+}
