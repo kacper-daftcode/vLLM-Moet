@@ -56,7 +56,8 @@ Environment:
                                         one bf16 rounding - the fixed order that replaces TP4's NCCL ring); 1 = only the
                                         576 geometry (other geometries left on the GPU, as before 11-04)
   VLLM_MOET_CPU_TIER_VRANK_CPUS         V > 1: the pools' CPUs per virtual rank, ';'-separated ranges ("2-7;10-15;18-23;26-31");
-  VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS  their dispatcher CPUs ("1,9,17,25"). Default: process (TP rank) r takes CCDs
+  VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS  their dispatcher CPUs ("1,9,17,25"); either V entries (this process) or TP x V (every
+                                        rank's, rank r takes entries r*V..r*V+V-1). Default: process (TP rank) r takes CCDs
                                         r*V .. r*V+V-1 - per CCD g: dispatcher 8g+1, pool 8g+2..8g+7 (POOL_THREADS 6; 12 adds
                                         the SMT siblings 8g+34..8g+39); main thread 8rV, the other threads 8rV+32/33
 """
@@ -267,16 +268,26 @@ def _cpu_layout_v(V: int) -> dict:
             pool += list(range(8 * g + 34, 8 * g + 40))
         pools.append(pool)
         disps.append(8 * g + 1)
+    # the overrides list either this process's V pools or every TP rank's (TP x V entries, rank r takes entries r*V .. r*V+V-1:
+    # one container environment serves both TP2 processes)
     spec = os.environ.get("VLLM_MOET_CPU_TIER_VRANK_CPUS")
     if spec:
-        pools = [_parse_cpu_list(part) for part in spec.split(";")]
-        if len(pools) != V:
-            raise RuntimeError(f"VLLM_MOET_CPU_TIER_VRANK_CPUS lists {len(pools)} pools for {V} virtual ranks")
+        parts = [_parse_cpu_list(part) for part in spec.split(";")]
+        if len(parts) == V:
+            pools = parts
+        elif len(parts) > V and len(parts) % V == 0 and g0 + V <= len(parts):
+            pools = parts[g0:g0 + V]
+        else:
+            raise RuntimeError(f"VLLM_MOET_CPU_TIER_VRANK_CPUS lists {len(parts)} pools for {V} virtual ranks (rank {r})")
     dspec = os.environ.get("VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS")
     if dspec:
-        disps = [int(x) for x in dspec.split(",")]
-        if len(disps) != V:
-            raise RuntimeError(f"VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS lists {len(disps)} CPUs for {V} virtual ranks")
+        parts = [int(x) for x in dspec.split(",")]
+        if len(parts) == V:
+            disps = parts
+        elif len(parts) > V and len(parts) % V == 0 and g0 + V <= len(parts):
+            disps = parts[g0:g0 + V]
+        else:
+            raise RuntimeError(f"VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS lists {len(parts)} CPUs for {V} virtual ranks (rank {r})")
     main = os.environ.get("VLLM_MOET_CPU_TIER_MAIN_CPU")
     main = int(main) if main else (8 * g0 if not spec else None)
     other = os.environ.get("VLLM_MOET_CPU_TIER_OTHER_CPUS")

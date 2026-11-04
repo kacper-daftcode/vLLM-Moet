@@ -23,7 +23,8 @@
 #            NAME (ds41-hyb)  TP (4: 1 | 2 | 4 GPUs)  GPUS (0,1,2,3 / 0,1 / 0 by TP)  PORT (8041)  BIND (127.0.0.1:)
 #            VRANKS ("" = VLLM_MOET_CPU_TIER_VRANKS auto: 4 / TP slices per expert; 1 = plain ranks, the TP4 path)
 #            VRANK_CPUS / VRANK_DISPATCHERS ("" = the CCD layout above)  the pools' cores per virtual rank (";"-separated
-#                        ranges, e.g. "2-7;10-15;18-23;26-31") and their dispatcher cores ("1,9,17,25") for another CPU geometry
+#                        ranges, e.g. "2-7;10-15;18-23;26-31") and their dispatcher cores ("1,9,17,25") for another CPU geometry:
+#                        TP x (4 / TP) entries = every rank's (rank r takes entries r*V..), or 4 / TP entries = each process's own
 #            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results, the kernel tables (below), profiles
 #            REPO (this checkout)    mounted at /repo with BAKED=0
 #            BAKED (1)               1 = the image's own copy of the hybrid (Dockerfile step 43: patched packages, runtime,
