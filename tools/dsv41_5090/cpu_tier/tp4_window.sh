@@ -146,7 +146,7 @@ if [[ -n "${PROFILE_STEPS:-}" ]]; then
   mkdir -p "$PROF_DIR"
   export EXTRA_ARGS="${EXTRA_ARGS:-} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/root/.cache/prof"
 fi
-bash docker/sm120/run-dsv41-5090.sh || { note "launcher failed"; exit 1; }
+bash docker/sm120/run-dsv41-5090.sh > >(tee -a "$SUMMARY") 2>&1 || { note "launcher failed"; exit 1; }   # its lines (the image, STORE_DRAM_RECORDS=auto's N) into the summary
 t0=$(date +%s)
 ready=0
 dropped2=0
