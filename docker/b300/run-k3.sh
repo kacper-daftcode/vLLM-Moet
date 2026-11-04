@@ -50,9 +50,16 @@
 #            INDEXER_KV_DTYPE ("")   K3.1 only: "" = FP8 indexer keys (132 B per token per DSA layer); mxfp4 = 68 B
 #                        (SM10x, the fused key insert); goes into the attention config as indexer_kv_dtype.
 #            DECODE_BACKEND ("")     latency_specialized = the fused CuTe DSL decode path of the recipes' "low-latency
-#                        decode" row (--additional-config decode_backend): decode steps 1.6-1.7x faster at batch 1 and
-#                        1.2-1.3x at 32-64 on 8x B300 per the K3.1 recipe; needs the V2 runner, FULL decode CUDA
-#                        graphs, TP8 or TP8 + DCP8 and no expert parallelism. "" = vLLM's default decode path.
+#                        decode" row (--additional-config decode_backend): persistent MoE experts, fused KDA, DSA
+#                        indexer and MLA cores and one mailbox per collective for steps up to 64 rows, the stock loop
+#                        with specialized attention up to 320 rows, stock above. Measured on hgx-02 (K3.1, k=3, FP8 KV,
+#                        DCP8, 2026-11-04/05) against the default path: single-stream code 252 vs 143 tok/s (114.7 vs
+#                        65.0 steps/s, the same 2.20 acceptance), 8K C=32 61.5 vs 48.4 tok/s per session, GSM8K-200
+#                        196/200, prefix hits unchanged, KV pool -4% (15.07M vs 15.73M tokens), cold start ~21 min
+#                        instead of ~9 (its CuTe DSL kernels compile at every start). Needs the V2 runner, FULL decode
+#                        CUDA graphs, TP8 or TP8 + DCP8 (or EP over MegaMoE), DSpark k <= 7, and on a 148-SM B300 the
+#                        Dockerfile.b300-k31 image (the kimi-k31 image sizes the experts grid for GB300's 152 SMs and
+#                        refuses to start the path). "" = vLLM's default decode path.
 #            SPEC_TOKENS (0)         DSpark draft tokens (the K3 recipe uses 7, the K3.1 recipe 5); needs DRAFT_DIR
 #            DRAFT_DIR ("")          Inferact/Kimi-K3-DSpark (K3) or Inferact/Kimi-K3.1-Pro-DSpark-preview (K3.1: 5 dense
 #                        MLA layers, its own FP8 MLA cache next to the target's packed DSA cache) checkpoint

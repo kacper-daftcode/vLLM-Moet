@@ -11,7 +11,8 @@ behind a runtime switch.
 | **DeepSeek-V4.1-Flash on 4× RTX 5090 (MoET hybrid)** | 120 of the 384 experts per layer resident on the cards, every other routed expert computed on the CPU from the checkpoint's own bytes, bit-identical to the all-resident path | merging (branch [`moet-hybrid`](https://github.com/kacper-daftcode/vLLM-Moet/tree/moet-hybrid)) | `docs/moet-hybrid.md` on the branch |
 | **2-bit experts on vLLM v0.24.0** | GLM-5.2 (753B), DeepSeek-V4-Flash (159B) and Kimi-K2.7-Code (1T) on one to four cards that cannot hold their checkpoints: a 2-bit codebook on hand-written SASS, an FP4 delta cache | frozen (builds, fixes accepted, no development) | [docs/v024-2bit.md](docs/v024-2bit.md) |
 | **Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000** | the official nightly with the PLE table on the GPUs, the skinny GEMM and an FP8 MoE GEMV | as built | [docs/qwen38-sm120.md](docs/qwen38-sm120.md) |
-| **Kimi-K3 + DSpark on 8× B300 (HGX, sm_103)** | the official v0.32.0 image with what DSpark needs on a hybrid KDA / MLA model: RecoverSSM admitted next to KV offload (the pool back from 19.3M to 21.6M tokens), the RedHat sliding-window draft under DCP8 with prefix caching | **active, in production** | [docs/k3-b300-dspark-kv.md](docs/k3-b300-dspark-kv.md) |
+| **Kimi-K3 + DSpark on 8× B300 (HGX, sm_103)** | the official v0.32.0 image with what DSpark needs on a hybrid KDA / MLA model: RecoverSSM admitted next to KV offload (the pool back from 19.3M to 21.6M tokens), the RedHat sliding-window draft under DCP8 with prefix caching | superseded by K3.1 on the same host (2026-11-04); rollback kept | [docs/k3-b300-dspark-kv.md](docs/k3-b300-dspark-kv.md) |
+| **Kimi-K3.1-Pro + DSpark on 8× B300 (HGX, sm_103)** | the day-0 `kimi-k31` image with its specialized decode path unlocked on a 148-SM B300 (the persistent experts grid was sized for GB300's 152 SMs): single-stream 252 vs 143 tok/s, 8K C=32 61.5 vs 48.4 tok/s per session at the same acceptance and GSM8K | **active, in production** | [docs/benchmarks/k31-b300-2026-11-04.md](docs/benchmarks/k31-b300-2026-11-04.md) |
 
 ## Results, as served
 
@@ -69,6 +70,7 @@ runs with; every knob and switch is listed in [docs/dsv41-sm120.md](docs/dsv41-s
 | `Dockerfile.sm120-dsv41-nightly`, `tools/dsv41_sm120/`, `docker/sm120/run-dsv41.sh` | DeepSeek-V4.1-Flash: the image, its patchers, kernels and tests, the launcher (+ the cron scripts in `docker/sm120/`) |
 | `Dockerfile.sm120-qwen38`, `tools/qwen38_sm120/`, `docker/sm120/run-qwen38.sh` | Qwen3.8-Flash-Next-FP8 |
 | `Dockerfile.b300-k3`, `tools/k3_b300/`, `docker/b300/run-k3.sh` | Kimi-K3 + DSpark on 8× B300: the image (official v0.32.0 + anchored patchers), the probes and the KV budget model, the launcher |
+| `Dockerfile.b300-k31`, `tools/k3_b300/patch_vllm_k31_experts_grid.py` | Kimi-K3.1-Pro on 8× B300: the day-0 image + the specialized decode's experts grid capped at the device's SM count; the same launcher serves both families |
 | `patch/`, `Dockerfile.sm120-v024`, `Dockerfile.recipes`, `docker/serve_recipe.py`, `bench/`, `kernels/`, `tools/*.py` | the 2-bit line: the generated v0.24.0 patch (never edited by hand), its images, the recipes and the benchmark runner, SASS sources and cubins, its tests |
 | `tools/sm120_perf/` | benchmark and profiling scripts |
 | `docs/` | one doc per line, the benchmark records, the kernel-design notes |

@@ -1,0 +1,28 @@
+# vLLM-Moet: Kimi-K3.1-Pro + DSpark on 8x B300 (HGX, sm_103) -- the day-0 vLLM image plus the fix it needs there.
+#
+# Base: vllm/vllm-openai:kimi-k31 (vLLM 0.1.dev24216+g266e88c05, the K3.1 line before its first release: K3.1 missed
+# v0.33.0, the recipe's minimum is 0.34.0), served on hgx-02 as TP8 + DCP8, FP8 KV, prefix caching, SimpleCPUOffloadConnector
+# (disk tier through the page cache), DSpark with Inferact/Kimi-K3.1-Pro-DSpark-preview and KDA RecoverSSM, the Python API
+# server (docker/b300/run-k3.sh). The two fixes K3 needed on v0.32.0 (RecoverSSM next to a KV connector, the hybrid KV
+# layout under DCP) are upstream in this line; tools/k3_b300/patch_vllm_*.py for K3 do not apply here.
+#
+#   1. The specialized decode path (`--additional-config '{"decode_backend":"latency_specialized"}'`, the recipes'
+#      "low-latency decode": the fused CuTe DSL decode step) on a 148-SM B300 (tools/k3_b300/patch_vllm_k31_experts_grid.py):
+#      the persistent routed-experts kernel's grid table was sized on GB300 (152 SMs) and the image refuses to start the
+#      path with "152 CTAs cannot be co-resident (1 per SM x 148 SMs)"; the kernel splits its work by its grid, so the
+#      patch caps the table at the device's SM count.
+#
+# Build:  DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r1 .   (~2 min)
+# Serve:  IMAGE=vllm-moet-b300:k31-266e88c0-r1 DECODE_BACKEND=latency_specialized ... docker/b300/run-k3.sh
+ARG BASE_IMAGE=vllm/vllm-openai:kimi-k31
+FROM ${BASE_IMAGE}
+
+COPY tools/k3_b300/patch_vllm_k31_experts_grid.py /opt/vllm-moet/k3_b300/
+RUN python3 /opt/vllm-moet/k3_b300/patch_vllm_k31_experts_grid.py --check \
+ && python3 /opt/vllm-moet/k3_b300/patch_vllm_k31_experts_grid.py \
+ && python3 -m py_compile /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py \
+ && find /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3 -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+LABEL org.opencontainers.image.title="vLLM-Moet B300 Kimi-K3.1" \
+      org.opencontainers.image.description="vllm/vllm-openai:kimi-k31 + the specialized decode's experts grid capped at the device's SM count (B300: 148)" \
+      org.opencontainers.image.source="https://github.com/kacper-daftcode/vLLM-Moet"
