@@ -129,14 +129,18 @@ inert at the launcher's defaults, bring that down for smaller hosts ("slow is ac
   (`ENGRAM_CACHE_GIB`) or from NVMe (io_uring, 512‑B O_DIRECT reads, 62 µs at QD 1); the rows reach the GPU through a mapped mailbox,
   a bounded in‑stream wait and a device landing buffer that **vLLM's own lookup kernel** dequantizes — bit‑identical to the pinned
   tables (the same bytes, the same kernel; verified at T = 1..4096). A decode step's 24 reads land in ~131 µs (median) against a
-  ~175–400 µs window before the layer‑1 consumer; a prompt's first chunk waits ~40 ms for its rows, later chunks are warm through
-  the host‑side lookahead (the prompt's hashes = vLLM's kernel). Needs `docker/sm120/seccomp-io_uring.json` and the worktree mounted
-  (the launcher adds both); code under `tools/dsv41_5090/engram_v2/`.
+  ~176 µs (p10 174, p90 421) window before the layer‑1 consumer; a prompt's first chunk waits ~20–70 ms for its rows, later chunks are warm
+  through the host‑side lookahead (the prompt's hashes = vLLM's kernel). The fetcher runs on the CPU tier's dispatcher thread (a poll hook).
+  **Measured on the full model (11-04): 271 GB used (457 before), decode 144.5 / 124.9 tok/s, a 5‑min mixed‑prompt soak at 84.6 tok/s against
+  the record's 84.4, TTFT 0.92 / 3.83 / 6.57 s (0.78 / 3.31 / 6.52 before).** Needs `docker/sm120/seccomp-io_uring.json` and the worktree
+  mounted (the launcher adds both); code under `tools/dsv41_5090/engram_v2/`.
 - **`STORE_NVME=1 STORE_DRAM_RECORDS=N` — the store tail (256 GB hosts at N ≈ 230, 128 GB at N ≈ 110).** Only N records per layer per
   rank stay pinned (an LRU the CPU tier's dispatcher keeps); a cold record is read from the store file on a miss (one 4.7 MB read,
   ~0.3–0.5 ms) into a spare slot while the request's resident experts compute — the same kernel on the same bytes. Promotions and
-  the prefill streaming read their cold records the same way (the prefill becomes NVMe‑bound: ~2.4× slower at N = 230, ~4.3× at
-  110 on the traces; decode ~−6 … −12 % at 230, −27 … −70 % at 110).
+  the prefill streaming read their cold records the same way (the prefill becomes NVMe‑bound). **Measured on the full model (11-04): N = 230 →
+  194 GB used, decode 130.5 / 108.0 tok/s (−10 / −14 %), TTFT 1.68 / 6.86 / 12.13 s (2.1–2.2× slower); N = 110 → 106 GB used, 111.0 / 81.5
+  tok/s (−24 / −35 %), TTFT 2.83 / 11.07 s (3.3–3.6×); the within‑boot identity check passes at N = 110 with Engram v2 (19,080 compact calls
+  per rank, 0 mismatches).**
 
 Measurements, the RAM budget per host size and the commands: `internal/dsv41-5090-cpu/handoff/engram-v2-2026-11-04.md` and
 `/root/work/HANDOFF-moet-hybrid-engram-v2.md`.
