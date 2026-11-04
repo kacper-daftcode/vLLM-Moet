@@ -9,15 +9,20 @@ W4A8MaterializedPhase2Kernel (FC2 -> route rows in workspace.route_output). With
 (default 0: off) and a supported call (w4a8_mx, silu with a SwiGLU limit, alpha 1 / beta 0, n64-repacked planes, no
 inline CSF / NVFP4 scales, deterministic_output, int32 ids, intermediate 576, hidden a multiple of 128, <= 512 experts),
 `_moet_prefill_fast_launch` runs our kernels instead - front-end (rows quant + deterministic routing + work lists), FC1,
-FC2 - writing the same token-major route rows into workspace.route_output, and returns before b12x's launch. Everything
-after it is unchanged: `_launch_dynamic_topk_sum` (b12x's W4A16TopKSumKernel, or step 33's fused shared-expert add) still
-reduces the route rows into the output. So the switch bypasses the dynamic front-end, Phase1 and Phase2 (the 1.3 + 0.05
-+ 0.8 ms of the layer-chunk), not the TopKSum (0.16 ms, at the DRAM floor). The route rows are bit-identical with
-b12x's (test_b12x_moe_prefill_fast_sm120.py: synthetic T set + the served dumps, vs b12x and vs spec B).
+FC2 - writing the same token-major route rows into workspace.route_output, and returns before b12x's launch. The top-k
+sum: by default (v2 of this patch, 4.11; VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM=1) the kernels also write the output (the
+sum is fused into FC2's epilogue - v8 kernels - or done by their own topk_sum kernel with older ones; the same chain as
+b12x's W4A16TopKSumKernel: fp32 adds in slot order, one bf16 rounding) and the caller's `_launch_dynamic_topk_sum` returns
+at once for that route_output (a module-level marker set by the hook); the shared-expert add that follows in vLLM's
+runner is unchanged. With VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM=0 the route rows are the interface as in v1 of the patch:
+b12x's TopKSum (0.16 ms, at the DRAM floor) reduces them. So the switch bypasses the dynamic front-end, Phase1, Phase2
+and the TopKSum of the layer-chunk. Route rows and output are bit-identical with b12x's
+(test_b12x_moe_prefill_fast_sm120.py: synthetic T set + the served dumps, vs b12x and vs spec B).
 Extension: VLLM_MOET_B12X_MOE_PREFILL_FAST_DIR (default /opt/vllm-moet/dsv41_sm120/b12x_moe_prefill_fast; JIT on first
 use, ~60 s, or prebuilt in the image). Anything unsupported or an import failure -> b12x's own launch, silently.
 
-Usage: python3 patch_vllm_b12x_moe_prefill_fast_sm120.py [--root FLASHINFER_DIR] [--check]   (idempotent)
+Usage: python3 patch_vllm_b12x_moe_prefill_fast_sm120.py [--root FLASHINFER_DIR] [--check]   (idempotent; a file carrying
+v1 of the patch - the r23 image - is upgraded in place: the v1 hook is removed and v2 applied)
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from pathlib import Path
 DEFAULT_ROOT = Path("/usr/local/lib/python3.12/dist-packages/flashinfer")
 REL = "experimental/b12x/moe/fused_moe/_impl.py"
 MARKER = "[vllm-moet] sm_120 fast prefill MoE"
+MARKER_V2 = "[vllm-moet] sm_120 fast prefill MoE v2 (fused top-k sum)"
+SUM_ANCHOR = ") -> None:\n    if route_output.numel() < m * num_topk * k:\n"  # the body start of _launch_dynamic_topk_sum
 
 DEF_ANCHOR = "def _launch_dynamic(\n    *,\n    workspace: TPDynamicWorkspace,\n"
 BODY_ANCHOR = ") -> None:\n    del stream\n    if dynamic_route_mode not in {\"direct\", \"grouped\"}:\n"
@@ -36,8 +43,21 @@ BODY_ANCHOR = ") -> None:\n    del stream\n    if dynamic_route_mode not in {\"d
 HELPERS = '''# {marker} (tools/dsv41_sm120/patch_vllm_b12x_moe_prefill_fast_sm120.py): FC1 + SwiGLU + MXFP8 quant and FC2 of
 # the deterministic dynamic path as pipelined CUDA kernels (tools/dsv41_sm120/b12x_moe_prefill_fast), bit for bit with
 # the b12x kernels; the route rows land in workspace.route_output and b12x's TopKSum runs on them unchanged.
-# VLLM_MOET_B12X_MOE_PREFILL_FAST=1 enables it; decided once per process.
+# VLLM_MOET_B12X_MOE_PREFILL_FAST=1 enables it; decided once per process. {marker_v2}: with
+# VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM=1 (default) the kernels also write the top-k sum into the output and
+# _launch_dynamic_topk_sum skips that route_output (_MOET_PREFILL_FAST_SUM_DONE).
 _MOET_PREFILL_FAST = None
+_MOET_PREFILL_FAST_SUM = None
+_MOET_PREFILL_FAST_SUM_DONE = None
+
+
+def _moet_prefill_fast_sum_enabled():
+    global _MOET_PREFILL_FAST_SUM
+    if _MOET_PREFILL_FAST_SUM is None:
+        import os
+
+        _MOET_PREFILL_FAST_SUM = os.environ.get("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM", "1") == "1"
+    return _MOET_PREFILL_FAST_SUM
 
 
 def _moet_prefill_fast_module():
@@ -80,6 +100,7 @@ def _moet_prefill_fast_launch(
     a,
     flat_ids,
     flat_weights,
+    scatter_output,
     E,
     m,
     k,
@@ -136,6 +157,14 @@ def _moet_prefill_fast_launch(
         down_alpha=weights.w2_alpha,
         global_scale=workspace.down_input_scale,
     )
+    global _MOET_PREFILL_FAST_SUM_DONE
+    fused = (
+        _moet_prefill_fast_sum_enabled()
+        and scatter_output is not None
+        and scatter_output.dtype == torch.bfloat16
+        and scatter_output.is_contiguous()
+        and tuple(scatter_output.shape) == (m, k)
+    )
     module.moe_prefill_fast(
         a,
         flat_ids.view(m, num_topk),
@@ -144,8 +173,10 @@ def _moet_prefill_fast_launch(
         float(swiglu_limit),
         n,
         route_out=workspace.route_output,
-        topk_sum=False,
+        out=scatter_output if fused else None,
+        topk_sum=fused,
     )
+    _MOET_PREFILL_FAST_SUM_DONE = workspace.route_output.data_ptr() if fused else None
     return True
 
 
@@ -159,6 +190,7 @@ BODY = (
     "        a=a,\n"
     "        flat_ids=flat_ids,\n"
     "        flat_weights=flat_weights,\n"
+    "        scatter_output=scatter_output,\n"
     "        E=E,\n"
     "        m=m,\n"
     "        k=k,\n"
@@ -182,15 +214,40 @@ BODY = (
 )
 
 
+SUM_BODY = (
+    SUM_ANCHOR[: len(") -> None:\n")]
+    + f"    global _MOET_PREFILL_FAST_SUM_DONE  # {MARKER_V2}: the fast kernels wrote the output of this call\n"
+    "    if _MOET_PREFILL_FAST_SUM_DONE is not None and _MOET_PREFILL_FAST_SUM_DONE == route_output.data_ptr():\n"
+    "        _MOET_PREFILL_FAST_SUM_DONE = None\n"
+    "        return\n"
+    + SUM_ANCHOR[len(") -> None:\n"):]
+)
+
+
+def unpatch_v1(src: str) -> str:
+    """Remove v1 of the hook (the r23 image's _impl.py) so that v2 applies to the pristine anchors."""
+    start = src.index(f"# {MARKER} (tools/dsv41_sm120/patch_vllm_b12x_moe_prefill_fast_sm120.py)")
+    end = src.index(DEF_ANCHOR)
+    if not (0 <= start < end):
+        raise SystemExit("_impl.py: v1 hook helpers not where expected")
+    src = src[:start] + src[end:]
+    b0 = src.index(f"    if _moet_prefill_fast_launch(  # {MARKER}\n")
+    b1 = src.index("    ):\n        return\n", b0) + len("    ):\n        return\n")
+    return src[:b0] + src[b1:]
+
+
 def patch(src: str) -> str:
-    if MARKER in src:
+    if MARKER_V2 in src:
         return src
-    for what, anchor in (("definition", DEF_ANCHOR), ("body", BODY_ANCHOR)):
+    if MARKER in src:
+        src = unpatch_v1(src)
+    for what, anchor in (("definition", DEF_ANCHOR), ("body", BODY_ANCHOR), ("top-k sum body", SUM_ANCHOR)):
         n = src.count(anchor)
         if n != 1:
-            raise SystemExit(f"_impl.py: the _launch_dynamic {what} anchor found {n} times (expected 1) - b12x changed")
-    src = src.replace(DEF_ANCHOR, HELPERS.format(marker=MARKER) + DEF_ANCHOR, 1)
-    return src.replace(BODY_ANCHOR, BODY, 1)
+            raise SystemExit(f"_impl.py: the {what} anchor found {n} times (expected 1) - b12x changed")
+    src = src.replace(DEF_ANCHOR, HELPERS.format(marker=MARKER, marker_v2=MARKER_V2) + DEF_ANCHOR, 1)
+    src = src.replace(BODY_ANCHOR, BODY, 1)
+    return src.replace(SUM_ANCHOR, SUM_BODY, 1)
 
 
 def main() -> int:
@@ -200,8 +257,8 @@ def main() -> int:
     a = ap.parse_args()
     path = a.root / REL
     src = path.read_text()
-    if MARKER in src:
-        print(f"{path}: already patched")
+    if MARKER_V2 in src:
+        print(f"{path}: already patched (v2)")
         return 0
     out = patch(src)
     compile(out, str(path), "exec")
@@ -209,7 +266,7 @@ def main() -> int:
         print(f"{path}: patch applies cleanly (not written)")
         return 0
     path.write_text(out)
-    print(f"{path}: patched ({MARKER})")
+    print(f"{path}: patched ({MARKER_V2})")
     return 0
 
 
