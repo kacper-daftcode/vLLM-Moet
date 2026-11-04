@@ -11,6 +11,8 @@
 #          GPU_MEM_UTIL (0.3; the 384-expert mini-real needs ~0.85); R=placement uses the model dir's placement.json
 #          EXTRA_DOCKER_ENV ("-e K=V ...") extra container environment, e.g. -e VLLM_MOET_CPU_TIER_STORE_EARLY=1
 #          NO_LOCK (0) 1 = do not take the GPU's flock (the caller holds it)
+#          STORE_ROOT (unset = STORE) a second mount for a store of symlinks into another store (the mini-real stores point
+#          into the full store: STORE_ROOT=<packs root>; without it the records fail to load, rc=-2)
 #          REPO (this checkout) the worktree mounted at /repo (patcher + runtime); NAME (moet-mini-hyb) the
 #          container; CACHE_DIR ($PWD/cache-ds41) the JIT caches; IMAGE (…-r23); PY (python3); CPU_TIER_TABLES (required:
 #          the kernel tables); TP (the GPU count) - e.g. TP=1 on the full-expert
@@ -62,8 +64,11 @@ for R in $RS; do
       /repo/tools/dsv41_5090/cpu_tier/serve_mini_hybrid.sh /model $PORT --no-enable-prefix-caching --max-cudagraph-capture-size 8 $EXTRA \
       > /tmp/moet-mini${TAG}-r$R.log 2>&1 ) &
   BG=$!
+  # the second client only after a successful first one (pipefail: a client that gave up must not leave the next one waiting)
+  set -o pipefail
   $PY $CLIENT --port $PORT --container $NAME --out /tmp/moet-mini${TAG}-run-r${R}a.json | tail -1 && \
   $PY $CLIENT --port $PORT --container $NAME --out /tmp/moet-mini${TAG}-run-r${R}b.json | tail -1
+  set +o pipefail
   grep "moet-cpu-tier\] rank 0: step" /tmp/moet-mini${TAG}-r$R.log | tail -2
   # the serve may still be queued on the flock (the client gave up): kill the waiter, not a running container's flock
   docker ps -q -f name="^$NAME$" | grep -q . || { pkill -P $BG 2>/dev/null; kill $BG 2>/dev/null; }
