@@ -8,7 +8,7 @@ behind a runtime switch.
 | line | what | status | doc |
 |---|---|---|---|
 | **DeepSeek-V4.1-Flash on 4× RTX PRO 6000** | the official checkpoint on vLLM nightly: the sm_120 gaps closed, the decode step and the prefill rebuilt around small tensor-core kernels | **active, in production** | [docs/dsv41-sm120.md](docs/dsv41-sm120.md) |
-| **DeepSeek-V4.1-Flash on 4× RTX 5090 (MoET hybrid)** | 110 of the 384 experts per layer resident on the cards, every other routed expert computed on the CPU from the checkpoint's own bytes, bit-identical to the all-resident path; ~148 / ~129 tok/s single stream | serving on one reference box | [docs/moet-hybrid.md](docs/moet-hybrid.md) |
+| **DeepSeek-V4.1-Flash on 4× RTX 5090 (MoET hybrid)** | 110 of the 384 experts per layer resident on the cards, every other routed expert computed on the CPU from the checkpoint's own bytes, bit-identical to the all-resident path; 145 / 125 tok/s on one stream, 4.6K tok/s prefill, 512K context, 512 GB of host RAM | serving on one reference box | [docs/moet-hybrid.md](docs/moet-hybrid.md), [the measurements and the field](docs/benchmarks/moet-hybrid-4x5090-2026-11-04.md) |
 | **2-bit experts on vLLM v0.24.0** | GLM-5.2 (753B), DeepSeek-V4-Flash (159B) and Kimi-K2.7-Code (1T) on one to four cards that cannot hold their checkpoints: a 2-bit codebook on hand-written SASS, an FP4 delta cache | frozen (builds, fixes accepted, no development) | [docs/v024-2bit.md](docs/v024-2bit.md) |
 | **Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000** | the official nightly with the PLE table on the GPUs, the skinny GEMM and an FP8 MoE GEMV | as built | [docs/qwen38-sm120.md](docs/qwen38-sm120.md) |
 
@@ -24,6 +24,18 @@ DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nig
 | fresh prefill | 163K tokens in 7.2 s (22.7K tok/s), 19K in 0.86 s; BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
 | KV cache | 9.62M tokens on the GPUs (18× concurrency at 512K) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
 | quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; identical requests return identical logits at any batch size and prompt length | the same checkpoint's quality |
+
+DeepSeek-V4.1-Flash, 4× RTX 5090 at 400 W + 512 GB DDR5, the MoET hybrid (TP4, 512K context, thinking, tool calling;
+110 of the 384 experts per layer on the cards, the rest computed on the CPU, bit-identical to the all-resident path;
+2026-11-03/04, [the record](docs/benchmarks/moet-hybrid-4x5090-2026-11-04.md)):
+
+| | 4× RTX 5090 + CPU tier | the field, as published by the authors |
+|---|---|---|
+| decode, 1 stream | **145 / 125 tok/s** on short prompts, 84 on mixed prompts over 30 min, 70–87 behind 2K–512K of context; **94 tok/s on Fraser Price's BRRR code bench** (2K / 16K / 64K alike) | native 4× RTX PRO 6000 (this line, Fraser's recipe): 700–770 tok/s with a 7-token draft; CPU-expert hybrids (SGLang + KTransformers on 2× 5070 Ti + 2× EPYC / 512 GB; 0xSero's EXL3 tier on 1× 3090 + 503 GiB): 19–50 tok/s; disk-streaming ports on 1× 5090 + 128 GB: 5 (native precision) to 28 (2-bit experts) |
+| decode, several streams | 2 streams 107 tok/s, 4 streams 123 aggregate (10-min soaks); BRRR 155 / 166 at 4 / 8 streams; 60 min × 4 streams 2,197 requests, 0 errors | native 4× PRO 6000: 1,960 at 8 streams |
+| prefill | **4.6–4.7K tok/s from 8K to 512K**; TTFT 1.8 s at 8K, 14 s at 64K, 28 s at 128K, ~113 s at 512K | native: 10–18K tok/s; the CPU-expert hybrids: 0.7–1.5K |
+| context, quality | 524,288 tokens served; needle 3/3 at 64K / 256K / ~512K; **HumanEval 160/164 vs the native 160/164, MATH-500 L5 55/60 vs 55/60** (paired, McNemar p = 1.0) | the native checkpoint's quality; the EXL3 / IQ2 ports quantize the experts |
+| footprint, power | ~29 GB per card; ~457 GiB of host RAM pinned (the experts' store 241 GiB + the Engram tables 189 GiB); 1.16 kW → 13.8 J per token (8.3 at 4 streams) | — |
 
 Measurement records: [docs/benchmarks/](docs/benchmarks/). The hybrid's numbers are in
 [docs/moet-hybrid.md](docs/moet-hybrid.md), the 2-bit line's tables in [docs/v024-2bit.md](docs/v024-2bit.md).

@@ -10,20 +10,24 @@ injected into the GPU's own MoE kernel before the top-k sum. No re-quantization,
 
 ## Measurements
 
-The launcher's defaults, TP4, no DSpark, 512K context.
+The launcher's defaults, TP4, no DSpark, 512K context. The full record of 2026-11-03/04 — the context curve, the 2- and
+4-stream soaks, the energy per token, Fraser Price's BRRR bench and the other published ways to run this model below the
+datacenter — is [`benchmarks/moet-hybrid-4x5090-2026-11-04.md`](benchmarks/moet-hybrid-4x5090-2026-11-04.md).
 
 | | |
 |---|---|
-| decode, single stream, short prompts | **~148 / ~129 tok/s** (prose / code). The step is 7.6 ms, of which ~2.1 ms is the GPU waiting for the CPU tier on the ~10 layers per step that miss (one expert's full CPU latency each, ~130 µs in situ) |
-| decode behind context | 58 / 78 / 82 tok/s behind 128K / 256K / 512K |
+| decode, single stream, short prompts | **145 / 125 tok/s** ('Hello' / 'def fib(n):', greedy; eleven boots of the same configuration span 134–149 / 110–129). The step is 7.5 ms, of which ~2.2 ms is the GPU waiting for the CPU tier on the ~10 layers per step that miss (one expert's full CPU latency each, ~130 µs in situ) |
+| decode on the BRRR script's sampled code generation | **93–94 tok/s on one stream at 2K / 16K / 64K of prompt** (temperature 1.0, to EOS ≤ 2,048 tokens: more distinct experts per step than the greedy short prompts), 135–155 tok/s aggregate at 4 streams, 136–166 at 8 |
+| decode behind context | **83 / 84 / 73 / 70 / 87 / 85 / 82 tok/s behind 2K / 8K / 32K / 64K / 128K / 256K / 512K** — the sparse attention keeps the step independent of the prompt length; the spread is the expert hit rate of the texts |
 | prefill (streamed experts, 4096-token chunks) | **2.4–2.7K tok/s at 2K, 4.4K at 14K, 4.7–4.8K at 30K**, 4.3–4.6K cold at 512K — PCIe-bound: 0.09–0.10 ms per missing expert per rank (~50 GB/s per link); the missing set of a chunk grows sublinearly, so a bigger chunk streams fewer bytes per token |
 | long context | needle-in-a-haystack **32K / 64K / 256K / ~512K: 3/3 each** (depths 0.1 / 0.5 / 0.9; TTFT 8.5 s at 32K, 14.5–15 s at 64K, 54–60 s at 256K, 117–118 s at 512K = 4.3–4.4K tok/s cold); 128K prompts 27–35 s TTFT |
-| concurrency (4 streams, 60-min soak) | **2,197 requests, 0 errors, no leak**; aggregate 114.6 tok/s (~29 per stream) — every stream brings its own expert misses (~136 CPU experts per 4-token step, 22–25 ms of CPU per step), so the hybrid serves one stream fast and several correctly but slowly; `MAX_NUM_SEQS=1` is the serving default. A 30-min single-stream soak of mixed prompts holds 84.4 tok/s flat with the 110-slot pool (87.6 with 120 slots at a 64K context) |
-| quality, paired against the native FP4 reference | **HumanEval 159/164 vs 160/164** (McNemar p = 1.0, 134 identical programs); **MATH-500 level 5: 55/60 vs 55/60** (0 discordant items, 59 identical answers) |
+| concurrency | 10-min soaks of mixed prompts: **2 streams 106.9 tok/s aggregate (53.5 each), 4 streams 123.4 (30.9 each)**, 0 errors; 60 min × 4 streams: **2,197 requests, 0 errors, no leak**, 114.6 aggregate — every stream brings its own expert misses (~136 CPU experts per 4-token step), so the hybrid serves one stream fast and several correctly but slowly; `MAX_NUM_SEQS=1` is the serving default. A 30-min single-stream soak of mixed prompts holds 84.4 tok/s flat with the 110-slot pool (87.6 with 120 slots at a 64K context) |
+| power | 1.16 kW under one stream (socket ~320 W + the four cards ~850 W at the 400 W cap) → **13.8 J per generated token**; 10.2 J at 2 streams, 8.3 J at 4; 366 W idle with the model loaded |
+| quality, paired against the native FP4 reference (same prompts, greedy, thinking off) | **HumanEval 160/164 vs 160/164** (0 discordant, 127 identical programs, McNemar p = 1.0); **MATH-500 level 5: 55/60 vs 55/60** (1 / 1 discordant, 56 identical answers, p = 1.0) — 2026-11-04 on the served defaults; 2026-10-26 on the 120-slot configuration: 159/164 vs 160/164, 55/60 vs 55/60 |
 | identity | bit-exact against the all-resident b12x path within one boot: 21,040 compact calls per rank, 98,220 CPU-computed rows, 0 differ (`DEBUG_COMPACT=1`; re-run PASS at the 110-slot pool); the CPU kernel bit-exact against b12x's GPU kernels on four parity sets (0 of 890,880 `route_output` elements differ) |
 | expert hit rate (pairs resident) | 0.83–0.85 on short prompts, 0.87 on HumanEval, 0.91 on MATH-500 |
 | host RAM while up | ~450 GB (the expert store 65 GB per rank + the Engram tables 2 × 23.6 GiB per rank, pinned), MemAvailable ~45 GB |
-| VRAM | ~30.5 GB per card; KV cache ~1.3 GiB (nvfp4 MLA) |
+| VRAM | ~29.3 GB per card at `GPU_MEM_UTIL` 0.90 with 110 expert slots; KV cache 1.28 GiB (nvfp4 MLA + mxfp4 indexer KV = 1.98 requests of 512K; a sequence's KV cost is sublinear in its length) |
 | boot | ~6 min (weights 160–250 s + 65 GB of records pinned per rank in ~60 s + warm-up) |
 
 ## How it works
