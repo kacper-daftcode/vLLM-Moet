@@ -87,8 +87,15 @@ def main():
     a = ap.parse_args()
     prompt = open(a.prompt_file).read()
     runs = [run_once(a, prompt) for _ in range(a.reps)]
-    med = lambda k: statistics.median(r[k] for r in runs if r[k] is not None)  # noqa: E731
-    pos = [statistics.median(r["per_position"][i] for r in runs) for i in range(len(runs[0]["per_position"]))]
+    # Without speculative decoding (no drafts) the acceptance fields are None: one token per step, no per-position row.
+    def med(k):
+        vals = [r[k] for r in runs if r[k] is not None]
+        return statistics.median(vals) if vals else float("nan")
+    pos = [statistics.median(r["per_position"][i] for r in runs if r["per_position"][i] is not None)
+           for i in range(len(runs[0]["per_position"]))] if runs[0]["per_position"] and runs[0]["per_position"][0] is not None else []
+    for r in runs:
+        if r["steps_s"] is None and r["tok_s"]:
+            r["steps_s"] = r["tok_s"]
     print(f"{a.label:<28} tok/s {med('tok_s'):6.1f} | accepted length {med('mean_accepted_length'):.2f} | "
           f"steps/s {med('steps_s'):5.1f} | reasoning {100 * med('reasoning_share'):3.0f}% of "
           f"{med('completion_tokens'):.0f} tok | per position " + " ".join(f"{p:.2f}" for p in pos), flush=True)
