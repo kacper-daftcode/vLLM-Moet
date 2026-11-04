@@ -12,6 +12,8 @@ set -u
 # bash reads a script lazily: an edit of this file while a window runs kills the window mid-measurement (10-26 08:3x,
 # 10-28 19:12 - both ours). The window therefore runs from a private copy; the source may change under it.
 if [[ -z "${TP4_WINDOW_COPY:-}" ]]; then
+  # the checkout is resolved from the ORIGINAL location before the copy (the copy lives in /tmp) and travels in the environment
+  export REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
   _copy="/tmp/tp4_window.$$.sh"
   cp "${BASH_SOURCE[0]}" "$_copy" || exit 1
   TP4_WINDOW_COPY="$_copy" exec bash "$_copy" "$@"
@@ -19,7 +21,7 @@ fi
 TAG="${1:?tag}"
 shift
 for kv in "$@"; do export "$kv"; done
-REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+REPO="${REPO:?REPO (the vLLM-Moet checkout) is required when running from a copy}"
 PY="${PY:-python3}"
 NAME="${NAME:-ds41-hyb}"
 PORT="${PORT:-8041}"
