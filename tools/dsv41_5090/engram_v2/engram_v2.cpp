@@ -433,7 +433,7 @@ static void prefetch_step(Fetcher& F) {
         E.layer = layer; E.id = id; E.job = -1;
         F.pending[key_of(layer, id)] = e;
         if (!issue_entry(F, e)) { F.pending.erase(key_of(layer, id)); F.free_entries.push_back(e); break; }
-        F.stats.prefetch_reads.fetch_add(2);
+        F.stats.prefetch_reads.fetch_add(L.scales_res ? 1 : 2);
         issued = true;
     }
     if (issued) {

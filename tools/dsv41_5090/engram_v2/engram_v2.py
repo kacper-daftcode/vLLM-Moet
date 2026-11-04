@@ -330,7 +330,13 @@ class Lookahead:
     """The prefill lookahead: when a request is scheduled, its prompt's rows for the chunks after the current one are
     queued for background reads into the row cache (this rank's hash columns, both Engram layers), up to `chunks`
     chunks ahead; the queue is cleared when the prompt is through. The hashing runs in a helper thread so the step
-    hook never waits for it."""
+    hook never waits for it.
+
+    The hash tables (HostHash: the tokenizer and the compressed token map) are built here, at creation = model load,
+    not lazily at the first long prompt: that construction is ~0.8 s of GIL-holding Python (the tokenizer, a loop over
+    the vocabulary) and, run in the helper thread while the first long prompt's prefill was launching kernels, it cost
+    that prompt ~0.45 s of TTFT (the 14K prompt of the 11-04 windows: 3.76-3.83 s against 3.30 s with the pinned
+    tables; the 30K prompt that followed it had no excess)."""
 
     def __init__(self, eng: EngramV2, tables: list, model_dir: str, chunk_tokens: int, chunks: int):
         self.eng, self.tables, self.chunk, self.ahead = eng, tables, chunk_tokens, chunks
@@ -339,6 +345,7 @@ class Lookahead:
         self.reqs: dict[str, dict] = {}    # req_id -> dict(prompt=np.ndarray, queued_to=int)
         self.stats = dict(requests=0, rows_queued=0, hash_s=0.0, skipped=0)
         self.lock = threading.Lock()
+        self._ensure_hash()                # eager: at model load, never under a running prefill
         self._jobs: list = []
         self._cv = threading.Condition(self.lock)
         self._thread = threading.Thread(target=self._worker, name="engram-v2-lookahead", daemon=True)
