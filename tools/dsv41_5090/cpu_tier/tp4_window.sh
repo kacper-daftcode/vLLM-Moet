@@ -165,8 +165,12 @@ note "ready after $(( $(date +%s) - t0 )) s"
 SNAP1=$(memsnap)
 note "memory management during the boot: $(memdelta "$SNAP0" "$SNAP1")"
 if [[ "${PIN_ENGINE:-1}" == "1" ]]; then
-  # the engine core and the API server off the kernel pools' cores (the workers pin their own threads)
-  for p in $(pgrep -f "VLLM::EngineCore" ; docker inspect --format '{{.State.Pid}}' "$NAME"); do
+  # the engine core and the API server off the kernel pools' cores (the workers pin their own threads). TP1: vLLM runs the
+  # model in the EngineCore process itself (uniproc executor) - its threads are the tier's pools and dispatchers, pinned by
+  # the runtime; only the API server is moved
+  engine_pids=$(pgrep -f "VLLM::EngineCore")
+  [[ "$TP" == "1" ]] && engine_pids=""
+  for p in $engine_pids $(docker inspect --format '{{.State.Pid}}' "$NAME"); do
     taskset -a -cp "${ENGINE_CPUS:-32,33,40,41,48,49,56,57}" "$p" > /dev/null 2>&1 && note "pinned pid $p ($(cat /proc/$p/comm 2>/dev/null)) to ${ENGINE_CPUS:-32,33,40,41,48,49,56,57}"
   done
 fi
