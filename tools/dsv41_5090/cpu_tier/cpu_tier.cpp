@@ -26,6 +26,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -162,30 +163,39 @@ static void lru_push_tail(Tier& T, Layer& L, int s) {   // most recently served
 // slot s (a spare slot now holding expert e's record) becomes resident in layer l; the layer's least recently served
 // unpinned record is evicted when the layer is at capacity (its slot returns to the spares). A record that became
 // resident meanwhile (a concurrent fetch) keeps the first copy: s returns to the spares.
+// evict the layer's least recently served unpinned records while it holds more than N (their slots return to the
+// spares). Pinned slots (a request being computed, a promotion's copy, a prefill round) are skipped, so a layer may hold
+// more than N for as long as the pins last; the callers that drop pins trim again.
+static void lru_trim(Tier& T, Layer& L) {
+    Tail& X = T.tail;
+    while (L.n_resident > X.per_layer) {
+        int victim = -1;
+        for (int v = L.lru_head; v >= 0; v = X.slots[v].next)
+            if (X.slots[v].pins == 0) { victim = v; break; }
+        if (victim < 0) return;
+        Slot& V = X.slots[victim];
+        lru_unlink(T, L, victim);
+        L.slot_of[V.expert] = -1;
+        L.records[V.expert] = nullptr;
+        V.expert = -1; V.layer = -1;
+        --L.n_resident;
+        X.evictions.fetch_add(1, std::memory_order_relaxed);
+        X.free_slots.push_back(victim);
+    }
+}
+
 static void lru_insert(Tier& T, int l, int e, int s) {
     Layer& L = T.layers[l];
     Tail& X = T.tail;
     if (L.slot_of[e] >= 0) { X.free_slots.push_back(s); return; }
     Slot& S = X.slots[s];
-    S.expert = e; S.layer = l; S.pins = 0;
+    S.expert = e; S.layer = l; S.pins = 1;   // pinned by the inserter until it is done with the record (it unpins)
     L.slot_of[e] = s;
     L.records[e] = X.arena + (int64_t)s * REC;
     lru_push_tail(T, L, s);
     ++L.n_resident;
-    if (L.n_resident > X.per_layer) {
-        for (int v = L.lru_head; v >= 0; v = X.slots[v].next) {
-            if (v == s || X.slots[v].pins) continue;
-            Slot& V = X.slots[v];
-            lru_unlink(T, L, v);
-            L.slot_of[V.expert] = -1;
-            L.records[V.expert] = nullptr;
-            V.expert = -1; V.layer = -1;
-            --L.n_resident;
-            X.evictions.fetch_add(1, std::memory_order_relaxed);
-            X.free_slots.push_back(v);
-            break;
-        }
-    }
+    lru_trim(T, L);
+    S.pins = 0;
 }
 
 // the subset {idx} of the grouped request arrays -> one kernel call
@@ -280,6 +290,9 @@ static void serve(Tier& T, int layer, uint32_t step) {
             const int64_t t_issue = now_ns();
             int slot_of_cold[CPU_TIER_MAX_PAIRS];
             int issued = 0, landed = 0;
+            static const bool dbg = getenv("CPU_TIER_TAIL_DEBUG") != nullptr;
+            if (dbg) fprintf(stderr, "[cpu_tier tail] layer %d step %u: %d experts, %d resident, %d cold, free slots %zu, ring space %u in_flight %u\n",
+                             layer, step, n_experts, n_res, n_cold, X.free_slots.size(), X.ring.space(), X.ring.in_flight);
             auto issue_some = [&]() {
                 std::lock_guard<std::mutex> g(X.mu);
                 while (issued < n_cold && !X.free_slots.empty() && X.ring.space() > 0) {
@@ -292,10 +305,18 @@ static void serve(Tier& T, int layer, uint32_t step) {
             };
             issue_some();
             int r = X.ring.submit(0);
+            if (dbg) fprintf(stderr, "[cpu_tier tail]   issued %d, submit -> %d, in_flight %u\n", issued, r, X.ring.in_flight);
             if (r < 0) { status = 5; X.io_errors.fetch_add(1); }
             if (status == 0 && n_res > 0) {
                 if (forward_subset(T, L, req, res_idx, n_res, recs, m_per, off, tok, pw, orow, n_tokens) != 0) status = 4;
                 X.resident_serves.fetch_add(n_res, std::memory_order_relaxed);
+            }
+            {   // the resident records are read: unpin them now (evictable again - a request with more cold experts than
+                // spare slots needs the evictions to make progress)
+                std::lock_guard<std::mutex> g(X.mu);
+                for (int i = 0; i < n_pinned; ++i) if (X.slots[pinned[i]].pins) --X.slots[pinned[i]].pins;
+                n_pinned = 0;
+                lru_trim(T, L);
             }
             int batch[CPU_TIER_MAX_PAIRS];
             while (status == 0 && landed < n_cold) {
@@ -307,6 +328,7 @@ static void serve(Tier& T, int layer, uint32_t step) {
                 while (X.ring.reap(&ud, &res)) {
                     const int c = (int)ud;
                     const int s = slot_of_cold[c];
+                    if (dbg) fprintf(stderr, "[cpu_tier tail]   landed cold #%d (expert %d) res %d slot %d\n", c, eid[cold_idx[c]], res, s);
                     if (res != (int)REC) { status = 5; X.io_errors.fetch_add(1); std::lock_guard<std::mutex> g(X.mu); X.free_slots.push_back(s); continue; }
                     {
                         std::lock_guard<std::mutex> g(X.mu);
@@ -322,6 +344,12 @@ static void serve(Tier& T, int layer, uint32_t step) {
                 if (issued < n_cold) { issue_some(); r = X.ring.submit(0); if (r < 0) { status = 5; break; } }
                 if (nb && status == 0) {
                     if (forward_subset(T, L, req, batch, nb, recs, m_per, off, tok, pw, orow, n_tokens) != 0) status = 4;
+                }
+                if (n_pinned) {   // the landed records are computed: unpin, trim
+                    std::lock_guard<std::mutex> g(X.mu);
+                    for (int i = 0; i < n_pinned; ++i) if (X.slots[pinned[i]].pins) --X.slots[pinned[i]].pins;
+                    n_pinned = 0;
+                    lru_trim(T, L);
                 }
             }
             if (status != 0) {
@@ -343,6 +371,7 @@ static void serve(Tier& T, int layer, uint32_t step) {
         if (X.on && n_pinned) {
             std::lock_guard<std::mutex> g(X.mu);
             for (int i = 0; i < n_pinned; ++i) if (X.slots[pinned[i]].pins) --X.slots[pinned[i]].pins;
+            lru_trim(T, L);
         }
         if (status == 0 || status == 4 || status == 5) {
             // the miss log (per distinct expert), for the placement manager
@@ -559,6 +588,7 @@ void cpu_tier_record_release(void* tier, int layer, int expert) {
     std::lock_guard<std::mutex> g(X.mu);
     const int s = T->layers[layer].slot_of[expert];
     if (s >= 0 && X.slots[s].pins) --X.slots[s].pins;
+    lru_trim(*T, T->layers[layer]);
 }
 
 // the prefill streaming's host pointers for `n` experts of `layer`: resident records pinned in place (released by
@@ -624,6 +654,7 @@ void cpu_tier_prefill_release(void* tier, int layer, const int32_t* experts, int
         const int s = L.slot_of[e];
         if (s >= 0 && X.slots[s].pins) --X.slots[s].pins;
     }
+    lru_trim(*T, L);
 }
 
 // is the record of (layer, expert) in DRAM right now (1), cold (0) or absent (-1)
