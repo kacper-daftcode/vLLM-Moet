@@ -185,6 +185,36 @@ def test_synthetic(scratch: str, cpu: int) -> None:
     # 9. the row helper agrees with the file
     for r in (0, 1, 777, n_rows - 1):
         assert np.array_equal(F.read_row_direct(1, r), np.concatenate([v1[r], s1[r]]))
+    # 10. the polled mode (production: the CPU tier's dispatcher calls engram_v2_poll from its loop): the thread stops,
+    # this thread polls; requests on both layers, rows checked, the prefetch queue drained by the polls too
+    F.stop()
+    F.start_polled()
+    poll = F.lib.engram_v2_poll
+    for it in range(50):
+        a = rng.integers(1000, 19000, size=12).astype(np.int32)
+        b = rng.integers(0, n_rows, size=12).astype(np.int32)
+        sa = M[0].publish(a)
+        sb = M[1].publish(b)
+        t0 = time.perf_counter()
+        while M[0].ack_step.value != sa or M[1].ack_step.value != sb:
+            poll(F.handle)
+            assert time.perf_counter() - t0 < 10, "polled mode: no ack"
+        assert np.array_equal(M[0].rows(12), expect_rows(v0, s0, a, 1000, 19000)), f"polled {it} layer 0"
+        assert np.array_equal(M[1].rows(12), expect_rows(v1, s1, b, 0, n_rows)), f"polled {it} layer 1"
+    ids = rng.integers(0, n_rows, size=64).astype(np.int32)
+    F.stats(reset=True)
+    F.prefetch(1, np.unique(ids))
+    t0 = time.perf_counter()
+    while True:
+        st = F.stats()
+        if st["prefetch_rows"] + st["prefetch_hits"] >= len(np.unique(ids)) or time.perf_counter() - t0 > 10:
+            break
+        poll(F.handle)
+    seq = M[1].publish(ids)
+    while M[1].ack_step.value != seq:
+        poll(F.handle)
+    assert M[1].ack_misses.value == 0, f"polled prefetch: {M[1].ack_misses.value} misses"
+    print("  polled mode: 50 request pairs served by the caller's polls, rows equal; prefetch drained by polls")
     F.close()
     print("  synthetic: PASS")
 

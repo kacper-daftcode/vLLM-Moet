@@ -58,6 +58,10 @@ def host_lib(path: str | None = None):
     lib.engram_v2_start.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
     lib.engram_v2_stop.restype = ctypes.c_int
     lib.engram_v2_stop.argtypes = [ctypes.c_void_p]
+    lib.engram_v2_start_polled.restype = ctypes.c_int
+    lib.engram_v2_start_polled.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    lib.engram_v2_poll.restype = None
+    lib.engram_v2_poll.argtypes = [ctypes.c_void_p]
     lib.engram_v2_destroy.argtypes = [ctypes.c_void_p]
     lib.engram_v2_request_bytes.restype = ctypes.c_int64
     lib.engram_v2_request_bytes.argtypes = [ctypes.c_int]
@@ -118,6 +122,13 @@ class HostFetcher:
         if self.started:
             self.lib.engram_v2_stop(self.handle)
             self.started = False
+
+    def start_polled(self) -> None:
+        """The polled mode (no thread): the owner calls lib.engram_v2_poll(handle) from its own loop - the CPU tier's
+        dispatcher through CpuTier.set_poll_hook. Call after stop() when switching from the thread mode."""
+        rc = self.lib.engram_v2_start_polled(self.handle, 0)
+        assert rc == 0, f"engram_v2_start_polled rc {rc}"
+        self.started = True
 
     def close(self) -> None:
         self.stop()
@@ -211,6 +222,23 @@ class EngramV2:
     def start(self) -> None:
         self.fetcher.start(first_seq=1)
 
+    def attach_dispatcher(self, tier) -> None:
+        """Hand the fetcher to the CPU tier's dispatcher thread (cpu_tier.CpuTier): its own thread stops, the dispatcher
+        polls the mailboxes / completions from its dedicated core."""
+        self.fetcher.stop()
+        self.fetcher.start_polled()
+        tier.set_poll_hook(self.lib.engram_v2_poll, self.fetcher.handle)
+        self.attached = tier
+
+    def detach_dispatcher(self) -> None:
+        tier = getattr(self, "attached", None)
+        if tier is not None:
+            try:
+                tier.set_poll_hook(None, None)
+            except Exception:
+                pass
+            self.attached = None
+
     def error(self) -> int:
         return int(self._err_view[0])
 
@@ -233,6 +261,7 @@ class EngramV2:
         self.fetcher.prefetch_clear()
 
     def close(self) -> None:
+        self.detach_dispatcher()
         self.fetcher.close()
         for p in self._mapped:
             self.ext.free_mapped(p)

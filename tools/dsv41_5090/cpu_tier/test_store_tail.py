@@ -276,9 +276,67 @@ def main() -> int:
             f.write(records[rec_of[2][E - 1]].tobytes())
     else:
         print("4. (skipped: expert E-1 of layer 2 is resident)")
+    # 5. the dispatcher's poll hook with the Engram v2 fetcher in its polled mode (the production wiring): a synthetic
+    # Engram table, the fetcher's mailboxes in plain memory, its requests served from the tier's dispatcher thread while
+    # tier requests run too
+    ok5 = True
+    try:
+        sys.path.insert(0, os.path.join(_HERE, "..", "engram_v2"))
+        from engram_v2 import HostFetcher, ROW_BYTES as EROW
+        n_er = 5000
+        epath = os.path.join(args.scratch, "engram_table.bin")
+        erng = np.random.default_rng(3)
+        evals = erng.integers(0, 256, size=(n_er, 256), dtype=np.uint8)
+        escal = erng.integers(100, 140, size=(n_er, 8), dtype=np.uint8)
+        buf = np.zeros(664 + n_er * 256 + 8 + n_er * 8 + 4096, dtype=np.uint8)
+        buf[664:664 + n_er * 256] = evals.reshape(-1)
+        buf[664 + n_er * 256 + 8: 664 + n_er * 256 + 8 + n_er * 8] = escal.reshape(-1)
+        buf.tofile(epath)
+        EF = HostFetcher([dict(path=epath, values_off=664, scales_off=664 + n_er * 256 + 8, n_rows=n_er, vocab_start=0, vocab_end=n_er, max_rows=256)],
+                         cache_bytes=4 << 20, fetch_cpu=-1, queue_depth=16, direct=True)
+        ereq = (ctypes.c_uint8 * EF.request_bytes())()
+        eack = (ctypes.c_uint8 * EF.ack_bytes())()
+        est_v = np.zeros((256, 256), dtype=np.uint8)
+        est_s = np.zeros((256, 8), dtype=np.uint8)
+        EF.set_mailbox(0, ctypes.addressof(ereq), ctypes.addressof(eack), est_v.ctypes.data, est_s.ctypes.data)
+        EF.start_polled()
+        assert lib.cpu_tier_set_poll_hook(tier, ctypes.cast(EF.lib.engram_v2_poll, ctypes.c_void_p), EF.handle) == 0
+        e_ids = np.frombuffer(ereq, dtype=np.int32, offset=32, count=256)
+        e_step = ctypes.c_uint32.from_buffer(ereq, 0)
+        e_n = ctypes.c_uint32.from_buffer(ereq, 4)
+        e_ack = ctypes.c_uint32.from_buffer(eack, 0)
+        lat = []
+        for it in range(40):
+            rows_ = erng.integers(0, n_er, size=12).astype(np.int32)
+            e_ids[:12] = rows_
+            e_n.value = 12
+            t0 = time.perf_counter()
+            e_step.value = it + 1
+            # a tier request in the same step (layer 1)
+            R = reqs[1]
+            ids1 = erng.integers(0, E, size=6).astype(np.int32)
+            for i, e in enumerate(ids1):
+                R.pairs[i] = Pair(0, int(e), i, 0, 0.5)
+                R.ids[i] = int(e)
+            R.n_pairs, R.n_tokens, R.n_all = 6, 1, 6
+            seq[1] += 1
+            R.step = seq[1]
+            while e_ack.value != it + 1 or acks[1].step != seq[1]:
+                assert time.perf_counter() - t0 < 30, "poll hook: no ack"
+            lat.append((time.perf_counter() - t0) * 1e6)
+            got = np.concatenate([est_v[:12], est_s[:12]], axis=1)
+            exp_ = np.concatenate([evals[rows_], escal[rows_]], axis=1)
+            ok5 &= np.array_equal(got, exp_) and acks[1].status == 0
+        lib.cpu_tier_set_poll_hook(tier, None, None)
+        EF.close()
+        print(f"5. the dispatcher's poll hook: 40 Engram requests (12 rows) served from the tier's dispatcher thread alongside tier "
+              f"requests, rows equal: {ok5}; both acks median {np.median(lat):.0f} us", flush=True)
+    except Exception as ex:
+        ok5 = False
+        print(f"5. poll hook test failed: {ex!r}", flush=True)
     lib.cpu_tier_stop(tier)
     lib.cpu_tier_destroy(tier)
-    passed = ok1 and ok2 and ok3 and ok4
+    passed = ok1 and ok2 and ok3 and ok4 and ok5
     print("PASS" if passed else "FAIL")
     return 0 if passed else 1
 

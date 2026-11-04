@@ -19,8 +19,10 @@ What the patched engram.py calls:
 Environment:
   VLLM_MOET_ENGRAM_MODE=nvme            on (default ram = inert: vLLM's pinned host tables)
   VLLM_MOET_ENGRAM_CACHE_GIB=2          DRAM row cache per rank (plain memory, split evenly over the Engram layers)
-  VLLM_MOET_ENGRAM_FETCH_CPU=<int>      the fetcher thread's CPU (default 8*rank+33: the SMT sibling of the CPU tier's
-                                        dispatcher core, one of the two cores vLLM's auxiliary threads already use)
+  VLLM_MOET_ENGRAM_POLLED=1             the CPU tier's dispatcher thread polls the fetcher from its dedicated core (default; the
+                                        fetcher's own thread runs only until the tier is created, and alone without the tier)
+  VLLM_MOET_ENGRAM_FETCH_CPU=<int>      the fetcher thread's CPU when it has one (default 8*rank+33: the dispatcher core's SMT
+                                        sibling - shared with the engine core / API server, which cost the 200-us window on 11-04)
   VLLM_MOET_ENGRAM_QD=64                io_uring depth per rank (reads in flight)
   VLLM_MOET_ENGRAM_TIMEOUT_MS=2000      the in-stream wait's bound; on expiry the error word is armed (fail-closed)
   VLLM_MOET_ENGRAM_MODEL_DIR=<dir>      the checkpoint (default: vLLM's model path)
@@ -55,6 +57,9 @@ LOG = os.environ.get("VLLM_MOET_ENGRAM_LOG", "0") == "1"
 LOG_EVERY = int(os.environ.get("VLLM_MOET_ENGRAM_LOG_EVERY", "100"))
 LOOKAHEAD = os.environ.get("VLLM_MOET_ENGRAM_LOOKAHEAD", "1") == "1"
 LOOKAHEAD_CHUNKS = int(os.environ.get("VLLM_MOET_ENGRAM_LOOKAHEAD_CHUNKS", "4"))
+# VLLM_MOET_ENGRAM_POLLED=1 (default): the CPU tier's dispatcher thread polls the fetcher (its dedicated spinning core);
+# 0 = the fetcher keeps its own thread on VLLM_MOET_ENGRAM_FETCH_CPU
+POLLED_BY_TIER = os.environ.get("VLLM_MOET_ENGRAM_POLLED", "1") == "1"
 ROW_VALUES, ROW_SCALES = 256, 8
 # the weight iterator skips the tables (patch_vllm_engram_v2.py patches should_skip_weight to honour this regex)
 SKIP_WEIGHT_RE = r"(^|\.)engram\.embed\.(weight|scale)$"
@@ -215,6 +220,23 @@ def _create(device: torch.device) -> None:
     _log(f"fetcher started: {len(tables)} tables, row cache {CACHE_GIB:.1f} GiB per rank "
          f"({S.eng.cache_rows()} rows), io_uring depth {QD}, {'O_DIRECT' if DIRECT else 'buffered'}, fetch CPU {fetch_cpu}, "
          f"wait timeout {TIMEOUT_MS:.0f} ms, lookahead {'on' if S.lookahead else 'off'}")
+    # the CPU tier's dispatcher polls the fetcher from its dedicated core when the tier exists (else the tier attaches
+    # us when it is created: vllm_moet_cpu_tier._create_tier_if_needed -> attach_dispatcher)
+    if POLLED_BY_TIER:
+        try:
+            import vllm_moet_cpu_tier as _tier
+            if _tier.ENABLED and _tier.S.created and _tier.S.tier is not None:
+                attach_dispatcher(_tier.S.tier)
+        except ImportError:
+            pass
+
+
+def attach_dispatcher(tier) -> None:
+    """Called by the CPU tier (or by _create above): the fetcher's work moves to the tier's dispatcher thread."""
+    if not ENABLED or not S.created or not POLLED_BY_TIER or S.eng is None or getattr(S.eng, "attached", None) is not None:
+        return
+    S.eng.attach_dispatcher(tier)
+    _log("fetcher attached to the CPU tier's dispatcher (polled from its core; the fetcher thread stopped)")
 
 
 # ---------------------------------------------------------------------------------------------------------------

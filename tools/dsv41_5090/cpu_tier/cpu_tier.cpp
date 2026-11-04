@@ -129,6 +129,11 @@ struct Tier {
     Use uses[USE_RING];
     std::atomic<int64_t> use_n{0};
     Tail tail;
+    // a poll hook the dispatcher calls once per loop iteration (the Engram v2 fetcher in its polled mode: its mailboxes
+    // and io_uring completions are served from this thread's dedicated core)
+    std::atomic<void (*)(void*)> poll_fn{nullptr};
+    std::atomic<void*> poll_arg{nullptr};
+    std::atomic<bool> polling{false};
 };
 
 static inline int64_t now_ns() {
@@ -425,6 +430,14 @@ static void dispatcher_main(Tier* T) {
             T->expected_seq[layer] = s;
         }
         if (++layer == T->n_layers) layer = 0;
+        {
+            void (*fn)(void*) = T->poll_fn.load(std::memory_order_acquire);
+            if (fn) {
+                T->polling.store(true, std::memory_order_release);
+                if (T->poll_fn.load(std::memory_order_acquire) == fn) fn(T->poll_arg.load(std::memory_order_relaxed));
+                T->polling.store(false, std::memory_order_release);
+            }
+        }
         _mm_pause();
     }
     T->running.store(false);
@@ -848,6 +861,18 @@ int64_t cpu_tier_store_load(const char* dir, int rank, int n_layers, int n_exper
     for (auto& x : th) x.join();
     if (failed.load()) return -2;
     return (int64_t)jobs.size();
+}
+
+// install (fn != null) or clear (null) the dispatcher's poll hook; the caller stops the previous owner of `arg` first
+int cpu_tier_set_poll_hook(void* tier, void (*fn)(void*), void* arg) {
+    Tier* T = (Tier*)tier;
+    if (!T) return -1;
+    T->poll_fn.store(fn, std::memory_order_release);
+    T->poll_arg.store(arg, std::memory_order_release);
+    if (!fn) {   // a call in progress returns before the caller frees `arg`
+        while (T->polling.load(std::memory_order_acquire)) _mm_pause();
+    }
+    return 0;
 }
 
 int64_t cpu_tier_request_bytes(void) { return (int64_t)sizeof(CpuTierRequest); }

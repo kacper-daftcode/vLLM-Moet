@@ -92,6 +92,8 @@ def host_lib(path: str | None = None):
     lib.cpu_tier_record_state.restype = ctypes.c_int
     lib.cpu_tier_record_state.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     lib.cpu_tier_tail_stats.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int64), ctypes.c_int]
+    lib.cpu_tier_set_poll_hook.restype = ctypes.c_int
+    lib.cpu_tier_set_poll_hook.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     return lib
 
 
@@ -279,6 +281,11 @@ class CpuTier:
     def prefill_release(self, layer: int, experts) -> None:
         ex = np.ascontiguousarray(experts, dtype=np.int32)
         self.lib.cpu_tier_prefill_release(self.handle, layer, ex.ctypes.data, len(ex))
+
+    def set_poll_hook(self, fn, arg) -> None:
+        """fn: a C function pointer `void fn(void*)` (ctypes) the dispatcher calls once per loop iteration; None clears it."""
+        fp = None if fn is None else ctypes.cast(fn, ctypes.c_void_p)
+        assert self.lib.cpu_tier_set_poll_hook(self.handle, fp, arg) == 0
 
     def tail_stats(self, reset: bool = False) -> dict:
         buf = (ctypes.c_int64 * 11)()

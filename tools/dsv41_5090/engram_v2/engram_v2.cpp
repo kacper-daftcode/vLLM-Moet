@@ -436,16 +436,14 @@ static void prefetch_step(Fetcher& F) {
     }
 }
 
-// The fetcher spins (like the CPU tier's dispatcher): a decode step gives it ~200 us between the publish and the
-// layer-1 consumer, so neither the mailbox poll nor the completion reap may sleep. Pinned to `fetch_cpu`.
-static void fetcher_main(Fetcher* Fp) {
-    Fetcher& F = *Fp;
-    pin_to_cpu(F.fetch_cpu);
-    uint32_t iter = 0;
-    while (!F.stop.load(std::memory_order_acquire)) {
-        // the CPU tier's _pin_process re-pins every thread of the worker to its "other" CPUs when the tier starts (after
-        // this thread exists): re-assert the affinity now and then (cheap; ~every 50 ms of spinning)
-        if ((++iter & 0xFFFFF) == 0) pin_to_cpu(F.fetch_cpu);
+// One iteration of the fetcher: the mailboxes (layer priority), the completions, a prefetch batch when idle. Called in
+// a loop by the fetcher's own thread, or - the production mode - by the CPU tier's dispatcher thread through its poll
+// hook (engram_v2_poll): the dispatcher already spins on a dedicated core (8r+1), whereas a thread of our own shares
+// 8r+33 with the engine core / API server and vLLM's auxiliary threads and lost the ~200 us window to preemption on the
+// 11-04 TP4 boot (a quarter of the cold-row requests took 500-1000 us, a few 9 ms). Never blocks except in a big
+// request's issue loop (the ring full: prefill-size requests, when the tier has no requests of its own).
+static void poll_once(Fetcher& F) {
+    {
         bool busy = false;
         for (size_t l = 0; l < F.layers.size(); ++l) {
             Layer& L = F.layers[l];
@@ -471,8 +469,22 @@ static void fetcher_main(Fetcher* Fp) {
             bool any_job = false;
             for (auto& J : F.jobs) any_job |= J.active;
             if (!any_job) prefetch_step(F);
-            _mm_pause();
         }
+    }
+}
+
+// The fetcher's own thread (the standalone mode: tests, the harness, a serve without the CPU tier). Spins like the
+// tier's dispatcher: a decode step gives it ~200 us, so neither the mailbox poll nor the reap may sleep. Pinned to
+// `fetch_cpu`; the tier's _pin_process re-pins every thread of the worker when the tier starts, so the affinity is
+// re-asserted now and then.
+static void fetcher_main(Fetcher* Fp) {
+    Fetcher& F = *Fp;
+    pin_to_cpu(F.fetch_cpu);
+    uint32_t iter = 0;
+    while (!F.stop.load(std::memory_order_acquire)) {
+        if ((++iter & 0xFFFFF) == 0) pin_to_cpu(F.fetch_cpu);
+        poll_once(F);
+        _mm_pause();
     }
     F.running.store(false);
 }
@@ -559,8 +571,29 @@ int engram_v2_stop(void* h) {
     Fetcher* F = (Fetcher*)h;
     if (!F || !F->running.load()) return -1;
     F->stop.store(true);
-    F->thread.join();
+    if (F->thread.joinable()) F->thread.join();
+    F->running.store(false);
     return 0;
+}
+
+// the polled mode: no thread of its own - the owner (the CPU tier's dispatcher, through cpu_tier_set_poll_hook) calls
+// engram_v2_poll() from its loop; one caller at a time. Switching from the thread mode: engram_v2_stop() first (the
+// mailbox state persists: a request pending at the switch is served by the first poll).
+int engram_v2_start_polled(void* h, uint32_t first_seq) {
+    Fetcher* F = (Fetcher*)h;
+    if (!F || F->running.load()) return -1;
+    for (auto& L : F->layers)
+        if (!L.req || !L.ack || !L.st_values || !L.st_scales) return -2;
+    if (first_seq) for (auto& L : F->layers) L.expected = first_seq;
+    F->stop.store(false);
+    F->running.store(true);   // "running" = serving (no thread)
+    return 0;
+}
+
+void engram_v2_poll(void* h) {
+    Fetcher* F = (Fetcher*)h;
+    if (!F || !F->running.load(std::memory_order_relaxed)) return;
+    poll_once(*F);
 }
 
 void engram_v2_destroy(void* h) {

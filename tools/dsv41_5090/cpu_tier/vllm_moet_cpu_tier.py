@@ -492,6 +492,13 @@ def _create_tier_if_needed(device: torch.device):
                                  record_release=(S.tier.record_release if tail else None))
     S.tier.start(first_step=1)
     S.created = True
+    # Engram v2 (VLLM_MOET_ENGRAM_MODE=nvme): its row fetcher moves onto this dispatcher thread (polled from its core)
+    try:
+        import vllm_moet_engram_v2 as _engram_v2
+        if _engram_v2.ENABLED:
+            _engram_v2.attach_dispatcher(S.tier)
+    except ImportError:
+        pass
 
     def _shutdown():
         try:
