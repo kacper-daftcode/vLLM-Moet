@@ -92,7 +92,7 @@ MODEL_DIR=... STORE=... CACHE_DIR=... BAKED=0 docker/sm120/run-dsv41-5090.sh
 ```
 
 `docker/sm120/run-dsv41-5090.sh` boots the measured serving configuration by default; its header lists every knob
-(`PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `PREFILL_OVERLAP`, `POOL_THREADS`, `POOL_SPIN_*`, `GPU_MEM_UTIL`,
+(`TP`, `PLACEMENT`, `SPARE`, `PROMOTE_WINDOW`, `SCRATCH`, `PREFILL_OVERLAP`, `POOL_THREADS`, `POOL_SPIN_*`, `GPU_MEM_UTIL`,
 `MAX_MODEL_LEN`, `SPEC_TOKENS`, `BAKED`, …). The static placement ships in `tools/dsv41_5090/routing/placements/`
 (`routing/placement.py` derives one from routing traces, `routing/collect_routes.py`). The hybrid's own switches arrive
 in the container as `VLLM_MOET_CPU_TIER_*` (documented at the top of `tools/dsv41_5090/cpu_tier/vllm_moet_cpu_tier.py`);
@@ -143,8 +143,19 @@ full model, 11-04); the TP4 code paths are untouched (V = 1). Measured on 32 GB 
 TP2, 16 at TP1): **TP2 on 2× 5090: 45.9 / 47.1 tok/s** on 'Hello' / 'def fib(n):', TTFT 1.9 s at 2K and 7.4 s at 14K; **TP1 on 1× 5090:
 39.8 / 33.5 tok/s**, TTFT 3.8 / 15.2 s (chunk 4096) — the step is the CPU tier (hit rate 0.54 / 0.44 at those slot counts: 3–4 misses
 per layer-step); host RAM is the same ~450 GB (+23 GB at TP1 for the 9-static placement's records). The design, budgets and every
-measurement: `internal/dsv41-5090-cpu/handoff/tp12-virtual-ranks-2026-11-04.md`; the 96 GB cards (2× / 1× RTX PRO 6000: ~215 / ~100
-slots per layer) are the target of this support and were not measured here.
+measurement: the private note `tp12-virtual-ranks-2026-11-04.md` (the hybrid's handoff directory).
+
+Running it: the launcher's `TP=2` / `TP=1` set the 32 GB-card defaults (GPUS 0,1 / 0; `SPARE` 6 / 7 with the 40-static / 9-static
+placement — `routing/placements/tp12-placement-0.026-uniform.json` for TP1 — `MAX_MODEL_LEN` 65536 / 32768, `PROMOTIONS` 4 / 1); `VRANKS=1`
+forces plain ranks; `VRANK_CPUS` / `VRANK_DISPATCHERS` lay the pools out on another CPU geometry (default: TP rank r takes CCDs rV..rV+V−1,
+dispatcher 8g+1 and pool 8g+2..8g+7 per CCD g). `SCRATCH` counts slices (an expert = 4 / TP slots); `DEBUG_COMPACT` needs `SCRATCH ≥ 48 × 4 / TP`.
+`tp4_window.sh` takes `TP` / `GPUS` (the KPI lines of every rank carry their virtual ranks' in-kernel µs). The same image serves every TP
+(`vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-tp12` = this branch's step 43 on the merged `-r23` layers): on it the TP4 path is the
+record's (identity 0 mismatches over 19,080 compact calls per rank, 143–146 / 121–125 tok/s, TTFT 0.93 / 3.33 / 6.73 s at 2K / 14K / 30K)
+and TP2 repeats the numbers above (0 mismatches over 15,160 calls per rank; 44–46 / 47 tok/s; TTFT 1.89 / 7.42 s; the compact-path outputs
+bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
+support and were not measured here: the run book — host requirements, the launcher lines at 96 GB, the window sequence, the expected
+numbers from the routing traces (~105–125 tok/s mixed / ~120–145 short at TP2, ~62–70 / ~80–90 at TP1) — is §13 of that note.
 
 ## Limits and open items
 

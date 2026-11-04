@@ -5,7 +5,7 @@ one CUDA graph per step, against the b12x-exact reference per (pair, slice); fai
 
 In the serving image, one sm_120 GPU under its lock, e.g.
     flock -w 3600 /tmp/exl3diff-gpu1.lock docker run --rm --gpus '"device=1"' --name moet-tier-test \
-      -v /mnt/nvme/cache/ds41/dot-cache:/root/.cache -v /mnt/nvme/vLLM-Moet-tp12:/repo -v <parity dir>:/parity \
+      -v <cache dir>/dot-cache:/root/.cache -v <checkout>:/repo -v <parity dir>:/parity \
       --entrypoint python3 <image> /repo/tools/dsv41_5090/cpu_tier/test_cpu_tier_vranks.py \
       --records /parity/b12x_inputs.npz,/parity/b12x_inputs_l0.npz,/parity/b12x_inputs_l1.npz,/parity/b12x_inputs_l39.npz \
       --tables /parity --layers 4 --steps 200 --cpus "8-13;16-21;24-29;2-7" --dispatcher-cpus 40,48,56,33
