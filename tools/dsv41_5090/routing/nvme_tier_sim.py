@@ -5,7 +5,7 @@ experts per step (unchanged by N), the NVMe record fetches per step (mean, share
 step with a fetch, and a decode-step estimate; then the prefill picture: the distinct non-static experts of a 4096-token
 chunk and how many of them the DRAM LRU of a decode-warm server holds (the rest stream from NVMe).
 
-    /root/work/venv/bin/python tools/dsv41_5090/routing/nvme_tier_sim.py [--routes ...] [--placement ...] [--spare 70]
+    python tools/dsv41_5090/routing/nvme_tier_sim.py [--routes ...] [--placement ...] [--spare 70]
         [--window 12] [--cap 4] [--n 344,320,280,240,230,200,160,120,110,100] [--t-expert 0.13] [--t-nvme 0.30,0.45,0.80]
         [--step-ms 7.5]
 
@@ -18,9 +18,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from collections import OrderedDict
 
 import numpy as np
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 E, L, K = 384, 40, 6
 REC = 4700160
@@ -47,8 +50,8 @@ class LRU:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--routes", default="internal/dsv41-5090-cpu/routes/routes.npz")
-    ap.add_argument("--placement", default="internal/dsv41-5090-cpu/routes/placement-0.1042-uniform.json")
+    ap.add_argument("--routes", default=os.path.join(_HERE, "..", "..", "..", "internal", "dsv41-5090-cpu", "routes", "routes.npz"))
+    ap.add_argument("--placement", default=os.path.join(_HERE, "..", "..", "..", "internal", "dsv41-5090-cpu", "routes", "placement-0.1042-uniform.json"))
     ap.add_argument("--spare", type=int, default=70)
     ap.add_argument("--window", type=int, default=12, help="promotion admission window (0 = every miss)")
     ap.add_argument("--cap", type=int, default=4, help="promotions per layer per step")

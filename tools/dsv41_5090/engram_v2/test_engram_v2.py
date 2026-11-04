@@ -1,7 +1,7 @@
 """Unit tests of the Engram v2 host fetcher (no GPU): synthetic table files on /mnt/nvme (O_DIRECT needs a real
 filesystem: tmpfs refuses it) and, when the checkpoint is present, the real layer-1 / layer-14 tables.
 
-    /root/work/venv/bin/python test_engram_v2.py [--scratch /mnt/nvme/cache/ds41/engram-v2-tests] [--model-dir ...]
+    python test_engram_v2.py [--scratch <an NVMe scratch directory>] [--model-dir ...]
                                                  [--cpu 33] [--no-real] [--perf-steps 400]
 
 Checks: every row the fetcher writes into the staging equals the bytes at the row's offsets in the file (misses and

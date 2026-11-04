@@ -2,8 +2,8 @@
 N records per layer, the cold records read from a store directory on a miss, every computed row compared bit for bit
 with the scalar reference - the same rows whether the record came from DRAM or from NVMe.
 
-    /root/work/venv/bin/python test_store_tail.py [--records ../../internal/dsv41-5090-cpu/parity/b12x_inputs_l1.npz]
-        [--tables ../../internal/dsv41-5090-cpu/parity] [--scratch /mnt/nvme/cache/ds41/engram-v2-tests/store]
+    python test_store_tail.py [--records <parity dir>/b12x_inputs_l1.npz]
+        [--tables <parity dir>] [--scratch <an NVMe scratch directory>/store]
         [--cpus 10-15] [--dispatcher-cpu 9] [--steps 60] [--dram 6]
 
 Needs a real filesystem for the store files (O_DIRECT: /mnt/nvme, not /tmp) and idle CPUs for the kernel pool (not
