@@ -22,6 +22,8 @@
 # Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb: built with --build-arg VLLM_MOET_CPU_TIER_PATCH=1)
 #            NAME (ds41-hyb)  TP (4: 1 | 2 | 4 GPUs)  GPUS (0,1,2,3 / 0,1 / 0 by TP)  PORT (8041)  BIND (127.0.0.1:)
 #            VRANKS ("" = VLLM_MOET_CPU_TIER_VRANKS auto: 4 / TP slices per expert; 1 = plain ranks, the TP4 path)
+#            VRANK_CPUS / VRANK_DISPATCHERS ("" = the CCD layout above)  the pools' cores per virtual rank (";"-separated
+#                        ranges, e.g. "2-7;10-15;18-23;26-31") and their dispatcher cores ("1,9,17,25") for another CPU geometry
 #            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results, the kernel tables (below), profiles
 #            REPO (this checkout)    mounted at /repo with BAKED=0
 #            BAKED (1)               1 = the image's own copy of the hybrid (Dockerfile step 43: patched packages, runtime,
@@ -219,6 +221,7 @@ docker run -d --name "$NAME" --restart no \
   -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${INDEXER_LOGITS_MB:-256}" -e B12X_DYNAMIC_DETERMINISTIC_OUTPUT="${MOE_DETERMINISTIC:-0}" \
   -e MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}" -e MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}" -e CAPTURE_SIZE="${CAPTURE_SIZE:-8}" \
   ${VRANKS:+-e VLLM_MOET_CPU_TIER_VRANKS=$VRANKS} \
+  ${VRANK_CPUS:+-e VLLM_MOET_CPU_TIER_VRANK_CPUS=$VRANK_CPUS} ${VRANK_DISPATCHERS:+-e VLLM_MOET_CPU_TIER_VRANK_DISPATCHERS=$VRANK_DISPATCHERS} \
   "${TIER_ENV[@]}" \
   ${EXTRA_DOCKER_ARGS} \
   --entrypoint bash "$IMAGE" \
