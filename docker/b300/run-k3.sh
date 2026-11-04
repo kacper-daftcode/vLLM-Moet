@@ -69,8 +69,8 @@
 #                        (models/kimi_k3/nvidia/mla.py), so DCP shards the draft KV like the target's. On K3.1 vLLM
 #                        defaults an MLA draft to its own plain fp8 cache on FLASHINFER_MLA (no dense kernel reads
 #                        the target's packed DSA pages).
-#            REJECTION_SAMPLE_METHOD (block for K3, "" for K3.1)  DSpark's rejection sampler: block = the K3 recipe's
-#                        and the served K3 value; "" = vLLM's default (standard), which the K3.1 recipe uses.
+#            REJECTION_SAMPLE_METHOD (block)  DSpark's rejection sampler: block = block verification, the K3 recipe's
+#                        value and the Inferact K3.1 draft card's; "" = vLLM's default (standard).
 #            USE_RECOVERSSM (0)      1 = --use-replayssm, which on K3 selects the KDA RecoverSSM verify: the k draft
 #                        tokens are verified off one checkpoint state instead of one full KDA state slot per
 #                        draft token (MambaSpec.num_speculative_blocks k -> 0). With SPEC_TOKENS=4 that is
@@ -148,8 +148,10 @@ DRAFT_DIR="${DRAFT_DIR:-}"
 DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND-FLASHINFER_MLA}"
 DRAFT_QUANTIZATION="${DRAFT_QUANTIZATION:-}"
 DRAFT_KV_CACHE_DTYPE="${DRAFT_KV_CACHE_DTYPE:-}"
-# K3 is served with the block rejection sampler (the K3 recipe's DSpark row); the K3.1 recipe leaves vLLM's default.
-if [[ "$FAMILY" == k3 ]]; then REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD-block}"; else REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD-}"; fi
+# Block verification for both families: the K3 recipe's DSpark row and the Inferact K3.1 draft card both pair
+# probabilistic drafting with the block rejection sampler (InferenceX's K3.1 coding curve, 3.08 accepted at k=5, is
+# measured that way); vLLM's default (standard) accepts less at sampling temperature. "" = vLLM's default.
+REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD-block}"
 USE_RECOVERSSM="${USE_RECOVERSSM:-0}"
 MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
