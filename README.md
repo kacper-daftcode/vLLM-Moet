@@ -14,14 +14,14 @@ behind a runtime switch.
 
 ## Results, as served
 
-DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r23`
+DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r24` (served since 2026-11-05 07:29Z; `-r23` before it)
 (TP4, 512K context, DSpark k = 7, vision, thinking, tool calling, KV offload to host RAM and disk):
 
 | | vLLM-Moet | official vLLM image on the same cards |
 |---|---|---|
 | decode, 1 stream | prose ~293 tok/s, code ~802 tok/s (129 steps/s); Fraser bench 688 tok/s median, 746 best over 40 reps | 60 steps/s with only the fixes it needs to start |
 | decode, 8 streams | prose ~721, code ~2,258 tok/s aggregate | — |
-| fresh prefill | 163K tokens in 7.2 s (22.7K tok/s), 19K in 0.86 s; BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
+| fresh prefill | 163K tokens in 6.8 s (23.9K tok/s), 19K in 0.82 s (`-r24`: the MXFP8 MoE-input gather + the v8 MoE kernels, bit-identical to `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
 | KV cache | 9.62M tokens on the GPUs (18× concurrency at 512K) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
 | quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; identical requests return identical logits at any batch size and prompt length | the same checkpoint's quality |
 
@@ -75,7 +75,7 @@ toolkit, PCIe peer-to-peer, ~330 GB of host shared memory (less: `KV_OFFLOAD_GIB
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /srv/models/DeepSeek-V4.1-Flash-1017
-export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r23 \
+export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r24 \
   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .     # ~11 min
 
