@@ -52,12 +52,16 @@ of prompt; the within-boot identity check passes in every cell; the per-window n
 | **4× RTX 5090** (512K) | 457 GiB · **146 / 126** · 0.9 / 3.3 s (30K: 6.5 s) | 278 GiB · 145 / 126 · 0.9 / 3.3 s; **+ the full LRU** (`STORE_MODE=all RESIDENT=0 SPARE=110`): 307 GiB · **147 / 126** · 0.9 / 3.5 s, **mixed prompts 86.5 tok/s flat over 30 min** (hit rate 0.88 vs 0.87; the 512 GB defaults' soak 84.4) | N = 280: **236 GiB · 138 / 120 · 1.3 / 4.9 s** (30K: 9.2 s, 1.4–1.5× the TTFT); N = 230: 200 GiB · 132 / 109 · 1.7 / 6.3 s | N = 110 (`ENGRAM_CACHE_GIB=1`): **112 GiB · 112 / 82 · 2.8 / 11.1 s**; N = 120: 120 GiB · 114 / 81 · 2.7 / 10.4 s (3.0–3.6× the TTFT) |
 | **2× RTX 5090** (64K) | 450 GiB · **46 / 47** · 1.9 / 7.3 s | 269 GiB · 45 / 47 · 2.0 / 7.4 s | N = 230: 190 GiB · **40 / 43** · 2.2 / 8.6 s | N = 110: 103 GiB · **36 / 35** · 3.4 / 13.4 s |
 | **1× RTX 5090** (32K) | ~470 GiB · **40 / 34** · 3.8 / 15 s | 285 GiB · 43 / 36 · 3.9 s | N = 230: 184 GiB · **40 / 32** · 4.1 s | N = 110: 98 GiB · **38 / 26** · 4.8 s |
+| **2× RTX PRO 6000** Server Edition (200 slots, 256K; a 354 GB test VM with one virtio disk, 2026-11-05) | — | 272 GiB · **97–102 / 39–77** · 1.6 / 4.3 s (30K: 8.5 s); hit rate 0.96; mixed prompts 55 tok/s with the disk's Engram tail; the step is GPU-bound at ~10 ms | — | — |
+| **1× RTX PRO 6000** Server Edition (89 slots, 128K; the same VM) | — | 304 GiB · **64 / 49** · 3.6 / 8.1 s; hit rate 0.86; mixed prompts 35 tok/s (disk-bound) | — | — |
 
 Reading the matrix: on four cards the NVMe tail costs 5–14 % of decode at N = 230–280 and 22–35 % at N = 110–120 (the prefill
 1.4× / 2× / 3× slower); on one or two cards the step is already the CPU tier's wait for the misses of a small slot budget
 (46 / 16 slots), so the tail costs little more. The footprint is ≈ 35 GiB + 0.72 GiB × N with Engram on NVMe (`STORE_DRAM_RECORDS=auto`
-fills the host with a 20 GiB headroom). The 96 GB cards (2× / 1× RTX PRO 6000, ~200–235 / ~90–100 slots per layer) run the same
-code; the routing traces put them at ~120–145 / ~80–90 tok/s on short prompts — not yet measured.
+fills the host with a 20 GiB headroom). The 96 GB cards run the same code bit-identically (identity 0 mismatches at both TPs) with
+the hit rates the traces predicted; on the test host they are held back by its disk (the Engram rows' tail, 0.3–3 ms per step and
+0.1–0.5 s per new prompt) and, at TP2, by the card's GPU side (~8 ms per step + 1.9 ms of CPU-tier wait) — a PRO 6000 host with an
+NVMe or 512 GB of RAM would put 2× PRO 6000 at ~100 tok/s short / ~80 mixed ([the record page](docs/benchmarks/moet-hybrid-4x5090-2026-11-04.md) "2× and 1× RTX PRO 6000").
 
 Where the hybrid sits among the published ways to run this model below the datacenter (CPU-expert hybrids on DDR4 hosts
 19–50 tok/s, disk-streaming single-5090 ports 5–28, DGX Station GB300 with host offload 90, native 4× RTX PRO 6000 700–770):
