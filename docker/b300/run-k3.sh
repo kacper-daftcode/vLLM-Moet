@@ -61,6 +61,9 @@
 #                        Dockerfile.b300-k31 image (the kimi-k31 image sizes the experts grid for GB300's 152 SMs and
 #                        refuses to start the path). "" = vLLM's default decode path.
 #            SPEC_TOKENS (0)         DSpark draft tokens (the K3 recipe uses 7, the K3.1 recipe 5); needs DRAFT_DIR
+#            SPEC_METHOD (dspark)    --speculative-config method: dspark for the Inferact drafts, dflash for the
+#                        RadixArk/Kimi-K3.1-Dflash2-Preview draft (block 5 = SPEC_TOKENS 4; needs the vllm-moet
+#                        dflash2 patch set, /root/work/k3-test/patch-k31/dflash2/README.md)
 #            DRAFT_DIR ("")          Inferact/Kimi-K3-DSpark (K3) or Inferact/Kimi-K3.1-Pro-DSpark-preview (K3.1: 5 dense
 #                        MLA layers, its own FP8 MLA cache next to the target's packed DSA cache) checkpoint
 #            DRAFT_ATTENTION_BACKEND (FLASHINFER_MLA)  the Inferact drafts are MLA-native; RedHatAI's speculator
@@ -156,6 +159,7 @@ KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 INDEXER_KV_DTYPE="${INDEXER_KV_DTYPE:-}"
 DECODE_BACKEND="${DECODE_BACKEND:-}"
 SPEC_TOKENS="${SPEC_TOKENS:-0}"
+SPEC_METHOD="${SPEC_METHOD:-dspark}"
 DRAFT_DIR="${DRAFT_DIR:-}"
 DRAFT_ATTENTION_BACKEND="${DRAFT_ATTENTION_BACKEND-FLASHINFER_MLA}"
 DRAFT_QUANTIZATION="${DRAFT_QUANTIZATION:-}"
@@ -210,6 +214,7 @@ case "$KV_OFFLOAD_PROMPT_ONLY" in 0|1) ;; *) echo "KV_OFFLOAD_PROMPT_ONLY must b
 case "$KV_OFFLOAD" in off|disk|cpu|native) ;; *) echo "KV_OFFLOAD must be off, disk, cpu or native, got $KV_OFFLOAD" >&2; exit 1 ;; esac
 case "$USE_RECOVERSSM" in 0|1) ;; *) echo "USE_RECOVERSSM must be 0 or 1, got $USE_RECOVERSSM" >&2; exit 1 ;; esac
 case "$DRAFT_SAMPLE_METHOD" in greedy|probabilistic) ;; *) echo "DRAFT_SAMPLE_METHOD must be greedy or probabilistic, got $DRAFT_SAMPLE_METHOD" >&2; exit 1 ;; esac
+case "$SPEC_METHOD" in dspark|dflash) ;; *) echo "SPEC_METHOD must be dspark or dflash, got $SPEC_METHOD" >&2; exit 1 ;; esac
 case "$MAMBA_SSM_CACHE_DTYPE" in ""|float32|bfloat16) ;; *) echo "MAMBA_SSM_CACHE_DTYPE must be \"\", float32 or bfloat16, got $MAMBA_SSM_CACHE_DTYPE" >&2; exit 1 ;; esac
 if [[ "$USE_RECOVERSSM" == 1 ]]; then
   [[ "$SPEC_TOKENS" != 0 ]] || { echo "USE_RECOVERSSM=1 needs SPEC_TOKENS > 0 (K3 accepts --use-replayssm only with speculative decoding)" >&2; exit 1; }
@@ -247,7 +252,7 @@ fi
 [[ -n "$ATTENTION_CONFIG" ]] && ARGS+=(--attention-config "$ATTENTION_CONFIG")
 [[ -n "$DECODE_BACKEND" ]] && ARGS+=(--additional-config "{\"decode_backend\":\"$DECODE_BACKEND\"}")
 if [[ "$SPEC_TOKENS" != 0 ]]; then
-  [[ -f "$DRAFT_DIR/config.json" ]] || { echo "SPEC_TOKENS=$SPEC_TOKENS needs DRAFT_DIR with the DSpark checkpoint" >&2; exit 1; }
+  [[ -f "$DRAFT_DIR/config.json" ]] || { echo "SPEC_TOKENS=$SPEC_TOKENS needs DRAFT_DIR with the $SPEC_METHOD draft checkpoint" >&2; exit 1; }
   MOUNTS+=(-v "$DRAFT_DIR:/draft:ro")
   DRAFT_OPTS=""
   [[ -n "$DRAFT_ATTENTION_BACKEND" ]] && DRAFT_OPTS+="\"attention_backend\":\"$DRAFT_ATTENTION_BACKEND\","
@@ -255,7 +260,7 @@ if [[ "$SPEC_TOKENS" != 0 ]]; then
   [[ -n "$DRAFT_KV_CACHE_DTYPE" ]] && DRAFT_OPTS+="\"kv_cache_dtype\":\"$DRAFT_KV_CACHE_DTYPE\","
   [[ -n "$REJECTION_SAMPLE_METHOD" ]] && DRAFT_OPTS+="\"rejection_sample_method\":\"$REJECTION_SAMPLE_METHOD\","
   ARGS+=(--speculative-config
-    "{\"model\":\"/draft\",\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},${DRAFT_OPTS}\"draft_sample_method\":\"${DRAFT_SAMPLE_METHOD}\"}")
+    "{\"model\":\"/draft\",\"method\":\"${SPEC_METHOD}\",\"num_speculative_tokens\":${SPEC_TOKENS},${DRAFT_OPTS}\"draft_sample_method\":\"${DRAFT_SAMPLE_METHOD}\"}")
 fi
 [[ "$USE_RECOVERSSM" == 1 ]] && ARGS+=(--use-replayssm)
 [[ -n "$MAMBA_SSM_CACHE_DTYPE" ]] && ARGS+=(--mamba-ssm-cache-dtype "$MAMBA_SSM_CACHE_DTYPE")
