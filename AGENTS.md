@@ -13,6 +13,7 @@ every rule below traces back to a real incident.
 | MoET hybrid on 1–4× RTX 5090 | `tools/dsv41_5090/` (index in its README) + the Dockerfile's steps 43 (CPU tier) and 44 (Engram v2), `docker/sm120/run-dsv41-5090.sh` | the same; identity against the all-resident path (`DEBUG_COMPACT=1` in a `tp4_window.sh` boot) is the gate, at every TP and RAM tier a change touches |
 | 2-bit experts on vLLM v0.24.0 (frozen) | the vllm fork branch `moet-v0.24.0`; `patch/` is **generated** from it | the procedure below — never the patch file |
 | Qwen3.8-Flash-Next-FP8 | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` | as the first line |
+| Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000 | `tools/ripple_sm120/` + `Dockerfile.sm120-ripple` (+ `tools/dsv41_sm120/p2p_ar/`, shared) | as the first line; steps numbered from 0 (the vLLM wheel) |
 
 ## The iron rule
 

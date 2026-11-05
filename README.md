@@ -11,6 +11,7 @@ behind a runtime switch.
 | **DeepSeek-V4.1-Flash on 1–4× RTX 5090 (MoET hybrid)** | a subset of the 384 experts per layer resident on the cards, every other routed expert computed on the CPU from the checkpoint's own bytes, bit-identical to the all-resident path; 4× 5090 + 512 GB: 145 / 125 tok/s on one stream, 4.6K tok/s prefill, 512K context; the same code on 2× / 1× 5090 and on 128–384 GB hosts (the Engram tables and the cold experts on NVMe) | serving; every configuration below measured on the reference box | [docs/moet-hybrid.md](docs/moet-hybrid.md), [the measurements and the field](docs/benchmarks/moet-hybrid-4x5090-2026-11-04.md) |
 | **2-bit experts on vLLM v0.24.0** | GLM-5.2 (753B), DeepSeek-V4-Flash (159B) and Kimi-K2.7-Code (1T) on one to four cards that cannot hold their checkpoints: a 2-bit codebook on hand-written SASS, an FP4 delta cache | frozen (builds, fixes accepted, no development) | [docs/v024-2bit.md](docs/v024-2bit.md) |
 | **Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000** | the official nightly with the PLE table on the GPUs, the skinny GEMM and an FP8 MoE GEMV | as built | [docs/qwen38-sm120.md](docs/qwen38-sm120.md) |
+| **Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000** | Ricursive's 65B dense model with its DFlash2 drafter on vLLM main: the TP all-reduces on the PCIe P2P push, the draft length by batch size; code ~600 tok/s single stream, ~3000 aggregate at 8 requests | serving (first image) | [docs/ripple-sm120.md](docs/ripple-sm120.md) |
 
 ## Results, as served
 
@@ -135,6 +136,7 @@ recommendations: [docs/moet-hybrid.md](docs/moet-hybrid.md) ("Running it", "Host
 | `Dockerfile.sm120-dsv41-nightly`, `tools/dsv41_sm120/`, `docker/sm120/run-dsv41.sh` | DeepSeek-V4.1-Flash: the image, its patchers, kernels and tests, the launcher (+ the cron scripts in `docker/sm120/`) |
 | `tools/dsv41_5090/`, `docker/sm120/run-dsv41-5090.sh`, `docker/sm120/host/`, `docker/sm120/seccomp-io_uring.json` | the MoET hybrid (Dockerfile steps 43–44): the CPU expert tier and its kernel, Engram v2, the routing tools, the measurement harness ([index](tools/dsv41_5090/README.md)); its launcher; the host units (GPU power cap, kernel-thread affinity); the seccomp profile io_uring needs |
 | `Dockerfile.sm120-qwen38`, `tools/qwen38_sm120/`, `docker/sm120/run-qwen38.sh` | Qwen3.8-Flash-Next-FP8 |
+| `Dockerfile.sm120-ripple`, `tools/ripple_sm120/`, `docker/sm120/run-ripple.sh` | Ripple-65B Preview (the all-reduce module is `tools/dsv41_sm120/p2p_ar/`, shared with DeepSeek) |
 | `patch/`, `Dockerfile.sm120-v024`, `Dockerfile.recipes`, `docker/serve_recipe.py`, `bench/`, `kernels/`, `tools/*.py` | the 2-bit line: the generated v0.24.0 patch (never edited by hand), its images, the recipes and the benchmark runner, SASS sources and cubins, its tests |
 | `tools/sm120_perf/` | benchmark and profiling scripts |
 | `docs/` | one doc per line, the benchmark records, the kernel-design notes |
