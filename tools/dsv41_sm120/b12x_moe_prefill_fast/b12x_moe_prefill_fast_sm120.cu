@@ -553,8 +553,9 @@ __device__ __forceinline__ void stage_next_item(ItemRing& ring, int d, int nb, i
 }
 
 struct Fc1Args {
-  const uint32_t* a_values;  // [T][K/4]
-  const uint8_t* a_scales;   // [T][K/32]
+  const uint32_t* a_values;  // [T][K/4] words; row r at byte r * lda (lda >= K, a multiple of 4; K when contiguous)
+  const uint8_t* a_scales;   // [T][K/32] bytes; row r at byte r * lds (lds >= K/32, a multiple of 4; K/32 when contiguous)
+  int lda, lds;              // row strides in bytes of a_values / a_scales
   const uint32_t* w13;       // n64-repacked planes (see the spec header)
   const uint32_t* w13_sf;
   const int32_t* row_pair;
@@ -568,10 +569,16 @@ struct Fc1Args {
   float limit;
 };
 
-template <int STAGES, int MINB>
+// STRIDED: a_values / a_scales are row-strided views (lda / lds; the rows' scale offsets staged in s_aoff_sf); the contiguous
+// instantiation (the served path) derives the scale offset from the A offset as before - the same code as v8, bit for bit and
+// cycle for cycle (K 5.11: the strided code path costs fc1 +0.5 % on call1, so the served path does not carry it)
+template <int STAGES, int MINB, bool STRIDED>
 __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
+  // STRIDED: byte offset of the rows' k32 scale bytes (row * lds; 0xFFFFFFFF: padding), staged like ring.aoff; the A rows and their
+  // scales may come as row-strided views of one gathered buffer (session U's one all-gather). Contiguous: 4 bytes, unused.
+  __shared__ uint32_t s_aoff_sf[STRIDED ? 2 : 1][STRIDED ? 64 : 1];
   __shared__ float s_amax[2][8][16];  // epilogue: a warp's partial amax (its 16 columns) of the 16 rows of an m-tile, by m-tile parity
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int q = lane >> 2, c = lane & 3;
@@ -586,8 +593,11 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   const int my_r16 = 2 * (warp & 3) + (sub >> 1) + 8 * (sub & 1);
   const uint32_t a_dst0 = (uint32_t)((kk_c * 8 + 2 * (warp & 3) + (sub >> 1)) * 64 + (kw8 >> 1) * 16 + ((kw8 & 1) * 2 + (sub & 1)) * 4);
   const uint32_t a_src0 = kk_c * 32 + kw8 * 4;
-  const auto aoff_of = [&](int pair) { return (uint32_t)(pair / a.topk) * (uint32_t)K; };
-  const auto no_pair_hook = [](int, int, int) {};
+  const auto aoff_of = [&](int pair) { return (uint32_t)(pair / a.topk) * (uint32_t)(STRIDED ? a.lda : K); };
+  // STRIDED: the row's scale offset is staged next to its A offset (the same step of the hand-off, threads 0-63)
+  const auto sf_pair_hook = [&](int nb, int t, int pair) {
+    if constexpr (STRIDED) s_aoff_sf[nb][t] = pair >= 0 ? (uint32_t)(pair / a.topk) * (uint32_t)a.lds : 0xFFFFFFFFu;
+  };
 
   // ---- issue side (its item is ring.items[iss_k & 1]; the slot of the item being issued is iss_k & 1)
   int iss_k = 0, iss_stage = 0, iss_mtiles = 0, nxt = 0;
@@ -613,9 +623,10 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
       uint32_t aoff4[4];  // the rows' A offsets first: their LDS latency overlaps the B address work
 #pragma unroll
       for (int j = 0; j < 4; ++j) aoff4[j] = ring.aoff[slot][j * 16 + my_r16];
-      const uint32_t aoff_sf = warp < 2 ? ring.aoff[slot][tid] : 0xFFFFFFFFu;  // warps 0-1: the scale word of row tid
+      // warps 0-1: the scale word of row tid (STRIDED: its own offset; contiguous: derived from the A offset, row * K / 32)
+      const uint32_t aoff_sf = warp < 2 ? (STRIDED ? s_aoff_sf[slot][tid] : ring.aoff[slot][tid]) : 0xFFFFFFFFu;
       stage_next_item(ring, t - claim_at, nb, tid, n_items, a.items, a.row_pair, a.counts + 3, a.dynamic_schedule, nxt,
-                      aoff_of, no_pair_hook);
+                      aoff_of, sf_pair_hook);
       // B: two projections, the 2 k32 blocks of the stage (128-column tiles: 256 x 16 B per projection)
       if (iss_wide) {
         const uint32_t o = (tid >> 7) * 2048 + (tid & 127) * 16;
@@ -646,10 +657,10 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
         const uint32_t o = on ? off : 0u;
         cp_async4_zfill(sb + kF1B + a_dst0 + j * 1024, reinterpret_cast<const uint8_t*>(a.a_values) + o + t * 64 + a_src0, on ? 4 : 0);
       }
-      if (warp < 2) {  // the rows' k128 scale words: row tid
+      if (warp < 2) {  // the rows' k128 scale words: row tid (its scale bytes at row * lds; k128 block t >> 1 = 4 bytes)
         const bool on = aoff_sf != 0xFFFFFFFFu;
         const uint32_t o = on ? aoff_sf : 0u;
-        cp_async4_zfill(sb + kF1B + kF1A + tid * 4, a.a_scales + (o >> 5) + (t >> 1) * 4, on ? 4 : 0);
+        cp_async4_zfill(sb + kF1B + kF1A + tid * 4, a.a_scales + (STRIDED ? o : (o >> 5)) + (t >> 1) * 4, on ? 4 : 0);
       }
       if (++iss_stage == n_stages) {
         ++iss_k;
@@ -669,6 +680,7 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
     const int pr = tid < m.z * 16 ? __ldg(a.row_pair + m.y + tid) : -1;
     ring.pairs[0][tid] = pr;
     ring.aoff[0][tid] = pr >= 0 ? aoff_of(pr) : 0xFFFFFFFFu;
+    sf_pair_hook(0, tid, pr);
   }
   __syncthreads();
   start_issue_item(0);
@@ -1218,7 +1230,7 @@ struct Launch {
   static int grid1(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel<S1, MB1>, kThreads, S1 * kF1Stage);
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel<S1, MB1, false>, kThreads, S1 * kF1Stage);
     return sms * (occ > 0 ? occ : 1);
   }
   static int grid2(int sms) {
@@ -1231,13 +1243,17 @@ struct Launch {
     using namespace b12x_moe_prefill_fast;
     static bool done = false;
     if (done) return;
-    cudaFuncSetAttribute(fc1_kernel<S1, MB1>, cudaFuncAttributeMaxDynamicSharedMemorySize, S1 * kF1Stage);
+    cudaFuncSetAttribute(fc1_kernel<S1, MB1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, S1 * kF1Stage);
+    cudaFuncSetAttribute(fc1_kernel<S1, MB1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, S1 * kF1Stage);
     cudaFuncSetAttribute(fc2_kernel<S2, MB2>, cudaFuncAttributeMaxDynamicSharedMemorySize, S2 * kF2Stage);
     done = true;
   }
   static void fc1(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc1_kernel<S1, MB1><<<grid, kThreads, S1 * kF1Stage, stream>>>(f1);
+    if (f1.lda != f1.K || f1.lds != f1.K / 32)  // row-strided views of one gathered buffer (session U's one all-gather)
+      fc1_kernel<S1, MB1, true><<<grid, kThreads, S1 * kF1Stage, stream>>>(f1);
+    else
+      fc1_kernel<S1, MB1, false><<<grid, kThreads, S1 * kF1Stage, stream>>>(f1);
   }
   static void fc2(const b12x_moe_prefill_fast::Fc2Args& f2, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
@@ -1300,8 +1316,9 @@ static void run_frontend(const b12x_moe_prefill_fast::FrontArgs& fa, cudaStream_
 
 }  // namespace
 
-// hidden [T, K] bf16 (or None with pre-quantized rows: a_values uint8 [T, K] e4m3 + a_scales uint8 [T, K/32] ue8m0, row-major,
-// exactly the bytes the front-end's quant_row writes; the quant stage is then skipped - session U's MXFP8 all-gather),
+// hidden [T, K] bf16 (or None with pre-quantized rows: a_values uint8 [T, K] e4m3 + a_scales uint8 [T, K/32] ue8m0, row-major
+// or row-strided views of one buffer (strides a multiple of 4 bytes), exactly the bytes the front-end's quant_row writes;
+// the quant stage is then skipped - session U's MXFP8 all-gather),
 // ids [T, topk] int32, token_weights [T, topk] fp32 (contiguous). Returns {out, route, a_values, a_scales, inter, inter_sf,
 // row_pair, counts}. `route_out` (if defined: [>= T*topk, K] bf16, the b12x workspace's route_output) receives the route
 // rows; `out` (if defined) the top-k sum (skipped when !topk_sum).
@@ -1324,10 +1341,17 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
     a_values = *a_values_opt;
     TORCH_CHECK(a_scales_opt.has_value() && a_scales_opt->defined(), "a_scales must come with a_values");
     a_scales = *a_scales_opt;
-    TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_values.dim() == 2 && a_values.is_contiguous(), "a_values: uint8 [T, K], contiguous");
+    // row-strided views are accepted (one gathered [T, K + K/32 + ...] buffer: values = buf[:, :K], scales = buf[:, K:K + K/32]):
+    // unit column stride, row strides a multiple of 4 bytes (4-byte cp.async), 4-byte aligned bases
+    TORCH_CHECK(a_values.scalar_type() == torch::kUInt8 && a_values.dim() == 2 && a_values.stride(1) == 1, "a_values: uint8 [T, K], unit column stride");
     T = (int)a_values.size(0); K = (int)a_values.size(1);
-    TORCH_CHECK(a_scales.scalar_type() == torch::kUInt8 && a_scales.is_contiguous() && a_scales.numel() == (int64_t)T * (K / 32),
-                "a_scales: uint8 [T, K/32], contiguous");
+    TORCH_CHECK(a_values.stride(0) >= K && a_values.stride(0) % 4 == 0 && (int64_t)T * a_values.stride(0) < (1LL << 32) &&
+                (reinterpret_cast<uintptr_t>(a_values.data_ptr()) & 3) == 0,
+                "a_values: row stride >= K, a multiple of 4, 4-byte aligned base, T * stride < 2^32 (the ring holds 32-bit row offsets)");
+    TORCH_CHECK(a_scales.scalar_type() == torch::kUInt8 && a_scales.dim() == 2 && a_scales.stride(1) == 1 && a_scales.size(0) == T &&
+                a_scales.size(1) == K / 32, "a_scales: uint8 [T, K/32], unit column stride");
+    TORCH_CHECK(a_scales.stride(0) >= K / 32 && a_scales.stride(0) % 4 == 0 && (reinterpret_cast<uintptr_t>(a_scales.data_ptr()) & 3) == 0,
+                "a_scales: row stride >= K/32, a multiple of 4, 4-byte aligned base");
   } else {
     TORCH_CHECK(hidden_opt.has_value() && hidden_opt->defined(), "hidden (bf16 rows) or a_values + a_scales (pre-quantized rows)");
     hidden = *hidden_opt;
@@ -1401,6 +1425,8 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   Fc1Args f1;
   f1.a_values = fa.a_values;
   f1.a_scales = fa.a_scales;
+  f1.lda = prequant ? (int)a_values.stride(0) : K;        // bytes per row of the e4m3 values
+  f1.lds = prequant ? (int)a_scales.stride(0) : K / 32;   // bytes per row of the ue8m0 scales
   f1.w13 = reinterpret_cast<const uint32_t*>(w13.data_ptr());
   f1.w13_sf = reinterpret_cast<const uint32_t*>(w13_sf.data_ptr());
   f1.row_pair = fa.row_pair;
@@ -1483,9 +1509,13 @@ torch::Tensor moe_prefill_fast_frontend(torch::Tensor hidden, torch::Tensor ids,
 }
 
 bool prequant_rows_supported() { return true; }  // the loader probes this entry (session U's pre-quantized rows)
+// the loader probes this entry too: a_values / a_scales may be row-strided views (unit column stride, 4-byte row strides and
+// bases) of one gathered buffer - session U's one-all-gather follow-up (K, 2026-11-05)
+bool strided_rows_supported() { return true; }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_prefill_fast", &moe_prefill_fast);
   m.def("moe_prefill_fast_frontend", &moe_prefill_fast_frontend);
   m.def("prequant_rows_supported", &prequant_rows_supported);
+  m.def("strided_rows_supported", &strided_rows_supported);
 }

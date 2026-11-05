@@ -47,7 +47,7 @@ def main() -> int:
     a = ap.parse_args()
     os.environ.setdefault("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     import torch
-    from b12x_moe_prefill_fast_sm120 import moe_prefill_fast, prequant_rows_supported
+    from b12x_moe_prefill_fast_sm120 import moe_prefill_fast, prequant_rows_supported, strided_rows_supported
     from b12x_moe_prefill_spec_sm120 import expert_sorted_rows, moe_prefill_spec
     from test_b12x_moe_prefill_spec_sm120 import _planes, _served
     import b12x.moe.fused_moe._impl as impl
@@ -169,6 +169,18 @@ def main() -> int:
             pq_ok = same(res_q[0], out_m) and same(res_q[1][valid], route_m[valid]) and same(res_q[4][valid, :N], inter_m[valid, :N])
             msg.append(f"pre-quantized rows entry {'identical' if pq_ok else 'DIFFER'}")
             ok &= pq_ok
+            # the same rows as row-strided views of ONE buffer (session U's one-all-gather layout: per row the K e4m3 bytes,
+            # the K/32 scale bytes, then 48 bytes of top-k ids / weights - here random garbage the kernels must not read)
+            if strided_rows_supported():
+                Tq, Kq = av_m.shape
+                buf = torch.randint(0, 256, (Tq, Kq + Kq // 32 + 48), device=av_m.device, dtype=torch.uint8)
+                buf[:, :Kq] = av_m
+                buf[:, Kq:Kq + Kq // 32] = as_m
+                res_s = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=buf[:, :Kq], a_scales=buf[:, Kq:Kq + Kq // 32], **kw)
+                torch.cuda.synchronize()
+                st_ok = same(res_s[0], out_m) and same(res_s[1][valid], route_m[valid]) and same(res_s[4][valid, :N], inter_m[valid, :N])
+                msg.append(f"strided rows (one-buffer layout, row stride {Kq + Kq // 32 + 48}) {'identical' if st_ok else 'DIFFER'}")
+                ok &= st_ok
         msg.append(f"time b12x {tb:.2f} ms, ours {min(t for _, t in runs):.2f} ms (eager, host included)")
         print(" | ".join(msg))
         sys.stdout.flush()

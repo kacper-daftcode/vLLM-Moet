@@ -59,6 +59,21 @@ def prequant_rows_supported() -> bool:
     return hasattr(_ext(), "prequant_rows_supported")
 
 
+def strided_rows_supported() -> bool:
+    """Whether the built extension takes a_values / a_scales as row-strided views (unit column stride, row strides and bases a
+    multiple of 4 bytes) - e.g. buf[:, :K] and buf[:, K:K + K // 32] of one gathered [T, K + K // 32 + ...] buffer (session
+    U's one-all-gather follow-up); older builds get contiguous copies."""
+    return hasattr(_ext(), "strided_rows_supported")
+
+
+def _rows_arg(x: torch.Tensor) -> torch.Tensor:
+    if x.is_contiguous():
+        return x
+    if strided_rows_supported() and x.dim() == 2 and x.stride(1) == 1 and x.stride(0) % 4 == 0 and x.data_ptr() % 4 == 0:
+        return x
+    return x.contiguous()
+
+
 def moe_prefill_fast(hidden: torch.Tensor | None, ids: torch.Tensor, weights: torch.Tensor, planes: dict, limit: float = 10.0,
                      n: int = N_INTERMEDIATE, route_out: torch.Tensor | None = None, out: torch.Tensor | None = None,
                      topk_sum: bool = True, cfg1: int | None = None, cfg2: int | None = None,
@@ -83,7 +98,7 @@ def moe_prefill_fast(hidden: torch.Tensor | None, ids: torch.Tensor, weights: to
             raise RuntimeError("this build of the fast prefill MoE extension takes bf16 rows only (no a_values / a_scales entry)")
         assert a_scales is not None, "a_scales must come with a_values"
         return _ext().moe_prefill_fast(None if hidden is None else hidden.contiguous(), *args,
-                                       a_values.contiguous(), a_scales.contiguous())
+                                       _rows_arg(a_values), _rows_arg(a_scales))
     assert hidden is not None, "hidden (bf16 rows) or a_values + a_scales (pre-quantized rows)"
     if prequant_rows_supported():
         return _ext().moe_prefill_fast(hidden.contiguous(), *args, None, None)
