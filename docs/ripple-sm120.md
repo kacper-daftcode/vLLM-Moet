@@ -83,8 +83,9 @@ Quality (baseline configuration): GSM8K-200 at 8 requests 193/200 (the model car
 the full set, NVFP4 on B300); arithmetic battery 4/5 (one wrong sum when the model answers without reasoning);
 needle 6/6 at 28K / 105K / 399K; tool call + round trip and strict JSON schema pass. Step 1 reproduces NCCL's bits
 by construction (the summation order is measured on the TP communicator at start-up and each row count is checked
-against NCCL; row counts that do not reproduce stay on NCCL) — the functional probes answer identically with and
-without it.
+against NCCL; row counts that do not reproduce stay on NCCL): three prompts × up to 768 greedy tokens with per-token
+logprobs (`tools/ripple_sm120/parity_probe.py`) are identical token for token and logprob for logprob between the
+P2P and the NCCL arm (1724 tokens, max |Δlogprob| 0), as are two runs on the same server.
 
 ## Not done, next
 
