@@ -17,8 +17,13 @@ import uuid
 
 
 def counters(base):
-    with urllib.request.urlopen(base + "/metrics", timeout=10) as r:
-        out = {"pos": {}}
+    """vLLM's DSpark counters from /metrics; empty when the server has none (another engine, metrics off)."""
+    out = {"pos": {}}
+    try:
+        r = urllib.request.urlopen(base + "/metrics", timeout=10)
+    except Exception:  # noqa: BLE001
+        return out
+    with r:
         for line in r.read().decode().splitlines():
             if not line.startswith("vllm:spec_decode_num_"):
                 continue
@@ -38,6 +43,8 @@ def run_once(a, prompt):
             "stream_options": {"include_usage": True}}
     if a.reasoning_effort:
         body["reasoning_effort"] = a.reasoning_effort
+    if a.extra_body:
+        body.update(json.loads(a.extra_body))
     headers = {"Content-Type": "application/json"}
     if a.api_key:
         headers["Authorization"] = "Bearer " + a.api_key
@@ -83,6 +90,7 @@ def main():
     ap.add_argument("--top-p", type=float, default=1.0)
     ap.add_argument("--reasoning-effort", default="low", help='"low", "high", "max" or "" for the server default')
     ap.add_argument("--api-key", default=os.environ.get("API_KEY", ""))
+    ap.add_argument("--extra-body", default="", help='JSON merged into the request body, e.g. \'{"chat_template_kwargs": {"thinking_effort": "low"}}\' for engines without reasoning_effort')
     ap.add_argument("--label", default="")
     a = ap.parse_args()
     prompt = open(a.prompt_file).read()

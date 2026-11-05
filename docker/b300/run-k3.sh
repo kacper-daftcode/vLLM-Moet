@@ -78,6 +78,11 @@
 #                        the target's packed DSA pages).
 #            REJECTION_SAMPLE_METHOD (block)  DSpark's rejection sampler: block = block verification, the K3 recipe's
 #                        value and the Inferact K3.1 draft card's; "" = vLLM's default (standard).
+#            DRAFT_SAMPLE_METHOD (probabilistic)  how the draft picks its tokens: probabilistic = sampled from the
+#                        draft distribution, the full draft logits in the ratio test (the Inferact card's pairing with
+#                        block verification; costs draft-logit memory); greedy = the draft's argmax, one-hot in the
+#                        ratio test (vLLM's default, the K3 recipe's low-latency row). A knob for measuring acceptance
+#                        at temperature 0 and 1 (2026-11-05); the served value is probabilistic.
 #            USE_RECOVERSSM (0)      1 = --use-replayssm, which on K3 selects the KDA RecoverSSM verify: the k draft
 #                        tokens are verified off one checkpoint state instead of one full KDA state slot per
 #                        draft token (MambaSpec.num_speculative_blocks k -> 0). With SPEC_TOKENS=4 that is
@@ -159,6 +164,7 @@ DRAFT_KV_CACHE_DTYPE="${DRAFT_KV_CACHE_DTYPE:-}"
 # probabilistic drafting with the block rejection sampler (InferenceX's K3.1 coding curve, 3.08 accepted at k=5, is
 # measured that way); vLLM's default (standard) accepts less at sampling temperature. "" = vLLM's default.
 REJECTION_SAMPLE_METHOD="${REJECTION_SAMPLE_METHOD-block}"
+DRAFT_SAMPLE_METHOD="${DRAFT_SAMPLE_METHOD:-probabilistic}"
 USE_RECOVERSSM="${USE_RECOVERSSM:-0}"
 MAMBA_SSM_CACHE_DTYPE="${MAMBA_SSM_CACHE_DTYPE:-}"
 MAX_CUDAGRAPH_CAPTURE_SIZE="${MAX_CUDAGRAPH_CAPTURE_SIZE:-}"
@@ -203,6 +209,7 @@ case "$DCP" in 1|2|4|8) ;; *) echo "DCP must divide TP 8 (1, 2, 4 or 8), got $DC
 case "$KV_OFFLOAD_PROMPT_ONLY" in 0|1) ;; *) echo "KV_OFFLOAD_PROMPT_ONLY must be 0 or 1, got $KV_OFFLOAD_PROMPT_ONLY" >&2; exit 1 ;; esac
 case "$KV_OFFLOAD" in off|disk|cpu|native) ;; *) echo "KV_OFFLOAD must be off, disk, cpu or native, got $KV_OFFLOAD" >&2; exit 1 ;; esac
 case "$USE_RECOVERSSM" in 0|1) ;; *) echo "USE_RECOVERSSM must be 0 or 1, got $USE_RECOVERSSM" >&2; exit 1 ;; esac
+case "$DRAFT_SAMPLE_METHOD" in greedy|probabilistic) ;; *) echo "DRAFT_SAMPLE_METHOD must be greedy or probabilistic, got $DRAFT_SAMPLE_METHOD" >&2; exit 1 ;; esac
 case "$MAMBA_SSM_CACHE_DTYPE" in ""|float32|bfloat16) ;; *) echo "MAMBA_SSM_CACHE_DTYPE must be \"\", float32 or bfloat16, got $MAMBA_SSM_CACHE_DTYPE" >&2; exit 1 ;; esac
 if [[ "$USE_RECOVERSSM" == 1 ]]; then
   [[ "$SPEC_TOKENS" != 0 ]] || { echo "USE_RECOVERSSM=1 needs SPEC_TOKENS > 0 (K3 accepts --use-replayssm only with speculative decoding)" >&2; exit 1; }
@@ -248,7 +255,7 @@ if [[ "$SPEC_TOKENS" != 0 ]]; then
   [[ -n "$DRAFT_KV_CACHE_DTYPE" ]] && DRAFT_OPTS+="\"kv_cache_dtype\":\"$DRAFT_KV_CACHE_DTYPE\","
   [[ -n "$REJECTION_SAMPLE_METHOD" ]] && DRAFT_OPTS+="\"rejection_sample_method\":\"$REJECTION_SAMPLE_METHOD\","
   ARGS+=(--speculative-config
-    "{\"model\":\"/draft\",\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},${DRAFT_OPTS}\"draft_sample_method\":\"probabilistic\"}")
+    "{\"model\":\"/draft\",\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},${DRAFT_OPTS}\"draft_sample_method\":\"${DRAFT_SAMPLE_METHOD}\"}")
 fi
 [[ "$USE_RECOVERSSM" == 1 ]] && ARGS+=(--use-replayssm)
 [[ -n "$MAMBA_SSM_CACHE_DTYPE" ]] && ARGS+=(--mamba-ssm-cache-dtype "$MAMBA_SSM_CACHE_DTYPE")
