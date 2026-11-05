@@ -163,9 +163,16 @@ dispatcher 8g+1 and pool 8g+2..8g+7 per CCD g). `SCRATCH` counts slices (an expe
 record's (identity 0 mismatches over 19,080 compact calls per rank; 146.6 / 126.2 tok/s, TTFT 0.97 / 3.27 / 6.50 s at 2K / 14K / 30K — a
 sample with the box's `kcompactd0` on a pool core's SMT sibling gave 143 / 121) and TP2 repeats the numbers above (0 mismatches over
 15,160 calls per rank; 46.1 / 47.2 tok/s; TTFT 1.91 / 7.34 s; the compact-path outputs bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
-support and were not measured here: the run book — host requirements, the launcher lines at 96 GB (`TP=2 SPARE=160 GPU_MEM_UTIL=0.90
-MAX_MODEL_LEN=262144 MAX_NUM_BATCHED_TOKENS=8192 SCRATCH=128`; `TP=1 SPARE=80 … MAX_MODEL_LEN=131072`), the window sequence, the expected
-numbers from the routing traces (~105–125 tok/s mixed / ~120–145 short at TP2, ~62–70 / ~80–90 at TP1) — is §13 of that note.
+support; the run book — host requirements, the launcher lines at 96 GB (`TP=2 SPARE=160 GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=262144
+MAX_NUM_BATCHED_TOKENS=8192 SCRATCH=128`; `TP=1 SPARE=80 … MAX_MODEL_LEN=131072`), the window sequence, the expected numbers from the
+routing traces — is §13 of that note. **Measured 2026-11-05 on a PRO 6000 test host** (a 354 GB VM with Server Edition cards and one
+virtio disk, so the Engram rows had to come from that disk: [`benchmarks/moet-hybrid-4x5090-2026-11-04.md`](benchmarks/moet-hybrid-4x5090-2026-11-04.md)
+"2× and 1× RTX PRO 6000"): **identity 0 mismatches at both TPs**, hit rates 0.96 (TP2, 200 slots) / 0.86 (TP1, 89 slots) as the
+traces predicted; **2× PRO 6000: 97–102 tok/s on short prompts** (the step 9.9 ms, GPU-bound: ~8 ms of GPU work + 1.9 ms of CPU-tier
+wait), TTFT 1.55 / 4.30 / 8.52 s at 2K / 14K / 30K, 272 GiB of host RAM; **1× PRO 6000: 64 / 49 tok/s**, TTFT 3.6 / 8.1 / 15.3 s, 304
+GiB; the mixed-prompt soaks (55 / 35 tok/s) and the TP1 numbers carry that host's disk (Engram rows 0.3–3 ms per step, 0.1–0.5 s per
+new prompt; at TP1 the default `ENGRAM_TIMEOUT_MS=2000` fails closed in the warm-up — `ENGRAM_TIMEOUT_MS=30000` there). On a host
+with an NVMe or 512 GB of RAM the same cards would sit at ~100 tok/s short / ~80 mixed at TP2.
 
 ## Hosts with less RAM: Engram v2 and the expert store's NVMe tail (2026-11-04)
 
