@@ -4,8 +4,11 @@
 #   build_sparse_mla_sass.sh [out.cubin]            (default: kernels/cubins-sm120/sparse_mla_prefill_v41.cubin)
 #
 # Requirements (see kernels/MANIFEST.md, "Sparse-MLA prefill"):
-#   CUBIT  — a cubit binary with the BUG-421 (path-following barrier allocation) and BUG-422 (BAR.SYNC stall
-#            floor 6) fixes; patches: /workspace/tmp/par31/V/cubit/0001-*.patch, 0002-*.patch on cubit 53e9ed8.
+#   CUBIT  — cubit `main` at or after ed4d316 (2026-11-05): session V's fixes are BUG-478 (path-following
+#            barrier allocation), BUG-479 (BAR.SYNC stall floor 6) and BUG-480 (R128-R254 tracking) there.
+#            Default: the main checkout's release build; the validated cubin (sha256 c896234bc76d6938...)
+#            reproduces byte for byte from main (checked 2026-11-05 at ed4d316 and again after the wave-11
+#            merge, cubit f79a48a / tables blackwell-isa 2eed3ac).
 #   TABLE  — tables/sm120.json(.gz) of the same cubit tree.
 # Scheduling policy (the measured 0.66-0.72x-of-reference build): CUBIT_SB_SHARE=1 (scoreboards shared as counters,
 # long uses on the top two, far WAR uses released early at 32 walked instructions), CUBIT_MMA_WAIT=1 +
@@ -14,8 +17,8 @@
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
-CUBIT=${CUBIT:-/workspace/tmp/par31/V/cubit-V/target/release/cubit}
-TABLE=${TABLE:-/workspace/tmp/par31/V/cubit-V/tables/sm120.json.gz}
+CUBIT=${CUBIT:-/workspace/cubit/target/release/cubit}
+TABLE=${TABLE:-/workspace/cubit/tables/sm120.json.gz}
 OUT=${1:-$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin}
 SASS=$REPO/kernels/sass/sparse_mla_prefill_v41.sass
 
