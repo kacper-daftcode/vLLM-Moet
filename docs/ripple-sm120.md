@@ -157,10 +157,16 @@ Per-item results: `ripple65b/results/gsm8k_full_{served-y2,attn-mxfp8}.json` (`w
 
 ## Not done, next
 
-- Multi-request throughput: the all-reduce is 33–47 % of the step at 8–32 requests and sits on the PCIe floor; the
-  structural fix is two-micro-batch overlap (the second half's GEMMs under the first half's push; estimate −30…−40 %
-  per step at 32 requests, −15 % at 8, nothing at 1). vLLM's DBO needs DP > 1 and a DeepEP / NIXL all-to-all backend
-  and is marked under development for the V2 runner, so this is our own implementation (days).
+- Multi-request throughput: the all-reduce is 33–47 % of the step at 8–32 requests and sits on the PCIe floor. The
+  structural fix, two micro-batches with one half's all-reduce under the other half's GEMMs, was measured in
+  isolation (`tools/ripple_sm120/decode_overlap_bench.py`, 2026-11-06): the platform hides 85–89 % of the P2P push
+  under GEMMs on another stream, but two halves stream the layer's weights twice (the decode GEMMs are
+  weight-bandwidth-bound: +43 % at 256 rows to +93 % at 96 for two halves, +24…+51 % when the halves alternate per
+  attention / MLP block so the second finds the block's ~80 MB in L2 — vLLM's DBO schedule). Net on the GEMMs + 2
+  all-reduces of a layer against today's serial step: **−16.5 % at 256 rows (32 requests × k 7), −14 % at 128,
+  −6.5 % at 96 (8 × k 11)**, i.e. about −12 % of the whole step at 32 requests and −5 % at 8 — not the −30…−40 %
+  the all-reduce share suggested. vLLM's DBO needs DP > 1 and a DeepEP / NIXL all-to-all backend and is marked
+  under development for the V2 runner, so it would be our own runner work (days) for that gain; the owner decides.
 - Fusing v_proj into the qkg GEMM (one launch and one weight stream less per layer: 4.4 µs of 16 rows; bits of V may
   move); fused add + norm + norm + fp4-quant kernels for PeriNorm (652 small launches per step, 1.4 ms).
 - KV offload (host RAM + disk tier, `KV_OFFLOAD_GIB`) for multi-turn agent sessions beyond the 3.1M-token GPU cache,
