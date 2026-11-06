@@ -3,6 +3,19 @@
 Hand‑written SASS assembled by `cubit` (shipped cubins: pinned @ `5912400`). Cubins are **SM120‑only**.
 Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sass/qmma_e4m3.merc.stub`.
 
+**Per-source allocator switches (cubit ≥ `f643e00`, 2026-11-06):** the five MC4 K ≥ 4096 sources are assembled with
+`CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1 cubit asm sass/<SASS> -o <cubin> --kernel moe_w2_mm --mercury-stub sass/qmma_e4m3.merc.stub`
+— `moe_w2_mm_mc4_k4096_a32.sass`, `moe_w2_mm_mc4_k6144.sass`, `moe_w2_mm_mc4_k6144_a32.sass`, `moe_w2_mm_mc4_k7168.sass`,
+`moe_w2_mm_mc4_k7168_a32.sass`. The two switches restore the `5912400` schedule of these kernels (the read-barrier
+chain on the scale-byte loads + the shared-W0 prologue; cubit KNOWN_ISSUES A19): measured on the test host (RTX PRO
+6000, K's harness, 25 reps, E = 64; bits identical to the shipped cubins in every arm) the `main` default runs them at
+1.37× / 1.38× / 1.65× / 1.21× / 1.67× of the shipped time and the switched build at 1.01× / 0.84× / 1.01× / 0.84× /
+0.98× (`mc4_k4096_a32` 340.7 → 467.6 → 343.5 µs, `mc4_k6144` 475.8 → 658.6 → 400.6, `mc4_k6144_a32` 513.4 → 847.4 →
+519.9, `mc4_k7168` 560.5 → 680.7 → 469.6, `mc4_k7168_a32` 599.8 → 1002.9 → 590.4). The switches cost 3–30 % on 57
+of the other 79 kernels and stay OFF for every other source. The shipped cubins are unchanged: a regenerated cubin
+of these five ships only after the in-situ validation pass (`tools/test_moe_w2_planes.py` + the GSM8K / agreement
+battery) is repeated with the new assembler, like every other regeneration in this manifest.
+
 **Sources re‑canonicalized for the current cubit (`main` ≥ `f8605f6`, strict encoder):** the
 `.ROW/.COL` operand suffixes on `QMMA.SF` (no such bit exists in the SM120 encoding — the `5912400`
 encoder silently dropped them, the current one refuses, BUG‑272) are gone from every `sass/*.sass`
@@ -117,16 +130,16 @@ format (f32 per‑128 scales) — never regenerated for `_a32`.
 |---|---|---|---|
 | `moe_w2_mm_k4096_a32.cubin` | `moe_w2_mm_k4096_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=4096 (w13) |
 | `moe_w2_mm_k2048_a32.cubin` | `moe_w2_mm_k2048_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=2048 (w2) |
-| `moe_w2_mm_mc4_k4096_a32.cubin` | `moe_w2_mm_mc4_k4096_a32.sass` | `moe_w2_mm` | MC=4 (prefill, full QMMA‑M), K=4096 |
+| `moe_w2_mm_mc4_k4096_a32.cubin` | `moe_w2_mm_mc4_k4096_a32.sass` | `moe_w2_mm` | MC=4 (prefill, full QMMA‑M), K=4096 — build with `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1` (shipped 340.7 µs; main default 1.37×, switched 1.01×; bits identical) |
 | `moe_w2_mm_mc4_k2048_a32.cubin` | `moe_w2_mm_mc4_k2048_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=2048 |
 | `moe_w2_mm_k1024_a32.cubin` | `moe_w2_mm_k1024_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=1024** (w2 under TP2) |
 | `moe_w2_mm_mc4_k1024_a32.cubin` | `moe_w2_mm_mc4_k1024_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=1024 |
 | `moe_w2_mm_k512_a32.cubin` | `moe_w2_mm_k512_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=512** (w2 under TP4), NWARP=4 |
 | `moe_w2_mm_mc4_k512_a32.cubin` | `moe_w2_mm_mc4_k512_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=512 |
 | `moe_w2_mm_k6144_a32.cubin` | `moe_w2_mm_k6144_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
-| `moe_w2_mm_mc4_k6144_a32.cubin` | `moe_w2_mm_mc4_k6144_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 |
+| `moe_w2_mm_mc4_k6144_a32.cubin` | `moe_w2_mm_mc4_k6144_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 — build with `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1` (shipped 513.4 µs; main default 1.65×, switched 1.01×; bits identical) |
 | `moe_w2_mm_k7168_a32.cubin` | `moe_w2_mm_k7168_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
-| `moe_w2_mm_mc4_k7168_a32.cubin` | `moe_w2_mm_mc4_k7168_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 |
+| `moe_w2_mm_mc4_k7168_a32.cubin` | `moe_w2_mm_mc4_k7168_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 — build with `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1` (shipped 599.8 µs; main default 1.67×, switched 0.98×; bits identical) |
 | `moe_w2_mm_mc4afrag_k4096_a32.cubin` | `moe_w2_mm_mc4afrag_k4096_a32.sass` | `moe_w2_mm` | **AFRAG** (prefill, fragment‑major A), K=4096 |
 | `moe_w2_mm_mc4afrag_k2048_a32.cubin` | `moe_w2_mm_mc4afrag_k2048_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=2048 |
 | `moe_w2_mm_mc4afrag_k1024_a32.cubin` | `moe_w2_mm_mc4afrag_k1024_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=1024 (TP2) |
