@@ -87,15 +87,78 @@ against NCCL; row counts that do not reproduce stay on NCCL): three prompts × u
 logprobs (`tools/ripple_sm120/parity_probe.py`) are identical token for token and logprob for logprob between the
 P2P and the NCCL arm (1724 tokens, max |Δlogprob| 0), as are two runs on the same server.
 
+## Where the decode step goes (profile, 2026-11-06)
+
+Torch-profiler traces of the served configuration, rank 0, mean over the middle steps of a 256-token decode
+(`tools/ripple_sm120/step_anatomy.py` on a rank trace; GEMM shapes in isolation: `tools/ripple_sm120/decode_gemm_bench.py`). The cards run their memory at
+16.5 GHz (2.11 TB/s), so a TP rank's 16.1 GB of weights per step have a 7.6 ms floor.
+
+| class (per step, rank 0) | 1 request, code (16 rows) | 8 requests, code (96 rows) | 32 requests, code (256 rows, static k 7) |
+|---|---|---|---|
+| step | 16.2 ms, 2375 kernels, GPU busy 96 % | 22.7 ms | 40.4 ms |
+| BF16 GEMMs (cuBLAS: qkg 5376×5120, v, o, drafter, lm_head) | 6.1 ms (38 %) — qkg 33 µs = 79 % of bandwidth, o 17 µs | 7.1 ms | 9.5 ms (compute-bound) |
+| NVFP4 GEMMs (FlashInfer-CUTLASS: gate_up, down) | 4.5 ms (28 %) — 33.5 / 22 µs | 4.9 ms | 6.6 ms |
+| all-reduce (172 per step) | 2.45 ms (15 %) — P2P two-shot 14.2 µs each | 7.4 ms (33 %) — 43 µs each, 1.47 MB per rank = 34 GB/s over PCIe | 18.9 ms (47 %) — NCCL 109 µs each, 3.9 MB per rank = 36 GB/s |
+| norms / gating / fp4 input quant (Inductor Triton, 652 launches) | 1.4 ms | 1.6 ms | 2.0 ms |
+| attention (FA2 split-KV, 85 launches) | 0.7 ms | 0.7 ms | 1.9 ms |
+| idle (launch granularity inside the graphs; async scheduling is already on) | 0.66 ms | 0.3 ms | 0.8 ms |
+
+Reading: at one request the step is weight-bandwidth-bound (GEMMs at 58–84 % of 2.11 TB/s) plus the all-reduce
+latency; at 8–32 requests the all-reduce is PCIe-bandwidth-bound (the two-shot push and NCCL both sit at 34–36 GB/s
+per rank) and takes a third to a half of the step. ≥ 100 steps/s at one request is out of reach without changing
+bytes: the BF16 attention projections are 6.6 GB of the 16.1 GB a rank reads per step.
+
+Closed by measurement (do not revisit without new evidence):
+
+- One-shot push for small `M` (`VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS`): never faster here — two-shot 12.1 / 13.4 / 17.1 /
+  33.4 / 44.4 / 58.6 µs for M = 8 / 16 / 32 / 64 / 96 / 128 against one-shot 13.3 / 23.2 / 40 / 80 / 123 / 166 and
+  NCCL 13.2 / 18.1 / 28.3 / 51.6 / 50.2 / 60.3 (4-rank graph bench, bits = NCCL for all).
+- NVFP4 GEMM backend (`--linear-backend`): in a microbench every backend reproduces FlashInfer-CUTLASS's bits and
+  `flashinfer_cudnn` is 2–10 µs faster per layer; in situ it is 10 % slower at one request (57 vs 63 steps/s) and
+  its outputs differ (parity diverges after 326 / 88 tokens). `b12x` is 19 % faster at M = 256 only. Kept: `auto`.
+- `--attention-backend FLASHINFER` (target; the drafter keeps FA2): prefill −8 % at 163K (27.0 s) and −9 % at 391K
+  (100.5 s), KV cache +13 %, but decode −10 % at one request (57 steps/s) and −3 % at eight. Kept: FA2.
+- Dynamic draft length at 32 requests: the −6 % against static k 7 (42.9 vs 40.4 ms per step) is the DFlash2 drafter,
+  which drafts the configured maximum (15, so 512 rows at 32 requests) whatever the schedule says for the step
+  (`DFlashSpeculator.num_query_per_req = 1 + num_speculative_steps`; `propose()` only special-cases 0) — its gate_up
+  GEMM runs 4.8 × 331 µs instead of 1.2 × 214 µs. The fix is a vLLM patch (draft `1 + k` rows per request with graphs
+  per k of the schedule); the schedule stays.
+- BF16 GEMMs through cuBLASLt instead of cuBLAS: no gain, different bits for most shapes.
+
+## Candidate: attention projections in MXFP8 (a numerics change — the owner's decision)
+
+`tools/ripple_sm120/make_mxfp8_attn_checkpoint.py` derives `Ripple-65B-Preview-NVFP4-attnMXFP8`: q/k/g/o_proj of all
+80 layers in MXFP8 (e4m3 values, one e8m0 scale per 32 elements, vLLM's own quantization convention), v_proj
+(256-wide per rank: faster in BF16 than any MXFP8 kernel), embeddings, lm_head and the NVFP4 MLPs unchanged;
+`quant_algo: MIXED_PRECISION` with a `quantized_layers` map, loaded by stock vLLM as `modelopt_mixed`
+(FlashInfer-CUTLASS MXFP8 GEMM on sm_120). Weights per rank 16.6 → 13.6 GiB, KV cache 3.14M → 3.27M tokens.
+
+Measured on this host (2026-11-06 00:14–00:25Z, same served configuration otherwise):
+
+| | NVFP4 checkpoint (served) | + attention in MXFP8 |
+|---|---|---|
+| code, 1 request | 600–613 tok/s @ 63.3 steps/s | **731 tok/s @ 70.0 steps/s** |
+| prose, 1 request | 167–196 @ 60.5–61 | 176–193 @ 68.3–69.0 |
+| code, 8 requests | 3036–3112 / 382–387 @ 43.7 | **3218–3248 / 405–407 @ 45.5** |
+| code, 32 requests | 4738 / 148 @ 22.4 | 4785–4802 / 150 @ 22.3 (all-reduce-bound) |
+| fresh prefill 19K / 163K / 391K | 2.45 s / 29–30 s / 110 s | 2.24 s / 28.5 s / 106.3 s |
+| GSM8K-200, 8 requests | 193 / 200 (wrong: 66 100 147 158 159 160 164) | 191 / 200 (wrong: 3 29 76 100 147 158 159 160 164) |
+| GSM8K full (1319), 8 requests, paired | **1282 / 1319 = 97.19 %** (the model card: 0.971) | **1278 / 1319 = 96.89 %** — 32 errors shared, 9 only here, 5 only on the served arm; exact McNemar p = 0.42 (not significant; point estimate −0.3 pp) |
+| needle 28K / 105K / 399K, tool call + round trip, JSON schema, arithmetic 4/5 | pass (same answers) | pass (same answers) |
+| greedy parity against the served arm | — | diverges after 67 / 59 / 94 tokens (code / prose / math), as any numerics change does |
+
+Per-item results: `ripple65b/results/gsm8k_full_{served-y2,attn-mxfp8}.json` (`wrong_runs[].run_index`). Not served: the owner decides whether +20 % single-stream speed is worth a numerics change the 1319-item paired test cannot distinguish from noise (−4 items).
+
 ## Not done, next
 
-- Prefill: `--attention-backend FLASHINFER` and 16K chunks against FA2 at 163K / 391K; MXFP8 attention projections
-  (an output change — gate it) — attention is half the weight bytes.
-- The decode step at one request (15.6 ms for 80 layers + the drafter): a profile first; candidates are the
-  one-shot push for `M ≤ 16` (`VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS`, neutral on DeepSeek), `--async-scheduling`, the
-  NVFP4 GEMM backend (`VLLM_NVFP4_GEMM_BACKEND`; FlashInfer-CUTLASS is vLLM's choice here).
-- The dynamic schedule's 8 % at 32 requests (graph sizes vs truncated drafts); a 9–16 band.
+- Multi-request throughput: the all-reduce is 33–47 % of the step at 8–32 requests and sits on the PCIe floor; the
+  structural fix is two-micro-batch overlap (the second half's GEMMs under the first half's push; estimate −30…−40 %
+  per step at 32 requests, −15 % at 8, nothing at 1). vLLM's DBO needs DP > 1 and a DeepEP / NIXL all-to-all backend
+  and is marked under development for the V2 runner, so this is our own implementation (days).
+- The DFlash2 drafter at the schedule's k rather than the maximum (−5 % at 32 requests, −2 % at 8): a vLLM patch.
+- Fusing v_proj into the qkg GEMM (one launch and one weight stream less per layer: 4.4 µs of 16 rows; bits of V may
+  move); fused add + norm + norm + fp4-quant kernels for PeriNorm (652 small launches per step, 1.4 ms).
 - KV offload (host RAM + disk tier, `KV_OFFLOAD_GIB`) for multi-turn agent sessions beyond the 3.1M-token GPU cache,
   with the prefix-hit fidelity probe; `--kv-cache-dtype fp8` only if capacity is ever short.
-- A BF16 reference (the 130 GB checkpoint, TP4 on the test host) for a paired GSM8K / parity gate of the NVFP4
-  checkpoint.
+- A BF16 reference (the 130 GB checkpoint, TP4 on the test host) for a paired GSM8K / parity gate of the NVFP4 and
+  the MXFP8-attention checkpoints.
