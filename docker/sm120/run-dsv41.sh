@@ -16,7 +16,7 @@
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe also in KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 #
-# Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk)
+# Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (8192 = two pipelined 4096-row groups per step since -r26; 4096 before)
 #            GPU_MEM_UTIL (0.94)     0.92 for the very first start (the autotune sweep OOMs at 0.95 on a cold CACHE_DIR)
 #            SPEC_TOKENS (5; 7 with SERVED=1)  DSpark draft tokens, 0 = no drafter (-2.4 GiB per GPU)
 #            MOE_BACKEND ("" ; b12x with SERVED=1)  --moe-backend; b12x = FlashInfer's W4A8 compact path the fused
@@ -60,7 +60,8 @@ CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
 SERVED_NAME="${SERVED_NAME:-deepseek-ai/DeepSeek-V4.1-Flash}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+# 8192 since -r26 (step 47: two 4096-row groups pipelined per step; PREFILL_PIPE=0 MAX_NUM_BATCHED_TOKENS=4096 restores the -r25 shape)
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 SERVED="${SERVED:-0}"
 case "$SERVED" in
@@ -78,6 +79,7 @@ SERVED_SWITCHES=(
   VLLM_MOET_MHC_MXFP8=1 VLLM_MOET_MHC_SIDE_DEFER=1
   VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1
   VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
+  VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE:-2}
 )
 if [[ "$SERVED" == "1" ]]; then
   : "${SPEC_TOKENS:=7}"

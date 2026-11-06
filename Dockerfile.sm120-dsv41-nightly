@@ -391,6 +391,24 @@ RUN if [ "$VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH" = "1" ] && [ "$VLLM_MOET_SPA
     && grep -q "sparse-MLA prefill SASS kernel" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py \
     && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin', 'rb').read()).hexdigest(); assert h.startswith('c896234bc76d6938'), h; print('sparse-MLA prefill SASS cubin', h[:16])"; fi
 
+# 47. The pipelined sequence-parallel prefill (runtime switch VLLM_MOET_PREFILL_PIPE=2 with --max-num-batched-tokens 8192,
+#     default off; needs steps 41 and 45). An eager step of > 4096 tokens is split into two 4096-row groups run one layer apart
+#     on two threads (vLLM's DBO hand-off protocol without the DBO runner): the SP reduce-scatter -> mHC -> projections ->
+#     all-gather chain of one group on a comm stream under the other's attention / MoE on the compute stream; group B's layer L
+#     always after group A's layer L (B's attention reads the KV A wrote). Every kernel keeps today's launch shape and inputs,
+#     so the bits are the served bits by construction: test host (4x RTX PRO 6000 SE, 2026-11-06) long_agree x2 / agree /
+#     run-to-run ALL IDENTICAL and 800/800 per-layer dump hashes identical vs the 4096 path on 4 ranks; fresh prefill 163K
+#     6947 -> 5360-5392 ms (-22.4..-22.9 %), 19K 819 -> 671 ms (NCCL was 38 % of the prefill on one stream). Any unmet
+#     dependency is a RuntimeError, never a silent fallback. Costs: a 268 ms prefill step instead of 174 ms for a concurrent
+#     decode, KV 12.54 -> 11.31 GiB at 8192 batched tokens (session K, K/REPORT.md section 4, K/NEEDS_OWNER.md 4).
+ARG VLLM_MOET_PREFILL_PIPE_PATCH=1
+RUN if [ "$VLLM_MOET_PREFILL_PIPE_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_GATHER_PATCH" = "1" ]; then \
+       python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_pipe_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_pipe_sm120.py --check \
+    && python3 -c "from vllm.v1.worker import moet_prefill_pipe as p; assert hasattr(p, 'step_context') and hasattr(p, 'record_for_comm'); print('prefill pipeline runtime importable')" \
+    && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py \
+    && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/model.py; fi
+
 # Labels: the launcher reads kv-mode and v41-kv-records; the tests and docs read the step flags.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="DeepSeek-V4.1-Flash on sm_120: vllm/vllm-openai nightly df3bd094 with the sm_120 gaps closed and the decode / prefill kernels of vLLM-Moet (docs/dsv41-sm120.md)" \
@@ -431,6 +449,7 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.b12x-moe-prefill-fast="${VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH}" \
       com.vllm-moet.prefill-sp-gather="${VLLM_MOET_PREFILL_SP_GATHER_PATCH}" \
       com.vllm-moet.sparse-mla-prefill-sass="${VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH}" \
+      com.vllm-moet.prefill-pipe="${VLLM_MOET_PREFILL_PIPE_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}" \
       com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}" \
       com.vllm-moet.engram-v2="${VLLM_MOET_ENGRAM_V2_PATCH}"
