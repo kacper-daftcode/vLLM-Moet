@@ -17,15 +17,16 @@ puts that vLLM on the official nightly image and adds the sm_120 steps. Patchers
 | 0 | vLLM at `03bd3c68` (the per-commit wheel on nightly `a2bcb565`, same pins) | — | the model serves; stock vLLM is the baseline below |
 | 1 | the TP group's bf16 `[M, 5120]` all-reduces of `M ≤ 128` rows on the PCIe P2P push with NCCL's summation order (the DeepSeek line's `p2p_ar` module behind a generic hook in `GroupCoordinator._all_reduce_out_place`; vLLM has only PyNCCL for 4 PCIe GPUs) | `VLLM_MOET_P2P_AR=1`, `VLLM_MOET_P2P_AR_M_MAX` / `_MAX_ROWS` (128 served; 64 default) | +2 % steps/s at 1 request, **+14 % at 8** (k = 7; 160 + 10 all-reduces per step); at 256 rows (32 requests × k 7) the push is 3 % slower than NCCL, so the cut-off is 128; outputs identical to NCCL |
 | — | vLLM's dynamic draft length by batch size (`num_speculative_tokens_per_batch_size`) | `SPEC_SCHEDULE` | 15 / 11 / 7 draft tokens for 1–2 / 3–8 / 9–32 requests: the verification of 16 tokens is free at 1 request (steps/s do not depend on k), compute-bound at 32 |
+| 2 | the DFlash2 drafter drafts the schedule's k instead of always 15: 1 + k query rows per request through its 5 layers (its grouped convolutions read each row's offset in its request's block from the speculator instead of `row % 16`), k sample rows, (1 + k) × requests context rows, CUDA graphs per query width as the target's (`patch_vllm_dflash_dynamic_k_sm120.py`) | — (no schedule: k = 15 every step, as before) | **+6.5 % at 32 requests** (code 4738 → 5045 tok/s, 22.4 → 24.0 steps/s = the static-k7 level with k 15 kept at 1 request; prose 1950 → 2080), the same at 1–8 (the drafter's 96 vs 128 rows at 8 requests were ~0.4 ms of 22.7); outputs are the target's argmax either way: parity identical, GSM8K-200 194 vs 193, needle 6/6 |
 
 **Baseline** (stock vLLM `03bd3c68`, k = 7, 512 output tokens, `glm_spec_matrix.py`): code 416 tok/s single stream
 at 63 steps/s (6.6 tokens per step), 2270 tok/s aggregate at 8 requests (283 per request, 43 steps/s); prose 169 / 915
 (the drafter accepts 1.7 of 7 on prose); fresh prefill 7.9K tok/s at 19K tokens, 5.3K at 163K, 3.5K at 391K; GPU KV
 cache 3.17M tokens (bf16); GSM8K-200 193/200 at 8 requests; needle 6/6 at 28K / 105K / 399K tokens; start 4 min.
 
-**As served** (`-r3`: step 1 up to 128 rows, dynamic draft length 15 / 11 / 7, 32 requests, 8192-token chunks, bf16 KV,
-no KV offload): see the table in [Measurements](#measurements) — code **~600 tok/s single stream, ~3000 tok/s
-aggregate at 8 requests, ~4600 at 32**; prose 170 / 960 / 1900; prefill and quality as the baseline.
+**As served** (`-r4`: steps 1 (up to 128 rows) and 2, dynamic draft length 15 / 11 / 7, 32 requests, 8192-token chunks,
+bf16 KV, no KV offload): see the table in [Measurements](#measurements) — code **~600 tok/s single stream, ~3000 tok/s
+aggregate at 8 requests, ~5000 at 32**; prose 170 / 980 / 2080; prefill and quality as the baseline.
 
 On the same four cards GLM-5.3-Flash (the slot's previous model, TP4, MTP k = 3, FP8 KV) did code 244–258 / prose
 175–190 tok/s single stream at 71–75 steps/s, ~720 / ~550 aggregate at 8 requests, prefill 8.3K / 7.9K / 7.1K tok/s,
@@ -36,7 +37,7 @@ GSM8K-200 192/200.
 ```bash
 hf download ricursiveAI/Ripple-65B-Preview-NVFP4 --local-dir /srv/models/Ripple-65B-Preview-NVFP4     # 57 GB
 hf download ricursiveAI/Ripple-65B-Preview-DFlash2 --local-dir /srv/models/Ripple-65B-Preview-DFlash2  # 8 GB
-DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r3 .   # ~3 min
+DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r4 .   # ~3 min
 MODEL_DIR=/srv/models/Ripple-65B-Preview-NVFP4 DRAFT_DIR=/srv/models/Ripple-65B-Preview-DFlash2 \
   GPUS=4,5,6,7 PORT=8002 SPEC_TOKENS=15 SPEC_SCHEDULE='[[1,2,15],[3,8,11],[9,32,7]]' \
   EXTRA_DOCKER_ARGS="-e VLLM_MOET_P2P_AR=1 -e VLLM_MOET_P2P_AR_M_MAX=128 -e VLLM_MOET_P2P_AR_MAX_ROWS=128" \
@@ -56,7 +57,7 @@ unchanged (the template renders them to the generated tokens, so the prefix cach
 ## Measurements
 
 4× RTX PRO 6000 Blackwell (400 W), TP4, 512 output tokens per request, `ignore_eos`, temperature 0; aggregate tok/s
-in the shared decode window / per request / engine steps per second. Image `-r2`/`-r3`, step 1 on unless noted.
+in the shared decode window / per request / engine steps per second. Image `-r2`/`-r3`/`-r4`, step 1 on unless noted.
 
 | configuration | code 1 | code 8 | code 32 | prose 1 | prose 8 | prose 32 |
 |---|---|---|---|---|---|---|
@@ -67,12 +68,16 @@ in the shared decode window / per request / engine steps per second. Image `-r2`
 | step 1, k 15 | 614 @ 64.2 | 2940 / 365 @ 37.9 | 4430 / 138 @ 14.1 | 169 @ 62.6 | 833 / 104 @ 37.5 | 1276 / 39 @ 14.1 |
 | step 1 (≤ 64 rows), dynamic 15/11/7 | 589 @ 63.2 | 2838 / 354 @ 40.8 | 4632 / 145 @ 21.7 | 169 @ 62.0 | 890 / 110 @ 40.6 | 1910 / 59 @ 21.8 |
 | step 1 (≤ 256 rows), dynamic 15/11/7 | 630 @ 63.2 | 2993 / 376 @ 42.5 | 4438 / 139 @ 21.0 | 171 @ 62.4 | 963 / 121 @ 42.6 | 1845 / 58 @ 21.1 |
+| step 1 (≤ 128 rows), dynamic 15/11/7 — served `-r3` (2026-11-05 23:26Z) | 600–613 @ 63.3 | 3036–3112 / 380 @ 43.7 | 4738 / 148 @ 22.4 | 167–196 @ 60.8 | 965 / 121 @ 43.1 | 1950–1970 / 61 @ 22.5 |
+| **+ step 2 (drafter at the schedule's k) — served `-r4`** | 626–640 @ 63.6 | 3010–3097 / 384 @ 43.5 | **5041–5046 / 158 @ 24.0** | 166–171 @ 62.3 | 984 / 122 @ 43.3 | **2074–2089 / 65 @ 24.1** |
 
 Reading: at one request the step takes ~15.6 ms whatever the draft length, so tokens per step (6.6 at k 7, 9.6 at
 k 15 on code) set the single-stream speed; at 32 requests the verification of 32 × (k + 1) rows is compute-bound and
 k 7 is the best static choice. The dynamic schedule costs ~8 % at 32 requests against static k 7 (21.7 vs 23.9
 steps/s) and gains 40 % at one; a static k 11 is the simple alternative (573 / 2890 / 4700). The all-reduce push pays
-at 8–16 requests (96 rows: 40.8 → 42.5 steps/s) and loses at 256 rows.
+at 8–16 requests (96 rows: 40.8 → 42.5 steps/s) and loses at 256 rows. Step 2 removes the schedule's cost at 32 requests: the
+drafter had been running its 16-wide block for every request whatever k (512 rows for 7 drafts each), now 8 — 24.0
+steps/s, the static-k7 level, with k 15 kept at one request.
 
 Prefill does not depend on the draft length: 19K tokens 2.3–2.5 s (7.9–8.4K tok/s), 163K 29–30 s (5.4–5.6K), 391K
 110 s (3.5K) — the 16 full-attention layers over 391K tokens on FlashAttention 2 (`FLASH_ATTN`, vLLM's choice on
@@ -121,8 +126,9 @@ Closed by measurement (do not revisit without new evidence):
 - Dynamic draft length at 32 requests: the −6 % against static k 7 (42.9 vs 40.4 ms per step) is the DFlash2 drafter,
   which drafts the configured maximum (15, so 512 rows at 32 requests) whatever the schedule says for the step
   (`DFlashSpeculator.num_query_per_req = 1 + num_speculative_steps`; `propose()` only special-cases 0) — its gate_up
-  GEMM runs 4.8 × 331 µs instead of 1.2 × 214 µs. The fix is a vLLM patch (draft `1 + k` rows per request with graphs
-  per k of the schedule); the schedule stays.
+  GEMM runs 4.8 × 331 µs instead of 1.2 × 214 µs. Fixed by step 2 (`1 + k` rows per request with graphs per width;
+  the drafter's grouped convolutions had to learn each row's offset in its block — their `row % 16` made the first
+  arm's drafts collapse to 0.24 acceptance at C8): 22.4 → 24.0 steps/s at 32 requests, the schedule stays.
 - BF16 GEMMs through cuBLASLt instead of cuBLAS: no gain, different bits for most shapes.
 
 ## Candidate: attention projections in MXFP8 (a numerics change — the owner's decision)
@@ -155,7 +161,6 @@ Per-item results: `ripple65b/results/gsm8k_full_{served-y2,attn-mxfp8}.json` (`w
   structural fix is two-micro-batch overlap (the second half's GEMMs under the first half's push; estimate −30…−40 %
   per step at 32 requests, −15 % at 8, nothing at 1). vLLM's DBO needs DP > 1 and a DeepEP / NIXL all-to-all backend
   and is marked under development for the V2 runner, so this is our own implementation (days).
-- The DFlash2 drafter at the schedule's k rather than the maximum (−5 % at 32 requests, −2 % at 8): a vLLM patch.
 - Fusing v_proj into the qkg GEMM (one launch and one weight stream less per layer: 4.4 µs of 16 rows; bits of V may
   move); fused add + norm + norm + fp4-quant kernels for PeriNorm (652 small launches per step, 1.4 ms).
 - KV offload (host RAM + disk tier, `KV_OFFLOAD_GIB`) for multi-turn agent sessions beyond the 3.1M-token GPU cache,

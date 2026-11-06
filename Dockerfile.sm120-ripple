@@ -8,7 +8,7 @@
 # the base's; the compiled _C / _moe_C / cumem ops come with the wheel, built against the same torch). The base's Rust
 # frontend binary stays at a2bcb565 and is not used (Python frontend).
 #
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r3 .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r4 .
 #   MODEL_DIR=/srv/models/Ripple-65B-Preview-NVFP4 DRAFT_DIR=/srv/models/Ripple-65B-Preview-DFlash2 docker/sm120/run-ripple.sh
 #
 # Steps are numbered like Dockerfile.sm120-dsv41-nightly's (a build arg each, a com.vllm-moet.ripple.* label the launcher
@@ -47,11 +47,23 @@ RUN if [ "$VLLM_MOET_RIPPLE_P2P_AR_PATCH" = "1" ]; then python3 /opt/vllm-moet/r
     && python3 -c "import vllm.distributed.parallel_state as p; assert hasattr(p, '_moet_p2p_try_all_reduce'); print('TP all-reduce hook patched')" \
     && ls /opt/vllm-moet/torch_extensions/p2p_allreduce_sm120/*.so; fi
 
+# 2. The DFlash2 drafter drafts the step's k under the dynamic schedule (num_speculative_tokens_per_batch_size) instead
+#    of the maximum: 1 + k query rows per request through its 5 layers (the grouped convolutions read each row's offset
+#    in its request's block from the speculator instead of row % 16), k sample rows, (1 + k) x requests context rows,
+#    CUDA graphs per query width as the target's. The greedy output is the target's argmax whatever the drafter
+#    proposes (parity identical). Measured: +6.5 % at 32 requests (code 4738 -> 5045 tok/s, the static-k7 level with
+#    k 15 kept at 1 request), the same at 1-8. No runtime switch: without a schedule every step has k = N as before.
+ARG VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH=1
+RUN if [ "$VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_dflash_dynamic_k_sm120.py \
+    && python3 -c "from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator as S; assert S._dynamic_query_width is True and 'load_draft_model' in S.__dict__; import vllm.model_executor.models.qwen3_dflash2 as m; assert 'offsets' in m.dflash2_grouped_conv_impl.__code__.co_varnames; print('DFlash2 dynamic-k patch importable')"; fi
+
 ARG VLLM_COMMIT
 ARG VLLM_MOET_RIPPLE_P2P_AR_PATCH
+ARG VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH
 LABEL org.opencontainers.image.title="vLLM-Moet Ripple-65B Preview SM120 (vLLM main)" \
       org.opencontainers.image.description="Ripple-65B Preview on sm_120: vllm/vllm-openai nightly a2bcb565 with vLLM 03bd3c68 (vllm#65745: RicursiveForCausalLM, ripple parsers, DFlash2 draft) and the sm_120 steps of vLLM-Moet (docs/ripple-sm120.md)" \
       com.vllm-moet.ripple.vllm-commit="${VLLM_COMMIT}" \
       com.vllm-moet.ripple.base="nightly-a2bcb5657a881a002e79d0adab3c6b5e39436121" \
       com.vllm-moet.ripple.step0-wheel="1" \
-      com.vllm-moet.ripple.p2p-ar="${VLLM_MOET_RIPPLE_P2P_AR_PATCH}"
+      com.vllm-moet.ripple.p2p-ar="${VLLM_MOET_RIPPLE_P2P_AR_PATCH}" \
+      com.vllm-moet.ripple.dflash-dynk="${VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH}"
