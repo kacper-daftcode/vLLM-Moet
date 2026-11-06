@@ -8,7 +8,7 @@
 # the base's; the compiled _C / _moe_C / cumem ops come with the wheel, built against the same torch). The base's Rust
 # frontend binary stays at a2bcb565 and is not used (Python frontend).
 #
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r4 .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r6 .
 #   MODEL_DIR=/srv/models/Ripple-65B-Preview-NVFP4 DRAFT_DIR=/srv/models/Ripple-65B-Preview-DFlash2 docker/sm120/run-ripple.sh
 #
 # Steps are numbered like Dockerfile.sm120-dsv41-nightly's (a build arg each, a com.vllm-moet.ripple.* label the launcher
@@ -62,10 +62,20 @@ ARG VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH=1
 RUN if [ "$VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_dflash_dynamic_k_sm120.py \
     && python3 -c "from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator as S; assert S._dynamic_query_width is True and 'load_draft_model' in S.__dict__; import vllm.model_executor.models.qwen3_dflash2 as m; assert 'offsets' in m.dflash2_grouped_conv_impl.__code__.co_varnames; print('DFlash2 dynamic-k patch importable')"; fi
 
+# 3. Two-microbatch decode for TP without DP (vLLM's DBO machinery unlocked for a dense TP model: one half's TP
+#    all-reduces on the comm stream under the other half's GEMMs), behind VLLM_MOET_DECODE_UBATCH=2 at runtime (default
+#    off: the image behaves as -r4). Measured on rtx at 32 requests: +4-5 % steps/s - the all-reduce hides completely,
+#    but the decode GEMMs are weight-bandwidth-bound, so two halves of 128 rows cost what one batch of 256 does
+#    (docs/ripple-sm120.md). The patcher also gives the p2p_ar module's _run an `out` argument.
+ARG VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH=1
+RUN if [ "$VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_decode_ubatch_tp_sm120.py \
+    && python3 -c "import vllm.distributed.parallel_state as p; assert hasattr(p, '_moet_dbo_all_reduce'); import vllm.v1.worker.gpu_worker as w; assert hasattr(w, '_moet_maybe_enable_decode_ubatching'); print('TP decode microbatching patched (runtime VLLM_MOET_DECODE_UBATCH=2)')"; fi
+
 ARG VLLM_COMMIT
 ARG VLLM_MOET_RIPPLE_STEP0_WHEEL
 ARG VLLM_MOET_RIPPLE_P2P_AR_PATCH
 ARG VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH
+ARG VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH
 ARG BASE_IMAGE
 LABEL org.opencontainers.image.title="vLLM-Moet Ripple-65B Preview SM120 (vLLM main)" \
       org.opencontainers.image.description="Ripple-65B Preview on sm_120: vllm/vllm-openai nightly a2bcb565 with vLLM 03bd3c68 (vllm#65745: RicursiveForCausalLM, ripple parsers, DFlash2 draft) and the sm_120 steps of vLLM-Moet (docs/ripple-sm120.md)" \
@@ -73,4 +83,5 @@ LABEL org.opencontainers.image.title="vLLM-Moet Ripple-65B Preview SM120 (vLLM m
       com.vllm-moet.ripple.base="${BASE_IMAGE}" \
       com.vllm-moet.ripple.step0-wheel="${VLLM_MOET_RIPPLE_STEP0_WHEEL}" \
       com.vllm-moet.ripple.p2p-ar="${VLLM_MOET_RIPPLE_P2P_AR_PATCH}" \
-      com.vllm-moet.ripple.dflash-dynk="${VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH}"
+      com.vllm-moet.ripple.dflash-dynk="${VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH}" \
+      com.vllm-moet.ripple.decode-ubatch="${VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH}"

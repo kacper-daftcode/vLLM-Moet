@@ -18,6 +18,7 @@ puts that vLLM on the official nightly image and adds the sm_120 steps. Patchers
 | 1 | the TP group's bf16 `[M, 5120]` all-reduces of `M ≤ 128` rows on the PCIe P2P push with NCCL's summation order (the DeepSeek line's `p2p_ar` module behind a generic hook in `GroupCoordinator._all_reduce_out_place`; vLLM has only PyNCCL for 4 PCIe GPUs) | `VLLM_MOET_P2P_AR=1`, `VLLM_MOET_P2P_AR_M_MAX` / `_MAX_ROWS` (128 served; 64 default) | +2 % steps/s at 1 request, **+14 % at 8** (k = 7; 160 + 10 all-reduces per step); at 256 rows (32 requests × k 7) the push is 3 % slower than NCCL, so the cut-off is 128; outputs identical to NCCL |
 | — | vLLM's dynamic draft length by batch size (`num_speculative_tokens_per_batch_size`) | `SPEC_SCHEDULE` | 15 / 11 / 7 draft tokens for 1–2 / 3–8 / 9–32 requests: the verification of 16 tokens is free at 1 request (steps/s do not depend on k), compute-bound at 32 |
 | 2 | the DFlash2 drafter drafts the schedule's k instead of always 15: 1 + k query rows per request through its 5 layers (its grouped convolutions read each row's offset in its request's block from the speculator instead of `row % 16`), k sample rows, (1 + k) × requests context rows, CUDA graphs per query width as the target's (`patch_vllm_dflash_dynamic_k_sm120.py`) | — (no schedule: k = 15 every step, as before) | **+6.5 % at 32 requests** (code 4738 → 5045 tok/s, 22.4 → 24.0 steps/s = the static-k7 level with k 15 kept at 1 request; prose 1950 → 2080), the same at 1–8 (the drafter's 96 vs 128 rows at 8 requests were ~0.4 ms of 22.7); outputs are the target's argmax either way: parity identical, GSM8K-200 194 vs 193, needle 6/6 |
+| 3 | two-microbatch decode for TP without DP: vLLM's DBO machinery (UBatchRunner, per-microbatch attention metadata, FULL graphs captured with a compute and a comm stream) unlocked for a dense TP model, the hand-off at the TP all-reduce — one half's all-reduces (the P2P push at ≤ 128 rows) on the comm stream under the other half's GEMMs (`patch_vllm_decode_ubatch_tp_sm120.py`) | `DECODE_UBATCH=2`, `DECODE_UBATCH_MIN_TOKENS` (128: 16+ requests at k 7) | **+4 % at 16 requests (40.9 → 42.5 steps/s), +5 % at 32 (26.2 → 27.6)**, nothing below: the all-reduce hides completely, but the decode GEMMs are weight-bandwidth-bound, so two halves of 128 rows cost what one batch of 256 does (per layer 4 × ~90 µs vs 2 × ~85 + 2 × 102 µs of all-reduce); outputs the target's argmax of a half-size batch (GSM8K-200 at 32 requests 194/200) |
 
 **Baseline** (stock vLLM `03bd3c68`, k = 7, 512 output tokens, `glm_spec_matrix.py`): code 416 tok/s single stream
 at 63 steps/s (6.6 tokens per step), 2270 tok/s aggregate at 8 requests (283 per request, 43 steps/s); prose 169 / 915
@@ -74,6 +75,7 @@ in the shared decode window / per request / engine steps per second. Image `-r2`
 | step 1 (≤ 128 rows), dynamic 15/11/7 — served `-r3` (2026-11-05 23:26Z) | 600–613 @ 63.3 | 3036–3112 / 380 @ 43.7 | 4738 / 148 @ 22.4 | 167–196 @ 60.8 | 965 / 121 @ 43.1 | 1950–1970 / 61 @ 22.5 |
 | **+ step 2 (drafter at the schedule's k) — served `-r4`** | 626–640 @ 63.6 | 3010–3097 / 384 @ 43.5 | **5041–5046 / 158 @ 24.0** | 166–171 @ 62.3 | 984 / 122 @ 43.3 | **2074–2089 / 65 @ 24.1** |
 | **+ attention projections in MXFP8 (the derived checkpoint) — served since 2026-11-06 10:02Z** | **727 @ 71.0** | **3346–3357 / 416 @ 48.3** | **5548–5576 / 174 @ 26.2** | 181–196 @ 69.8 | 1044–1081 / 133 @ 47.8 | 2209–2303 / 70 @ 26.2 |
+| **+ step 3 (two microbatches at ≥ 128 tokens) — served `-r6` since 2026-11-06 10:58Z** | 726–758 @ 71 | 3343–3390 / 413 @ 48.4 | **5802–5848 / 183 @ 27.6** (16 requests: 4490–4526 / 281 @ 42.5 vs 4299–4348 @ 40.9) | 192–201 @ 69.5 | 1029–1071 / 129 @ 47.6 | 2340–2378 / 73 @ 27.5 |
 
 Reading: at one request the step takes ~15.6 ms whatever the draft length, so tokens per step (6.6 at k 7, 9.6 at
 k 15 on code) set the single-stream speed; at 32 requests the verification of 32 × (k + 1) rows is compute-bound and
@@ -177,16 +179,13 @@ from the served bits after 369 code / 83 prose tokens (math identical), max |Δl
 
 ## Not done, next
 
-- Multi-request throughput: the all-reduce is 33–47 % of the step at 8–32 requests and sits on the PCIe floor. The
-  structural fix, two micro-batches with one half's all-reduce under the other half's GEMMs, was measured in
-  isolation (`tools/ripple_sm120/decode_overlap_bench.py`, 2026-11-06): the platform hides 85–89 % of the P2P push
-  under GEMMs on another stream, but two halves stream the layer's weights twice (the decode GEMMs are
-  weight-bandwidth-bound: +43 % at 256 rows to +93 % at 96 for two halves, +24…+51 % when the halves alternate per
-  attention / MLP block so the second finds the block's ~80 MB in L2 — vLLM's DBO schedule). Net on the GEMMs + 2
-  all-reduces of a layer against today's serial step: **−16.5 % at 256 rows (32 requests × k 7), −14 % at 128,
-  −6.5 % at 96 (8 × k 11)**, i.e. about −12 % of the whole step at 32 requests and −5 % at 8 — not the −30…−40 %
-  the all-reduce share suggested. vLLM's DBO needs DP > 1 and a DeepEP / NIXL all-to-all backend and is marked
-  under development for the V2 runner, so it would be our own runner work (days) for that gain; the owner decides.
+- Multi-request throughput: the all-reduce was 33–47 % of the step at 8–32 requests on the PCIe floor. Step 3 overlaps it
+  with the other microbatch's GEMMs — the trace shows the all-reduce hidden completely — but on this platform the
+  decode GEMMs at 128 rows cost what they cost at 256 (weight-bandwidth-bound; a second call on the same weights right
+  after the first finds little in L2: `tools/ripple_sm120/decode_overlap_bench.py`, the L2 probe in session F's notes),
+  so the net is +4–5 % at 16–32 requests, not the −30…−40 % the all-reduce share suggested. What is left for the
+  multi-session regime is the all-reduce's bytes themselves (an FP8 / MXFP8 all-reduce — a numerics change for the
+  owner to decide — would halve the PCIe traffic: ~−4 ms of a 38 ms step at 32 requests).
 - Fusing v_proj into the qkg GEMM (one launch and one weight stream less per layer: 4.4 µs of 16 rows; bits of V may
   move); fused add + norm + norm + fp4-quant kernels for PeriNorm (652 small launches per step, 1.4 ms).
 - KV offload (host RAM + disk tier, `KV_OFFLOAD_GIB`) for multi-turn agent sessions beyond the 3.1M-token GPU cache,

@@ -21,6 +21,7 @@
 #                        (ricursiveAI/Ripple-65B-Preview-NVFP4) further names, space-separated
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe also in KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
+#            DECODE_UBATCH (0)  2 = two-microbatch decode (step 3) for uniform decodes >= DECODE_UBATCH_MIN_TOKENS (128) tokens
 #
 # Engine:    MAX_MODEL_LEN (524288)  the checkpoint allows 2,097,152; the drafter's positions are configured to 131,072
 #            MAX_NUM_SEQS (32)       MAX_NUM_BATCHED_TOKENS (8192: the prefill chunk)  GPU_MEM_UTIL (0.92)
@@ -68,6 +69,13 @@ PROFILE_DIR="${PROFILE_DIR:-$PWD/profiles-$NAME}"
 NCCL_P2P_LEVEL="${NCCL_P2P_LEVEL:-SYS}"
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
+# Step 3 (image -r6+): DECODE_UBATCH=2 runs uniform decodes of >= DECODE_UBATCH_MIN_TOKENS tokens as two microbatches with one
+# half's TP all-reduces under the other half's GEMMs (vLLM's DBO without DP; needs the V2 runner pinned). Default off.
+DECODE_UBATCH="${DECODE_UBATCH:-0}"
+DECODE_UBATCH_MIN_TOKENS="${DECODE_UBATCH_MIN_TOKENS:-128}"
+if [[ "$DECODE_UBATCH" == "2" ]]; then
+  EXTRA_DOCKER_ARGS="$EXTRA_DOCKER_ARGS -e VLLM_MOET_DECODE_UBATCH=2 -e VLLM_MOET_DECODE_UBATCH_MIN_TOKENS=$DECODE_UBATCH_MIN_TOKENS -e VLLM_USE_V2_MODEL_RUNNER=1"
+fi
 
 [[ -f "$MODEL_DIR/config.json" ]] || { echo "no config.json in MODEL_DIR=$MODEL_DIR" >&2; exit 1; }
 if [[ -n "$DRAFT_DIR" && "$SPEC_TOKENS" != "0" ]]; then
