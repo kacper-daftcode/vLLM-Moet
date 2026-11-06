@@ -155,6 +155,17 @@ Measured on this host (2026-11-06 00:14–00:25Z, same served configuration othe
 
 Per-item results: `ripple65b/results/gsm8k_full_{served-y2,attn-mxfp8}.json` (`wrong_runs[].run_index`). Not served: the owner decides whether +20 % single-stream speed is worth a numerics change the 1319-item paired test cannot distinguish from noise (−4 items).
 
+## The 2026-11-06 nightly (vLLM 4fab5a07, Ripple native) — built as `-r5`, not served
+
+`vllm/vllm-openai:nightly-4fab5a07…` (vLLM 0.33.0rc1.dev910, FlashInfer 0.7.3, torch 2.14.0+cu130) has `RicursiveForCausalLM`
+and `DFlash2RicursiveDraftModel` natively, so step 0 is off there (`--build-arg VLLM_MOET_RIPPLE_STEP0_WHEEL=0 --build-arg
+BASE_IMAGE=vllm/vllm-openai:nightly-x86_64@sha256:8b45a8be…`); steps 1 and 2 apply unchanged. Measured in situ against
+`-r4` (same configuration): the same speed (code 616–653 @ 63.7 / 2996–3034 @ 43.6 / 5064–5079 @ 24.2; prose 2100–2122 @
+24.1), the same smoke / needle answers, GSM8K-200 192/200 (r4 194, r3 193) — but other numerics: the parity probe diverges
+from the served bits after 369 code / 83 prose tokens (math identical), max |Δlogprob| 0.36 on the common prefix, KV
+3.147M tokens (−0.9 %), start 211 s (compile cache miss). With no speed to gain the served image stays `-r4` (bits of
+03bd3c68 + FlashInfer 0.7.2); `-r5` is the base to move to when a newer vLLM brings something, with the quality gates.
+
 ## Not done, next
 
 - Multi-request throughput: the all-reduce is 33–47 % of the step at 8–32 requests and sits on the PCIe floor. The
