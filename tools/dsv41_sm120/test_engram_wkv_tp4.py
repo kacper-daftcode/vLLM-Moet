@@ -7,7 +7,7 @@ Every rank runs prepare_embeddings + forward - the full path: lookup, TP all-gat
 post-wkv kernel - with the split off (the reference), forced at every size (1..4096 tokens: the slices + NCCL
 all-gather of the output) and at the default threshold, eagerly and replayed from CUDA graphs (NCCL inside the
 capture); the outputs must be identical bit for bit, also to the same Engram with upstream's wkv (vllm#58678:
-ColumnParallelLinear with gather_output, each rank loading its shard). Then timings on this host: the output
+ColumnParallelLinear with gather_output, each rank loading its shard). Then timings on 4x RTX PRO 6000: the output
 all-gather alone and the forward with and without the split and with upstream's wkv, in a CUDA graph at decode sizes
 and eagerly at prefill sizes.
 

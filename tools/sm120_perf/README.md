@@ -46,7 +46,7 @@ says `rootcplx-noswitch`): vLLM's one-shot custom all-reduce is *pull*-based (ev
 peers' buffers) and PCIe P2P reads are latency-bound here — 60 KiB takes 75–85 µs vs 12.8 µs for
 NCCL LL over P2P, growing linearly with size. FlashInfer's *push*-based PCIe IPC all-reduce (the
 nightly wheels ship it; vLLM main enables it with `VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1`),
-tuned on this host, in a CUDA graph, per call: 1 token × 5120 bf16 **5.3 µs vs NCCL 10.4**, 2 tokens
+tuned on 4× RTX PRO 6000, in a CUDA graph, per call: 1 token × 5120 bf16 **5.3 µs vs NCCL 10.4**, 2 tokens
 7.8 vs 12.1, 4 tokens 13.1 vs 12.4, **6 tokens (DSpark k=5 decode) 16.5 vs 12.8**, 12 tokens 18.8 vs
 16.9, 24 tokens 25.3 vs 26.0, 48 tokens 43.4 vs 44.3, 64 tokens 49.5 vs 58.1. It wins only below
 4 tokens per step; at this deployment's shapes NCCL LL is at the PCIe latency floor, so the

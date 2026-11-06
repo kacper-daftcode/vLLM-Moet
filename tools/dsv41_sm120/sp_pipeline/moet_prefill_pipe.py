@@ -5,7 +5,7 @@ Installed by tools/dsv41_sm120/patch_vllm_prefill_pipe_sm120.py as vllm/v1/worke
 V2 model runner, the DeepSeek-V4.1 model / model state / replay layers / Engram import it. Everything here is a no-op
 unless VLLM_MOET_PREFILL_PIPE=2 and the step qualifies, so the patched files behave as before otherwise.
 
-What it does (K/REPORT.md §4.0 has the dependency graph). With --max-num-batched-tokens 8192 an eager prefill step
+What it does. With --max-num-batched-tokens 8192 an eager prefill step
 carries up to two 4 096-row *groups* of the same request (A = rows [0, 4096), B = the rest: for any prompt length the
 groups are exactly today's sequence of 4 096-row chunks). The runner builds attention metadata + a replay batch + a
 forward context per group (group-private metadata builders and model-state buffers, "slots" 1 and 2; slot 0 = the
@@ -26,7 +26,7 @@ Switches: VLLM_MOET_PREFILL_PIPE (0 = off, 2 = two groups), VLLM_MOET_PREFILL_PI
 VLLM_MOET_PREFILL_PIPE_REPLAY (serial | stream: the replay section on its own stream with handoffs - measured neutral),
 VLLM_MOET_PREFILL_PIPE_DUMP=<dir> (+ <dir>/ENABLE present: per-layer sha256 of the hc states, the bits harness).
 
-Measured (test host, 4x RTX PRO 6000 SE, TP4, image r25 + this patch, K/REPORT.md §4.1): fresh prefill 163K 6947 -> 5360 ms
+Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
 PIPE=0 at 4096, 4 ranks). What remains: the two replay tails per step (write_kv(20) + the 128-row layers, launch-bound and
 skewed across ranks) ~ 80-90 ms of a ~300 ms step.
@@ -75,7 +75,7 @@ def mixed_policy() -> str:
 
 def replay_mode() -> str:
     """VLLM_MOET_PREFILL_PIPE_REPLAY: "serial" (default) = a group's replay section (layers 20-39 on 128 rows) is issued
-    whole on the compute stream, as the rest of its tail (v1 of K/REPORT.md §4: -22.9 % at 163K); "stream" = the section
+    whole on the compute stream, as the rest of its tail (v1: -22.9 % at 163K); "stream" = the section
     on a stream of its own with a CPU handoff per layer (v3: measured the same within noise - the two groups end their
     sequence-parallel layers together, so one layer is all a tail can overlap)."""
     mode = os.environ.get("VLLM_MOET_PREFILL_PIPE_REPLAY", "serial")

@@ -7,17 +7,17 @@ behind a runtime switch.
 
 | line | what | status | doc |
 |---|---|---|---|
-| **DeepSeek-V4.1-Flash on 4× RTX PRO 6000** | the official checkpoint on vLLM nightly: the sm_120 gaps closed, the decode step and the prefill rebuilt around small tensor-core kernels | **active, in production** | [docs/dsv41-sm120.md](docs/dsv41-sm120.md) |
+| **DeepSeek-V4.1-Flash on 4× RTX PRO 6000** | the official checkpoint on vLLM nightly: the sm_120 gaps closed, the decode step and the prefill rebuilt around small tensor-core kernels | **active, serving** | [docs/dsv41-sm120.md](docs/dsv41-sm120.md) |
 | **DeepSeek-V4.1-Flash on 1–4× RTX 5090 or 1–2× RTX PRO 6000 (the MoET hybrid)** | a subset of every layer's 384 experts on the cards, every other routed expert computed on the CPU in-step from the checkpoint's own bytes — bit-identical to the all-resident path; the Engram tables and the cold experts optionally on NVMe for 128–384 GB hosts | serving; every configuration below measured | [docs/moet-hybrid.md](docs/moet-hybrid.md), [the record and the field](docs/benchmarks/moet-hybrid-4x5090-2026-11-04.md) |
 | **2-bit experts on vLLM v0.24.0** | GLM-5.2 (753B), DeepSeek-V4-Flash (159B) and Kimi-K2.7-Code (1T) on one to four cards that cannot hold their checkpoints: a 2-bit codebook on hand-written SASS, an FP4 delta cache | frozen (builds, fixes accepted, no development) | [docs/v024-2bit.md](docs/v024-2bit.md) |
 | **Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000** | the official nightly with the PLE table on the GPUs, the skinny GEMM and an FP8 MoE GEMV | as built | [docs/qwen38-sm120.md](docs/qwen38-sm120.md) |
-| **Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000** | Ricursive's 65B dense model with its DFlash2 drafter on vLLM main: the TP all-reduces on the PCIe P2P push, the draft length by batch size, the drafter at the schedule's k, two microbatches at 16+ requests; code ~730 tok/s single stream, ~3350 aggregate at 8 requests, ~5800 at 32 with the attention projections in MXFP8 (a derived checkpoint, served on the owner's decision; ~630 / ~3050 / ~5100 on the NVFP4 checkpoint) | serving (first image) | [docs/ripple-sm120.md](docs/ripple-sm120.md) |
+| **Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000** | Ricursive's 65B dense model with its DFlash2 drafter on vLLM main: the TP all-reduces on the PCIe P2P push, the draft length by batch size, the drafter at the schedule's k, two microbatches at 16+ requests; code ~630 tok/s single stream, ~3050 aggregate at 8 requests, ~5100 at 32 on the NVFP4 checkpoint, ~740 / ~3350 / ~5800 with an optional derived checkpoint (attention projections in MXFP8) | serving | [docs/ripple-sm120.md](docs/ripple-sm120.md) |
 
 ## Results, as served
 
 ### 4× RTX PRO 6000: DeepSeek-V4.1-Flash native
 
-DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r25` (served since 2026-11-05 21:36Z; `-r24` before it)
+DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r25`
 (TP4, 512K context, DSpark k = 7, vision, thinking, tool calling, KV offload to host RAM and disk):
 
 | | vLLM-Moet | official vLLM image on the same cards |
@@ -27,6 +27,21 @@ DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nig
 | fresh prefill | 163K tokens in 6.6 s (24.5K tok/s), 19K in 0.79 s (`-r25`: the sparse-MLA prefill attention on the cubit-assembled SASS kernel, bit-identical to `-r24`'s 6.8 s and `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
 | KV cache | 9.62M tokens on the GPUs (18× concurrency at 512K) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
 | quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; identical requests return identical logits at any batch size and prompt length | the same checkpoint's quality |
+
+### 4× RTX PRO 6000: Ripple-65B Preview
+
+Ripple-65B Preview with the DFlash2 drafter, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:ripple-nightly-a2bcb565-r6`
+(TP4, 512K context, draft length 15 / 11 / 7 by batch size, two microbatches at 16+ requests); the first number is the
+derived checkpoint with the attention projections in MXFP8, the second the NVFP4 checkpoint ([the doc](docs/ripple-sm120.md)):
+
+| | vLLM-Moet | stock vLLM (`03bd3c68`) on the same cards, static k = 7 |
+|---|---|---|
+| decode, 1 stream | code ~740 / 630 tok/s at 71 / 64 steps/s; prose ~195 / 170 | code 416 (~600 with k = 15, a stock option), prose 169 at 63 steps/s |
+| decode, 8 streams | code ~3,350 / 3,050 tok/s aggregate; prose ~1,050 / 980 | code 2,270, prose 915 |
+| decode, 32 streams | code ~5,800 / 5,100; prose ~2,360 / 2,080 | — |
+| fresh prefill | 19K tokens in 2.2 s, 163K in 28.5 s, 391K in 106 s | 2.4 s, 31 s, 112 s |
+| KV cache | 3.27M / 3.14M tokens on the GPUs (bf16) | 3.17M |
+| quality | GSM8K-200 194/200, needle 6/6 at 28K / 105K / 399K, tool calls / JSON pass; on the NVFP4 checkpoint the steps keep stock vLLM's numerics (step 1 reproduces NCCL's bits, greedy parity identical) | GSM8K-200 193/200 |
 
 ### 1–4× RTX 5090, 1–2× RTX PRO 6000: DeepSeek-V4.1-Flash as the MoET hybrid
 

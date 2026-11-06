@@ -40,7 +40,7 @@
 #            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (the next turn hits the previous answer)
 #
 # Experiments: PREFILL_DBO (0)  1 = --enable-dbo (two prefill microbatches; needs an image built with step 15; measured
-#                        slower on this host), DBO_PREFILL_THRESHOLD (1024), DBO_DECODE_THRESHOLD (4096)
+#                        slower on 4x RTX PRO 6000), DBO_PREFILL_THRESHOLD (1024), DBO_DECODE_THRESHOLD (4096)
 #            PROFILER (0)            1 = torch profiler endpoints (/start_profile, /stop_profile), traces in PROFILE_DIR
 #
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100, default high; the OpenAI

@@ -13,7 +13,7 @@ keeps the model's numerics and changes where the time goes; the write-up with th
 | vLLM's own CuTe-DSL skinny GEMM (gated to B300 upstream) for the ~480 BF16 decode GEMMs per step, with plans tuned on this card | `VLLM_MOET_SM120_LL_GEMM=0` (use a fresh `CACHE_DIR`) | — |
 | an FP8 [32, 32] block-scaled MoE GEMV for the routed experts at decode token counts, silu·up and the quantization fused into the down GEMV; a tuned Triton `fused_moe` config for prefill | `VLLM_MOET_SM120_MOE_GEMV=0` | bit-identical to Triton |
 
-**As served** (4× RTX PRO 6000, TP4, MTP k = 3): **98.5 steps/s, prose 243 / code 346 tok/s single
+**Measured** (4× RTX PRO 6000, TP4, MTP k = 3): **98.5 steps/s, prose 243 / code 346 tok/s single
 stream** against 65 steps/s and 137–160 / 228 tok/s of the unmodified nightly; 2.28M-token KV at 256K
 context with `--kv-cache-memory 32GiB`; needle PASS at 27.6K / 91.9K.
 

@@ -4,8 +4,8 @@ one layer apart, the SP collectives of one under the compute of the other (step 
 
 Switch: VLLM_MOET_PREFILL_PIPE=2 (default 0 = today's path, every patched line is a no-op), together with
 --max-num-batched-tokens 8192 (two groups per step; a 4 096 step has one group and takes today's path). Runtime module
-tools/dsv41_sm120/sp_pipeline/moet_prefill_pipe.py (installed as vllm/v1/worker/moet_prefill_pipe.py) - its docstring and
-K/REPORT.md §4.0 (internal) have the design, the dependency graph and the hazards.
+tools/dsv41_sm120/sp_pipeline/moet_prefill_pipe.py (installed as vllm/v1/worker/moet_prefill_pipe.py) - its docstring has
+the design, the dependency graph and the hazards.
 
 Why. On image r25 a 4 096-token SP layer-chunk is 2 reduce-scatters + 2 all-gathers ~ 2.5 ms of NCCL next to 3.3 ms of
 compute on one stream with zero overlap: NCCL = 37.9 % of the 19K prefill's kernel time, bandwidth-bound (36 GB/s per

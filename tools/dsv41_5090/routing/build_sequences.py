@@ -169,7 +169,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--sessions", type=int, default=12)
     ap.add_argument("--session-tokens", type=int, default=16384)
-    ap.add_argument("--transcripts", default="/root/.cursor/projects/root/agent-transcripts")
+    ap.add_argument("--transcripts", required=True, help="directory of .jsonl chat transcripts used as the prompt corpus")
     ap.add_argument("--code-files", type=int, default=8)
     ap.add_argument("--code-tokens", type=int, default=8192)
     ap.add_argument("--parquet", default="/mnt/nvme/data/github-code-clean/train-00000-of-00880.parquet")

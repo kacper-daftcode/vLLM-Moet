@@ -25,7 +25,15 @@ FORBIDDEN = [
     (re.compile(r"/mnt/nvme/vLLM-Moet"), "host checkout path"),
     (re.compile(r"(?<![\w./-])internal/"), "reference to the private notes"),
     (re.compile(r"\bsessions? [A-Z]\b(?!-)"), "agent session letter"),
+    (re.compile(r"\bsessions? \[[A-Z]\]|\(\[[A-Z]\]\)|\breproduces? \[[A-Z]\]"), "agent session letter"),
     (re.compile(r"\bsesj[aie]\b", re.I), "Polish session note"),
+    (re.compile(r"\bowner'?s (decision|call|approval)|owner-approved|\bthe owner decides\b|\b[Dd]ecided \d{4}-\d\d-\d\d"), "decision narrative"),
+    (re.compile(r"\bserv(ed|ing) since\b|\bin production\b|\bproduction box\b|\bprod logs\b"), "deployment narrative"),
+    (re.compile(r"\b\d{1,2}:\d{2}(:\d{2})?Z\b"), "deployment timestamp"),
+    (re.compile(r"\b(test|dev) host\b|\btesthost\b"), "test-host reference"),
+    (re.compile(r"agent-transcripts|/root/\.cursor|NEEDS_OWNER|\bK/REPORT"), "agent tooling or session report"),
+    (re.compile(r"private note|operators' notes|hand-?off directory|\bHANDOFF[-_](20\d\d|moet)"), "reference to the private notes"),
+    (re.compile(r"\bripple65b\b"), "deployment slot path"),
 ]
 # Files that legitimately name internal/ (the ignore rules, the contract) or carry provenance strings.
 WORDING_EXEMPT = {

@@ -13,7 +13,7 @@
 #                        as many tokens as the schedule gives the number of running requests (Model Runner V2 truncates
 #                        the drafts centrally, full CUDA graphs stay)
 #
-# Container: IMAGE (vllm-moet-sm120:ripple-nightly-a2bcb565-r4)  NAME (ripple-65b)  GPUS (4,5,6,7; indices or UUIDs)
+# Container: IMAGE (vllm-moet-sm120:ripple-nightly-a2bcb565-r6)  NAME (ripple-65b)  GPUS (4,5,6,7; indices or UUIDs)
 #            TP (4)  PORT (8002)  BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
 #            CPUS ("")  --cpuset-cpus for the container (the NUMA node of GPUS)   MEMORY ("")  --memory cap
 #            CACHE_DIR ($PWD/cache-$NAME)  torch.compile / FlashInfer caches; the first start fills it
@@ -40,7 +40,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (Ripple-65B Preview checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:ripple-nightly-a2bcb565-r4}"
+IMAGE="${IMAGE:-vllm-moet-sm120:ripple-nightly-a2bcb565-r6}"
 NAME="${NAME:-ripple-65b}"
 GPUS="${GPUS:-4,5,6,7}"
 TP="${TP:-4}"

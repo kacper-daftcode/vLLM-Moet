@@ -1,9 +1,9 @@
 # vLLM-Moet: Ripple-65B Preview (ricursiveAI; ModelOpt NVFP4 MLPs, BF16 attention / embeddings / lm_head) on sm_120
 # (4x RTX PRO 6000 Blackwell), TP4, with the DFlash2 drafter. Launcher: docker/sm120/run-ripple.sh; docs: docs/ripple-sm120.md.
 #
-# The official vllm/vllm-openai nightly a2bcb565 (2026-11-05 07:16Z: torch 2.14.0+cu130, FlashInfer 0.7.2) predates
+# The official vllm/vllm-openai nightly a2bcb565 (torch 2.14.0+cu130, FlashInfer 0.7.2) predates
 # RicursiveForCausalLM: vllm#65745 (the model, the `ripple` reasoning / tool-call parsers, the DFlash2 draft with NoPE
-# layers) merged 2026-11-05 17:36Z as 03bd3c68, 56 commits after the base with no change under requirements/. Step 0
+# layers) merged as 03bd3c68, 56 commits after the base with no change under requirements/. Step 0
 # replaces the base's vllm package with the per-commit wheel of 03bd3c68 from wheels.vllm.ai (--no-deps: the pins are
 # the base's; the compiled _C / _moe_C / cumem ops come with the wheel, built against the same torch). The base's Rust
 # frontend binary stays at a2bcb565 and is not used (Python frontend).

@@ -8,7 +8,7 @@ kernel (`moe_gemv/`, JIT-compiled in the container) for the routed experts at de
 | file | what it does |
 |---|---|
 | `patch_short_conv_attn.py` | replaces five pageable `tensor.to(device)` copies in `ShortConvAttentionMetadataBuilder.build()` (PLE short-conv metadata) with pinned non-blocking copies. The pageable copies synchronized the stream on every decode step; measured effect: worker main thread no longer stalls in the builder, `nvidia-smi` util 84 % → 94 %, 15.3 → 15.0 ms per decode step (+2–3 %). The remaining step time is GPU kernels. |
-| `patch_low_latency_gemm.py`, `test_low_latency_gemm.py` | opens vLLM's own CuTe-DSL **skinny GEMM** for this model (`models/qwen3_8_flash_next/nvidia/low_latency_gemm.py`, upstream gated to sm_103/B300) on sm_120 and adds plans tuned on this host (`tools/sm120_perf/skinny_tune.py`) for the token counts and per-rank shapes upstream lacks. ~480 BF16 decode GEMMs per step (GDN/QSA projections, hyper-connection down+inject, router, shared expert, PLE, LM head) leave cuBLAS's `cutlass_80_wmma` M=4 path: 24×2560 10.6 → 1.7 µs, 2560×1536 11.3 → 6.7, 336×10240 9.2 → 6.2, 320×2560 4.7 → 2.6, 512×2560 4.6 → 3.0, 4096×2560 19.6 → 15.4 (1.36 TB/s). **76.7 → 85.2 steps/s (13.0 → 11.7 ms), prose 192 → 206 tok/s, code 269 → 301 tok/s**; needle 27.6K/91.9K PASS, prefill unchanged (13.6k tok/s). Same numerics as cuBLAS (bf16×bf16→fp32). The compiled torch graph changes, so the launcher gives this mode its own `torch_compile_cache` (vLLM's cache hash does not see the patch). `VLLM_MOET_SM120_LL_GEMM=0` or `LL_GEMM=0` reverts. Still on cuBLAS: `10240×320` HC up-projection ×97/step (skinny ties at 6.5 µs, ~1 TB/s), `2560×160` shared-expert down ×48 (K=160 has no valid skinny tile), two single-call shapes. |
+| `patch_low_latency_gemm.py`, `test_low_latency_gemm.py` | opens vLLM's own CuTe-DSL **skinny GEMM** for this model (`models/qwen3_8_flash_next/nvidia/low_latency_gemm.py`, upstream gated to sm_103/B300) on sm_120 and adds plans tuned on 4× RTX PRO 6000 (`tools/sm120_perf/skinny_tune.py`) for the token counts and per-rank shapes upstream lacks. ~480 BF16 decode GEMMs per step (GDN/QSA projections, hyper-connection down+inject, router, shared expert, PLE, LM head) leave cuBLAS's `cutlass_80_wmma` M=4 path: 24×2560 10.6 → 1.7 µs, 2560×1536 11.3 → 6.7, 336×10240 9.2 → 6.2, 320×2560 4.7 → 2.6, 512×2560 4.6 → 3.0, 4096×2560 19.6 → 15.4 (1.36 TB/s). **76.7 → 85.2 steps/s (13.0 → 11.7 ms), prose 192 → 206 tok/s, code 269 → 301 tok/s**; needle 27.6K/91.9K PASS, prefill unchanged (13.6k tok/s). Same numerics as cuBLAS (bf16×bf16→fp32). The compiled torch graph changes, so the launcher gives this mode its own `torch_compile_cache` (vLLM's cache hash does not see the patch). `VLLM_MOET_SM120_LL_GEMM=0` or `LL_GEMM=0` reverts. Still on cuBLAS: `10240×320` HC up-projection ×97/step (skinny ties at 6.5 µs, ~1 TB/s), `2560×160` shared-expert down ×48 (K=160 has no valid skinny tile), two single-call shapes. |
 
 ## PLE table on the GPUs instead of the CPU offload worker (+10 % decode, +15 % prefill)
 
@@ -111,11 +111,11 @@ does not change and no separate `torch_compile_cache` is needed. Knobs: `VLLM_MO
 `…_FUSE_ACT=0` (see below). `test_fused_moe_integration.py` checks the dispatch decisions and the
 equality with Triton through the patched module.
 
-**Fused activation in the down GEMM** (same session, second file patched: `experts/triton_moe.py`,
+**Fused activation in the down GEMM** (second file patched: `experts/triton_moe.py`,
 `TritonExperts.apply`): at decode token counts the down GEMV takes the bf16 gate/up output of the
 first GEMM directly — every block computes `bf16(silu(gate)) · up`, the per-32-group absmax, the
 scale (rounded up to a power of two because vLLM quantizes activations with UE8M0 scales when
-DeepGEMM's E8M0 mode is on, `is_deep_gemm_e8m0_used()`, the case on this host), and the fp8 values
+DeepGEMM's E8M0 mode is on, `is_deep_gemm_e8m0_used()`, the case on sm_120), and the fp8 values
 into shared memory, then runs the GEMM from there. Bit-identical to `act_and_mul` +
 `per_token_group_quant_fp8` + GEMV (0 differing output elements at M = 1…12 in
 `test_fused_moe_gemv_sm120.py`; the extension is built without `--use_fast_math` for that), two
@@ -124,7 +124,7 @@ The patched `triton_moe.py` imports the hook from the patched `fused_moe.py` and
 without it; LoRA, static `a2_scale`, emulation and the aligned (≥ 13 tokens) path keep vLLM's
 sequence.
 
-In situ (container 5d190863, 22:35Z): **98.5 steps/s (10.15 ms/step), prose 243 / code 346 tok/s**,
+In situ: **98.5 steps/s (10.15 ms/step), prose 243 / code 346 tok/s**,
 acceptance and needle answers identical to the unfused GEMV run (bit-identical path); profile
 `profiles/qwen38/`: `fused_moe_gemv_kernel<1,5,false,true>` 11.2 µs per layer replaces
 `act_and_mul` 1.4 + `per_token_group_quant` 2.2 + GEMV 10.3 µs and two launch gaps; the previous

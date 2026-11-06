@@ -210,7 +210,7 @@ __global__ void __launch_bounds__(kThreads) fused_moe_gemv_kernel(const MoeGemvA
   } else if constexpr (FUSE_ACT) {
     // Pair mb: v[e] = bf16(silu(gate[e])) * up[e] (bf16 product, as vLLM's act_and_mul),
     // then per 32-group: s = max(|v|, 1e-10) / 448, rounded up to a power of two when
-    // vLLM's quant uses UE8M0 scales (is_deep_gemm_e8m0_used(), the case on this host),
+    // vLLM's quant uses UE8M0 scales (is_deep_gemm_e8m0_used(), the case on sm_120),
     // q = fp8(clamp(v / s)) -- one warp per group, lane = element. Row 0 of the tile only.
     const __nv_bfloat16* __restrict__ xr = p.X + (size_t)mb * p.ldx;
     for (int kb = warp; kb < KB; kb += kWarps) {

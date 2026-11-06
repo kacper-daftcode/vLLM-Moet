@@ -4,8 +4,7 @@
 The NVFP4 export keeps q/k/v/g/o_proj in BF16 (82 "ignore" entries: lm_head, embed_tokens, every self_attn*). On the
 4x RTX PRO 6000 decode step those BF16 projections are 6.6 GB of the 16.1 GB a TP rank reads per step (41 %); in MXFP8
 (fp8-e4m3 values, one e8m0 scale per 32 elements along K, the OCP MX block format vLLM's ModelOpt loader reads as
-quant_algo "MXFP8") the same layers are 3.4 GB. Measured on this host (tools/ripple_sm120 session Y, 2026-11-06,
-FlashInfer-CUTLASS MXFP8 with the dynamic activation quant included, per rank, M = 16 rows): qkg 31.8 -> 19.3 us,
+quant_algo "MXFP8") the same layers are 3.4 GB. Measured on 4x RTX PRO 6000 (FlashInfer-CUTLASS MXFP8 with the dynamic activation quant included, per rank, M = 16 rows): qkg 31.8 -> 19.3 us,
 o_proj 17.4 -> 10.3 us; the 256-wide v_proj is faster in BF16 (4.4 vs 12.0 us), so it stays BF16 by default.
 
 Output: the same shard layout (one safetensors per input shard, same names), every selected
@@ -17,7 +16,7 @@ projections MXFP8), the other files copied. The quantization follows vLLM's `_mx
 reproduces the intended values.
 
 The checkpoint's outputs differ from the NVFP4 checkpoint's (a numerics change): gate it (GSM8K, needle, tool calls,
-parity against the served arm) before serving - tools/ripple_sm120/README.md.
+parity against the NVFP4 arm) before serving - docs/ripple-sm120.md.
 
 usage: make_mxfp8_attn_checkpoint.py SRC_DIR DST_DIR [--projs q_proj,k_proj,g_proj,o_proj] [--threads 32]
 """

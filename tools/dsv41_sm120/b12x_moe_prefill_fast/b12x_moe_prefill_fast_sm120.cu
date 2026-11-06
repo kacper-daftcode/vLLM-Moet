@@ -577,7 +577,7 @@ __global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
   // STRIDED: byte offset of the rows' k32 scale bytes (row * lds; 0xFFFFFFFF: padding), staged like ring.aoff; the A rows and their
-  // scales may come as row-strided views of one gathered buffer (session U's one all-gather). Contiguous: 4 bytes, unused.
+  // scales may come as row-strided views of one gathered buffer (the one-all-gather layout). Contiguous: 4 bytes, unused.
   __shared__ uint32_t s_aoff_sf[STRIDED ? 2 : 1][STRIDED ? 64 : 1];
   __shared__ float s_amax[2][8][16];  // epilogue: a warp's partial amax (its 16 columns) of the 16 rows of an m-tile, by m-tile parity
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -1250,7 +1250,7 @@ struct Launch {
   }
   static void fc1(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    if (f1.lda != f1.K || f1.lds != f1.K / 32)  // row-strided views of one gathered buffer (session U's one all-gather)
+    if (f1.lda != f1.K || f1.lds != f1.K / 32)  // row-strided views of one gathered buffer (the one-all-gather layout)
       fc1_kernel<S1, MB1, true><<<grid, kThreads, S1 * kF1Stage, stream>>>(f1);
     else
       fc1_kernel<S1, MB1, false><<<grid, kThreads, S1 * kF1Stage, stream>>>(f1);
@@ -1318,7 +1318,7 @@ static void run_frontend(const b12x_moe_prefill_fast::FrontArgs& fa, cudaStream_
 
 // hidden [T, K] bf16 (or None with pre-quantized rows: a_values uint8 [T, K] e4m3 + a_scales uint8 [T, K/32] ue8m0, row-major
 // or row-strided views of one buffer (strides a multiple of 4 bytes), exactly the bytes the front-end's quant_row writes;
-// the quant stage is then skipped - session U's MXFP8 all-gather),
+// the quant stage is then skipped - the MXFP8 all-gather),
 // ids [T, topk] int32, token_weights [T, topk] fp32 (contiguous). Returns {out, route, a_values, a_scales, inter, inter_sf,
 // row_pair, counts}. `route_out` (if defined: [>= T*topk, K] bf16, the b12x workspace's route_output) receives the route
 // rows; `out` (if defined) the top-k sum (skipped when !topk_sum).
@@ -1508,9 +1508,9 @@ torch::Tensor moe_prefill_fast_frontend(torch::Tensor hidden, torch::Tensor ids,
   return rt.counts;
 }
 
-bool prequant_rows_supported() { return true; }  // the loader probes this entry (session U's pre-quantized rows)
+bool prequant_rows_supported() { return true; }  // the loader probes this entry (pre-quantized rows)
 // the loader probes this entry too: a_values / a_scales may be row-strided views (unit column stride, 4-byte row strides and
-// bases) of one gathered buffer - session U's one-all-gather follow-up (K, 2026-11-05)
+// bases) of one gathered buffer - the one-all-gather layout
 bool strided_rows_supported() { return true; }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

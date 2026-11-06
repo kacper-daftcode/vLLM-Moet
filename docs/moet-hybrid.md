@@ -151,8 +151,8 @@ holds within each configuration (`DEBUG_COMPACT`: 0 mismatches over 15,160 compa
 full model, 11-04); the TP4 code paths are untouched (V = 1). Measured on 32 GB cards (the slots per layer follow the VRAM: 46 at
 TP2, 16 at TP1): **TP2 on 2× 5090: 45.9 / 47.1 tok/s** on 'Hello' / 'def fib(n):', TTFT 1.9 s at 2K and 7.4 s at 14K; **TP1 on 1× 5090:
 39.8 / 33.5 tok/s**, TTFT 3.8 / 15.2 s (chunk 4096) — the step is the CPU tier (hit rate 0.54 / 0.44 at those slot counts: 3–4 misses
-per layer-step); host RAM is the same ~450 GB (+23 GB at TP1 for the 9-static placement's records). The design, budgets and every
-measurement: the private note `tp12-virtual-ranks-2026-11-04.md` (the hybrid's handoff directory).
+per layer-step); host RAM is the same ~450 GB (+23 GB at TP1 for the 9-static placement's records). The per-window numbers:
+[the record](benchmarks/moet-hybrid-4x5090-2026-11-04.md).
 
 Running it: the launcher's `TP=2` / `TP=1` set the 32 GB-card defaults (GPUS 0,1 / 0; `SPARE` 6 / 7 with the 40-static / 9-static
 placement — `routing/placements/tp12-placement-0.026-uniform.json` for TP1 — `MAX_MODEL_LEN` 65536 / 32768, `PROMOTIONS` 4 / 1); `VRANKS=1`
@@ -163,9 +163,9 @@ dispatcher 8g+1 and pool 8g+2..8g+7 per CCD g). `SCRATCH` counts slices (an expe
 record's (identity 0 mismatches over 19,080 compact calls per rank; 146.6 / 126.2 tok/s, TTFT 0.97 / 3.27 / 6.50 s at 2K / 14K / 30K — a
 sample with the box's `kcompactd0` on a pool core's SMT sibling gave 143 / 121) and TP2 repeats the numbers above (0 mismatches over
 15,160 calls per rank; 46.1 / 47.2 tok/s; TTFT 1.91 / 7.34 s; the compact-path outputs bit-identical to the pre-merge boots). The 96 GB cards (2× / 1× RTX PRO 6000: ~200–235 / ~90–100 slots per layer) are the target of this
-support; the run book — host requirements, the launcher lines at 96 GB (`TP=2 SPARE=160 GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=262144
-MAX_NUM_BATCHED_TOKENS=8192 SCRATCH=128`; `TP=1 SPARE=80 … MAX_MODEL_LEN=131072`), the window sequence, the expected numbers from the
-routing traces — is §13 of that note. **Measured 2026-11-05 on a PRO 6000 test host** (a 354 GB VM with Server Edition cards and one
+support; the launcher lines at 96 GB are `TP=2 SPARE=160 GPU_MEM_UTIL=0.90 MAX_MODEL_LEN=262144
+MAX_NUM_BATCHED_TOKENS=8192 SCRATCH=128` and `TP=1 SPARE=80 … MAX_MODEL_LEN=131072`; the expected numbers come from the
+routing traces. **Measured on 2× and 1× RTX PRO 6000** (a 354 GB VM with Server Edition cards and one
 virtio disk, so the Engram rows had to come from that disk: [`benchmarks/moet-hybrid-4x5090-2026-11-04.md`](benchmarks/moet-hybrid-4x5090-2026-11-04.md)
 "2× and 1× RTX PRO 6000"): **identity 0 mismatches at both TPs**, hit rates 0.96 (TP2, 200 slots) / 0.86 (TP1, 89 slots) as the
 traces predicted; **2× PRO 6000: 97–102 tok/s on short prompts** (the step 9.9 ms, GPU-bound: ~8 ms of GPU work + 1.9 ms of CPU-tier
@@ -203,8 +203,7 @@ mixed-prompt soak 84.4 tok/s):
 | 256 GB | `+ STORE_NVME=1 STORE_DRAM_RECORDS=230` | **194–200 GB** | **130.5–131.0 / 108.0–109.5** | 1.68 / 6.86 / 12.13 s (2.1–2.2×) | (the N = 110 check covers the path) |
 | 128 GB | `+ STORE_DRAM_RECORDS=110 ENGRAM_CACHE_GIB=1` | **106–112 GB** | **111.0–112.4 / 81.5–82.5** | 2.83 / 11.07 / — (3.3–3.6×) | `DEBUG_COMPACT` PASS: 19,080 compact calls per rank, 0 mismatches |
 
-The working notes with every measurement and its command are the operators' notes (`engram-v2-2026-11-04.md`,
-`HANDOFF-moet-hybrid-engram-v2.md`).
+Every window with its command and raw numbers: [the record](benchmarks/moet-hybrid-4x5090-2026-11-04.md).
 
 **Filling the host: `STORE_DRAM_RECORDS=auto`.** N is continuous — one record per layer costs 4 slices × 40 layers × 4.7 MB = 0.72 GiB — and
 the host's footprint (`free` used, GiB; measured at N = 344 + the full LRU 307, 344 → 278, 280 → 236, 230 → 200, 120 → 120, 110 → 112) is
@@ -249,7 +248,7 @@ a default-configuration sample by up to −7 %, the record samples are quoted):
 
 The 2× and 1× boxes lose little to the tail (the step is the CPU tier's already, the record reads overlap it): a 2× 5090 box with 256 GB
 serves at ~40 / 43 tok/s, with 128 GB at ~36 / 35; a 1× 5090 box with 128 GB at ~37 / 26. The per-window numbers, the identity checks and
-the commands are in the operators' notes (`HANDOFF-moet-hybrid-next.md`, `tp12-virtual-ranks-2026-11-04.md`, `engram-v2-2026-11-04.md`).
+the commands: [the record](benchmarks/moet-hybrid-4x5090-2026-11-04.md).
 
 ## Limits and open items
 
@@ -259,7 +258,7 @@ the commands are in the operators' notes (`HANDOFF-moet-hybrid-next.md`, `tp12-v
   the streamed path sums two b12x runs).
 - Concurrency: the CPU tier's cost is the number of distinct missing experts a step pulls from DRAM, and concurrent
   sequences almost never share their misses (34 → 82 → 197 distinct CPU experts per step at 1 / 2 / 4 streams) — a
-  single-stream (at most two-stream) design on this box's memory bandwidth.
+  single-stream (at most two-stream) design on the host's memory bandwidth.
 - `GPU_MEM_UTIL` 0.90 with 110 expert slots is the 512K default: the sparse-attention indexer's prefill peak needs ~1.3 GiB
   outside the budget (at 0.94 it OOMed on the 4th chunk of a 128K prompt); 0.94 with 120 slots fits a 64K context.
 - The CPU kernel's idle spin in mode 2 (a DRAM stream per worker) is faster per expert but heats the memory side until it

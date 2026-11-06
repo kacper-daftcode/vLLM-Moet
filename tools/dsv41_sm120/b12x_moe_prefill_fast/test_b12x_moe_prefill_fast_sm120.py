@@ -161,7 +161,7 @@ def main() -> int:
                 msg.append(f"run {ri}: " + "; ".join(parts))
         msg.append(f"{len(runs)} runs {'identical' if det else 'DIFFER'}")
         ok &= det
-        # the pre-quantized-rows entry (session U's MXFP8 all-gather): the same rows fed back as a_values / a_scales must give
+        # the pre-quantized-rows entry (the MXFP8 all-gather): the same rows fed back as a_values / a_scales must give
         # the same route rows and output (the quant stage is skipped, everything else is the same code)
         if prequant_rows_supported():
             res_q = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=av_m, a_scales=as_m, **kw)
@@ -169,7 +169,7 @@ def main() -> int:
             pq_ok = same(res_q[0], out_m) and same(res_q[1][valid], route_m[valid]) and same(res_q[4][valid, :N], inter_m[valid, :N])
             msg.append(f"pre-quantized rows entry {'identical' if pq_ok else 'DIFFER'}")
             ok &= pq_ok
-            # the same rows as row-strided views of ONE buffer (session U's one-all-gather layout: per row the K e4m3 bytes,
+            # the same rows as row-strided views of ONE buffer (the one-all-gather layout: per row the K e4m3 bytes,
             # the K/32 scale bytes, then 48 bytes of top-k ids / weights - here random garbage the kernels must not read)
             if strided_rows_supported():
                 Tq, Kq = av_m.shape

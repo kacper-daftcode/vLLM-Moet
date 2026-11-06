@@ -2,7 +2,7 @@
 
 Boundary 2 of the eager prefill step (patch_vllm_prefill_sp_sm120.py) reduce-scatters the attention output, runs the mHC
 boundary on this rank's row shard and today all-gathers the normed MoE input in bf16 ([T, 5120] = 10 240 B/row, 738 us per
-4096-row chunk on the PCIe ring). Its three consumers (../sp_moe_gather/REPORT in /workspace/tmp/par31/U, section 1) are
+4096-row chunk on the PCIe ring). Its three consumers are
 row-local in a way that lets every rank finish its own rows first and gather the compact results:
 
   routed experts  b12x's dynamic path quantizes the rows to MXFP8 (e4m3 + UE8M0 per 32 columns) in its front-end; our fast
@@ -113,7 +113,7 @@ def unpack_small(small: torch.Tensor, k: int, topk: int) -> tuple[torch.Tensor, 
 def _one_all_gather() -> bool:
     """VLLM_MOET_PREFILL_SP_GATHER_ONE_AG=1: one all-gather of [c, K + K/32 + 8 topk] rows instead of two (needs the fast prefill
     MoE build with strided_rows_supported(); checked once in _check_eligible). Default 0 = the two gathers of step 45.
-    Measured in situ (session K, test host 4x RTX PRO 6000 SE, image r25, 6.11): bits identical (long_agree x2 + agree_client ALL
+    Measured in situ (4x RTX PRO 6000 SE, image r25): bits identical (long_agree x2 + agree_client ALL
     IDENTICAL vs the two-gather arm), fresh prefill 163K 6973 / 6987 / 6975 ms vs 6946 / 6949 / 6947 (+0.4 %), 19K 826 / 824 / 822 vs
     818 / 819 / 821 - the shared expert's CUTLASS GEMM still needs a contiguous e4m3 operand and that 21 MB copy costs more than the
     second NCCL launch it saves; it pays only once that consumer takes the operand with a row stride. Kept opt-in for that follow-up."""

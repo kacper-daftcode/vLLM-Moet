@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Session V: generate + assemble the sparse-MLA prefill SASS kernel (sm_120).
+# Generate + assemble the sparse-MLA prefill SASS kernel (sm_120).
 #
 #   build_sparse_mla_sass.sh [out.cubin]            (default: kernels/cubins-sm120/sparse_mla_prefill_v41.cubin)
 #
 # Requirements (see kernels/MANIFEST.md, "Sparse-MLA prefill"):
-#   CUBIT  — cubit `main` at or after ed4d316 (2026-11-05): session V's fixes are BUG-478 (path-following
+#   CUBIT  — cubit `main` at or after ed4d316: the required fixes are BUG-478 (path-following
 #            barrier allocation), BUG-479 (BAR.SYNC stall floor 6) and BUG-480 (R128-R254 tracking) there.
 #            Default: the main checkout's release build; the validated cubin (sha256 c896234bc76d6938...)
 #            reproduces byte for byte from main up to cubit 52767f9 (checked 2026-11-05 at ed4d316, f79a48a,

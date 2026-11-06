@@ -1,7 +1,7 @@
 """Engram row-id statistics of DeepSeek-V4.1-Flash on real text: what a DRAM row cache in front of NVMe buys.
 
     python engram_hash_probe.py [--code-tokens 20000000] [--parquet .../train-00000-of-00880.parquet]
-                                [--transcripts /root/.cursor/projects/root/agent-transcripts] [--json out.json]
+                                --transcripts DIR [--json out.json]
 
 Ports vLLM's hashing (models/deepseek_v41/common/engram.py: compressed token map, per-layer multipliers,
 prime bucket ranges, rolling XOR hash) to numpy, tokenizes a corpus (code + agent transcripts), and reports per
@@ -167,7 +167,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--parquet", default="/mnt/nvme/data/github-code-clean/train-00000-of-00880.parquet")
     ap.add_argument("--code-tokens", type=int, default=20_000_000)
-    ap.add_argument("--transcripts", default="/root/.cursor/projects/root/agent-transcripts")
+    ap.add_argument("--transcripts", required=True, help="directory of .jsonl chat transcripts used as the prompt corpus")
     ap.add_argument("--holdout", type=float, default=0.3, help="tail fraction of the stream scored against the head")
     ap.add_argument("--json", default="")
     args = ap.parse_args()

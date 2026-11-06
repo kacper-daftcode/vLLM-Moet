@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate sass/sparse_mla_prefill_v41.sass — DeepSeek-V4.1 sparse-MLA prefill attention on sm_120, bit-identical with
-spec B = FlashInfer 0.7.2 `sparse_mla_prefill_dsv41_bf16_kernel<16, true>` (front "cubit + prefill", Phase 1b, session V).
+spec B = FlashInfer 0.7.2 `sparse_mla_prefill_dsv41_bf16_kernel<16, true>` (the cubit prefill front, phase 1b).
 
 One CTA = one token x 16 heads, 8 warps, 1 CTA/SM (smem 87 040 B > 100 KB / 2). Per 64-candidate chunk of the SWA cache
 (528-byte fp8 records: 512 e4m3 + 16 UE8M0 scales per 32) and then of the compressed cache (288-byte FP4 records: 256 B of

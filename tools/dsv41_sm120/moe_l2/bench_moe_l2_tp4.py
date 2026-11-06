@@ -7,7 +7,7 @@ DeepGemmFP4Experts prepare -> apply (fused quant+scatter, FC1, silu*mul+quant, F
 stream next to the shared expert on an aux stream (GEMV v3 w13 [1152 <- 5120], silu*mul, quant, GEMV v1 w2
 [5120 <- 576]), the add and vLLM's all-reduce. Every layer routes to fresh random experts (top-6 of --experts), so
 weights are cold as in the served graph. Variants: the discard off (VLLM_MOET_MOE_FC2_DISCARD=0 equivalent), FC2's
-padding rows discarded inline on the model stream (fc2; the patch's default, served since 2026-10-13), the same
+padding rows discarded inline on the model stream (fc2; the patch's default), the same
 discard forked onto the patch's side stream after FC2 and joined after the gather (fc2side; VLLM_MOET_MOE_FC2_DISCARD_SIDE=1,
 opt-in: -3.7 us per layer here at 6 tokens, but +1.7 us per FFN segment in the served decode graph of window 9),
 and one experiment: fc2+fc1 (FC1's padding rows too, right after the FC1 call, before silu*mul reads the real

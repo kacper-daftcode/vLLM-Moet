@@ -1,7 +1,7 @@
 # tools/ripple_sm120 — Ripple-65B Preview on sm_120
 
 The Ripple line's patchers, probes and checks, by Dockerfile step (`Dockerfile.sm120-ripple`; what each step does and the
-served state: `docs/ripple-sm120.md`). Shared with the DeepSeek line: `tools/dsv41_sm120/p2p_ar/` (the P2P all-reduce
+measurements: `docs/ripple-sm120.md`). Shared with the DeepSeek line: `tools/dsv41_sm120/p2p_ar/` (the P2P all-reduce
 module step 1 attaches to).
 
 | file | step | what |
@@ -15,7 +15,7 @@ module step 1 attaches to).
 | `step_anatomy.py` | — | per-step anatomy of a decode trace (`PROFILER=1`, `/start_profile` … `/stop_profile`): mean time per class (BF16 / NVFP4 GEMM, all-reduce, norms, attention, drafter glue), GPU idle, kernels per step, `--dump N` for the ordered kernel list of one step |
 | `decode_gemm_bench.py` | — | the decode GEMM shapes of Ripple TP4 in isolation on one GPU inside the image: every vLLM NVFP4 / MXFP8 linear kernel for sm_120 and BF16 cuBLAS vs cuBLASLt at M = 16 / 96 / 256, CUDA-graph timed with weight rotation past L2 and FlashInfer's autotuner as in serving, bits compared against the served kernel (a microbench win is not an in-situ win: `flashinfer_cudnn`) |
 | `decode_overlap_bench.py` | — | TP4 microbench on 4 GPUs inside the image (`torchrun`): one decode layer's per-rank GEMMs at M rows (BF16 qkg / o, NVFP4 gate_up / down, weights rotated past L2) and its two `[M, 5120]` all-reduces (P2P two-shot ≤ 128 rows, NCCL above) as CUDA graphs — serial (today), two halves serial, two halves with one half's all-reduces on a comm stream under the other half's GEMMs (two-stream and DBO-style per-block alternation): what two-micro-batch overlap would buy on this platform (85–89 % of the push hides, the halves re-stream the weights: net −16.5 % at 256 rows, −6.5 % at 96) |
-| `make_mxfp8_attn_checkpoint.py` | candidate | derives `Ripple-65B-Preview-NVFP4-attnMXFP8` from the NVFP4 checkpoint: q/k/g/o_proj (BF16 in ModelOpt's export, 41 % of the bytes a TP rank reads per decode step) to MXFP8 with vLLM's e8m0/32 convention, v_proj / embeddings / lm_head / NVFP4 MLPs unchanged, `quant_algo: MIXED_PRECISION`; loads on stock vLLM (`modelopt_mixed`, FlashInfer-CUTLASS MXFP8 GEMM on sm_120). A numerics change - measured in `docs/ripple-sm120.md`, served only on the owner's decision |
+| `make_mxfp8_attn_checkpoint.py` | — (optional checkpoint) | derives `Ripple-65B-Preview-NVFP4-attnMXFP8` from the NVFP4 checkpoint: q/k/g/o_proj (BF16 in ModelOpt's export, 41 % of the bytes a TP rank reads per decode step) to MXFP8 with vLLM's e8m0/32 convention, v_proj / embeddings / lm_head / NVFP4 MLPs unchanged, `quant_algo: MIXED_PRECISION`; loads on stock vLLM (`modelopt_mixed`, FlashInfer-CUTLASS MXFP8 GEMM on sm_120). A numerics change - measured in `docs/ripple-sm120.md`; an option, not the default |
 
-Measurement on the slot uses the GLM-5.3-Flash battery (`glm_spec_matrix.py`, `prefill_sizes.py`, GSM8K-200 through
+Measurements use the GLM-5.3-Flash battery (`glm_spec_matrix.py`, `prefill_sizes.py`, GSM8K-200 through
 `llm_decode_bench.py`) so Ripple and GLM-5.3-Flash numbers on the same four cards are comparable.
