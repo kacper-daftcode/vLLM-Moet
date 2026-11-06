@@ -25,8 +25,11 @@ at 63 steps/s (6.6 tokens per step), 2270 tok/s aggregate at 8 requests (283 per
 cache 3.17M tokens (bf16); GSM8K-200 193/200 at 8 requests; needle 6/6 at 28K / 105K / 399K tokens; start 4 min.
 
 **As served** (`-r4`: steps 1 (up to 128 rows) and 2, dynamic draft length 15 / 11 / 7, 32 requests, 8192-token chunks,
-bf16 KV, no KV offload): see the table in [Measurements](#measurements) — code **~600 tok/s single stream, ~3000 tok/s
-aggregate at 8 requests, ~5000 at 32**; prose 170 / 980 / 2080; prefill and quality as the baseline.
+bf16 KV, no KV offload; since 2026-11-06 10:02Z the derived checkpoint with the attention projections in MXFP8 — the
+owner's decision, see [the candidate section](#candidate-attention-projections-in-mxfp8-a-numerics-change--the-owners-decision)):
+code **~730 tok/s single stream, ~3350 tok/s aggregate at 8 requests, ~5550 at 32**; prose 190 / 1060 / 2250; prefill
+−4…−5 % against the NVFP4 checkpoint, quality as the baseline (GSM8K-200 194/200, needle 6/6). The NVFP4 checkpoint
+under the same image did 630 / 3050 / 5100 and 170 / 980 / 2080.
 
 On the same four cards GLM-5.3-Flash (the slot's previous model, TP4, MTP k = 3, FP8 KV) did code 244–258 / prose
 175–190 tok/s single stream at 71–75 steps/s, ~720 / ~550 aggregate at 8 requests, prefill 8.3K / 7.9K / 7.1K tok/s,
@@ -70,6 +73,7 @@ in the shared decode window / per request / engine steps per second. Image `-r2`
 | step 1 (≤ 256 rows), dynamic 15/11/7 | 630 @ 63.2 | 2993 / 376 @ 42.5 | 4438 / 139 @ 21.0 | 171 @ 62.4 | 963 / 121 @ 42.6 | 1845 / 58 @ 21.1 |
 | step 1 (≤ 128 rows), dynamic 15/11/7 — served `-r3` (2026-11-05 23:26Z) | 600–613 @ 63.3 | 3036–3112 / 380 @ 43.7 | 4738 / 148 @ 22.4 | 167–196 @ 60.8 | 965 / 121 @ 43.1 | 1950–1970 / 61 @ 22.5 |
 | **+ step 2 (drafter at the schedule's k) — served `-r4`** | 626–640 @ 63.6 | 3010–3097 / 384 @ 43.5 | **5041–5046 / 158 @ 24.0** | 166–171 @ 62.3 | 984 / 122 @ 43.3 | **2074–2089 / 65 @ 24.1** |
+| **+ attention projections in MXFP8 (the derived checkpoint) — served since 2026-11-06 10:02Z** | **727 @ 71.0** | **3346–3357 / 416 @ 48.3** | **5548–5576 / 174 @ 26.2** | 181–196 @ 69.8 | 1044–1081 / 133 @ 47.8 | 2209–2303 / 70 @ 26.2 |
 
 Reading: at one request the step takes ~15.6 ms whatever the draft length, so tokens per step (6.6 at k 7, 9.6 at
 k 15 on code) set the single-stream speed; at 32 requests the verification of 32 × (k + 1) rows is compute-bound and
@@ -132,6 +136,11 @@ Closed by measurement (do not revisit without new evidence):
 - BF16 GEMMs through cuBLASLt instead of cuBLAS: no gain, different bits for most shapes.
 
 ## Candidate: attention projections in MXFP8 (a numerics change — the owner's decision)
+
+**Decided 2026-11-06 10:58 CET: served** (the owner's call after the paired full GSM8K below). With the r4 image: code
+727 tok/s @ 71.0 steps/s single stream (+15 % over NVFP4 under the same image), 3346–3357 at 8 requests (+9 %),
+5548–5576 at 32 (+8 %); GSM8K-200 194/200, needle 6/6; `MODEL_DIR` in the slot's `run.sh`, rollback
+`MODEL_DIR=/workspace/models/Ripple-65B-Preview-NVFP4`. The measurements that led to it:
 
 `tools/ripple_sm120/make_mxfp8_attn_checkpoint.py` derives `Ripple-65B-Preview-NVFP4-attnMXFP8`: q/k/g/o_proj of all
 80 layers in MXFP8 (e4m3 values, one e8m0 scale per 32 elements, vLLM's own quantization convention), v_proj
