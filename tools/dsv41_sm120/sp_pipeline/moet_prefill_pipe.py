@@ -24,6 +24,12 @@ and the moment differ. PIPE=0 at 8 192 batched tokens is *not* today's numerics 
 Switches: VLLM_MOET_PREFILL_PIPE (0 = off, 2 = two groups), VLLM_MOET_PREFILL_PIPE_ROWS (4096), VLLM_MOET_PREFILL_PIPE_MIXED
 (pipe | today | error: a step whose rows are not all prefill), VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY (0; -1 = high),
 VLLM_MOET_PREFILL_PIPE_REPLAY (serial | stream: the replay section on its own stream with handoffs - measured neutral),
+VLLM_MOET_PREFILL_PIPE_TAIL (serial | barrier | sync: when a group's replay tail may start relative to the other
+group's last sequence-parallel phase, see tail_mode), VLLM_MOET_PREFILL_PIPE_LOG_STEPS (0 | 1 = one log line per
+step with decode rows: the batch composition and the groups | 2 = every pipelined step),
+VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS (0 | 1: the groups' replay layers as CUDA graphs, one graph set per slot; needs
+--compilation-config decoder_replay_cudagraph_capture_sizes >= the 128-row window, see replay_graphs),
+VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL (0 | 1: the groups one after the other, the bits oracle of the pipelined path),
 VLLM_MOET_PREFILL_PIPE_DUMP=<dir> (+ <dir>/ENABLE present: per-layer sha256 of the hc states, the bits harness).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
@@ -89,6 +95,49 @@ def _comm_priority() -> int:
         return 0
 
 
+def tail_mode() -> str:
+    """VLLM_MOET_PREFILL_PIPE_TAIL: when a group's replay tail (the layer-20 KV writes, the 128-row layers 20-39, the
+    collapse) may start. "serial" (default) = as soon as the group's own last phase ended and the other group's turn
+    is over (v1). "barrier" = the compute stream first waits for the other groups' last sequence-parallel phase as
+    well, so both groups' SP layers are complete on the GPU before either tail starts and the two tails run back to
+    back. "sync" = "barrier" plus a host wait for the compute stream to drain before the first tail is issued (the
+    tails start with the CPU and the GPU together, in step across ranks as today's single chunk). Neither changes any
+    arithmetic. Measured: the tails are launch-bound on the CPU (about 1 500 kernels + 2 500 other runtime calls per
+    group), so neither variant can shorten them - see tools/dsv41_sm120/sp_pipeline docs."""
+    mode = os.environ.get("VLLM_MOET_PREFILL_PIPE_TAIL", "serial")
+    return mode if mode in ("serial", "barrier", "sync") else "serial"
+
+
+def log_steps() -> int:
+    try:
+        return int(os.environ.get("VLLM_MOET_PREFILL_PIPE_LOG_STEPS", "0"))
+    except ValueError:
+        return 0
+
+
+def force_sequential() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL=1: the step's groups run one after the other on the runner thread
+    (run_sequential: today's bits per group, no overlap) even when both are sequence parallel - the oracle of the
+    pipelined path at identical step shapes (the mixed-step bits harness)."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL", "0") == "1"
+
+
+def replay_graphs() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1: capture vLLM's decoder-replay CUDA graphs (the 128-row layers 20-39,
+    DecoderReplayCudaGraphManager, sizes from --compilation-config decoder_replay_cudagraph_capture_sizes) once per
+    row-group slot as well, so a pipelined group's replay tail runs as a graph (its replay batch lives in slot-private
+    buffers; slot 0's graphs read slot 0's). Off (default): the groups' replay layers run eagerly, whatever slot 0 has."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS", "0") == "1"
+
+
+def graph_slots() -> list[int]:
+    """The row-group slots that get replay CUDA graphs of their own (model_state.capture_inner_cudagraphs): 1..n with
+    VLLM_MOET_PREFILL_PIPE=2 and VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1, else none."""
+    if mode() != 2 or not replay_graphs():
+        return []
+    return list(range(1, PipeRunner.NUM_GROUPS + 1))
+
+
 # ------------------------------------------------------------------------------------------------- per-thread state
 _tls = threading.local()
 _PREPARE_SLOT = 0  # the slot the runner thread is building metadata for (0 = the whole step)
@@ -113,6 +162,8 @@ class PipeGroup:
     stream: Any = None  # the thread's current stream at its last handoff (C, or R inside the replay section)
     phase_stream: Any = None  # the stream of the open phase (N for a boundary chain, R for the replay section)
     phase_kind: str = ""  # "comm" | "replay"
+    last_phase_event: Any = None  # the event recorded at the group's last comm-phase end (the tail gate, tail_mode)
+    prefill_rows_from: int = 0  # the group's first row that belongs to a prefilling request (decode rows precede it)
 
 
 def current_group() -> PipeGroup | None:
@@ -249,6 +300,7 @@ class PipeStep:
             g.stream = compute_stream
             g.phase_stream = None
             g.phase_kind = ""
+            g.last_phase_event = None
 
     # -- per-thread state restored at every resume
     def _resume(self, g: PipeGroup) -> None:
@@ -393,6 +445,8 @@ def phase_end() -> None:
     ev = torch.cuda.Event()
     ev.record(g.phase_stream)
     torch.cuda.set_stream(step.compute_stream)
+    if g.phase_kind == "comm":
+        g.last_phase_event = ev
     g.phase_open = False
     g.phase_stream = None
     g.phase_kind = ""
@@ -402,12 +456,36 @@ def phase_end() -> None:
     step.compute_stream.wait_event(ev)
 
 
+def _tail_gate() -> None:
+    """VLLM_MOET_PREFILL_PIPE_TAIL=barrier|sync at the start of a group's replay tail: the compute stream waits for the
+    last sequence-parallel phase of every group that comes after this one (its boundary chain on the comm stream),
+    so both groups' SP layers are complete before the first tail starts; "sync" also drains the compute stream on the
+    host. The last group has nothing to wait for. A no-op in "serial" mode and outside a pipelined group."""
+    mode = tail_mode()
+    if mode == "serial":
+        return
+    g = current_group()
+    if g is None or g.step is None or not g.step.pipelined:
+        return
+    step = g.step
+    later = [h for h in step.groups if h.idx > g.idx]
+    if not later:
+        return
+    for h in later:
+        if h.last_phase_event is not None:
+            step.compute_stream.wait_event(h.last_phase_event)
+    if mode == "sync":
+        step.compute_stream.synchronize()
+
+
 def replay_begin(*inputs: torch.Tensor | None) -> None:
     """Start of a group's replay section (the 128-row layers 20-39 + collapse): a launch-bound chain of small kernels
     and all-reduces that would block the other group's compute if it sat on the compute stream (v2 of §4.2: +1.7 %).
     It runs on a stream of its own, R, after everything the compute stream has so far; the handoffs inside
     (yield_point, once per layer) keep R current. `inputs` are the hc states the section reads that were born on the
-    compute stream: kept out of its reuse until R is done with them. A no-op unless VLLM_MOET_PREFILL_PIPE_REPLAY=stream."""
+    compute stream: kept out of its reuse until R is done with them. A no-op unless VLLM_MOET_PREFILL_PIPE_REPLAY=stream
+    (the tail gate of VLLM_MOET_PREFILL_PIPE_TAIL applies in every replay mode)."""
+    _tail_gate()
     if replay_mode() != "stream":
         return
     _phase_begin("replay")
@@ -495,6 +573,11 @@ def run_groups(groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipeline
     assert runner is not None, "prefill pipeline: groups without a runner"
     from vllm.utils.torch_utils import current_stream
 
+    if pipelined and force_sequential():
+        pipelined = False
+        if _STATS["steps"] == 0:
+            logger.info("vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL=1 - the groups run one "
+                        "after the other (the bits oracle of the pipelined path)")
     step = PipeStep(
         groups, current_stream(), runner.comm_stream, runner.row_switch, runner.device, pipelined,
         replay_stream=getattr(runner, "replay_stream", None),
@@ -528,6 +611,8 @@ class PipeRunner:
     """Per model runner: the comm stream, the per-group metadata builders (slots 1..n), the sliced-batch buffers and
     the row-buffer storages."""
 
+    NUM_GROUPS = 2
+
     def __init__(self, runner: Any) -> None:
         from vllm.v1.worker.utils import AttentionGroup  # noqa: F401 - the type the copies keep
 
@@ -536,7 +621,7 @@ class PipeRunner:
         self.model_state = runner.model_state
         self.kv_cache_config = runner.kv_cache_config
         self.max_num_reqs = runner.max_num_reqs
-        self.num_groups = 2
+        self.num_groups = self.NUM_GROUPS
         self.comm_stream = torch.cuda.Stream(device=self.device, priority=_comm_priority())
         self.replay_stream = torch.cuda.Stream(device=self.device)
         # The groups' query offsets / seq lens are rebased: not views of the step's buffers.
@@ -615,7 +700,8 @@ class PipeRunner:
             self._warn_once("parallel", "prefill pipeline: DP / PP / DCP / PCP steps run today's path")
             return None
         num_reqs = input_batch.num_reqs
-        if not bool(input_batch.is_prefilling_np[:num_reqs].all()):
+        mixed = not bool(input_batch.is_prefilling_np[:num_reqs].all())
+        if mixed:
             policy = mixed_policy()
             _STATS["mixed"] += 1
             if policy == "error":
@@ -632,7 +718,40 @@ class PipeRunner:
         if num_tokens > self.num_groups * rows:
             self._warn_once("big", "prefill pipeline: a step of %d tokens > %d x %d rows: the last group takes the rest",
                             num_tokens, self.num_groups, rows)
-        return self._build(input_batch, block_tables, slot_mappings, bounds)
+        groups = self._build(input_batch, block_tables, slot_mappings, bounds)
+        verbosity = log_steps()
+        if verbosity >= 2 or (verbosity >= 1 and mixed):
+            self._log_step(input_batch, groups, mixed)
+        return groups
+
+    @staticmethod
+    def _log_step(input_batch, groups: list[PipeGroup], mixed: bool) -> None:
+        """VLLM_MOET_PREFILL_PIPE_LOG_STEPS: the batch composition of a pipelined step - the requests' query lengths
+        and roles, the decode rows, the groups' row and request ranges (the mixed-step harness reads these)."""
+        num_reqs = input_batch.num_reqs
+        qsl = input_batch.query_start_loc_np[: num_reqs + 1]
+        qlens = [int(x) for x in (qsl[1:] - qsl[:-1])]
+        prefilling = [bool(x) for x in input_batch.is_prefilling_np[:num_reqs]]
+        decode_rows = sum(q for q, p in zip(qlens, prefilling) if not p)
+        parts = []
+        for g in groups:
+            lo, hi = g.token_offset, g.token_offset + g.num_tokens
+            req_lo = int(np.searchsorted(qsl, lo, side="right") - 1)
+            req_hi = int(np.searchsorted(qsl, hi - 1, side="right") - 1)
+            parts.append(f"g{g.idx}=[{lo},{hi})/reqs {req_lo}-{req_hi}")
+        logger.info(
+            "prefill pipeline step: %d tokens, %d requests (%d prefill, %d decode; %d decode rows)%s; query lens %s; "
+            "roles %s; groups %s",
+            input_batch.num_tokens,
+            num_reqs,
+            sum(prefilling),
+            num_reqs - sum(prefilling),
+            decode_rows,
+            " MIXED" if mixed else "",
+            qlens if num_reqs <= 16 else f"{qlens[:16]}...",
+            "".join("P" if p else "D" for p in prefilling) if num_reqs <= 64 else f"{sum(prefilling)}P/{num_reqs - sum(prefilling)}D",
+            " ".join(parts),
+        )
 
     def _build(self, input_batch, block_tables, slot_mappings, bounds) -> list[PipeGroup]:
         from vllm.config import CUDAGraphMode
@@ -673,7 +792,16 @@ class PipeRunner:
                 slot_mapping=build_slot_mappings_by_layer(group_slot_mappings, self.kv_cache_config),
                 is_padding=ubatch.is_padding,
             )
-            groups.append(PipeGroup(idx=i, token_offset=lo, num_tokens=hi - lo, forward_context=forward_ctx, slot=slot))
+            ub_reqs = ubatch.num_reqs
+            ub_pref = [bool(p) for p in ubatch.is_prefilling_np[:ub_reqs]]
+            ub_qsl = ubatch.query_start_loc_np[: ub_reqs + 1]
+            prefill_from = next((int(ub_qsl[j]) for j in range(ub_reqs) if ub_pref[j]), hi - lo)
+            groups.append(
+                PipeGroup(
+                    idx=i, token_offset=lo, num_tokens=hi - lo, forward_context=forward_ctx, slot=slot,
+                    prefill_rows_from=prefill_from,
+                )
+            )
         # the whole step's buffers current again for whatever else the step prepares (the groups keep their own)
         select = getattr(self.model_state, "_moet_pipe_select_slot", None)
         if select is not None:
@@ -744,5 +872,32 @@ def dump_layer(layer: int, positions: torch.Tensor, **tensors: torch.Tensor | No
         entry[name] = _sha(t)
         if isinstance(t, torch.Tensor):
             entry[name + "_shape"] = list(t.shape)
+    lines = [entry]
+    start = 0 if g is None else g.prefill_rows_from
+    if g is not None and 0 < start < n:
+        # a mixed step: the prefilling request's rows alone (the decode rows ahead of them belong to another request
+        # whose position in its generation is not reproducible run to run; the prefill rows' arithmetic does not
+        # depend on them at an identical step shape). Full-row tensors: rows [start, n); a row-sharded tensor
+        # ([n / tp, ...]): the decode rows sit in rank 0's shard.
+        try:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            tp = get_tensor_model_parallel_world_size()
+        except Exception:  # noqa: BLE001
+            tp = 1
+        sub = dict(entry)
+        sub.update({"kind": "prefill_rows", "rows": n - start, "pos0": int(positions[start].item()), "from": start})
+        for name, t in tensors.items():
+            if not isinstance(t, torch.Tensor):
+                continue
+            if t.shape[0] == n:
+                sub[name] = _sha(t[start:])
+            elif tp > 1 and t.shape[0] * tp == n:
+                shard = t.shape[0]
+                sub[name] = _sha(t[min(start, shard):]) if rank == 0 else _sha(t)
+            else:
+                sub[name] = _sha(t)
+        lines.append(sub)
     with open(os.path.join(_DUMP_DIR, f"rank{rank}.jsonl"), "a") as fh:
-        fh.write(json.dumps(entry) + "\n")
+        for e in lines:
+            fh.write(json.dumps(e) + "\n")

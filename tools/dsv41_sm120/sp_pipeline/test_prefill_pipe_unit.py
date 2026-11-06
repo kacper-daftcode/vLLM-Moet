@@ -263,6 +263,113 @@ check(tails == list(range(len(order) - 5, len(order))), "(5c) REPLAY=serial: the
 os.environ.pop("VLLM_MOET_PREFILL_PIPE_REPLAY", None)
 
 
+# ------------------------------------------------------------------------------------------ (5d): the tail gate
+# VLLM_MOET_PREFILL_PIPE_TAIL=barrier|sync: group 0's tail (replay_begin) makes the compute stream wait for group 1's
+# last phase (recorded on the comm stream); group 1's gate waits for nothing; serial = no gate. Observable: a slow
+# kernel in group 1's last phase on N must have finished before group 0's tail kernel on C runs.
+gate_seen = {"a_waited": None, "b_gate_noop": True, "a_sync_drained": None}
+
+
+def _busy(x, n):
+    w = torch.randn(x.shape[1], x.shape[1], device=dev) * 0.01
+    for _ in range(n):  # a few ms of GPU work
+        x = torch.tanh(x @ w)
+    return x
+
+
+def fn_gate(g):
+    x = inputs[g.idx]
+    marker = torch.zeros(1, device=dev)  # written on N inside group 1's last phase
+    for layer in range(LAYERS):
+        pipe.phase_begin()
+        y = torch.tanh(x @ W[layer])
+        if g.idx == 1 and layer == LAYERS - 1:
+            _busy(torch.randn(2048, 2048, device=dev), 40)
+            marker.fill_(1.0)  # on N, at the end of the slow phase
+            gate_seen["marker"] = marker
+        pipe.phase_end()
+        x = torch.tanh(y @ W[layer].t())
+    if g.idx == 0:
+        pipe.replay_begin(x)  # the gate
+        if pipe.tail_mode() == "sync":
+            gate_seen["a_sync_drained"] = torch.cuda.current_stream().query()  # drained: nothing pending on C
+        probe = gate_seen["marker"].clone() if "marker" in gate_seen else None  # on C: 1.0 iff N's phase was done
+        if probe is not None:
+            gate_seen["a_waited"] = probe
+        pipe.replay_end(x)
+    else:
+        ev_before = torch.cuda.Event()
+        ev_before.record(C)
+        pipe.replay_begin(x)  # group 1: the last group waits for nothing
+        pipe.replay_end(x)
+    return x
+
+
+for mode in ("serial", "barrier", "sync"):
+    os.environ["VLLM_MOET_PREFILL_PIPE_TAIL"] = mode
+    gate_seen = {"a_waited": None, "b_gate_noop": True, "a_sync_drained": None}
+    outs = pipe.run_groups(make_groups(), fn_gate, pipelined=True)
+    torch.cuda.synchronize()
+    ok_vals = torch.equal(pipe.merge_outputs(outs), ref)
+    waited = gate_seen["a_waited"]
+    waited_v = None if waited is None else float(waited.item())
+    if mode == "serial":
+        check(ok_vals and pipe.tail_mode() == "serial", "(5d) TAIL=serial: no gate, results unchanged")
+    else:
+        check(ok_vals and waited_v == 1.0, f"(5d) TAIL={mode}: group 0's tail on C runs after group 1's last phase on N (marker {waited_v})")
+        if mode == "sync":
+            check(gate_seen["a_sync_drained"] is True, "(5d) TAIL=sync: the compute stream is drained when group 0's tail is issued")
+os.environ.pop("VLLM_MOET_PREFILL_PIPE_TAIL", None)
+check(pipe.tail_mode() == "serial", "(5d) TAIL default is serial")
+
+
+# ------------------------------------------------------------------------------------------ (5e): the mixed-step dump entry
+# dump_layer of a group with decode rows ahead of the prefill rows writes the whole-tensor entry and a "prefill_rows"
+# entry whose hashes cover rows [from, n) only (and match a direct hash of those rows); without decode rows one entry.
+import hashlib
+import json
+import tempfile
+
+dump_dir = tempfile.mkdtemp()
+open(os.path.join(dump_dir, "ENABLE"), "w").close()
+pipe._DUMP_DIR = dump_dir
+g_mixed = pipe.PipeGroup(idx=0, token_offset=0, num_tokens=8, forward_context=None, slot=1, prefill_rows_from=3)
+pos = torch.arange(100, 108, device=dev)
+xt = torch.randn(8, 4, device=dev)
+shard = torch.randn(8, 2, device=dev)  # tp = 1 here: a full-row tensor too
+pipe._tls.group = g_mixed
+try:
+    pipe.dump_layer(7, pos, x=xt, residual=shard)
+finally:
+    pipe._tls.group = None
+lines = [json.loads(l) for l in open(os.path.join(dump_dir, "rank0.jsonl")).read().splitlines() if l.strip()]
+sub = [e for e in lines if e.get("kind") == "prefill_rows"]
+whole = [e for e in lines if e.get("kind") != "prefill_rows"]
+ok_sub = (
+    len(sub) == 1 and len(whole) == 1 and sub[0]["rows"] == 5 and sub[0]["pos0"] == 103 and sub[0]["from"] == 3
+    and sub[0]["x"] == hashlib.sha256(xt[3:].contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:24]
+    and sub[0]["residual"] == hashlib.sha256(shard[3:].contiguous().view(torch.uint8).cpu().numpy().tobytes()).hexdigest()[:24]
+    and whole[0]["rows"] == 8 and whole[0]["pos0"] == 100
+)
+check(ok_sub, f"(5e) dump_layer of a mixed group writes the whole entry + a prefill_rows entry (rows {sub[0]['rows'] if sub else None} from {sub[0]['from'] if sub else None})")
+g_plain = pipe.PipeGroup(idx=1, token_offset=8, num_tokens=8, forward_context=None, slot=2)
+pipe._tls.group = g_plain
+try:
+    pipe.dump_layer(7, pos, x=xt)
+finally:
+    pipe._tls.group = None
+lines = [json.loads(l) for l in open(os.path.join(dump_dir, "rank0.jsonl")).read().splitlines() if l.strip()]
+check(len(lines) == 3 and not [e for e in lines[2:] if e.get("kind") == "prefill_rows"], "(5e) a group without decode rows writes the whole entry only")
+pipe._DUMP_DIR = ""
+os.environ["VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL"] = "1"
+order.clear()
+outs = pipe.run_groups(make_groups(), fn, pipelined=True)
+torch.cuda.synchronize()
+check(torch.equal(pipe.merge_outputs(outs), ref) and order == [("compute", 0, l) for l in range(LAYERS)] + [("compute", 1, l) for l in range(LAYERS)],
+      "(5e) FORCE_SEQUENTIAL=1 runs the groups one after the other with the reference results")
+os.environ.pop("VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL", None)
+
+
 # ------------------------------------------------------------------------------------------ (6): a failing group
 def fn_fail(g):
     pipe.phase_begin()

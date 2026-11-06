@@ -6,7 +6,10 @@ A chunk is identified by (rank, pos0, rows): group 1 of A's step s is the chunk 
 which is B's step 2 s + 1. Per layer the sha256 of every hc state (x = the MoE partial handed to the next boundary,
 residual, post_mix, res_mix, pre_mix) must be identical on every rank.
 
-usage: compare_dumps.py DIR_A DIR_B [--layers 0-19]
+usage: compare_dumps.py DIR_A DIR_B [--keys x,residual,...] [--kind all|prefill_rows]
+  --kind prefill_rows: the mixed-step entries (a group with decode rows ahead of a prefilling request: the hashes
+  of the prefill rows alone, keyed by their first position) - the pipelined run vs the same server with
+  VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL=1 under the same number of decode streams.
 """
 import argparse
 import json
@@ -18,6 +21,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("a", type=Path)
 ap.add_argument("b", type=Path)
 ap.add_argument("--keys", default="x,residual,post_mix,res_mix,pre_mix")
+ap.add_argument("--kind", default="all", choices=["all", "prefill_rows"])
 args = ap.parse_args()
 keys = args.keys.split(",")
 
@@ -30,6 +34,8 @@ def load(d: Path):
             if not line.strip():
                 continue
             e = json.loads(line)
+            if e.get("kind", "all") != args.kind:
+                continue
             out[(rank, e["pos0"], e["rows"], e["layer"])] = e
     return out
 

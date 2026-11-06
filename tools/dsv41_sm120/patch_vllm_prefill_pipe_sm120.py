@@ -291,6 +291,7 @@ MODEL_STATE_EDITS = [
         "        # step, 1.. = the step's row groups); prepare_attn swaps a slot's set in (_moet_pipe_select_slot).\n"
         "        self._moet_pipe_slots: dict[int, dict] = {}\n"
         "        self._moet_pipe_cur = 0\n"
+        "        self._moet_pipe_slot_cudagraphs: dict[int, Any] = {}  # slot -> DecoderReplayCudaGraphManager (capture_inner_cudagraphs)\n"
         "        layers = self.decoder_replay_layers\n        compilation_config = vllm_config.compilation_config\n",
     ),
     (
@@ -304,8 +305,39 @@ MODEL_STATE_EDITS = [
         "        if self._replay is None:\n",
     ),
     (
+        "replay graphs per slot (dispatch)",
+        "        cudagraphs, run_graph = self.replay_cudagraphs, None\n",
+        f"        cudagraphs, run_graph = self._moet_pipe_replay_cudagraphs(), None  # {MARKER}: the slot's own graphs\n",
+    ),
+    (
+        "replay graphs per slot (capture)",
+        "            self._replay_attn_groups = None\n"
+        "            self.replay_cudagraphs.capture_replay_graphs(prepare)\n",
+        "            self._replay_attn_groups = None\n"
+        "            self.replay_cudagraphs.capture_replay_graphs(prepare)\n"
+        f"            # {MARKER}: a row group's replay batch lives in its slot's buffers / builders, so its graphs are captured per slot\n"
+        "            # (VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1); without them the groups' replay layers run eagerly, never slot 0's graphs.\n"
+        "            for _slot in _moet_pipe.graph_slots():\n"
+        "                self._moet_pipe_select_slot(_slot)\n"
+        "                self._replay_attn_groups = None\n"
+        "                if _slot not in self._moet_pipe_slot_cudagraphs:\n"
+        "                    self._moet_pipe_slot_cudagraphs[_slot] = DecoderReplayCudaGraphManager(\n"
+        "                        self.vllm_config, self.device, self.decoder_replay_layers\n"
+        "                    )\n"
+        "                self._moet_pipe_slot_cudagraphs[_slot].capture_replay_graphs(prepare)\n"
+        "            self._moet_pipe_select_slot(0)\n",
+    ),
+    (
         "slot method",
         "    def _warm_up_replay_kernels(\n",
+        "    def _moet_pipe_replay_cudagraphs(self):\n"
+        f'        """{MARKER}: the replay CUDA graphs of the slot being prepared: slot 0 (the whole step) = the model state\'s own\n'
+        "        manager; a row group's slot = the manager captured for it in capture_inner_cudagraphs, or None (eager) - a group\n"
+        '        must never take slot 0\'s graphs, which read slot 0\'s metadata buffers."""\n'
+        "        if self._moet_pipe_cur == 0:\n"
+        "            return self.replay_cudagraphs\n"
+        "        return self._moet_pipe_slot_cudagraphs.get(self._moet_pipe_cur)\n"
+        "\n"
         "    _MOET_PIPE_ATTRS = (\n"
         '        "_replay_start",\n'
         '        "_replay_start_staging",\n'
