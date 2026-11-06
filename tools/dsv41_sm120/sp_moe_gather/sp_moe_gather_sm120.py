@@ -110,6 +110,20 @@ def unpack_small(small: torch.Tensor, k: int, topk: int) -> tuple[torch.Tensor, 
 
 
 # ------------------------------------------------------------------------------------------------- the runtime path
+def _one_all_gather() -> bool:
+    """VLLM_MOET_PREFILL_SP_GATHER_ONE_AG=1: one all-gather of [c, K + K/32 + 8 topk] rows instead of two (needs the fast prefill
+    MoE build with strided_rows_supported(); checked once in _check_eligible). Default 0 = the two gathers of step 45.
+    Measured in situ (session K, test host 4x RTX PRO 6000 SE, image r25, 6.11): bits identical (long_agree x2 + agree_client ALL
+    IDENTICAL vs the two-gather arm), fresh prefill 163K 6973 / 6987 / 6975 ms vs 6946 / 6949 / 6947 (+0.4 %), 19K 826 / 824 / 822 vs
+    818 / 819 / 821 - the shared expert's CUTLASS GEMM still needs a contiguous e4m3 operand and that 21 MB copy costs more than the
+    second NCCL launch it saves; it pays only once that consumer takes the operand with a row stride. Kept opt-in for that follow-up."""
+    global _ONE_AG
+    if _ONE_AG is None:
+        _ONE_AG = os.environ.get("VLLM_MOET_PREFILL_SP_GATHER_ONE_AG", "0") == "1"
+    return _ONE_AG
+
+
+_ONE_AG: bool | None = None
 _CTX: dict[tuple, dict[str, Any]] = {}  # (stand-in data_ptr, shape) -> the gathered pieces + consumption flags
 _ELIGIBLE: dict[int, bool] = {}  # id(ffn) -> decided once
 _STATS = {"calls": 0, "bf16_fallback": 0}
@@ -191,6 +205,8 @@ def _check_eligible(ffn) -> tuple[bool, str]:
             return False, "the fast prefill MoE kernels are not active (VLLM_MOET_B12X_MOE_PREFILL_FAST=1 + step 42's hook)"
         if not fast.prequant_rows_supported():
             return False, "the fast prefill MoE extension has no pre-quantized rows entry"
+        if _one_all_gather() and not getattr(fast, "strided_rows_supported", lambda: False)():
+            return False, "VLLM_MOET_PREFILL_SP_GATHER_ONE_AG=1 needs the fast prefill MoE build with strided a_values / a_scales"
         if not fast.supported(n=ffn.moe_intermediate_size // ffn.tp_size, k=ffn.hidden_size, num_topk=ffn.n_activated_experts,
                               experts=ffn.n_routed_experts, ids_dtype=torch.int32):
             return False, "the fast prefill MoE kernels do not serve this MoE shape"
@@ -247,14 +263,25 @@ def gather_moe_input(ffn, x_shard: torch.Tensor, num_tokens: int, input_ids: tor
     if topk_weights.dtype != torch.float32:
         topk_weights = topk_weights.to(torch.float32)
 
-    # 4. the two all-gathers: the e4m3 bytes, and the small rows (scales + ids + weights)
-    q_full = all_gather(q, 0)[:num_tokens]
+    # 4. the all-gathers: the e4m3 bytes, and the small rows (scales + ids + weights) - two gathers (default), or ONE gather of
+    #    [c, K + K/32 + 8 topk] rows (VLLM_MOET_PREFILL_SP_GATHER_ONE_AG=1; the fast prefill MoE kernels read a_values / a_scales
+    #    as row-strided views of the gathered buffer since K's commit of 5.11 - the same bytes, one NCCL launch less per layer;
+    #    the shared expert's CUTLASS operand is the one consumer that still needs a contiguous [T, K] copy)
     small = pack_small(s_rm, topk_ids, topk_weights, c)
-    small_full = all_gather(small, 0)[:num_tokens]
+    if _one_all_gather():
+        full = all_gather(torch.cat([q, small], dim=1), 0)[:num_tokens]  # [T, K + 208], row stride K + 208 (a multiple of 4)
+        q_full, small_full = full[:, :k], full[:, k:]
+        q_shared = q_full.contiguous()
+    else:
+        q_full = all_gather(q, 0)[:num_tokens]
+        small_full = all_gather(small, 0)[:num_tokens]
+        q_shared = q_full
     s_full, ids_full, w_full = unpack_small(small_full, k, topk)
+    if _one_all_gather():
+        s_full = small_full[:, :k // SCALE_BLOCK]  # the strided view for the fast kernels (unpack_small's copy serves the swizzle)
 
     # 5. the consumers' views: the shared expert's pair on the stand-in (step 38's hook), the rest on the side channel
-    buf._moet_mxfp8 = (q_full.view(torch.float8_e4m3fn), swizzle_scales(s_full))
+    buf._moet_mxfp8 = (q_shared.view(torch.float8_e4m3fn), swizzle_scales(s_full.contiguous() if _one_all_gather() else s_full))
     key = (buf.data_ptr(), tuple(buf.shape))
     assert not _CTX, "prefill SP gather: a previous MoE call did not finish()"
     _CTX[key] = dict(router=logits, topk=(w_full, ids_full), prequant=(q_full, s_full),
