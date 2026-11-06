@@ -283,7 +283,9 @@ def gather_moe_input(ffn, x_shard: torch.Tensor, num_tokens: int, input_ids: tor
     # 5. the consumers' views: the shared expert's pair on the stand-in (step 38's hook), the rest on the side channel
     buf._moet_mxfp8 = (q_shared.view(torch.float8_e4m3fn), swizzle_scales(s_full.contiguous() if _one_all_gather() else s_full))
     key = (buf.data_ptr(), tuple(buf.shape))
-    assert not _CTX, "prefill SP gather: a previous MoE call did not finish()"
+    # One gather in flight per stand-in: the pipelined prefill (step 47 candidate, sp_pipeline/) has two row groups'
+    # gathers open at once, each with its own stand-in buffer; a repeated key means a MoE call did not finish().
+    assert key not in _CTX, "prefill SP gather: a previous MoE call on this stand-in did not finish()"
     _CTX[key] = dict(router=logits, topk=(w_full, ids_full), prequant=(q_full, s_full),
                      taken={"router": False, "topk": False, "prequant": False})
     _STATS["calls"] += 1
