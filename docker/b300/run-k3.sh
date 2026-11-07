@@ -63,7 +63,7 @@
 #            SPEC_TOKENS (0)         DSpark draft tokens (the K3 recipe uses 7, the K3.1 recipe 5); needs DRAFT_DIR
 #            SPEC_METHOD (dspark)    --speculative-config method: dspark for the Inferact drafts, dflash for the
 #                        RadixArk/Kimi-K3.1-Dflash2-Preview draft (block 5 = SPEC_TOKENS 4; needs the vllm-moet
-#                        dflash2 patch set, /root/work/k3-test/patch-k31/dflash2/README.md)
+#                        dflash2 patch set in the image - not in Dockerfile.b300-k31 yet)
 #            DRAFT_DIR ("")          Inferact/Kimi-K3-DSpark (K3) or Inferact/Kimi-K3.1-Pro-DSpark-preview (K3.1: 5 dense
 #                        MLA layers, its own FP8 MLA cache next to the target's packed DSA cache) checkpoint
 #            DRAFT_ATTENTION_BACKEND (FLASHINFER_MLA)  the Inferact drafts are MLA-native; RedHatAI's speculator
