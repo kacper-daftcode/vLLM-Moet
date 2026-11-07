@@ -394,5 +394,61 @@ b = (torch.ones(3, 3) * 2, [torch.ones(3, 1), torch.ones(3, 2)])
 m = pipe.merge_outputs([a, b])
 check(isinstance(m, tuple) and m[0].shape == (5, 3) and isinstance(m[1], list) and m[1][1].shape == (5, 2) and m[1][0][2].item() == 1, "merge_outputs: (hidden, [aux]) tuples concatenate per element")
 
+
+# ------------------------------------------------------------------------------------------ (7): the communicator switch (COMM2)
+# CommSwitch resolves every attribute on the calling thread's group's communicator: odd pipelined groups -> alt, the even
+# group, the runner thread and sequential groups -> base; a call that spans several attribute lookups stays on one side.
+class FakeComm:
+    def __init__(self, tag):
+        self.tag = tag
+        self.disabled = False
+        self.calls = []
+
+    def all_gather(self, out, inp):
+        self.calls.append(("all_gather", self.tag))
+        return self.tag
+
+
+sw = pipe.CommSwitch(FakeComm("base"), FakeComm("alt"))
+seen_comm = {}
+
+
+def fn_comm(g: pipe.PipeGroup):
+    seen_comm[g.idx] = (sw.tag, sw.all_gather(None, None), sw.disabled)
+    pipe.phase_begin()
+    pipe.phase_end()
+    return inputs[g.idx]
+
+
+pipe.run_groups(make_groups(), fn_comm, pipelined=True)
+torch.cuda.synchronize()
+check(seen_comm.get(0) == ("base", "base", False) and seen_comm.get(1) == ("alt", "alt", False) and sw.tag == "base",
+      f"(7) CommSwitch: group 0 -> base, group 1 -> alt, the runner thread -> base ({seen_comm})")
+seen_comm.clear()
+pipe.run_groups(make_groups(), fn_comm, pipelined=False)
+check(seen_comm.get(0) == ("base", "base", False) and seen_comm.get(1) == ("base", "base", False),
+      f"(7) CommSwitch: sequential groups stay on base ({seen_comm})")
+check(not pipe.comm2_enabled() and pipe.kv_connector_policy() == "allow", "(7) COMM2 off and KV_CONNECTOR=allow by default")
+os.environ["VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR"] = "refuse"
+
+
+class FakeCfg:
+    kv_transfer_config = object()
+
+
+class FakeRunnerCfg:
+    vllm_config = FakeCfg()
+
+
+os.environ["VLLM_MOET_PREFILL_PIPE"] = "2"
+saved_runner = pipe._RUNNER
+pipe._RUNNER = None
+res = pipe.plan_groups(FakeRunnerCfg(), None, None, None, None)
+check(res is None and pipe._RUNNER is None and pipe._KV_CONNECTOR_REFUSED["logged"],
+      "(7) KV_CONNECTOR=refuse with a connector configured: plan_groups returns None (today's path) without building the runner, logged once")
+pipe._RUNNER = saved_runner
+os.environ.pop("VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR", None)
+os.environ.pop("VLLM_MOET_PREFILL_PIPE", None)
+
 print("ALL PASS" if not failures else f"FAILURES: {len(failures)}")
 sys.exit(1 if failures else 0)

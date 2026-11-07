@@ -30,7 +30,10 @@ step with decode rows: the batch composition and the groups | 2 = every pipeline
 VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS (0 | 1: the groups' replay layers as CUDA graphs, one graph set per slot; needs
 --compilation-config decoder_replay_cudagraph_capture_sizes >= the 128-row window, see replay_graphs),
 VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL (0 | 1: the groups one after the other, the bits oracle of the pipelined path),
-VLLM_MOET_PREFILL_PIPE_DUMP=<dir> (+ <dir>/ENABLE present: per-layer sha256 of the hc states, the bits harness).
+VLLM_MOET_PREFILL_PIPE_DUMP=<dir> (+ <dir>/ENABLE present: per-layer sha256 of the hc states, the bits harness),
+VLLM_MOET_PREFILL_PIPE_COMM2 (0 | 1: the odd group's collectives on a second NCCL communicator, see comm2_enabled - K-6),
+VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR (allow | refuse: whether the pipeline may activate when a KV transfer connector - the
+production KV offload tier - is configured, see kv_connector_policy - K-6, the r26 production window of 2026-11-07).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
@@ -136,6 +139,30 @@ def graph_slots() -> list[int]:
     if mode() != 2 or not replay_graphs():
         return []
     return list(range(1, PipeRunner.NUM_GROUPS + 1))
+
+
+def comm2_enabled() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_COMM2=1: the odd group's collectives (its boundary reduce-scatters / all-gathers on the comm
+    stream, the indexer's all_gatherv on the compute stream, the all-reduces of its replay tail) go through a second NCCL
+    communicator over the same TP ranks (PipeRunner.comm2, a PyNcclCommunicator built once on every rank at the first
+    pipelined step), the even group's through the TP group's own. Why (K-6, the ws0_3 trace of K-5 read kernel by
+    kernel): NCCL serializes every collective of one communicator in issue order, across streams - the compute stream's
+    all_gatherv of group B's indexer top-k waits for group A's whole RS2 -> glue -> AG2 chain on the comm stream (6 per
+    step, ~1.1 ms each = 8 ms of a 188-ms SP phase), and a late AG of one group delays the other group's next RS. Two
+    communicators decouple the groups' chains; the bytes, the algorithm and the summation order of every collective are
+    unchanged (same ranks, same topology), so the bits are today's. Off (default): one communicator, as r26."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_COMM2", "0") == "1"
+
+
+def kv_connector_policy() -> str:
+    """VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR: "allow" (default) = the pipeline activates as usual; "refuse" = when the
+    server runs a KV transfer connector (vllm_config.kv_transfer_config is set: the production KV offload tier,
+    KV_OFFLOAD_GIB > 0) the pipeline stays off - one loud log line at the first eligible step, today's 4 096-row path for
+    every step. Background: in the production window of 2026-11-07 r26 (PIPE=2 at 8 192 tokens) measured +31 % at 163K
+    with the offload connector, which no test-host arm had exercised; "refuse" is the safe default to ship until the
+    pipelined step is validated with the connector on (K/BRIEF_K6.md section 0)."""
+    policy = os.environ.get("VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR", "allow")
+    return policy if policy in ("allow", "refuse") else "allow"
 
 
 # ------------------------------------------------------------------------------------------------- per-thread state
@@ -603,6 +630,65 @@ def run_groups(groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipeline
     return step.run_sequential(fn)
 
 
+# ------------------------------------------------------------------------------------------- the second communicator
+class CommSwitch:
+    """Stands in for the TP group's `device_communicator.pynccl_comm` (VLLM_MOET_PREFILL_PIPE_COMM2=1): every attribute
+    and method resolves on the communicator of the calling thread's group - the odd groups' on `alt`, everything else
+    (the even group, the runner thread, decode steps, graph capture) on `base`. The choice is per call, so a collective
+    that opens a NCCL group (all_gatherv: group_start .. group_end) stays on one communicator. Every rank makes the same
+    choice for the same op (the groups' programs are identical across ranks), which is all NCCL asks of a communicator."""
+
+    def __init__(self, base, alt) -> None:
+        self._base = base
+        self._alt = alt
+
+    def _pick(self):
+        g = current_group()
+        if g is not None and g.idx % 2 == 1 and g.step is not None and g.step.pipelined:
+            return self._alt
+        return self._base
+
+    def __getattr__(self, name):
+        if name in ("_base", "_alt"):
+            raise AttributeError(name)
+        return getattr(self._pick(), name)
+
+    def __repr__(self) -> str:
+        return f"CommSwitch(base={self._base!r}, alt={self._alt!r})"
+
+
+def _install_comm2(device: torch.device):
+    """Build the second NCCL communicator over the TP ranks (collective: every rank calls this at the same step) and
+    install the switch on the TP group's device communicator. Returns the communicator, or None when it is not possible
+    (no pynccl, world size 1) - then the single communicator stays and a warning says so."""
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.distributed.parallel_state import get_tp_group
+
+    tp = get_tp_group()
+    dc = getattr(tp, "device_communicator", None)
+    base = getattr(dc, "pynccl_comm", None)
+    if dc is None or base is None or getattr(base, "disabled", True) or tp.world_size < 2:
+        logger.warning("vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE_COMM2=1 needs the TP group's pynccl "
+                       "communicator (found %r) - the groups share one communicator", base)
+        return None
+    if isinstance(base, CommSwitch):
+        return base._alt
+    group = tp.cpu_group
+    comm2 = PyNcclCommunicator(group=group, device=device)
+    if getattr(comm2, "disabled", True):
+        logger.warning("vllm-moet sm_120 prefill pipeline: the second NCCL communicator is disabled - the groups share one")
+        return None
+    dc.pynccl_comm = CommSwitch(base, comm2)
+    logger.info(
+        "vllm-moet sm_120 prefill pipeline: the odd row group's collectives run on a second NCCL communicator (rank %d of "
+        "%d; VLLM_MOET_PREFILL_PIPE_COMM2=1) - the two groups' reduce-scatter / all-gather chains are no longer serialized "
+        "in one NCCL queue",
+        comm2.rank,
+        comm2.world_size,
+    )
+    return comm2
+
+
 # ------------------------------------------------------------------------------------------------- runner side
 _RUNNER: "PipeRunner | None" = None
 
@@ -647,13 +733,18 @@ class PipeRunner:
             if buffers:
                 self.row_switch = RowBufferSwitch(buffers, self.num_groups)
         self._warned: set[str] = set()
+        # K-6: the odd group's collectives on a communicator of their own (VLLM_MOET_PREFILL_PIPE_COMM2=1). Built here, at
+        # the first pipelined step, on every rank at once (the groups' first step is the same step on every rank); the
+        # one-element warm-up all-reduce inside synchronizes the current stream once.
+        self.comm2 = _install_comm2(self.device) if comm2_enabled() else None
         logger.info(
             "vllm-moet sm_120 prefill pipeline ready: %d groups of %d rows, %d row buffers per group, comm stream "
-            "priority %d",
+            "priority %d, %s",
             self.num_groups,
             group_rows(),
             0 if self.row_switch is None else len(self.row_switch.buffers),
             _comm_priority(),
+            "two NCCL communicators (COMM2=1)" if self.comm2 is not None else "one NCCL communicator",
         )
 
     def _copy_attn_groups(self, attn_groups):
@@ -809,10 +900,32 @@ class PipeRunner:
         return groups
 
 
+_KV_CONNECTOR_REFUSED = {"logged": False}
+
+
+def _kv_connector_configured(runner: Any) -> bool:
+    cfg = getattr(runner, "vllm_config", None)
+    return getattr(cfg, "kv_transfer_config", None) is not None
+
+
 def plan_groups(runner: Any, input_batch: Any, batch_desc: Any, block_tables, slot_mappings) -> list[PipeGroup] | None:
     """Runner side, once per real eager step after the whole step's metadata: the step's groups, or None."""
     global _RUNNER
     if mode() != 2:
+        return None
+    if kv_connector_policy() == "refuse" and _kv_connector_configured(runner):
+        # K-6: never a silent slowdown - the pipelined step is not validated with a KV transfer connector (the production
+        # KV offload tier); say so once, loudly, and run today's path.
+        if not _KV_CONNECTOR_REFUSED["logged"]:
+            _KV_CONNECTOR_REFUSED["logged"] = True
+            logger.warning(
+                "vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE=2 requested but a KV transfer connector is "
+                "configured (%s) and VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR=refuse - the pipelined prefill stays OFF, every "
+                "step runs today's path (the r26 production window of 2026-11-07: +31 %% at 163K with the offload tier). "
+                "Set VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR=allow once the pipelined step is validated with the connector.",
+                type(getattr(runner.vllm_config, "kv_transfer_config", None)).__name__,
+            )
+        _STATS["today"] += 1
         return None
     if _RUNNER is None:
         _RUNNER = PipeRunner(runner)
