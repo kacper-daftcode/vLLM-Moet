@@ -495,5 +495,217 @@ os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "nonsense"
 check(pipe.order() == "today" and not pipe.comm2_enabled(), "(8) an unknown ORDER value is today's")
 os.environ.pop("VLLM_MOET_PREFILL_PIPE_ORDER", None)
 
+# ------------------------------------------------------------------------------------------ (9): K-8 - the phase graph
+# The step graph protocol on fakes: a GEMM chain per group with phases across the compute / comm streams is captured by
+# _phase_capture_step (the two threads under one stream capture), replayed by run_groups on new inputs (static inputs,
+# metadata copies, outputs copied out), verified against the eager section (verify mode), and refused for a step whose key
+# or metadata differs (eager fallback, counted). Plus the metadata snapshot's rules and record_for_comm's hold-until-join.
+from dataclasses import dataclass as _dc  # noqa: E402
+
+check(pipe.phase_graphs() == "0" and pipe.phase_graph_max_ctx() == 262144 and not pipe.phase_graph_capturing(),
+      "(9) PHASE_GRAPHS=0 and MAX_CTX=262144 by default, not capturing")
+os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "bogus"
+check(pipe.phase_graphs() == "0", "(9) an unknown PHASE_GRAPHS value is off")
+
+
+@_dc
+class FakeChunk:
+    cu_seqlen_ke: torch.Tensor
+    max_seqlen_k: int
+    token_start: int
+
+
+@_dc
+class FakeMeta:
+    block_table: torch.Tensor
+    seq_lens: torch.Tensor
+    seq_lens_cpu: torch.Tensor
+    num_prefills: int
+    chunks: list
+
+
+@_dc
+class FakeCtx:
+    attn_metadata: dict
+    slot_mapping: dict
+    is_padding: torch.Tensor | None = None
+    batch_descriptor: tuple | None = None
+
+
+persistent_bt = torch.arange(64, device=dev, dtype=torch.int32).view(1, 64)
+persistent_sl = torch.zeros(1, dtype=torch.int32, device=dev)
+persistent_slots = torch.zeros(2, 8, dtype=torch.int64, device=dev)
+
+
+def make_ctx(ctx_len: int, fresh_ke: torch.Tensor | None = None, extra: bool = False, prefills: int = 1):
+    meta = FakeMeta(
+        block_table=persistent_bt, seq_lens=persistent_sl, seq_lens_cpu=torch.tensor([ctx_len]), num_prefills=prefills,
+        chunks=[FakeChunk(torch.full((4,), ctx_len, dtype=torch.int32, device=dev) if fresh_ke is None else fresh_ke,
+                          ctx_len // 2, 0)],
+    )
+    attn = {"layers.0": meta}
+    if extra:
+        attn["layers.1"] = meta
+    return FakeCtx(attn_metadata=attn, slot_mapping={"layers.0": persistent_slots[:, :4]}, batch_descriptor=(4,))
+
+
+cap_ctx = make_ctx(1000)
+snap = pipe._MetaSnapshot(cap_ctx)
+check(len(snap.tensors) == 4 and "attn_metadata.layers.0.chunks[0].cu_seqlen_ke" in snap.tensors
+      and snap.values.get("attn_metadata.layers.0.chunks[0].max_seqlen_k") == 500
+      and snap.values.get("attn_metadata.layers.0.seq_lens_cpu") == [1000],
+      f"(9) _MetaSnapshot flattens device tensors by path and host values (cpu tensors as lists): {sorted(snap.tensors)}")
+plan, why = snap.plan(make_ctx(600))
+check(why is None and len(plan) == 1 and plan[0][0].data_ptr() == snap.tensors["attn_metadata.layers.0.chunks[0].cu_seqlen_ke"].data_ptr(),
+      f"(9) a smaller context passes (extents <=), persistent buffers are not copied, the fresh tensor is ({why})")
+plan, why = snap.plan(make_ctx(1200))
+check(plan is None and "extent" in (why or ""), f"(9) a larger context than the capture's is refused: {why}")
+plan, why = snap.plan(make_ctx(600, prefills=2))
+check(plan is None and "num_prefills" in (why or ""), f"(9) a different host value is refused: {why}")
+plan, why = snap.plan(make_ctx(600, extra=True))
+check(plan is None and "structure" in (why or ""), f"(9) a different metadata structure is refused: {why}")
+plan, why = snap.plan(make_ctx(600, fresh_ke=torch.zeros(3, dtype=torch.int32, device=dev)))
+check(why is None and plan[0][0].shape[0] == 3, f"(9) a shorter fresh tensor copies into a prefix of the captured one ({why})")
+plan, why = snap.plan(make_ctx(600, fresh_ke=torch.zeros(5, dtype=torch.int32, device=dev)))
+check(plan is None and "shape" in (why or ""), f"(9) a longer fresh tensor is refused: {why}")
+
+# the protocol on the GPU: capture, replay, verify, fallback
+WG = [torch.randn(H, H, device=dev) * 0.05 for _ in range(3)]
+held_seen = {"in_phase": None, "after": None}
+
+
+def section_fn(g: pipe.PipeGroup, hs, pos, ids, hashes, mask):
+    x = hs
+    for layer in range(3):
+        pipe.phase_begin()
+        y = torch.tanh(x @ WG[layer])
+        pipe.record_for_comm(x)
+        if layer == 0 and g.idx == 0:
+            held_seen["in_phase"] = len(g.comm_held)
+        pipe.phase_end()
+        if layer == 0 and g.idx == 0:
+            held_seen["after"] = len(g.comm_held)
+        x = torch.tanh(y @ WG[layer].t())
+    return pipe.SectionState(x, x * 2, x[:, :4].float(), x[:, :2].float(), x[:, :1].float(), {2: x + 1}, True, ids)
+
+
+def rest_fn(g: pipe.PipeGroup, pos, ids, state: pipe.SectionState):
+    return state.hidden_states + state.residual + state.aux_hidden_by_layer[2]
+
+
+def section_reference(hs):
+    x = hs
+    for layer in range(3):
+        x = torch.tanh(torch.tanh(x @ WG[layer]) @ WG[layer].t())
+    return x + x * 2 + (x + 1)
+
+
+class FakeReplayLayers:
+    _moet_replay_batches = {1: object(), 2: object()}
+
+
+class FakeModelState:
+    decoder_replay_layers = FakeReplayLayers()
+
+
+runner.model_state = FakeModelState()
+runner.phase_graph = None
+runner.phase_graph_failed = None
+runner.engram_modules = []
+runner._warned = set()
+runner._warn_once = lambda key, msg, *a: print("  warn-once:", key, msg % a)
+positions_buf = torch.arange(8, device=dev, dtype=torch.int64)
+hs_steps = [torch.randn(8, H, device=dev) for _ in range(3)]
+cur = {"hs": hs_steps[0]}
+
+
+def inputs_fn(g: pipe.PipeGroup):
+    lo, hi = g.token_offset, g.token_offset + g.num_tokens
+    return (cur["hs"][lo:hi], positions_buf[lo:hi], None, None, None)
+
+
+hooks = pipe.PhaseHooks(inputs_fn, section_fn, rest_fn)
+
+
+def make_graph_groups(ctx_len=1000, rows=4):
+    gs = make_groups(rows=rows)
+    for g in gs:
+        g.forward_context = make_ctx(ctx_len)
+    return gs
+
+
+full_fn = lambda g: rest_fn(g, None, None, section_fn(g, *inputs_fn(g)))  # noqa: E731 - the eager tail
+os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "1"
+capture_stream = torch.cuda.Stream(device=dev)  # a capture cannot begin on the default stream (PipeRunner.capture_stream)
+capture_stream.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(capture_stream):
+    pipe._PHASE["request"] = "warmup"
+    out_w = pipe.run_groups(make_graph_groups(), full_fn, pipelined=True, phase=hooks)
+    pipe._PHASE["request"] = "capture"
+    t0 = time.time()
+    out_c = pipe.run_groups(make_graph_groups(), full_fn, pipelined=True, phase=hooks)
+    pipe._PHASE["request"] = None
+torch.cuda.synchronize()
+pg = runner.phase_graph
+check(pg is not None and pg.graph is not None and len(pg.inputs) == 2 and len(pg.outputs) == 2 and not pipe.phase_graph_capturing(),
+      f"(9) capture pass: a step graph with static inputs / outputs for both groups ({(time.time() - t0) * 1000:.0f} ms)")
+check(torch.equal(pipe.merge_outputs(out_c), section_reference(hs_steps[0])),
+      "(9) the capture pass's output (one replay + the eager rest) equals the eager reference")
+check(held_seen == {"in_phase": 1, "after": 0}, f"(9) record_for_comm holds the tensor inside the phase and releases it at the join {held_seen}")
+steps0 = dict(pipe.stats())
+cur["hs"] = hs_steps[1]
+out_g = pipe.run_groups(make_graph_groups(ctx_len=700), full_fn, pipelined=True, phase=hooks)
+torch.cuda.synchronize()
+st = pipe.stats()
+check(torch.equal(pipe.merge_outputs(out_g), section_reference(hs_steps[1])) and pg.num_launches == 1
+      and st["phase_graph_steps"] == steps0["phase_graph_steps"] + 1 and st["phase_graph_eager"] == steps0["phase_graph_eager"],
+      f"(9) a step on the graph: new inputs copied in, one launch, outputs equal the eager reference ({pg.num_launches} launches)")
+os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "verify"
+cur["hs"] = hs_steps[2]
+out_v = pipe.run_groups(make_graph_groups(ctx_len=900), full_fn, pipelined=True, phase=hooks)
+torch.cuda.synchronize()
+st = pipe.stats()
+check(torch.equal(pipe.merge_outputs(out_v), section_reference(hs_steps[2])) and st["phase_graph_verified"] == 1
+      and st["phase_graph_mismatch"] == 0 and pg.num_launches == 2,
+      f"(9) verify mode: graph and eager section compared (verified {st['phase_graph_verified']}, mismatch {st['phase_graph_mismatch']})")
+# a planted difference is reported and counted, the tails continue from the eager outputs
+saved_section = hooks.section
+
+
+def section_planted(g, hs, pos, ids, hashes, mask):
+    s = saved_section(g, hs, pos, ids, hashes, mask)
+    s.residual.add_(1.0)  # the eager rerun differs from the graph by construction
+    return s
+
+
+hooks.section = section_planted
+out_p = pipe.run_groups(make_graph_groups(ctx_len=900), full_fn, pipelined=True, phase=hooks)
+torch.cuda.synchronize()
+st = pipe.stats()
+hooks.section = saved_section
+check(st["phase_graph_mismatch"] == 1 and torch.equal(pipe.merge_outputs(out_p), section_reference(hs_steps[2]) + 1.0),
+      f"(9) verify mode reports a mismatch (count {st['phase_graph_mismatch']}) and the tails use the eager outputs")
+os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "1"
+# fallbacks: a context beyond the capture's, a different group shape, a missing replay batch -> eager, counted, loud once
+eager0 = pipe.stats()["phase_graph_eager"]
+out_e = pipe.run_groups(make_graph_groups(ctx_len=1500), full_fn, pipelined=True, phase=hooks)
+gs = make_graph_groups()
+gs[1].req_lo = 1
+out_e2 = pipe.run_groups(gs, full_fn, pipelined=True, phase=hooks)
+FakeReplayLayers._moet_replay_batches = {1: object()}
+out_e3 = pipe.run_groups(make_graph_groups(), full_fn, pipelined=True, phase=hooks)
+FakeReplayLayers._moet_replay_batches = {1: object(), 2: object()}
+torch.cuda.synchronize()
+check(pipe.stats()["phase_graph_eager"] == eager0 + 3 and pg.num_launches == 2
+      and all(torch.equal(pipe.merge_outputs(o), section_reference(hs_steps[2])) for o in (out_e, out_e2, out_e3)),
+      "(9) a step the graph does not serve (context, request slice, replay batch) runs eagerly with today's results")
+os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "0"
+out_off = pipe.run_groups(make_graph_groups(), full_fn, pipelined=True, phase=hooks)
+check(pg.num_launches == 2 and torch.equal(pipe.merge_outputs(out_off), section_reference(hs_steps[2])),
+      "(9) PHASE_GRAPHS=0: the graph is never launched, today's path")
+os.environ.pop("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS", None)
+pg.release()
+runner.phase_graph = None
+
 print("ALL PASS" if not failures else f"FAILURES: {len(failures)}")
 sys.exit(1 if failures else 0)

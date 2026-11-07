@@ -17,14 +17,23 @@ one compute stream, asserted on the CPU), the RS/AG per group are the same colle
 
 Patched files (anchor-based, idempotent, after steps 10/39/41/45; the installed text is checked, nothing else accepted):
   vllm/v1/worker/gpu/model_runner.py                the step's row groups after the whole-step metadata, the model call
-                                                    inside the pipeline's step context (eager steps only)
+                                                    inside the pipeline's step context (eager steps only); K-8: the phase
+                                                    graph's capture after the inner cudagraphs (both capture passes)
   vllm/models/deepseek_v41/nvidia/model.py          the forward split into head (once) and tail (once per group); the
-                                                    layer's two boundary phases; the dump hook of the bits harness
+                                                    layer's two boundary phases; the dump hook of the bits harness; K-8:
+                                                    the tail split into the sequence-parallel section (shard, layers 0-19,
+                                                    the first replay layer's KV = the phase graph) and the rest, the SP
+                                                    path kept under the phase graph's stream capture
   vllm/models/deepseek_v41/attention.py             the end of phase 1 after the projections' all-gather
   vllm/models/deepseek_v41/nvidia/model_state.py    the replay-batch buffers / staging / builders per slot
   vllm/models/deepseek_v41/decoder_replay_layers.py the replay batch per slot (the thread's group)
-  vllm/models/deepseek_v41/common/engram.py         the Engram rows at the group's row offset
+  vllm/models/deepseek_v41/common/engram.py         the Engram rows at the group's row offset; K-8: no wait on the prefetch
+                                                    event inside the phase graph's capture (the module waits before the launch)
   (and tools/dsv41_sm120/sp_moe_gather/sp_moe_gather_sm120.py: one MoE gather in flight per stand-in, not per process)
+
+The K-8 edits (VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS, marker "... phase graph") form a second stage applied after the first:
+a file the first stage already patched (an r26 / r26b image) takes the second stage alone, so the r26b image's files can be
+re-patched in place for a bind-mount (K/k8pg/repatch_r26b.sh).
 
 Usage:
     python3 patch_vllm_prefill_pipe_sm120.py [--dist DIR] [--helper FILE] [--check]
@@ -44,6 +53,7 @@ DEFAULT_DIST = Path("/usr/local/lib/python3.12/dist-packages/vllm")
 DEFAULT_HELPER = Path(__file__).resolve().parent / "sp_pipeline" / "moet_prefill_pipe.py"
 HELPER_DST = "v1/worker/moet_prefill_pipe.py"
 MARKER = "[vllm-moet] sm_120 prefill pipeline"
+MARKER2 = "[vllm-moet] sm_120 prefill pipeline phase graph"  # the K-8 stage (VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS)
 IMPORT = f"from vllm.v1.worker import moet_prefill_pipe as _moet_pipe  # {MARKER}\n"
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -72,6 +82,28 @@ RUNNER_EDITS = [
         "                else:\n                    # Eager (NONE): call the raw model directly.\n"
         f"                    with _moet_pipe.step_context(moet_pipe_groups):  # {MARKER}\n"
         "                        model_output = self.model(**model_inputs)\n",
+    ),
+]
+
+# K-8: the phase graph is captured right after the model state's inner graphs, in both of vLLM's capture passes (the
+# memory-profiling pass measures it, the real pass keeps it)
+RUNNER_EDITS_K8 = [
+    (
+        "phase graph capture",
+        "                    self.model_state.capture_inner_cudagraphs(\n"
+        "                        input_buffers,\n"
+        "                        self.block_tables,\n"
+        "                        self.attn_groups,\n"
+        "                        self.kv_cache_config,\n"
+        "                    )\n",
+        "                    self.model_state.capture_inner_cudagraphs(\n"
+        "                        input_buffers,\n"
+        "                        self.block_tables,\n"
+        "                        self.attn_groups,\n"
+        "                        self.kv_cache_config,\n"
+        "                    )\n"
+        f"                    # {MARKER2} (VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS): the sequence-parallel section of a full pipelined step\n"
+        "                    _moet_pipe.capture_phase_graphs(self, profile_only=profile_only)\n",
     ),
 ]
 
@@ -247,6 +279,152 @@ MODEL_EDITS = [
         "            )\n"
         "            if previous_aux is not None:\n"
         "                # idx is the one-based id of the layer whose post this is.\n",
+    ),
+]
+
+# K-8 (second stage, on the text the first stage produced): the group's tail split into the sequence-parallel section and
+# the rest, the dispatch passing both to the pipeline, the SP path kept under the phase graph's stream capture.
+MODEL_EDITS_K8 = [
+    (
+        "sp step under capture",
+        "        if torch.cuda.is_current_stream_capturing() or in_piecewise_cudagraph():\n"
+        "            return False\n"
+        "        logger.info_once(\n"
+        '            "vllm-moet sm_120 prefill SP: eager steps of >= %d tokens reduce-scatter the sublayer outputs and run "\n',
+        f"        # {MARKER2}: the step graph is captured on the sequence-parallel path - vLLM's own graphs never carry it\n"
+        "        if (torch.cuda.is_current_stream_capturing() and not _moet_pipe.phase_graph_capturing()) or in_piecewise_cudagraph():\n"
+        "            return False\n"
+        "        logger.info_once(\n"
+        '            "vllm-moet sm_120 prefill SP: eager steps of >= %d tokens reduce-scatter the sublayer outputs and run "\n',
+    ),
+    (
+        "replay split",
+        "    replay_batch = replay.replay_batch\n"
+        "    assert replay_batch is not None\n"
+        "    replay.write_batch_kv(hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        f"    # {MARKER}: the replay section (rows gather, layers 20-39 on 128 rows, collapse) on its own stream, handing the\n"
+        "    # CPU to the other group once per layer (yield_point in the layer forward)\n"
+        "    _moet_pipe.replay_begin(hidden_states, pre_mix, post_mix, res_mix, residual)\n",
+        "    assert replay.replay_batch is not None\n"
+        "    replay.write_batch_kv(hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        "    return _moet_sp_decoder_replay_rest(replay, hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        "\n"
+        "\n"
+        "def _moet_sp_decoder_replay_rest(\n"
+        "    replay,\n"
+        "    hidden_states: torch.Tensor,\n"
+        "    positions: torch.Tensor,\n"
+        "    input_ids: torch.Tensor | None,\n"
+        "    pre_mix: torch.Tensor,\n"
+        "    post_mix: torch.Tensor,\n"
+        "    res_mix: torch.Tensor,\n"
+        "    residual: torch.Tensor,\n"
+        ") -> tuple[torch.Tensor, ...]:\n"
+        f'    """{MARKER2}: _moet_sp_decoder_replay after the first replay layer\'s KV write (the phase graph ends with that\n'
+        '    write): the replay rows\' states brought to full rows, the replay layers, the collapse."""\n'
+        "    replay_batch = replay.replay_batch\n"
+        "    assert replay_batch is not None\n"
+        f"    # {MARKER}: the replay section (rows gather, layers 20-39 on 128 rows, collapse) on its own stream, handing the\n"
+        "    # CPU to the other group once per layer (yield_point in the layer forward)\n"
+        "    _moet_pipe.replay_begin(hidden_states, pre_mix, post_mix, res_mix, residual)\n",
+    ),
+    (
+        "dispatch hooks",
+        "        return _moet_pipe.merge_outputs(_moet_pipe.run_groups(groups, run_group, pipelined))\n",
+        f"        def group_inputs(g):  # {MARKER2}: the group's rows of the step's tensors (copied into the graph's static buffers)\n"
+        "            return (rows(hidden_states, g), rows(positions, g), rows(input_ids, g), rows(engram_hashes, g), rows(engram_mask, g))\n"
+        "\n"
+        "        def group_section(g, hs, pos, ids, hashes, mask):\n"
+        "            return self._moet_sp_section(hs, pos, ids, None, hashes, mask)\n"
+        "\n"
+        "        def group_rest(g, pos, ids, state):\n"
+        "            return self._moet_tail_rest(pos, ids, None, state)\n"
+        "\n"
+        "        return _moet_pipe.merge_outputs(\n"
+        "            _moet_pipe.run_groups(\n"
+        "                groups, run_group, pipelined, phase=_moet_pipe.PhaseHooks(group_inputs, group_section, group_rest)\n"
+        "            )\n"
+        "        )\n",
+    ),
+    (
+        "tail head",
+        "    def _moet_forward_tail(\n"
+        "        self,\n"
+        "        hidden_states: torch.Tensor,\n"
+        "        positions: torch.Tensor,\n"
+        "        input_ids: torch.Tensor | None,\n"
+        "        intermediate_tensors: IntermediateTensors | None,\n"
+        "        engram_hashes: torch.Tensor | None,\n"
+        "        engram_mask: torch.Tensor | None,\n"
+        "    ) -> torch.Tensor | IntermediateTensors:\n"
+        f'        """{MARKER}: the forward from the sequence-parallel shard on (the body of forward as before)."""\n',
+        "    def _moet_forward_tail(\n"
+        "        self,\n"
+        "        hidden_states: torch.Tensor,\n"
+        "        positions: torch.Tensor,\n"
+        "        input_ids: torch.Tensor | None,\n"
+        "        intermediate_tensors: IntermediateTensors | None,\n"
+        "        engram_hashes: torch.Tensor | None,\n"
+        "        engram_mask: torch.Tensor | None,\n"
+        "    ) -> torch.Tensor | IntermediateTensors:\n"
+        f'        """{MARKER}: the forward from the sequence-parallel shard on (the body of forward as before) = the\n'
+        f'        sequence-parallel section and the rest ({MARKER2}: a pipelined step may run the section as the graph)."""\n'
+        "        state = self._moet_sp_section(hidden_states, positions, input_ids, intermediate_tensors, engram_hashes, engram_mask)\n"
+        "        return self._moet_tail_rest(positions, input_ids, intermediate_tensors, state)\n"
+        "\n"
+        "    def _moet_sp_section(\n"
+        "        self,\n"
+        "        hidden_states: torch.Tensor,\n"
+        "        positions: torch.Tensor,\n"
+        "        input_ids: torch.Tensor | None,\n"
+        "        intermediate_tensors: IntermediateTensors | None,\n"
+        "        engram_hashes: torch.Tensor | None,\n"
+        "        engram_mask: torch.Tensor | None,\n"
+        '    ) -> "_moet_pipe.SectionState":\n'
+        f'        """{MARKER2}: the sequence-parallel section of the tail - the shard, the layers before the replay layers,\n'
+        '        the first replay layer\'s KV write when a replay batch exists (what the phase graph captures)."""\n',
+    ),
+    (
+        "tail rest",
+        "        late_aux: list[torch.Tensor] = []\n"
+        "        if self.decoder_replay_layers is not None:\n"
+        "            if (\n"
+        "                _moet_sp_sharded(residual, positions)  # [vllm-moet] sm_120 prefill SP: KV for every row from the shards, the replay rows gathered\n"
+        "                and self.decoder_replay_layers.replay_batch is not None\n"
+        "                and not in_piecewise_cudagraph()\n"
+        "            ):\n"
+        "                hidden_states, pre_mix, *late_aux = _moet_sp_decoder_replay(\n",
+        f"        # {MARKER2}: the section ends with the first replay layer's KV write; the rest is _moet_tail_rest\n"
+        "        wrote_kv = False\n"
+        "        if (\n"
+        "            self.decoder_replay_layers is not None\n"
+        "            and _moet_sp_sharded(residual, positions)  # [vllm-moet] sm_120 prefill SP: KV for every row from the shards, the replay rows gathered\n"
+        "            and self.decoder_replay_layers.replay_batch is not None\n"
+        "            and not in_piecewise_cudagraph()\n"
+        "        ):\n"
+        "            self.decoder_replay_layers.write_batch_kv(hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        "            wrote_kv = True\n"
+        "        return _moet_pipe.SectionState(hidden_states, residual, post_mix, res_mix, pre_mix, aux_hidden_by_layer, wrote_kv, input_ids)\n"
+        "\n"
+        "    def _moet_tail_rest(\n"
+        "        self,\n"
+        "        positions: torch.Tensor,\n"
+        "        input_ids: torch.Tensor | None,\n"
+        "        intermediate_tensors: IntermediateTensors | None,\n"
+        '        state: "_moet_pipe.SectionState",\n'
+        "    ) -> torch.Tensor | IntermediateTensors:\n"
+        f'        """{MARKER2}: the rest of the tail after the sequence-parallel section - the replay hand-off (the replay rows\n'
+        '        gathered to full rows), the replay layers, the collapse and norm (the body of forward as before)."""\n'
+        "        full_num_tokens = positions.shape[0]\n"
+        "        hidden_states, residual, post_mix, res_mix, pre_mix = (\n"
+        "            state.hidden_states, state.residual, state.post_mix, state.res_mix, state.pre_mix\n"
+        "        )\n"
+        "        aux_hidden_by_layer = state.aux_hidden_by_layer\n"
+        "        input_ids = state.input_ids\n"
+        "        late_aux: list[torch.Tensor] = []\n"
+        "        if self.decoder_replay_layers is not None:\n"
+        "            if state.wrote_kv:\n"
+        "                hidden_states, pre_mix, *late_aux = _moet_sp_decoder_replay_rest(\n",
     ),
 ]
 
@@ -437,29 +615,59 @@ ENGRAM_EDITS = [
     ),
 ]
 
+# K-8: inside the phase graph's capture the layer must not wait on the prefetch event (recorded outside the capture:
+# cudaErrorStreamCaptureIsolation); the module makes the compute stream wait for it before every launch instead.
+ENGRAM_EDITS_K8 = [
+    (
+        "prefetch wait under capture",
+        "    def _finish_prefetch(self, event: torch.cuda.Event) -> None:\n"
+        "        # Wait for this layer's lookup only, not for later layers on the stream.\n"
+        "        torch.cuda.current_stream().wait_event(event)\n",
+        "    def _finish_prefetch(self, event: torch.cuda.Event) -> None:\n"
+        "        # Wait for this layer's lookup only, not for later layers on the stream.\n"
+        f"        if _moet_pipe.phase_graph_capturing():  # {MARKER2}: the event is recorded outside the capture; the launch waits for it\n"
+        "            return\n"
+        "        torch.cuda.current_stream().wait_event(event)\n",
+    ),
+]
+
 FILES = [
-    ("v1/worker/gpu/model_runner.py", RUNNER_EDITS),
-    ("models/deepseek_v41/nvidia/model.py", MODEL_EDITS),
-    ("models/deepseek_v41/attention.py", ATTN_EDITS),
-    ("models/deepseek_v41/nvidia/model_state.py", MODEL_STATE_EDITS),
-    ("models/deepseek_v41/decoder_replay_layers.py", REPLAY_EDITS),
-    ("models/deepseek_v41/common/engram.py", ENGRAM_EDITS),
+    ("v1/worker/gpu/model_runner.py", RUNNER_EDITS, RUNNER_EDITS_K8),
+    ("models/deepseek_v41/nvidia/model.py", MODEL_EDITS, MODEL_EDITS_K8),
+    ("models/deepseek_v41/attention.py", ATTN_EDITS, []),
+    ("models/deepseek_v41/nvidia/model_state.py", MODEL_STATE_EDITS, []),
+    ("models/deepseek_v41/decoder_replay_layers.py", REPLAY_EDITS, []),
+    ("models/deepseek_v41/common/engram.py", ENGRAM_EDITS, ENGRAM_EDITS_K8),
 ]
 
 
-def patch_text(src: str, edits, check: bool) -> tuple[str, str]:
-    """Apply the edits; returns (new source, status) with status in {applied, already, missing:<edit>}."""
-    if MARKER in src:
-        return src, "already"
+def _apply(src: str, edits) -> tuple[str, str | None]:
     for label, anchor, _new in edits:
         n = src.count(anchor)
         if n != 1:
             return src, f"missing:{label} ({n} matches)"
-    if check:
-        return src, "applied"
     for _label, anchor, new in edits:
         src = src.replace(anchor, new, 1)
-    return src, "applied"
+    return src, None
+
+
+def patch_text(src: str, edits, check: bool, edits_k8=()) -> tuple[str, str]:
+    """Apply the edits in two stages - the pipeline (MARKER) and the K-8 phase graph (MARKER2) - each skipped when its
+    marker is in the text already; returns (new source, status) with status in {applied, applied:k8, already,
+    missing:<edit>}. A file the first stage patched earlier (an r26 / r26b image) takes the second stage alone. `check`
+    only names the dry run (the caller writes nothing then); the second stage's anchors are checked on the first's output."""
+    stages = []
+    if MARKER not in src:
+        stages.append(("", edits))
+    if edits_k8 and MARKER2 not in src:
+        stages.append(("k8", edits_k8))
+    if not stages:
+        return src, "already"
+    for _tag, stage_edits in stages:
+        src, err = _apply(src, stage_edits)
+        if err is not None:
+            return src, err
+    return src, "applied" if stages[0][0] == "" else "applied:k8"
 
 
 def main() -> int:
@@ -474,14 +682,14 @@ def main() -> int:
         return 1
     compile(args.helper.read_text(), str(args.helper), "exec")
     outputs = []
-    for rel, edits in FILES:
+    for rel, edits, edits_k8 in FILES:
         path = args.dist / rel
         if not path.exists():
             print(f"{rel}: not found under {args.dist}")
             rc = 1
             continue
         src = path.read_text()
-        new, status = patch_text(src, edits, args.check)
+        new, status = patch_text(src, edits, args.check, edits_k8)
         if status.startswith("missing"):
             print(f"{rel}: anchor {status} - not patched")
             rc = 1
@@ -489,11 +697,12 @@ def main() -> int:
         if status == "already":
             print(f"{rel}: already patched")
             continue
+        n_edits = len(edits) + len(edits_k8) if status == "applied" else len(edits_k8)
         if args.check:
-            print(f"{rel}: all {len(edits)} anchors present (dry run)")
+            print(f"{rel}: all {n_edits} anchors present (dry run{', K-8 stage only' if status == 'applied:k8' else ''})")
         else:
             compile(new, str(path), "exec")
-            outputs.append((path, new, len(edits)))
+            outputs.append((path, new, n_edits))
     if rc or args.check:
         return rc
     for path, new, n in outputs:

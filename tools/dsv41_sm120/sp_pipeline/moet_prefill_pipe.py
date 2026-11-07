@@ -36,7 +36,10 @@ VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR (allow | refuse: whether the pipeline may ac
 production KV offload tier - is configured, see kv_connector_policy - K-6, the r26 production window of 2026-11-07),
 VLLM_MOET_PREFILL_PIPE_AFFINITY (unset | pin[,fifo]: the group threads' CPU placement and scheduling class, see
 affinity_policy - K-7, r26b hardening against host CPU load), VLLM_MOET_PREFILL_PIPE_ORDER (today | comm2 | comm2prio: the
-named launch-order variant of K/k6/DESIGN_launch_order.md, a bundle over COMM2 / COMM_PRIORITY, see order - K-7).
+named launch-order variant of K/k6/DESIGN_launch_order.md, a bundle over COMM2 / COMM_PRIORITY, see order - K-7),
+VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS (0 | 1 | verify: the whole sequence-parallel section of a full pipelined step - both groups,
+shard -> layers 0-19 -> the first replay layer's KV - as one CUDA graph captured at engine start and replayed with one launch per
+step, see phase_graphs - K-8), VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX (262144: the context length the graph is captured for).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
@@ -219,6 +222,47 @@ def kv_connector_policy() -> str:
     return policy if policy in ("allow", "refuse") else "allow"
 
 
+def phase_graphs() -> str:
+    """VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS (K-8): "0" (default) = every pipelined step issues its ~5 200 launches from the two
+    group threads, as r26 / r26b. "1" = the whole sequence-parallel section of a full step (both 4 096-row groups: the shard,
+    layers 0-19 with their RS -> mHC -> shard GEMMs -> AG chains on the comm stream, the first replay layer's KV write) is
+    captured ONCE at engine start (capture_phase_graphs, from the runner's capture_model) as one CUDA graph across the compute,
+    comm and aux streams - today's two-thread program recorded as a DAG, the NCCL kernels in today's deterministic issue order -
+    and replayed with one cudaGraphLaunch per step; the replay hand-off (the rows gather, the 128-row layers 20-39 as K-7's
+    per-slot graphs, the collapse) stays eager after it. The CPU leaves the SP phase: robustness to host load. Steps the graph
+    does not serve take today's path, said once per reason (PhaseGraph.mismatch): partial groups, steps with decode rows, a group
+    of several requests, a context beyond VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX, a metadata structure other than the
+    captured one, a missing replay batch. "verify" = "1" plus, every step, the eager two-thread section on the same static
+    inputs and a torch.equal of every output tensor (one loud log line per step, counters in stats(); the tails continue
+    from the eager outputs) - the bits oracle, since the per-layer dump hook cannot run inside a graph. Design and the
+    graph-breaker inventory: K/k8/DESIGN_phase_graph.md."""
+    value = os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS", "0")
+    return value if value in ("0", "1", "verify") else "0"
+
+
+def phase_graph_max_ctx() -> int:
+    """VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX: the sequence length (context + the step's rows) the phase graph is captured
+    for. The indexer's prefill metadata sizes its logits buffer and K gather by the context (host integers baked into the graph),
+    so the capture uses this maximum and a step whose context exceeds it runs eagerly; the kernels bound their work by the real
+    extents on the device. Memory: ~2 KB of graph pool per token of context (1 024 rows x fp32 logits / 2)."""
+    try:
+        return int(os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX", "262144"))
+    except ValueError:
+        return 262144
+
+
+# "capturing" is True on every thread while the step graph is being captured (the patched sites that would otherwise behave
+# differently under stream capture consult it); "request" drives the capture passes (None | "warmup" | "capture").
+_PHASE: dict[str, Any] = {"capturing": False, "request": None}
+
+
+def phase_graph_capturing() -> bool:
+    """True while the phase graph is being captured: _moet_prefill_sp_step keeps the sequence-parallel path (it declines under
+    stream capture otherwise, since vLLM's own graphs never carry it) and Engram's _finish_prefetch skips its wait on an event
+    recorded outside the capture (the module waits for it on the compute stream before every launch instead)."""
+    return _PHASE["capturing"]
+
+
 # --------------------------------------------------------------------------------------- the group threads' placement
 _PLACEMENT: dict[str, Any] = {"cpus": None, "warned": set(), "fifo_ok": None}
 
@@ -285,7 +329,11 @@ def _place_thread(idx: int, num_groups: int) -> None:
 _tls = threading.local()
 _PREPARE_SLOT = 0  # the slot the runner thread is building metadata for (0 = the whole step)
 _PENDING: list["PipeGroup"] | None = None  # the step's groups, published by the runner around the model call
-_STATS = {"steps": 0, "pipelined": 0, "sequential": 0, "mixed": 0, "today": 0}
+_STATS = {
+    "steps": 0, "pipelined": 0, "sequential": 0, "mixed": 0, "today": 0,
+    # K-8: pipelined steps that ran the phase graph / fell back to eager, verify-mode steps compared / found different
+    "phase_graph_steps": 0, "phase_graph_eager": 0, "phase_graph_verified": 0, "phase_graph_mismatch": 0,
+}
 
 
 @dataclass
@@ -307,6 +355,9 @@ class PipeGroup:
     phase_kind: str = ""  # "comm" | "replay"
     last_phase_event: Any = None  # the event recorded at the group's last comm-phase end (the tail gate, tail_mode)
     prefill_rows_from: int = 0  # the group's first row that belongs to a prefilling request (decode rows precede it)
+    req_lo: int = 0  # the group's first / last request index in the step's batch (the phase graph's key, K-8)
+    req_hi: int = 0
+    comm_held: list = field(default_factory=list)  # tensors the open phase reads on the comm stream, released at its join
 
 
 def current_group() -> PipeGroup | None:
@@ -444,6 +495,7 @@ class PipeStep:
             g.phase_stream = None
             g.phase_kind = ""
             g.last_phase_event = None
+            g.comm_held = []
 
     # -- per-thread state restored at every resume
     def _resume(self, g: PipeGroup) -> None:
@@ -527,6 +579,7 @@ class PipeStep:
             _mhc_warmup()._MOET_SP_PIN_TOKENS = saved_pin
             for g in self.groups:
                 g.step = None
+                g.comm_held = []
         if self.errors:
             failed = min(self.errors)
             raise RuntimeError(f"prefill pipeline: group {failed} of {len(self.groups)} failed") from self.errors[
@@ -598,6 +651,9 @@ def phase_end() -> None:
     step.check_order(g)
     step.yield_(g)
     step.compute_stream.wait_event(ev)
+    # the join is enqueued: the tensors the chain read on the comm stream may go back to the compute stream's pool (every
+    # later compute-stream kernel is stream-ordered after the join) - see record_for_comm
+    g.comm_held.clear()
 
 
 def _tail_gate() -> None:
@@ -681,10 +737,14 @@ def phase_is_open() -> bool:
 def record_for_comm(x: torch.Tensor) -> torch.Tensor:
     """A tensor born on the compute stream that the open phase reads on the comm stream: keep its block out of the
     compute stream's reuse until the comm stream is done with it (the one allocator hazard of the two-stream flow;
-    the other direction is covered by phase_begin's wait)."""
+    the other direction is covered by phase_begin's wait). Done by holding a reference until the phase's join is enqueued
+    (phase_end), not by record_stream: the lifetime is the same (the block is freed on the compute stream after the join,
+    every later compute-stream kernel is ordered behind it), but under the phase graph's capture (K-8) the caching allocator
+    defers a recorded block's free to the capture's end - 80 reduce-scatter inputs x 40 MB = 3.2 GB of graph memory (the
+    model's own mhc.py keeps its side-stream inputs the same way, for the same reason)."""
     g = current_group()
     if g is not None and g.phase_open and g.step is not None:
-        x.record_stream(g.step.comm_stream)
+        g.comm_held.append(x)
     return x
 
 
@@ -710,9 +770,13 @@ def merge_outputs(outputs: list[Any]) -> Any:
     return torch.cat(outputs, dim=0)
 
 
-def run_groups(groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipelined: bool) -> list[Any]:
+def run_groups(
+    groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipelined: bool, phase: "PhaseHooks | None" = None
+) -> list[Any]:
     """Run fn(group) for every group: pipelined on two threads (both groups sequence parallel), else one after the
-    other. Called on the runner thread inside the model's forward."""
+    other. Called on the runner thread inside the model's forward. `phase` (K-8) = the model's split of fn into the
+    sequence-parallel section and the rest: with VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS the section of a full step runs as
+    the captured graph (or is being captured, during capture_phase_graphs); fn stays the eager path of every other step."""
     runner = _RUNNER
     assert runner is not None, "prefill pipeline: groups without a runner"
     from vllm.utils.torch_utils import current_stream
@@ -726,7 +790,31 @@ def run_groups(groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipeline
         groups, current_stream(), runner.comm_stream, runner.row_switch, runner.device, pipelined,
         replay_stream=getattr(runner, "replay_stream", None),
     )
+    if _PHASE["request"] is not None:
+        # a capture pass of capture_phase_graphs (the dummy step): warm-up = the whole step eagerly as today, capture = the
+        # section under stream capture, the rest eagerly
+        if not pipelined or phase is None:
+            raise RuntimeError(
+                f"prefill pipeline: the phase graph's dummy step is not pipelined (pipelined={pipelined}, hooks={phase is not None})"
+            )
+        if _PHASE["request"] == "warmup":
+            return step.run(fn)
+        return _phase_capture_step(runner, groups, phase)
     _STATS["steps"] += 1
+    if pipelined and phase is not None and phase_graphs() != "0":
+        graph = runner.phase_graph
+        why = "no graph captured" if graph is None else graph.mismatch(runner, groups)
+        if why is None:
+            _STATS["pipelined"] += 1
+            return _phase_graph_step(runner, groups, phase, graph)
+        _STATS["phase_graph_eager"] += 1
+        runner._warn_once(
+            "phase_graph:" + why.split(":")[0],
+            "prefill pipeline: a pipelined step runs eagerly, not as the phase graph (%s)%s", why,
+            "" if graph is not None else (
+                f" - capture failed: {runner.phase_graph_failed}" if runner.phase_graph_failed else " - nothing was captured"
+            ),
+        )
     if pipelined:
         _STATS["pipelined"] += 1
         if _STATS["pipelined"] == 1:
@@ -745,6 +833,433 @@ def run_groups(groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipeline
             [g.num_tokens for g in groups],
         )
     return step.run_sequential(fn)
+
+
+# ------------------------------------------------------------------------------------------- the phase graph (K-8)
+@dataclass
+class SectionState:
+    """What the sequence-parallel section of a group hands to the rest of its tail: the hc state after the last SP layer
+    (hidden_states = the full-row partial sum the next boundary would reduce-scatter, residual / post_mix / res_mix /
+    pre_mix = this rank's row shard), the aux hidden states the drafter reads (by layer), the group's input ids as the
+    section left them, and whether the first replay layer's KV was written (the replay batch exists). In graph mode the
+    tensors live in the graph pool and are copied into private buffers after every launch."""
+
+    hidden_states: torch.Tensor
+    residual: torch.Tensor
+    post_mix: torch.Tensor
+    res_mix: torch.Tensor
+    pre_mix: torch.Tensor
+    aux_hidden_by_layer: dict[int, torch.Tensor]
+    wrote_kv: bool
+    input_ids: torch.Tensor | None = None
+
+    def named_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        out = [("hidden_states", self.hidden_states), ("residual", self.residual), ("post_mix", self.post_mix),
+               ("res_mix", self.res_mix), ("pre_mix", self.pre_mix)]
+        out += [(f"aux[{k}]", self.aux_hidden_by_layer[k]) for k in sorted(self.aux_hidden_by_layer)]
+        if self.input_ids is not None:
+            out.append(("input_ids", self.input_ids))
+        return out
+
+    def static_copy(self) -> "SectionState":
+        """Private buffers of the same shapes (allocated outside any capture)."""
+        return SectionState(
+            torch.empty_like(self.hidden_states), torch.empty_like(self.residual), torch.empty_like(self.post_mix),
+            torch.empty_like(self.res_mix), torch.empty_like(self.pre_mix),
+            {k: torch.empty_like(v) for k, v in self.aux_hidden_by_layer.items()}, self.wrote_kv,
+            None if self.input_ids is None else torch.empty_like(self.input_ids),
+        )
+
+    def copy_from(self, other: "SectionState") -> None:
+        for (name, dst), (name2, src) in zip(self.named_tensors(), other.named_tensors()):
+            assert name == name2, (name, name2)
+            dst.copy_(src)
+        self.wrote_kv = other.wrote_kv
+
+
+@dataclass
+class PhaseHooks:
+    """The model's split of a group's tail for the phase graph: inputs(g) = the group's rows of the step's tensors
+    (hidden states, positions, input ids, Engram hashes, Engram mask), section(g, *inputs) -> SectionState (the SP
+    section: shard, layers 0-19, the first replay layer's KV), rest(g, positions, input_ids, state) -> the group's output
+    (the replay hand-off, the 128-row layers, the collapse)."""
+
+    inputs: Callable[[PipeGroup], tuple]
+    section: Callable[..., SectionState]
+    rest: Callable[..., Any]
+
+
+# host values of the attention metadata that may be SMALLER at a step than at the capture (the kernels bound their work by
+# the device-side extents; the captured value sized the buffers); every other host value must be equal
+_META_LE_HINTS = ("seq_len", "seqlen", "total_seq", "query_len", "max_seq", "num_blocks", "context_len")
+
+
+class _MetaSnapshot:
+    """The tensors and host values reachable from a group's forward context (attn_metadata, the per-layer slot mappings,
+    is_padding, the batch descriptor), flattened by path. At capture time it is the graph's static metadata; at every step
+    plan() compares a fresh context with it: same structure, host values equal (or <= where they are extents), and for each
+    device tensor the copy to make (none when it is the same storage = a persistent builder buffer; into the captured
+    tensor, or a prefix of it, otherwise - the fresh per-step allocations of the indexer's chunk plan)."""
+
+    ROOTS = ("attn_metadata", "slot_mapping", "is_padding", "batch_descriptor")
+
+    def __init__(self, ctx: Any) -> None:
+        self.tensors: dict[str, torch.Tensor] = {}
+        self.values: dict[str, Any] = {}
+        self._seen: set[int] = set()
+        for root in self.ROOTS:
+            self._visit(root, getattr(ctx, root, None), 0)
+        self._seen = set()
+
+    @staticmethod
+    def _is_plain(obj) -> bool:
+        return isinstance(obj, (bool, int, float, str, bytes, type(None)))
+
+    def _visit(self, path: str, obj: Any, depth: int) -> None:
+        import dataclasses as _dc
+
+        if self._is_plain(obj):
+            if obj is not None:
+                self.values[path] = obj
+            return
+        if isinstance(obj, torch.Tensor):
+            if obj.is_cuda:
+                self.tensors[path] = obj
+            elif obj.numel() <= 65536:
+                self.values[path] = obj.tolist()  # host tensors (seq_lens_cpu, query_start_loc_cpu) are host values
+            else:
+                self.values[path] = ("cpu-tensor", tuple(obj.shape))
+            return
+        if isinstance(obj, np.ndarray):
+            self.values[path] = obj.tolist() if obj.size <= 65536 else ("ndarray", obj.shape)
+            return
+        if depth > 10 or id(obj) in self._seen:
+            return
+        self._seen.add(id(obj))
+        type_name = type(obj).__name__
+        if type_name.endswith(("Config", "Builder", "Backend", "Layer", "Module", "Manager", "Group", "Spec")):
+            return  # configuration / machinery an object may point back to: not the step's data
+        if isinstance(obj, dict):
+            for key in sorted(obj, key=str):
+                self._visit(f"{path}.{key}", obj[key], depth + 1)
+        elif isinstance(obj, (list, tuple)):
+            self.values[path + ".len"] = len(obj)
+            for i, v in enumerate(obj):
+                self._visit(f"{path}[{i}]", v, depth + 1)
+        elif _dc.is_dataclass(obj) and not isinstance(obj, type):
+            for f in _dc.fields(obj):
+                self._visit(f"{path}.{f.name}", getattr(obj, f.name, None), depth + 1)
+        elif isinstance(obj, (torch.nn.Module, torch.cuda.Stream, torch.cuda.Event)) or callable(obj):
+            return
+        elif hasattr(obj, "__dict__"):
+            for key in sorted(vars(obj)):
+                if not key.startswith("__"):
+                    self._visit(f"{path}.{key}", vars(obj)[key], depth + 1)
+
+    @staticmethod
+    def _le(a, b) -> bool:
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            return a <= b
+        if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
+            return all(_MetaSnapshot._le(x, y) for x, y in zip(a, b))
+        return a == b
+
+    def plan(self, ctx: Any) -> tuple[list[tuple[torch.Tensor, torch.Tensor]] | None, str | None]:
+        """(the copies to make as (dst captured, src fresh) pairs, None) or (None, why not)."""
+        fresh = _MetaSnapshot(ctx)
+        if fresh.tensors.keys() != self.tensors.keys():
+            missing = sorted(set(self.tensors) ^ set(fresh.tensors))
+            return None, f"metadata structure: {len(missing)} path(s) differ, e.g. {missing[:3]}"
+        if fresh.values.keys() != self.values.keys():
+            missing = sorted(set(self.values) ^ set(fresh.values))
+            return None, f"metadata values: {len(missing)} path(s) differ, e.g. {missing[:3]}"
+        for path, cap in self.values.items():
+            new = fresh.values[path]
+            leaf = path.rsplit(".", 1)[-1]
+            if any(h in leaf for h in _META_LE_HINTS):
+                if not self._le(new, cap):
+                    return None, f"metadata extent: {path} = {str(new)[:40]} > captured {str(cap)[:40]}"
+            elif new != cap:
+                return None, f"metadata value: {path} = {str(new)[:40]} != captured {str(cap)[:40]}"
+        copies: list[tuple[torch.Tensor, torch.Tensor]] = []
+        for path, cap in self.tensors.items():
+            new = fresh.tensors[path]
+            if new.dtype != cap.dtype:
+                return None, f"metadata dtype: {path} {new.dtype} != {cap.dtype}"
+            if new.data_ptr() == cap.data_ptr() and new.shape == cap.shape and new.stride() == cap.stride():
+                continue  # the same persistent buffer the builder filled for this step
+            if new.shape == cap.shape:
+                copies.append((cap, new))
+            elif (new.dim() == cap.dim() and new.dim() >= 1 and new.shape[1:] == cap.shape[1:]
+                  and new.shape[0] <= cap.shape[0]):
+                copies.append((cap[: new.shape[0]], new))
+            else:
+                return None, f"metadata shape: {path} {tuple(new.shape)} vs captured {tuple(cap.shape)}"
+        return copies, None
+
+
+class PhaseGraph:
+    """One captured step graph: the two groups' sequence-parallel sections as today's two-thread program recorded across
+    the compute / comm / aux streams. Static inputs (the groups' rows of the step's tensors, private copies), the captured
+    forward contexts (their metadata tensors are the graph's), the outputs (graph-pool tensors, copied out after every
+    launch), the key the step must match."""
+
+    def __init__(self) -> None:
+        self.graph: torch.cuda.CUDAGraph | None = None
+        self.key: list[tuple] = []
+        self.inputs: list[tuple] = []  # per group: the static input tensors (None where the model passes None)
+        self.contexts: list[Any] = []  # per group: the captured forward context (kept alive: the graph reads its tensors)
+        self.meta: list[_MetaSnapshot] = []
+        self.outputs: list[SectionState] = []  # per group: the section's outputs inside the graph pool
+        self.out_static: list[SectionState] = []  # per group: private copies filled after every launch
+        self.plans: list[list[tuple[torch.Tensor, torch.Tensor]]] = []
+        self.captured_ctx: int = 0  # the sequence length the dummy step had
+        self.num_launches: int = 0
+
+    @staticmethod
+    def group_key(g: PipeGroup) -> tuple:
+        return (g.num_tokens, g.token_offset, g.slot, g.req_lo, g.req_hi, g.prefill_rows_from)
+
+    def mismatch(self, runner: "PipeRunner", groups: list[PipeGroup]) -> str | None:
+        """None when the graph serves this step, else why not (the first reason)."""
+        if self.graph is None:
+            return "no graph"
+        if len(groups) != len(self.key):
+            return f"groups: {len(groups)} != {len(self.key)}"
+        for g, key in zip(groups, self.key):
+            if self.group_key(g) != key:
+                return f"group shape: group {g.idx} (rows, offset, slot, reqs, prefill_from) = {self.group_key(g)} != {key}"
+        layers = getattr(runner.model_state, "decoder_replay_layers", None)
+        batches = getattr(layers, "_moet_replay_batches", None)
+        for g in groups:
+            if batches is None or batches.get(g.slot) is None:
+                return f"replay batch: group {g.idx} (slot {g.slot}) has none"
+        plans = []
+        for g, snap in zip(groups, self.meta):
+            plan, why = snap.plan(g.forward_context)
+            if why is not None:
+                return f"group {g.idx}: {why}"
+            plans.append(plan)
+        self.plans = plans
+        return None
+
+    def copy_in(self, fresh_inputs: list[tuple]) -> None:
+        for static, fresh in zip(self.inputs, fresh_inputs):
+            for dst, src in zip(static, fresh):
+                if dst is None or src is None:
+                    if (dst is None) != (src is None):
+                        raise RuntimeError("prefill pipeline: phase graph input presence differs from the capture")
+                    continue
+                dst.copy_(src)
+        for plan in self.plans:
+            for dst, src in plan:
+                dst.copy_(src)
+
+    def copy_out(self) -> list[SectionState]:
+        for static, out in zip(self.out_static, self.outputs):
+            static.copy_from(out)
+        return self.out_static
+
+    def release(self) -> None:
+        self.graph = None
+        self.inputs, self.contexts, self.meta, self.outputs, self.out_static, self.plans = [], [], [], [], [], []
+
+
+def _wait_engram_prefetch(runner: "PipeRunner", stream: torch.cuda.Stream) -> None:
+    """The Engram lookups of the head run on a prefetch stream (CPU-offloaded tables) and the layer waits for their event;
+    inside the graph that wait is skipped (phase_graph_capturing), so the compute stream waits here, before the launch."""
+    for module in runner.engram_modules:
+        ev = getattr(module, "_prefetch_done", None)
+        if ev is not None:
+            stream.wait_event(ev)
+
+
+def _compare_states(a: SectionState, b: SectionState) -> list[str]:
+    """The names of the tensors that differ (torch.equal), or the structural difference."""
+    na, nb = a.named_tensors(), b.named_tensors()
+    if [n for n, _ in na] != [n for n, _ in nb] or a.wrote_kv != b.wrote_kv:
+        return [f"structure {[n for n, _ in na]} / wrote_kv {a.wrote_kv} vs {[n for n, _ in nb]} / {b.wrote_kv}"]
+    return [n for (n, x), (_, y) in zip(na, nb) if x.shape != y.shape or x.dtype != y.dtype or not torch.equal(x, y)]
+
+
+def _phase_capture_step(runner: "PipeRunner", groups: list[PipeGroup], phase: PhaseHooks) -> list[Any]:
+    """The capture pass of the dummy step: the groups' sections under stream capture (one graph across the streams, the
+    two threads' program as it runs), one replay (the outputs then hold real values), the rest of the step eagerly."""
+    import gc
+
+    from vllm.platforms import current_platform
+    from vllm.utils.torch_utils import current_stream
+
+    compute = current_stream()
+    pg = PhaseGraph()
+    pg.key = [PhaseGraph.group_key(g) for g in groups]
+    pg.inputs = [
+        tuple(None if t is None else t.detach().clone().contiguous() for t in phase.inputs(g)) for g in groups
+    ]
+    pg.contexts = [g.forward_context for g in groups]
+    pg.meta = [_MetaSnapshot(ctx) for ctx in pg.contexts]
+    for i, snap in enumerate(pg.meta):
+        if not snap.tensors:
+            raise RuntimeError(f"prefill pipeline: phase graph capture - group {i}'s forward context has no metadata tensors")
+
+    def section_fn(g: PipeGroup) -> SectionState:
+        state = phase.section(g, *pg.inputs[g.idx])
+        if not isinstance(state, SectionState):
+            raise RuntimeError(f"prefill pipeline: the section returned {type(state).__name__}, not SectionState")
+        if not state.wrote_kv:
+            raise RuntimeError("prefill pipeline: phase graph capture - the dummy step has no replay batch (the first "
+                               "replay layer's KV was not written); the graph would not match any real step")
+        bad = [n for n, t in state.named_tensors() if not isinstance(t, torch.Tensor) or not t.is_cuda]
+        if bad:
+            raise RuntimeError(f"prefill pipeline: phase graph capture - section outputs that are not CUDA tensors: {bad}")
+        return state
+
+    if compute == torch.cuda.default_stream(runner.device):
+        raise RuntimeError("prefill pipeline: the phase graph must be captured on a non-default stream "
+                           "(capture_phase_graph runs the passes on the runner's capture stream)")
+    _wait_engram_prefetch(runner, compute)
+    torch.cuda.synchronize()
+    gc.collect()
+    pool = current_platform.get_global_graph_pool()
+    graph = torch.cuda.CUDAGraph(keep_graph=True)
+    _PHASE["capturing"] = True
+    t0 = time.time()
+    try:
+        graph.capture_begin(pool=pool, capture_error_mode="thread_local")
+        try:
+            step = PipeStep(groups, compute, runner.comm_stream, runner.row_switch, runner.device, True,
+                            replay_stream=getattr(runner, "replay_stream", None))
+            outputs = step.run(section_fn)
+        except BaseException:
+            # the capture is invalidated: end it so the streams and the allocator leave capture mode, keep the cause
+            try:
+                graph.capture_end()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+        graph.capture_end()
+    finally:
+        _PHASE["capturing"] = False
+    try:
+        import vllm.compilation.moet_nccl_graph_records as _moet_nccl
+
+        if _moet_nccl.records_enabled():
+            _moet_nccl.finish_capture(graph)
+        else:
+            graph.instantiate()
+    except ImportError:
+        graph.instantiate()
+    pg.graph = graph
+    pg.outputs = outputs
+    pg.out_static = [state.static_copy() for state in outputs]
+    # one replay: the capture recorded the kernels without running them - the outputs hold values afterwards, and a graph
+    # that cannot launch fails here, at engine start, not in the first request
+    graph.replay()
+    torch.cuda.synchronize()
+    runner.phase_graph = pg
+    runner.phase_graph_failed = None
+    nodes = ""
+    try:
+        import cuda.bindings.runtime as rt
+
+        res = rt.cudaGraphGetNodes(rt.cudaGraph_t(init_value=int(graph.raw_cuda_graph())), 0)
+        if int(res[0]) == 0:
+            nodes = f", {int(res[2])} graph nodes"
+    except Exception:  # noqa: BLE001 - diagnostics only
+        pass
+    logger.info(
+        "vllm-moet sm_120 prefill pipeline: phase graph captured in %.1f s - the sequence-parallel section of a %d-row step "
+        "(%d groups x %d rows, slots %s) across the compute / comm streams%s; VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS=%s, "
+        "MAX_CTX=%d; outputs %s",
+        time.time() - t0, sum(g.num_tokens for g in groups), len(groups), groups[0].num_tokens, [g.slot for g in groups],
+        nodes, phase_graphs(), phase_graph_max_ctx(),
+        [(n, tuple(t.shape), str(t.dtype).replace("torch.", "")) for n, t in outputs[0].named_tensors()],
+    )
+    rest_states = pg.copy_out()
+    tail = PipeStep(groups, compute, runner.comm_stream, runner.row_switch, runner.device, False)
+    return tail.run_sequential(lambda g: phase.rest(g, pg.inputs[g.idx][1], pg.inputs[g.idx][2], rest_states[g.idx]))
+
+
+def _phase_graph_step(runner: "PipeRunner", groups: list[PipeGroup], phase: PhaseHooks, pg: PhaseGraph) -> list[Any]:
+    """A real pipelined step on the graph: inputs and metadata in, one launch, outputs out, the tails eagerly; in verify
+    mode the eager section on the same inputs and the comparison first."""
+    from vllm.utils.torch_utils import current_stream
+
+    compute = current_stream()
+    fresh = [phase.inputs(g) for g in groups]
+    pg.copy_in(fresh)
+    _wait_engram_prefetch(runner, compute)
+    pg.graph.replay()
+    pg.num_launches += 1
+    _STATS["phase_graph_steps"] += 1
+    if _STATS["phase_graph_steps"] == 1:
+        logger.info(
+            "vllm-moet sm_120 prefill pipeline: the sequence-parallel section of the pipelined steps runs as the phase graph "
+            "(one launch per step; VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS=%s)", phase_graphs(),
+        )
+    states = pg.copy_out()
+    if phase_graphs() == "verify":
+        step = PipeStep(groups, compute, runner.comm_stream, runner.row_switch, runner.device, True,
+                        replay_stream=getattr(runner, "replay_stream", None))
+        eager = step.run(lambda g: phase.section(g, *pg.inputs[g.idx]))
+        diffs = {g.idx: _compare_states(states[g.idx], eager[g.idx]) for g in groups}
+        _STATS["phase_graph_verified"] += 1
+        bad = {i: d for i, d in diffs.items() if d}
+        if bad:
+            _STATS["phase_graph_mismatch"] += 1
+            logger.error(
+                "vllm-moet sm_120 prefill pipeline: PHASE GRAPH VERIFY step %d MISMATCH - graph vs eager differ in %s "
+                "(the tails continue from the eager outputs; mismatches so far %d of %d)",
+                _STATS["phase_graph_verified"], bad, _STATS["phase_graph_mismatch"], _STATS["phase_graph_verified"],
+            )
+        else:
+            logger.info(
+                "vllm-moet sm_120 prefill pipeline: phase graph verify step %d IDENTICAL (%d tensors per group, torch.equal; "
+                "mismatches so far %d)", _STATS["phase_graph_verified"], len(states[0].named_tensors()),
+                _STATS["phase_graph_mismatch"],
+            )
+        states = eager
+    tail = PipeStep(groups, compute, runner.comm_stream, runner.row_switch, runner.device, False)
+    return tail.run_sequential(lambda g: phase.rest(g, fresh[g.idx][1], fresh[g.idx][2], states[g.idx]))
+
+
+def capture_phase_graphs(runner: Any, profile_only: bool = False) -> None:
+    """Runner side, from capture_model after model_state.capture_inner_cudagraphs (both of vLLM's passes): build the dummy
+    step the graph is captured on - one request of VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX tokens with the last
+    2 x 4 096 as this step's rows, the production bounds, the per-slot metadata of a real step - run it once eagerly
+    (warm-up: cuBLAS workspaces per stream, the JIT kernels, the bf16 replica GEMM's calibration, the indexer workspace at
+    the maximum before lock_workspace), then capture its sequence-parallel section. A failure leaves every pipelined step
+    eager and says so with the traceback (never a silent fallback). The graph of the memory-profiling pass is dropped
+    right away (it lives in that pass's throwaway pool; its size is in the pass's measurement) - K-7's lesson."""
+    global _RUNNER
+    if mode() != 2 or phase_graphs() == "0":
+        return
+    if kv_connector_policy() == "refuse" and _kv_connector_configured(runner):
+        return
+    if _RUNNER is None:
+        _RUNNER = PipeRunner(runner)
+    pr = _RUNNER
+    if pr.phase_graph is not None:
+        pr.phase_graph.release()
+        pr.phase_graph = None
+    try:
+        pr.capture_phase_graph(runner)
+    except Exception as exc:  # noqa: BLE001 - the server comes up eagerly, loudly
+        pr.phase_graph = None
+        pr.phase_graph_failed = f"{type(exc).__name__}: {str(exc)[:300]}"
+        logger.exception(
+            "vllm-moet sm_120 prefill pipeline: PHASE GRAPH CAPTURE FAILED (%s) - every pipelined step runs eagerly "
+            "(VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS=%s requested)", pr.phase_graph_failed, phase_graphs(),
+        )
+    finally:
+        _PHASE["request"] = None
+        _PHASE["capturing"] = False
+    if profile_only and pr.phase_graph is not None:
+        pr.phase_graph.release()
+        pr.phase_graph = None
+        import gc
+
+        gc.collect()
 
 
 # ------------------------------------------------------------------------------------------- the second communicator
@@ -850,6 +1365,15 @@ class PipeRunner:
             if buffers:
                 self.row_switch = RowBufferSwitch(buffers, self.num_groups)
         self._warned: set[str] = set()
+        # K-8: the phase graph of a full step (capture_phase_graphs), the reason it is missing, the Engram modules whose
+        # prefetch event the compute stream waits for before a launch
+        self.phase_graph: PhaseGraph | None = None
+        self.phase_graph_failed: str | None = None
+        self.engram_modules = [m for m in runner.model.modules() if hasattr(m, "_prefetch_done")]
+        self.model = runner.model
+        # the capture passes run on this stream (a capture cannot begin on the default stream; the warm-up runs on it too, so
+        # the per-stream cuBLAS workspaces exist before the capture); the real steps launch the graph on the runner's stream
+        self.capture_stream = torch.cuda.Stream(device=self.device)
         # K-6: the odd group's collectives on a communicator of their own (VLLM_MOET_PREFILL_PIPE_COMM2=1). Built here, at
         # the first pipelined step, on every rank at once (the groups' first step is the same step on every rank); the
         # one-element warm-up all-reduce inside synchronizes the current stream once.
@@ -1013,7 +1537,7 @@ class PipeRunner:
             groups.append(
                 PipeGroup(
                     idx=i, token_offset=lo, num_tokens=hi - lo, forward_context=forward_ctx, slot=slot,
-                    prefill_rows_from=prefill_from,
+                    prefill_rows_from=prefill_from, req_lo=req_lo, req_hi=req_hi,
                 )
             )
         # the whole step's buffers current again for whatever else the step prepares (the groups keep their own)
@@ -1021,6 +1545,81 @@ class PipeRunner:
         if select is not None:
             select(0)
         return groups
+
+    def capture_phase_graph(self, runner: Any) -> None:
+        """K-8: the dummy step of the phase graph and its two passes (warm-up, capture) through the model's forward - the
+        runner's eager path on a dummy batch, so the graph reads the buffers a real step fills (the replay-graph capture's
+        principle). One request in the middle of its prompt: context = PHASE_GRAPH_MAX_CTX - the step's rows (the host
+        extents of the metadata are then maxima), the step = NUM_GROUPS x group_rows() rows, every row prefilling."""
+        from vllm.config import CUDAGraphMode
+        from vllm.forward_context import BatchDescriptor, set_forward_context
+        from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
+        from vllm.v1.worker.gpu.input_batch import InputBatch, set_dummy_context
+
+        rows = group_rows()
+        num_tokens = rows * self.num_groups
+        max_ctx = min(phase_graph_max_ctx(), int(runner.max_model_len))
+        context_len = max(max_ctx - num_tokens, 0)
+        input_batch = InputBatch.make_dummy(1, num_tokens, runner.input_buffers, is_padding=False)
+        block_tables, slot_mappings = runner.prepare_dummy_attn(input_batch, False)
+        if context_len:
+            set_dummy_context(
+                input_batch, runner.block_tables, context_len, self.kv_cache_config.num_blocks, runner.max_model_len,
+                input_block_tables=block_tables,
+            )
+        # a prefilling request whose prompt continues after this step (every real full step is one)
+        input_batch.is_prefilling_np[:] = True
+        input_batch.has_prefill = True
+        input_batch.prefill_len_np[:] = input_batch.num_computed_prefill_tokens_np + num_tokens + rows
+        if getattr(input_batch, "prefill_runs_as_decode_np", None) is not None:
+            input_batch.prefill_runs_as_decode_np[:] = False
+        # real slot mappings for the dummy rows (the dummy ones are all PAD: no KV write, every token invalid) so the warm-up
+        # and the capture run the KV writes and the validity-dependent kernels as a real step does; the blocks are the
+        # dummy block tables' (ids wrapping inside the cache), written at engine start, before any request
+        positions64 = input_batch.positions[:num_tokens].to(torch.int64)
+        for k, (table, block_size) in enumerate(zip(block_tables, runner.block_tables.block_sizes)):
+            if k >= slot_mappings.shape[0]:
+                break
+            block_idx = torch.div(positions64, block_size, rounding_mode="floor").clamp_(max=table.shape[1] - 1)
+            blocks = table[0].to(torch.int64)[block_idx]
+            slot_mappings[k, :num_tokens].copy_(blocks * block_size + positions64 % block_size)
+        attn_metadata = self.model_state.prepare_attn(
+            input_batch, CUDAGraphMode.NONE, block_tables, slot_mappings, runner.attn_groups, self.kv_cache_config
+        )
+        bounds = [(i * rows, (i + 1) * rows) for i in range(self.num_groups)]
+        groups = self._build(input_batch, block_tables, slot_mappings, bounds)
+        model_inputs = {
+            "input_ids": input_batch.input_ids,
+            "positions": input_batch.positions,
+            "inputs_embeds": None,
+            "intermediate_tensors": None,
+            **self.model_state.prepare_inputs(input_batch, runner.req_states),
+        }
+        logger.info(
+            "vllm-moet sm_120 prefill pipeline: capturing the phase graph on a dummy step of %d rows (%d groups x %d, context "
+            "%d tokens = MAX_CTX %d, %d KV blocks): warm-up pass, then the capture pass",
+            num_tokens, self.num_groups, rows, context_len, max_ctx, self.kv_cache_config.num_blocks,
+        )
+        self.capture_stream.wait_stream(torch.cuda.current_stream())
+        for request in ("warmup", "capture"):
+            _PHASE["request"] = request
+            try:
+                with torch.cuda.stream(self.capture_stream), set_forward_context(
+                    attn_metadata,
+                    self.vllm_config,
+                    num_tokens=num_tokens,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    batch_descriptor=BatchDescriptor(num_tokens=num_tokens),
+                    slot_mapping=build_slot_mappings_by_layer(slot_mappings, self.kv_cache_config),
+                    is_padding=input_batch.is_padding,
+                ), step_context(groups):
+                    self.model(**model_inputs)
+            finally:
+                _PHASE["request"] = None
+            torch.cuda.synchronize()
+        if self.phase_graph is None:
+            raise RuntimeError("the capture pass ran but no phase graph was recorded (did the dummy step pipeline?)")
+        self.phase_graph.captured_ctx = max_ctx
 
 
 _KV_CONNECTOR_REFUSED = {"logged": False}
@@ -1065,12 +1664,15 @@ _DUMP_FORWARD = {"n": 0}
 
 
 def _dump_active() -> bool:
-    return bool(_DUMP_DIR) and os.path.exists(os.path.join(_DUMP_DIR, "ENABLE"))
+    # never inside the phase graph's capture / dummy passes (K-8): the hook reads the tensors back to the host
+    return bool(_DUMP_DIR) and _PHASE["request"] is None and not _PHASE["capturing"] and os.path.exists(
+        os.path.join(_DUMP_DIR, "ENABLE")
+    )
 
 
 def dump_forward_begin() -> None:
     """Once per model forward (the head): numbers the forwards of this process."""
-    if _DUMP_DIR:
+    if _DUMP_DIR and _PHASE["request"] is None:
         _DUMP_FORWARD["n"] += 1
 
 
