@@ -450,5 +450,50 @@ pipe._RUNNER = saved_runner
 os.environ.pop("VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR", None)
 os.environ.pop("VLLM_MOET_PREFILL_PIPE", None)
 
+# ------------------------------------------------------------------------------------------ (8): K-7 - thread placement, launch-order bundle
+# thread_cpus: distinct CPUs from the top of the allowed set per (rank, group); _place_thread pins the group threads of a
+# pipelined step (sched_getaffinity on the thread = its CPU) and leaves the runner thread as it was; ORDER bundles.
+cpus_by_rank = [pipe.thread_cpus(2, allowed=list(range(120)), rank=r) for r in range(4)]
+flat = [c for d in cpus_by_rank for c in d.values()]
+check(len(set(flat)) == 8 and min(flat) == 112 and max(flat) == 119 and cpus_by_rank[0] == {0: 119, 1: 118},
+      f"(8) thread_cpus: 4 ranks x 2 groups -> 8 distinct CPUs 112-119 from the top of the allowed set ({cpus_by_rank})")
+check(pipe.thread_cpus(2, allowed=[5, 7], rank=3) == {0: 7, 1: 5}, "(8) thread_cpus wraps on a small allowed set")
+check(not pipe.affinity_policy() and pipe.order() == "today" and pipe._comm_priority() == 0,
+      "(8) AFFINITY unset, ORDER=today, comm priority 0 by default")
+main_aff = os.sched_getaffinity(0)
+os.environ["VLLM_MOET_PREFILL_PIPE_AFFINITY"] = "pin,bogus"
+pipe._PLACEMENT.update({"cpus": None, "warned": set(), "fifo_ok": None})
+seen_aff = {}
+
+
+def fn_aff(g: pipe.PipeGroup):
+    seen_aff[g.idx] = (os.sched_getaffinity(0), threading.current_thread().name)
+    pipe.phase_begin()
+    pipe.phase_end()
+    return inputs[g.idx]
+
+
+pipe.run_groups(make_groups(), fn_aff, pipelined=True)
+torch.cuda.synchronize()
+want = pipe.thread_cpus(2, allowed=sorted(main_aff), rank=0)
+check(pipe.affinity_policy() == frozenset({"pin"}) and seen_aff.get(0, (None,))[0] == {want[0]}
+      and seen_aff.get(1, (None,))[0] == {want[1]} and os.sched_getaffinity(0) == main_aff,
+      f"(8) AFFINITY=pin: group threads pinned to {want}, the runner thread keeps its {len(main_aff)} CPUs ({seen_aff})")
+os.environ["VLLM_MOET_PREFILL_PIPE_AFFINITY"] = "pin,fifo"
+pipe._PLACEMENT.update({"cpus": None, "warned": set(), "fifo_ok": None})
+pipe.run_groups(make_groups(), fn_aff, pipelined=True)
+torch.cuda.synchronize()
+check(pipe._PLACEMENT["fifo_ok"] in (True, False) and seen_aff.get(0, (None,))[0] == {want[0]},
+      f"(8) AFFINITY=pin,fifo: SCHED_FIFO {'granted' if pipe._PLACEMENT['fifo_ok'] else 'refused (no CAP_SYS_NICE) - logged once, pinning kept'}")
+os.environ.pop("VLLM_MOET_PREFILL_PIPE_AFFINITY", None)
+pipe._PLACEMENT.update({"cpus": None, "warned": set(), "fifo_ok": None})
+os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "comm2"
+check(pipe.order() == "comm2" and pipe.comm2_enabled() and pipe._comm_priority() == 0, "(8) ORDER=comm2 -> COMM2 on, priority 0")
+os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "comm2prio"
+check(pipe.order() == "comm2prio" and pipe.comm2_enabled() and pipe._comm_priority() == -1, "(8) ORDER=comm2prio -> COMM2 on, priority -1")
+os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "nonsense"
+check(pipe.order() == "today" and not pipe.comm2_enabled(), "(8) an unknown ORDER value is today's")
+os.environ.pop("VLLM_MOET_PREFILL_PIPE_ORDER", None)
+
 print("ALL PASS" if not failures else f"FAILURES: {len(failures)}")
 sys.exit(1 if failures else 0)

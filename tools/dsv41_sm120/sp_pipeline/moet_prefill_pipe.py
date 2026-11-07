@@ -33,7 +33,10 @@ VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL (0 | 1: the groups one after the other, 
 VLLM_MOET_PREFILL_PIPE_DUMP=<dir> (+ <dir>/ENABLE present: per-layer sha256 of the hc states, the bits harness),
 VLLM_MOET_PREFILL_PIPE_COMM2 (0 | 1: the odd group's collectives on a second NCCL communicator, see comm2_enabled - K-6),
 VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR (allow | refuse: whether the pipeline may activate when a KV transfer connector - the
-production KV offload tier - is configured, see kv_connector_policy - K-6, the r26 production window of 2026-11-07).
+production KV offload tier - is configured, see kv_connector_policy - K-6, the r26 production window of 2026-11-07),
+VLLM_MOET_PREFILL_PIPE_AFFINITY (unset | pin[,fifo]: the group threads' CPU placement and scheduling class, see
+affinity_policy - K-7, r26b hardening against host CPU load), VLLM_MOET_PREFILL_PIPE_ORDER (today | comm2 | comm2prio: the
+named launch-order variant of K/k6/DESIGN_launch_order.md, a bundle over COMM2 / COMM_PRIORITY, see order - K-7).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
@@ -91,11 +94,45 @@ def replay_mode() -> str:
     return mode if mode in ("serial", "stream") else "serial"
 
 
+def order() -> str:
+    """VLLM_MOET_PREFILL_PIPE_ORDER: the launch-order variant of the pipelined step (K-6's hardware read of the SP phase,
+    K/k6/DESIGN_launch_order.md section 3). "today" (default) = r26: one NCCL communicator, the comm stream at priority 0.
+    "comm2" = the odd group's collectives on a second NCCL communicator (= COMM2=1: the two groups' RS -> AG chains are
+    no longer one NCCL FIFO, the compute stream's indexer all_gatherv of one group no longer waits for the other's chain;
+    8 ms of a 188-ms SP phase). "comm2prio" = "comm2" + the comm stream at priority -1 (the glue + NCCL CTAs take every
+    freed SM slot instead of the compute kernels' last wave; K-3 measured the priority alone as a loss without a trace).
+    A named bundle: the individual switches COMM2 / COMM_PRIORITY still apply on top (the stricter setting wins)."""
+    variant = os.environ.get("VLLM_MOET_PREFILL_PIPE_ORDER", "today")
+    return variant if variant in ("today", "comm2", "comm2prio") else "today"
+
+
 def _comm_priority() -> int:
+    if order() == "comm2prio":
+        return -1
     try:
         return int(os.environ.get("VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY", "0"))
     except ValueError:
         return 0
+
+
+def affinity_policy() -> frozenset[str]:
+    """VLLM_MOET_PREFILL_PIPE_AFFINITY (K-7): how a pipelined step's two group threads are placed on the CPU. Unset / empty
+    (default) = as r26: the threads inherit the process's affinity and the CFS class. "pin" = every group thread calls
+    sched_setaffinity on one CPU of its own, chosen from the top of the process's allowed set so that the 2 x TP threads
+    of a node take distinct CPUs (rank r, group i -> allowed[-(1 + r * 2 + i)]); the kernel's load balancer then moves other
+    runnable tasks (a nice'd neighbour) off those CPUs, and the thread is never migrated. "fifo" (with pin) = the thread also
+    asks for SCHED_FIFO priority 1 - it then preempts every CFS task on its CPU at once; needs CAP_SYS_NICE in the container
+    (refused -> one warning, pinning only). Why: the pipelined step's two replay tails are CPU-launch-bound (K-3: ~1 500
+    kernels + 2 500 runtime calls per group, CPU slack ~0), so a group thread that loses its CPU to a neighbour delays the
+    tail's 85 all-reduces on every rank (K-6 §8.0: +20…+32 % at 163K under 100 nice -n 10 spinners, r25's path 0 %).
+    Measured (K-7, test host, kv16+FS): "pin" is WORSE - 163K quiet 5 519 / 5 480 / 5 487 ms (+2 % vs 5 376-5 391 as built),
+    under 100 spinners 7 479 / 7 485 / 7 346 (+36 % vs +26.6 % as built), bits identical: a thread fixed to one CPU shares it
+    with whatever lands there, an unpinned one is placed on an idle CPU at every wakeup. Profile under load: issuing one tail
+    takes the thread 120-130 ms quiet (for ~50 ms of GPU work; hidden by the 65-77 ms CPU lead built in the SP phase) and
+    147-166 ms under load while the lead shrinks to 5-31 ms, so the GPU window becomes the issue span and the other ranks wait
+    in the tail's all-reduces for the starved rank (K/REPORT.md 9.2). Not a default; kept as a switch for measurements."""
+    raw = os.environ.get("VLLM_MOET_PREFILL_PIPE_AFFINITY", "")
+    return frozenset(p for p in (s.strip() for s in raw.split(",")) if p in ("pin", "fifo"))
 
 
 def tail_mode() -> str:
@@ -150,8 +187,9 @@ def comm2_enabled() -> bool:
     all_gatherv of group B's indexer top-k waits for group A's whole RS2 -> glue -> AG2 chain on the comm stream (6 per
     step, ~1.1 ms each = 8 ms of a 188-ms SP phase), and a late AG of one group delays the other group's next RS. Two
     communicators decouple the groups' chains; the bytes, the algorithm and the summation order of every collective are
-    unchanged (same ranks, same topology), so the bits are today's. Off (default): one communicator, as r26."""
-    return os.environ.get("VLLM_MOET_PREFILL_PIPE_COMM2", "0") == "1"
+    unchanged (same ranks, same topology), so the bits are today's. Off (default): one communicator, as r26.
+    Also on with VLLM_MOET_PREFILL_PIPE_ORDER=comm2 | comm2prio (K-7)."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_COMM2", "0") == "1" or order() in ("comm2", "comm2prio")
 
 
 def kv_connector_policy() -> str:
@@ -163,6 +201,67 @@ def kv_connector_policy() -> str:
     pipelined step is validated with the connector on (K/BRIEF_K6.md section 0)."""
     policy = os.environ.get("VLLM_MOET_PREFILL_PIPE_KV_CONNECTOR", "allow")
     return policy if policy in ("allow", "refuse") else "allow"
+
+
+# --------------------------------------------------------------------------------------- the group threads' placement
+_PLACEMENT: dict[str, Any] = {"cpus": None, "warned": set(), "fifo_ok": None}
+
+
+def _tp_rank() -> int:
+    try:
+        from vllm.distributed import get_tensor_model_parallel_rank
+
+        return int(get_tensor_model_parallel_rank())
+    except Exception:  # noqa: BLE001 - outside a distributed process (the unit test)
+        return 0
+
+
+def thread_cpus(num_groups: int, allowed: list[int] | None = None, rank: int | None = None) -> dict[int, int]:
+    """The CPU each group thread is pinned to under VLLM_MOET_PREFILL_PIPE_AFFINITY=pin: group i of TP rank r takes
+    allowed[-(1 + r * num_groups + i)] of the process's allowed CPUs (sorted), wrapping on a set too small for the node's
+    2 x TP threads (then two threads may share a CPU, still away from the lowest-numbered CPUs where the IRQs land)."""
+    if allowed is None:
+        allowed = sorted(os.sched_getaffinity(0))
+    if rank is None:
+        rank = _tp_rank()
+    n = len(allowed)
+    return {i: allowed[-(1 + (rank * num_groups + i) % n)] for i in range(num_groups)}
+
+
+def _place_thread(idx: int, num_groups: int) -> None:
+    """Called on a group thread at its start (one thread per group per step): sched_setaffinity / SCHED_FIFO per
+    affinity_policy; every refusal is logged once and the thread goes on as placed by the kernel."""
+    policy = affinity_policy()
+    if not policy:
+        return
+    if _PLACEMENT["cpus"] is None:
+        _PLACEMENT["cpus"] = thread_cpus(num_groups)
+        allowed = sorted(os.sched_getaffinity(0))
+        logger.info(
+            "vllm-moet sm_120 prefill pipeline: group threads of rank %d pinned to CPUs %s (%d allowed CPUs, %d-%d; "
+            "VLLM_MOET_PREFILL_PIPE_AFFINITY=%s)",
+            _tp_rank(), _PLACEMENT["cpus"], len(allowed), allowed[0], allowed[-1], ",".join(sorted(policy)),
+        )
+    if "pin" in policy:
+        try:
+            os.sched_setaffinity(0, {_PLACEMENT["cpus"][idx]})
+        except OSError as exc:
+            if "pin" not in _PLACEMENT["warned"]:
+                _PLACEMENT["warned"].add("pin")
+                logger.warning("vllm-moet sm_120 prefill pipeline: group thread sched_setaffinity refused (%s) - unpinned", exc)
+    if "fifo" in policy:
+        try:
+            os.sched_setscheduler(0, os.SCHED_FIFO, os.sched_param(1))
+            if _PLACEMENT["fifo_ok"] is None:
+                _PLACEMENT["fifo_ok"] = True
+                logger.info("vllm-moet sm_120 prefill pipeline: group threads run SCHED_FIFO priority 1")
+        except (OSError, PermissionError) as exc:
+            if _PLACEMENT["fifo_ok"] is None:
+                _PLACEMENT["fifo_ok"] = False
+                logger.warning(
+                    "vllm-moet sm_120 prefill pipeline: group thread SCHED_FIFO refused (%s; CAP_SYS_NICE needed) - CFS, pinning only",
+                    exc,
+                )
 
 
 # ------------------------------------------------------------------------------------------------- per-thread state
@@ -376,6 +475,7 @@ class PipeStep:
 
     def _thread_main(self, g: PipeGroup, fn: Callable[[PipeGroup], Any]) -> None:
         try:
+            _place_thread(g.idx, len(self.groups))  # K-7: VLLM_MOET_PREFILL_PIPE_AFFINITY, a no-op by default
             torch.cuda.set_device(self.device)
             with torch.inference_mode():
                 self._wait_turn(g)
@@ -737,6 +837,12 @@ class PipeRunner:
         # the first pipelined step, on every rank at once (the groups' first step is the same step on every rank); the
         # one-element warm-up all-reduce inside synchronizes the current stream once.
         self.comm2 = _install_comm2(self.device) if comm2_enabled() else None
+        if order() != "today":
+            logger.info(
+                "vllm-moet sm_120 prefill pipeline: launch order %s (VLLM_MOET_PREFILL_PIPE_ORDER) = second NCCL communicator "
+                "for the odd group %s, comm stream priority %d",
+                order(), "on" if self.comm2 is not None else "UNAVAILABLE (one communicator)", _comm_priority(),
+            )
         logger.info(
             "vllm-moet sm_120 prefill pipeline ready: %d groups of %d rows, %d row buffers per group, comm stream "
             "priority %d, %s",
