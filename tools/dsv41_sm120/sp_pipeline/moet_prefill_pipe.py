@@ -101,7 +101,11 @@ def order() -> str:
     no longer one NCCL FIFO, the compute stream's indexer all_gatherv of one group no longer waits for the other's chain;
     8 ms of a 188-ms SP phase). "comm2prio" = "comm2" + the comm stream at priority -1 (the glue + NCCL CTAs take every
     freed SM slot instead of the compute kernels' last wave; K-3 measured the priority alone as a loss without a trace).
-    A named bundle: the individual switches COMM2 / COMM_PRIORITY still apply on top (the stricter setting wins)."""
+    A named bundle: the individual switches COMM2 / COMM_PRIORITY still apply on top (the stricter setting wins).
+    Measured (K-7, test host, kv16+FS, "comm2prio"): bits identical on every gate, 163K 5 389 / 5 321 / 5 344 ms = -0.6 % vs
+    5 376-5 391 as built, 19K -1 %; the compute stream's gaps in the SP phase 48 -> 25 ms per step (the indexer all_gatherv waits
+    are gone) but the compute kernels slow down under a priority -1 comm stream (attention +5 ms, MXFP8 GEMMs +6 per 19K step),
+    net -4 % of the SP phase; no protection against host CPU load (+35 %, it never touches the tails). Opt-in (K/REPORT.md 9.2)."""
     variant = os.environ.get("VLLM_MOET_PREFILL_PIPE_ORDER", "today")
     return variant if variant in ("today", "comm2", "comm2prio") else "today"
 
@@ -130,7 +134,10 @@ def affinity_policy() -> frozenset[str]:
     with whatever lands there, an unpinned one is placed on an idle CPU at every wakeup. Profile under load: issuing one tail
     takes the thread 120-130 ms quiet (for ~50 ms of GPU work; hidden by the 65-77 ms CPU lead built in the SP phase) and
     147-166 ms under load while the lead shrinks to 5-31 ms, so the GPU window becomes the issue span and the other ranks wait
-    in the tail's all-reduces for the starved rank (K/REPORT.md 9.2). Not a default; kept as a switch for measurements."""
+    in the tail's all-reduces for the starved rank (K/REPORT.md 9.2). "fifo" alone (SCHED_FIFO 1, CAP_SYS_NICE, no pin) is worse
+    still: quiet 5 494 / 5 506 / 5 540, under load 7 880 / 7 724 / 7 411 (+40 %) - the RT group threads preempt the server's own
+    CFS threads (the NCCL proxy, the runner, the connector) on their CPUs, not just the spinners. Neither is a default; both stay
+    as switches for measurements. The hardening that works is VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1 (see replay_graphs)."""
     raw = os.environ.get("VLLM_MOET_PREFILL_PIPE_AFFINITY", "")
     return frozenset(p for p in (s.strip() for s in raw.split(",")) if p in ("pin", "fifo"))
 
@@ -166,7 +173,16 @@ def replay_graphs() -> bool:
     """VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1: capture vLLM's decoder-replay CUDA graphs (the 128-row layers 20-39,
     DecoderReplayCudaGraphManager, sizes from --compilation-config decoder_replay_cudagraph_capture_sizes) once per
     row-group slot as well, so a pipelined group's replay tail runs as a graph (its replay batch lives in slot-private
-    buffers; slot 0's graphs read slot 0's). Off (default): the groups' replay layers run eagerly, whatever slot 0 has."""
+    buffers; slot 0's graphs read slot 0's). Off (default): the groups' replay layers run eagerly, whatever slot 0 has.
+    Measured (K-7, test host, kv16+FS, sizes [128, 256]): the r26b hardening against host CPU load - a pipelined step's two
+    replay tails (~1 400 launches each) take a thread 120-130 ms to issue for ~50 ms of GPU work, so under 100 nice -n 10
+    spinners the 163K prefill is +26.6 % as built (the starved rank's tail delays the other ranks' 85 all-reduces) and +3.3 %
+    with the graphs (tail GPU window 45 ms, all-reduces 7-9 ms, the CPU 10+ ms ahead on every rank); quiet +0.6 %; bits
+    identical on long_agree x2 with prompt logprobs / agree / run-to-run (the per-layer dump hook cannot run inside a graph:
+    layers 0-19 400/400 identical, layers 20-39 covered by the end-to-end gates only). Cost: KV 11.31 -> 10.3 GiB per GPU
+    at 0.94 (the memory profiler books 2.33 GiB of graphs vs 1.34; really 0.98 vs 0.52). Needs the patcher of the same
+    commit (the slot managers are rebuilt at every capture: vLLM's memory-profiling pass leaves a manager created during it
+    on a throwaway graph pool). K/REPORT.md 9.2."""
     return os.environ.get("VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS", "0") == "1"
 
 
@@ -238,9 +254,10 @@ def _place_thread(idx: int, num_groups: int) -> None:
         _PLACEMENT["cpus"] = thread_cpus(num_groups)
         allowed = sorted(os.sched_getaffinity(0))
         logger.info(
-            "vllm-moet sm_120 prefill pipeline: group threads of rank %d pinned to CPUs %s (%d allowed CPUs, %d-%d; "
-            "VLLM_MOET_PREFILL_PIPE_AFFINITY=%s)",
-            _tp_rank(), _PLACEMENT["cpus"], len(allowed), allowed[0], allowed[-1], ",".join(sorted(policy)),
+            "vllm-moet sm_120 prefill pipeline: group threads of rank %d - VLLM_MOET_PREFILL_PIPE_AFFINITY=%s%s (%d allowed CPUs, %d-%d)",
+            _tp_rank(), ",".join(sorted(policy)),
+            f", pinned to CPUs {_PLACEMENT['cpus']}" if "pin" in policy else " (no pinning: the threads migrate)",
+            len(allowed), allowed[0], allowed[-1],
         )
     if "pin" in policy:
         try:
