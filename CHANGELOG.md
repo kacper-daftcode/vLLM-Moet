@@ -1,9 +1,17 @@
 # Changelog
 
-Served images and what changed between them. Image tags are `vllm-moet-sm120:<line>-<base>-rNN`; the
+Released images and what changed between them. Image tags are `vllm-moet-sm120:<line>-<base>-rNN`; the
 commit an image was built from is in its release tag.
 
 ## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
+
+### `dsv41-nightly-df3bd094-r25` — 2026-11-05
+- Step 46: the sparse-MLA prefill attention chunks on the cubit-assembled SASS kernel; fresh prefill 163K 6.8 → 6.6 s,
+  bit-identical to `-r24`.
+
+### `dsv41-nightly-df3bd094-r24` — 2026-11-05
+- Step 45 on by default: the sequence-parallel prefill's MoE input all-gathered as MXFP8 (0.52× the bytes); fresh
+  prefill 163K 7.1 → 6.8 s, bits identical.
 
 ### `dsv41-nightly-df3bd094-r23` — 2026-11-03 (`v2026.11.03-r23`)
 - Step 42: the prefill MoE (FC1 + SwiGLU + MXFP8 quant, FC2 of b12x's dynamic path) on our pipelined
@@ -33,11 +41,38 @@ commit an image was built from is in its release tag.
   GEMV, the FP4 KV record and the MXFP4 indexer cache on sm_120, single-copy KV offload with a disk tier,
   the mHC boundary off the critical path, the small-M BF16 GEMMs with cuBLAS's bits, Engram's `wkv` split.
 
-## MoET hybrid on 4× RTX 5090
+## MoET hybrid on 1–4× RTX 5090
 
-- Branch `moet-hybrid` (merging): 120 of 384 experts per layer resident, the rest computed on the CPU from the
-  pinned expert store, bit-identical to the all-resident b12x path; decode 148 / 129 tok/s on short prompts,
-  HumanEval 159/164 vs 160/164 native, MATH-500 L5 55/60 vs 55/60.
+### `dsv41-nightly-df3bd094-r23-hyb-engram` — 2026-11-04, Dockerfile steps 43 + 44 (`--build-arg VLLM_MOET_CPU_TIER_PATCH=1 --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1`)
+- Step 44, Engram v2: the Engram tables stay on NVMe (io_uring + a DRAM row cache, vLLM's own lookup kernel on a device
+  landing buffer, bit-identical rows) — `ENGRAM_MODE=nvme`, −189 GiB of host RAM at the same speed (278 GiB used).
+- The expert store's NVMe tail (`STORE_NVME=1 STORE_DRAM_RECORDS=N|auto`): only N records per layer per rank pinned, the
+  cold ones read on a miss; 236 GiB at 138 / 120 tok/s (256 GB hosts), 112 GiB at 112 / 82 (128 GB hosts); `auto` sizes N
+  from the host. The full LRU on 384 GB hosts (`STORE_MODE=all RESIDENT=0 SPARE=110`): 307 GiB, 147 / 125, +3.6 % on mixed prompts.
+- TP2 / TP1 through virtual ranks (step 43's runtime, in both tags): 2× RTX 5090 46 / 47 tok/s, 1× RTX 5090 40 / 34, each
+  also with the RAM tiers; identity 0 mismatches at every TP. The default `docker run` at TP4 is unchanged.
+
+### `dsv41-nightly-df3bd094-r23-hyb` — 2026-11-04, Dockerfile step 43 (`--build-arg VLLM_MOET_CPU_TIER_PATCH=1`)
+- The CPU expert tier on the `-r23` image: 110 of 384 experts per layer resident per rank (40 static + 70 LRU), the rest
+  computed on the CPU from the pinned expert store inside the captured decode graph, bit-identical to the all-resident
+  b12x path (19,080 compact calls per rank, 0 mismatches); decode 145 / 125 tok/s on short prompts, 84 on mixed prompts
+  over 30 min, 94 on the BRRR code bench; prefill 4.6–4.7K tok/s from 8K to 512K; 512K context (needle 3/3 to ~512K);
+  HumanEval 160/164 vs 160/164 native, MATH-500 L5 55/60 vs 55/60; 457 GiB of host RAM; 13.8 J per token.
+
+## Ripple-65B Preview on 4× RTX PRO 6000
+
+### `ripple-nightly-a2bcb565-r6` — 2026-11-06
+- Step 3: two-microbatch decode for TP without DP (`DECODE_UBATCH=2`, off by default): +4 % at 16 requests, +5 % at 32.
+- The derived checkpoint with the attention projections in MXFP8 (`tools/ripple_sm120/make_mxfp8_attn_checkpoint.py`,
+  an option: a numerics change): +15 / +9 / +8 % at 1 / 8 / 32 requests over NVFP4.
+
+### `ripple-nightly-a2bcb565-r4` — 2026-11-06
+- Step 2: the DFlash2 drafter drafts the schedule's k (1 + k rows per request, graphs per width); +6.5 % at 32 requests.
+
+### `ripple-nightly-a2bcb565-r3` — 2026-11-05
+- Steps 0–1: vLLM `03bd3c68` with the Ripple architecture on nightly `a2bcb565`; the TP all-reduces of ≤ 128 rows on the
+  PCIe P2P push (+14 % at 8 requests); the dynamic draft length 15 / 11 / 7 by batch size. Code 600 / 3050 / 4740 tok/s at
+  1 / 8 / 32 requests against stock vLLM's 416 / 2270 at static k 7.
 
 ## Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000
 

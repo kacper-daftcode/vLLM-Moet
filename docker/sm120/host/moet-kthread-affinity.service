@@ -1,0 +1,11 @@
+[Unit]
+Description=MoET hybrid host: kernel memory-management threads off the CPU-tier pool cores (kthread-affinity.sh)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/moet/kthread-affinity.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

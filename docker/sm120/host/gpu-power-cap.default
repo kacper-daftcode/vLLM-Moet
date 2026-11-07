@@ -1,0 +1,5 @@
+# Power cap applied to every NVIDIA GPU at boot by gpu-power-cap.service (and re-checked by the MoET hybrid's launcher
+# before each boot of ds41-hyb). rtxdev2, 2026-10-25: GPU 0 (01:00.0) fell off the PCIe bus twice under 4-GPU full-power
+# prefill at 430-440 W per card; 400 W holds since (cost: ~2 % TTFT at 120K prompts, nothing on decode). The card's
+# default is 550 W (max 600). To restore: CAP_W=550 here + `systemctl restart gpu-power-cap`, or disable the unit.
+CAP_W=400

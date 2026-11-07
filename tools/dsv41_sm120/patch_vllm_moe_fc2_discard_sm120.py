@@ -14,7 +14,7 @@ gather - the gather reads only real rows, disjoint 128-byte lines, so the two ru
 discard in front of the gather. In bench_moe_l2_tp4.py's graph on 4x RTX PRO 6000 that was another -3.7 us per MoE
 layer at 6 tokens (-5.4 at 48), but in the served decode graph (window 9, 2026-10-14) the gather next to the discard
 took 6.5 us instead of 3.3 and every FFN segment got +1.7 us (+54 us per step): the default stays the inline launch
-served since 2026-10-13. The join sits in the same apply() call, so everything the model stream - or a stream forked
+the default. The join sits in the same apply() call, so everything the model stream - or a stream forked
 from it later - writes into the workspace afterwards (the next FC1, the indexer's scratch: vLLM's workspace manager
 hands every consumer views of one buffer) is ordered after the discard, as with the inline launch.
 

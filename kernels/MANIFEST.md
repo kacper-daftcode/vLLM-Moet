@@ -3,7 +3,20 @@
 Hand‑written SASS assembled by `cubit` (shipped cubins: pinned @ `5912400`). Cubins are **SM120‑only**.
 Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sass/qmma_e4m3.merc.stub`.
 
-**Sources re‑canonicalized for today's cubit (`main` ≥ `f8605f6`, strict encoder; 2026‑10‑28):** the
+**Per-source allocator switches (cubit ≥ `f643e00`, 2026-11-06):** the five MC4 K ≥ 4096 sources are assembled with
+`CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1 cubit asm sass/<SASS> -o <cubin> --kernel moe_w2_mm --mercury-stub sass/qmma_e4m3.merc.stub`
+— `moe_w2_mm_mc4_k4096_a32.sass`, `moe_w2_mm_mc4_k6144.sass`, `moe_w2_mm_mc4_k6144_a32.sass`, `moe_w2_mm_mc4_k7168.sass`,
+`moe_w2_mm_mc4_k7168_a32.sass`. The two switches restore the `5912400` schedule of these kernels (the read-barrier
+chain on the scale-byte loads + the shared-W0 prologue; cubit KNOWN_ISSUES A19): measured on the test host (RTX PRO
+6000, K's harness, 25 reps, E = 64; bits identical to the shipped cubins in every arm) the `main` default runs them at
+1.37× / 1.38× / 1.65× / 1.21× / 1.67× of the shipped time and the switched build at 1.01× / 0.84× / 1.01× / 0.84× /
+0.98× (`mc4_k4096_a32` 340.7 → 467.6 → 343.5 µs, `mc4_k6144` 475.8 → 658.6 → 400.6, `mc4_k6144_a32` 513.4 → 847.4 →
+519.9, `mc4_k7168` 560.5 → 680.7 → 469.6, `mc4_k7168_a32` 599.8 → 1002.9 → 590.4). The switches cost 3–30 % on 57
+of the other 79 kernels and stay OFF for every other source. The shipped cubins are unchanged: a regenerated cubin
+of these five ships only after the in-situ validation pass (`tools/test_moe_w2_planes.py` + the GSM8K / agreement
+battery) is repeated with the new assembler, like every other regeneration in this manifest.
+
+**Sources re‑canonicalized for the current cubit (`main` ≥ `f8605f6`, strict encoder):** the
 `.ROW/.COL` operand suffixes on `QMMA.SF` (no such bit exists in the SM120 encoding — the `5912400`
 encoder silently dropped them, the current one refuses, BUG‑272) are gone from every `sass/*.sass`
 and every generator in `gen/`, and the 4‑operand `IMAD.WIDE.U32 Rd, Ra, b, Rc` (silicon reads `c` as
@@ -26,7 +39,7 @@ quantizing at a coarser group, so ONE cubin set serves activation groups
 per‑k32 fold costs ≤6% on decode‑shape kernel micro‑bench (e2e within the
 2×6000 anchor band).
 
-**Production defaults: G1=128 G2=128 UE8M0=1** — numerically the a128
+**Default configuration: G1=128 G2=128 UE8M0=1** — numerically the a128
 format (its per_token_group_quant inherited the platform's DeepGEMM‑E8M0
 power‑of‑2 rounding). The per‑32 variants this rev was built to test
 (activation‑precision handoff, plan A) were **E2E‑falsified** on GSM8K‑200
@@ -117,16 +130,16 @@ format (f32 per‑128 scales) — never regenerated for `_a32`.
 |---|---|---|---|
 | `moe_w2_mm_k4096_a32.cubin` | `moe_w2_mm_k4096_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=4096 (w13) |
 | `moe_w2_mm_k2048_a32.cubin` | `moe_w2_mm_k2048_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1 (decode), K=2048 (w2) |
-| `moe_w2_mm_mc4_k4096_a32.cubin` | `moe_w2_mm_mc4_k4096_a32.sass` | `moe_w2_mm` | MC=4 (prefill, full QMMA‑M), K=4096 |
+| `moe_w2_mm_mc4_k4096_a32.cubin` | `moe_w2_mm_mc4_k4096_a32.sass` | `moe_w2_mm` | MC=4 (prefill, full QMMA‑M), K=4096 — build with `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1` (shipped 340.7 µs; main default 1.37×, switched 1.01×; bits identical) |
 | `moe_w2_mm_mc4_k2048_a32.cubin` | `moe_w2_mm_mc4_k2048_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=2048 |
 | `moe_w2_mm_k1024_a32.cubin` | `moe_w2_mm_k1024_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=1024** (w2 under TP2) |
 | `moe_w2_mm_mc4_k1024_a32.cubin` | `moe_w2_mm_mc4_k1024_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=1024 |
 | `moe_w2_mm_k512_a32.cubin` | `moe_w2_mm_k512_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=512** (w2 under TP4), NWARP=4 |
 | `moe_w2_mm_mc4_k512_a32.cubin` | `moe_w2_mm_mc4_k512_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=512 |
 | `moe_w2_mm_k6144_a32.cubin` | `moe_w2_mm_k6144_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=6144** (gate‑up @ hidden 6144 — **GLM‑5.x**) |
-| `moe_w2_mm_mc4_k6144_a32.cubin` | `moe_w2_mm_mc4_k6144_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 |
+| `moe_w2_mm_mc4_k6144_a32.cubin` | `moe_w2_mm_mc4_k6144_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=6144 — build with `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1` (shipped 513.4 µs; main default 1.65×, switched 1.01×; bits identical) |
 | `moe_w2_mm_k7168_a32.cubin` | `moe_w2_mm_k7168_a32.sass` | `moe_w2_mm` | 2‑bit MoE GEMM, MC=1, **K=7168** (gate‑up @ hidden 7168 — **Kimi‑K2.x**) |
-| `moe_w2_mm_mc4_k7168_a32.cubin` | `moe_w2_mm_mc4_k7168_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 |
+| `moe_w2_mm_mc4_k7168_a32.cubin` | `moe_w2_mm_mc4_k7168_a32.sass` | `moe_w2_mm` | MC=4 (prefill), K=7168 — build with `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1` (shipped 599.8 µs; main default 1.67×, switched 0.98×; bits identical) |
 | `moe_w2_mm_mc4afrag_k4096_a32.cubin` | `moe_w2_mm_mc4afrag_k4096_a32.sass` | `moe_w2_mm` | **AFRAG** (prefill, fragment‑major A), K=4096 |
 | `moe_w2_mm_mc4afrag_k2048_a32.cubin` | `moe_w2_mm_mc4afrag_k2048_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=2048 |
 | `moe_w2_mm_mc4afrag_k1024_a32.cubin` | `moe_w2_mm_mc4afrag_k1024_a32.sass` | `moe_w2_mm` | AFRAG (prefill), K=1024 (TP2) |
@@ -371,8 +384,9 @@ gap-fill) and the launcher stays single-stream.
 | cubin | SASS | kernel | purpose |
 |---|---|---|---|
 | `mla_prefill_state.cubin` | `mla_prefill_state2.sass` | `mla_prefill_state2` | prefill accumulate, fp8 smem staging, 2 CTA/SM (~2.2× vs Triton) |
+| `sparse_mla_prefill_v41.cubin` (sha256 c896234bc76d6938…, 49 128 B; assembled with cubit 53e9ed8 + BUG-421/422 = main's BUG-478/479 (`ed4d316`), `CUBIT_SB_SHARE=1 CUBIT_RB_EARLY=32 CUBIT_MMA_WAIT=1 CUBIT_MMA_WB_DRAIN=13`; strict round trip with cubit main 2 663 / 2 663) | `sparse_mla_prefill_v41.sass` (generator `gen/gen_sparse_mla_prefill_v41.py`) | `sparse_mla_prefill_v41` | DeepSeek‑V4.1 sparse‑MLA prefill attention (step 40 class), **bit‑identical** (`torch.equal`, output + lse) with FlashInfer 0.7.2 `sparse_mla_prefill_dsv41_bf16_kernel<16,true>` on the synthetic suite (8 cases: fp8 SWA + FP4 compressed caches, partial lengths, −1 holes, page sizes 32/64/128, sink/no sink, empty rows); 1 token × 16 heads per CTA, 8 warps, 87 040 B smem, 1 CTA/SM, register prefetch of the next 64‑candidate chunk; 0.66–0.72× of the reference time on GPU 4 (845/953/2466/981 µs vs 1290/1447/3547/1370 for 128+512 p128 / 192+512 / 1152+512 / 128+512 p64, 4096 rows). Assemble with `tools/dsv41_sm120/sparse_mla_sass/build_sparse_mla_sass.sh` — needs cubit `main` at or after `ed4d316` (V's fixes = BUG‑478/479/480 there; the script's defaults point at `/workspace/cubit` since 2026‑11‑05 and the cubin reproduces byte for byte from `main` up to cubit `52767f9`; from `f064bed` (BUG‑485, the allocator's WAW rule) `main` emits the same instruction text with **two extra wait control words** (`@P0 VIMNMX R18/R19`) — the shipped cubin stays pinned to this digest, a rebuild would need the in‑situ A/B again). **Reproduction contract (cubit KNOWN_ISSUES A20, 2026‑11‑06):** a shipped cubin is reproduced byte for byte from itself — `cubit disassemble --frozen <shipped.cubin> -o k.sass && cubit asm -T <shipped.cubin> k.sass -o rebuilt.cubin && cmp` — with any cubit ≥ 0.2.0 (the frozen path is gated 157/157 on every cubit push); re‑assembling the `.sass` source is a *regeneration* whose control codes follow the current allocator and is a new schedule that needs in‑situ validation before it ships and `CUBIT_SB_SHARE=1 CUBIT_RB_EARLY=32 CUBIT_MMA_WAIT=1 CUBIT_MMA_WB_DRAIN=13`. Harness `tools/dsv41_sm120/sparse_mla_sass/test_sparse_mla_sass_sm120.py` (`--synthetic`, `--time`, dumps from the real prefill via `patch_vllm_sparse_mla_prefill_dump_sm120.py` + `replay_specB_dumps.py`). **Dumps from the real prefill: 8/8 bit‑identical (19K/163K, layers 0 and 2). In situ (4× RTX PRO 6000 SE, r23 image + `VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1`, 2026‑11‑05): fresh prefill 163K 7.70 → 7.30 s (−5.2 %), 19K 905 → 860 ms (−5.0 %), long_agree ×2 + agree ALL IDENTICAL, loaded on 4 ranks, 0 disabled, 0 Traceback.** Dockerfile step 46 (image `-r25`). |
 
-> Only the kernels the server actually loads are shipped (verified against prod logs). The cubit
+> Only the kernels the server actually loads are shipped (verified against the server's load logs). The cubit
 > sparse‑MLA **decode** kernels and the **mHC** kernels are opt‑in/experimental (not loaded in the
 > shipped config) and live in the `cubit` repo (@ `5912400`); they are intentionally omitted here.
 

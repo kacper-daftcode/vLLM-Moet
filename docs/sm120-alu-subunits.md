@@ -73,7 +73,7 @@ measurements below (16-op single-class runs already pay a few percent).
 Use the probe number to size the floor of *your* emission order; do not
 treat it as the silicon's limit for the mix.
 
-Working rules from kernels built against this map (sessions [G]/[J]/[F]):
+Working rules from kernels built against this map:
 
 - **Budget the LOP3+PRMT share of the stream to ≤ ~33%**, not just the
   total op count. A hand kernel with 11% fewer instructions but 57% of
@@ -87,7 +87,7 @@ Working rules from kernels built against this map (sessions [G]/[J]/[F]):
 
 ## Tensor pipe: accumulator width is free; QMMA halves instructions, not rate
 
-Saturated rates, 16 warps, same probe pattern (session [J]):
+Saturated rates, 16 warps, same probe pattern:
 
 | form | cyc/instr/warp |
 |---|---:|
@@ -124,7 +124,7 @@ window predicts. That kernel runs at ~92% of its mix ceiling: **it sits at
 the ALU floor of its fixed instruction mix.**
 
 Fifth confirmation on the cb2 (MUL1) ports, with the mechanism isolated
-(session [F]): two parity-green rearrangements of the up-delta port both
+(series 4): two parity-green rearrangements of the up-delta port both
 measured *worse* than the phase-ordered emission — a SHFL prefetched one
 tile ahead (+0.6 µs) and nvcc-style producer/consumer interleave of the
 next tile's extraction into the current tile's decode (+2.0 µs). The
@@ -179,21 +179,21 @@ afford its deep interleave only because ptxas hoists the *producers*
 
 ## Provenance
 
-Session [H] 2026-08-07/08: 25 probe variants + three bit-exact kernel
+Series 1: 25 probe variants + three bit-exact kernel
 interventions, each with full parity battery (bit-equality vs the certified
 build ×3, synthetic + real-pack gates, A/B cold-rotation benches ×2). The
 `SGXT.U32` imm-width encoding used by rule 3 was missing from the ISA table
 and shipped from the same ground truth (blackwell-isa `4e8a589`, cubit
 `dd97d6e`).
 
-Session [J] 2026-08-08: tensor-form rates (HMMA.F16/.F32, QMMA.F32, mixed),
+Series 2: tensor-form rates (HMMA.F16/.F32, QMMA.F32, mixed),
 the `ucb2` three-class mix ceiling, and the e4m3 delta-band measurement on
-real packs; same probe harness, anchors reproduce [T]/[H] to 0.05 cyc/instr.
-Session [G] 2026-08-08: the ≤33% B-port budget rule and the
+real packs; same probe harness, anchors reproduce the earlier series to 0.05 cyc/instr.
+Series 3: the ≤33% B-port budget rule and the
 `HADD2.H1H1A` pack replacement, validated on the K1-cb0 port (full parity
 matrix, 1.20× vs the nvcc wave kernel measured under the same contract).
 
-Session [F] 2026-08-08/09: the `ucb3` down-delta mix ceiling, the
+Series 4: the `ucb3` down-delta mix ceiling, the
 probe-order caveat (nvcc wave sustains 0.74 issued/sched on a census the
 phase-ordered probe caps at 0.694), rules 8–9, and the two-sided budget
 note (`ucb2b`), from the two cb2 (MUL1) unified ports — up-delta
@@ -202,9 +202,9 @@ same contract, with 16% fewer instructions; M=8-native at 0.144× the
 per-token cost of the M=1-only wave) and down-delta `exl3_wave_k3cb2`
 (0.91× solo; M=8-native at 0.152× per token), both with full parity
 matrices on synthetic and real delta packs. Same probe harness; `ucb2`
-anchor reproduces [J] to 0.01 cyc/instr.
+anchor reproduces series 2 to 0.01 cyc/instr.
 
-Measurement hygiene on this box: the bench GPUs run with a reduced power
+Measurement hygiene on the bench machine: the bench GPUs run with a reduced power
 limit (300 W vs the 600 W default) — sustained loads throttle SM clocks
 below the lock after a few tens of milliseconds, while the canonical
 500-iteration burst protocol holds the locked clock. Certified numbers

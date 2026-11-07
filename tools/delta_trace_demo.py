@@ -10,7 +10,7 @@ JSON dump / `precision_map`) with a synthetic but realistic MoE routing stream
 The per-slot byte size is shrunk to a few bytes; the manager logic is
 byte-size-agnostic (it works on slot indices and (layer, expert) pairs), so
 this runs on any CUDA device in ~1 s and a few MB while exercising the exact
-code path used in production.
+code path used when serving.
 
 Run inside the vLLM image on any free GPU:
 

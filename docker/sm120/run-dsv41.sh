@@ -16,7 +16,7 @@
 #            NCCL_P2P_LEVEL (SYS)    P2P over PCIe also in KVM guests NCCL classifies as PHB
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 #
-# Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk)
+# Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 8192 with PREFILL_PIPE=2)
 #            GPU_MEM_UTIL (0.94)     0.92 for the very first start (the autotune sweep OOMs at 0.95 on a cold CACHE_DIR)
 #            SPEC_TOKENS (5; 7 with SERVED=1)  DSpark draft tokens, 0 = no drafter (-2.4 GiB per GPU)
 #            MOE_BACKEND ("" ; b12x with SERVED=1)  --moe-backend; b12x = FlashInfer's W4A8 compact path the fused
@@ -40,7 +40,7 @@
 #            KV_OFFLOAD_PROMPT_ONLY (1)  0 = offload generated tokens too (the next turn hits the previous answer)
 #
 # Experiments: PREFILL_DBO (0)  1 = --enable-dbo (two prefill microbatches; needs an image built with step 15; measured
-#                        slower on this host), DBO_PREFILL_THRESHOLD (1024), DBO_DECODE_THRESHOLD (4096)
+#                        slower on 4x RTX PRO 6000), DBO_PREFILL_THRESHOLD (1024), DBO_DECODE_THRESHOLD (4096)
 #            PROFILER (0)            1 = torch profiler endpoints (/start_profile, /stop_profile), traces in PROFILE_DIR
 #
 # Reasoning effort: the image renders the checkpoint's tiers (low 50 / high 75 / max 100, default high; the OpenAI
@@ -60,6 +60,9 @@ CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
 SERVED_NAME="${SERVED_NAME:-deepseek-ai/DeepSeek-V4.1-Flash}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+# Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is measured -22.6 % at 163K WITHOUT the KV offload tier (test host) and +31 % WITH it
+# (production, 2026-11-07, rolled back): off by default until the pipeline and the offload connector are reconciled (r26b).
+# PREFILL_PIPE=2 MAX_NUM_BATCHED_TOKENS=8192 turns it on for deployments without KV offload.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 SERVED="${SERVED:-0}"
@@ -77,7 +80,8 @@ SERVED_SWITCHES=(
   VLLM_MOET_MOE_TOPKSUM_ADD=1 VLLM_MOET_SWA_DRAFT_BUILD=1 B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
   VLLM_MOET_MHC_MXFP8=1 VLLM_MOET_MHC_SIDE_DEFER=1
   VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1
-  VLLM_MOET_DET_TOPK=1
+  VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
+  VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE:-0}
 )
 if [[ "$SERVED" == "1" ]]; then
   : "${SPEC_TOKENS:=7}"

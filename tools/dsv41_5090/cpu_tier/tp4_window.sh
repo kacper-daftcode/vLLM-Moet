@@ -1,0 +1,354 @@
+#!/bin/bash
+# One boot of the full model on 4x 5090 (phase 2.4) inside a 4-GPU window: start the hybrid serve, wait for it,
+# measure (short-prompt identity outputs, decode tok/s, VRAM, host RSS, the tier's KPI lines), stop it. Meant to run
+# under the four GPU locks, taken in order 0 -> 1 -> 2 -> 3 (the same order the other lines use):
+#   flock -w 7200 /tmp/exl3diff-gpu0.lock flock -w 7200 /tmp/exl3diff-gpu1.lock flock -w 7200 /tmp/exl3diff-gpu2.lock \
+#     flock -w 7200 /tmp/exl3diff-gpu3.lock bash tools/dsv41_5090/cpu_tier/tp4_window.sh TAG [env for run-dsv41-5090.sh ...]
+#   e.g. ... tp4_window.sh static SPARE=0 PROMOTIONS=0
+#        ... tp4_window.sh promote SPARE=13 PROMOTIONS=4
+# Outputs: /tmp/ds41-hyb-<TAG>.log (container log), /tmp/ds41-hyb-<TAG>-outputs.json (the identity client's run),
+# /tmp/ds41-hyb-<TAG>-summary.txt. With BOARD=<file> it appends start / end lines to that shared GPU board.
+set -u
+# bash reads a script lazily: an edit of this file while a window runs kills the window mid-measurement (10-26 08:3x,
+# 10-28 19:12 - both ours). The window therefore runs from a private copy; the source may change under it.
+if [[ -z "${TP4_WINDOW_COPY:-}" ]]; then
+  # the checkout is resolved from the ORIGINAL location before the copy (the copy lives in /tmp) and travels in the environment
+  export REPO="${REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
+  _copy="/tmp/tp4_window.$$.sh"
+  cp "${BASH_SOURCE[0]}" "$_copy" || exit 1
+  TP4_WINDOW_COPY="$_copy" exec bash "$_copy" "$@"
+fi
+TAG="${1:?tag}"
+shift
+for kv in "$@"; do export "$kv"; done
+REPO="${REPO:?REPO (the vLLM-Moet checkout) is required when running from a copy}"
+PY="${PY:-python3}"
+NAME="${NAME:-ds41-hyb}"
+# TP=2 / TP=1 (11-04, virtual ranks): the window takes the launcher's TP / GPUS (locks 0,1 / 0 held by the caller), checks
+# only its GPUs for foreign processes and reads the KPI lines of TP ranks (each rank's line carries its virtual ranks)
+TP="${TP:-4}"
+case "$TP" in 4) GPUS="${GPUS:-0,1,2,3}" ;; 2) GPUS="${GPUS:-0,1}" ;; 1) GPUS="${GPUS:-0}" ;; esac
+export TP GPUS
+RANKS=$(seq 0 $((TP - 1)) | tr '\n' ' ')
+PORT="${PORT:-8041}"
+READY_TIMEOUT="${READY_TIMEOUT:-2400}"
+GEN_TOKENS="${GEN_TOKENS:-256}"
+LOG=/tmp/ds41-hyb-$TAG.log
+SUMMARY=/tmp/ds41-hyb-$TAG-summary.txt
+BOARD="${BOARD:-}"   # optional: a shared GPU board file the window announces itself on
+WHO="${WHO:-MoET hybrid}"   # the board lines' author (an agent on a side branch sets its own)
+: "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
+export MODEL_DIR
+
+note() { echo "[$(date -u +%H:%M:%S)] $*" | tee -a "$SUMMARY"; }
+: > "$SUMMARY"
+# /tmp is tmpfs (three reboots on 10-25 took the day's logs): the window's artefacts are copied to NVMe at the end
+KEEP="${KEEP_DIR:-${CACHE_DIR:-$PWD/cache-$NAME}/boots}"
+keep_artefacts() {
+  mkdir -p "$KEEP" 2>/dev/null || return 0
+  for f in "$SUMMARY" "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-ttft.json" "/tmp/ds41-hyb-$TAG-needle.json" "/tmp/ds41-hyb-$TAG-soak.json" "/tmp/ds41-hyb-$TAG-placement.txt" "/tmp/ds41-hyb-$TAG-thermal.txt"; do
+    [[ -s "$f" ]] && cp -f "$f" "$KEEP/" 2>/dev/null
+  done
+  [[ -s "$LOG" ]] && gzip -c "$LOG" > "$KEEP/$(basename "$LOG").gz" 2>/dev/null
+  return 0
+}
+# whatever ends this script (a kill included) stops the container first: the GPU locks (inherited from the flock
+# chain, held through this process's fds) must outlive the container
+cleanup() {
+  if docker ps -q -f name="^${NAME}$" | grep -q .; then
+    docker logs "$NAME" > "$LOG" 2>&1
+    docker stop -t 20 "$NAME" > /dev/null 2>&1
+    docker rm -f "$NAME" > /dev/null 2>&1
+    if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped by the script's exit trap; GPUs released)." >> "$BOARD"; fi
+  fi
+  keep_artefacts
+  rm -f "${TP4_WINDOW_COPY:-/nonexistent}"
+}
+trap cleanup EXIT TERM INT
+
+# 1. nothing foreign on the GPUs. Only containers that can touch a GPU count (a --gpus device request, the nvidia
+# runtime, or NVIDIA_VISIBLE_DEVICES in their environment): the other lines' CPU-only containers (SWE-bench task and
+# scoring containers, `minisweagent-*` / `sweb.eval.*`) run for hours and must not block a window (10-26 14:24: a
+# window aborted on eight scoring containers after waiting 2 h 45 for the locks)
+gpu_containers=""
+# (TP < 4: the other GPUs may legitimately be busy - only the per-GPU compute-process check below applies)
+for c in $([[ "$TP" == "4" ]] && docker ps --format '{{.Names}}'); do
+  info=$(docker inspect -f '{{len .HostConfig.DeviceRequests}} {{.HostConfig.Runtime}}{{range .Config.Env}} {{.}}{{end}}' "$c" 2>/dev/null) || continue
+  devreq=${info%% *}
+  if [[ "$devreq" != "0" || "$info" == *" nvidia"* || "$info" == *"NVIDIA_VISIBLE_DEVICES="* && "$info" != *"NVIDIA_VISIBLE_DEVICES=void"* ]]; then
+    gpu_containers+="$c "
+  fi
+done
+if [[ -n "$gpu_containers" ]]; then
+  note "ABORT: GPU containers running: $gpu_containers"; exit 2
+fi
+if nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name --format=csv,noheader | grep -q .; then
+  note "ABORT: compute processes on GPUs $GPUS: $(nvidia-smi -i "$GPUS" --query-compute-apps=pid,process_name --format=csv,noheader | tr '\n' ' ')"; exit 2
+fi
+# host RAM: the hybrid pins ~396 GB (4 x 52 GB store + 4 x 47 GiB Engram) and needs ~480 of the 498 GB while up; a boot
+# into a box with less than RAM_MIN_GB available dies in the OOM killer at the JIT warmup (10-24) - fail fast instead
+avail_gb=$(awk '/^MemAvailable:/ {printf "%d", $2 / 1048576}' /proc/meminfo)
+if (( avail_gb < ${RAM_MIN_GB:-465} )); then
+  note "ABORT: MemAvailable ${avail_gb} GB < ${RAM_MIN_GB:-465} GB needed for the boot; top RSS: $(ps -eo rss,comm --sort=-rss | awk 'NR>1 && NR<5 {printf "%s %.0f GB; ", $2, $1/1048576}')"; exit 2
+fi
+if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: **${TP}-GPU window started** (TP$TP boot \`$TAG\` on GPUs $GPUS: $*; container \`$NAME\`, port $PORT, log $LOG)." >> "$BOARD"; fi
+note "window start: boot $TAG ($*); MemAvailable ${avail_gb} GB; GPU power limits: $(nvidia-smi --query-gpu=power.limit --format=csv,noheader,nounits | awk '{printf "%d ", $1}')W (cap $( (. /etc/default/gpu-power-cap 2>/dev/null; echo "${CAP_W:-400}") ) W, re-applied by the launcher if above)"
+# the box's memory-management activity across the window (compaction / page migration -> TLB shootdowns on the workers'
+# cores; kcompactd / khugepaged CPU time): snapshots at start, ready, end
+memsnap() {
+  awk '/^(compact_stall|compact_fail|compact_success|compact_daemon_wake|pgmigrate_success|pgmigrate_fail|thp_fault_alloc|thp_collapse_alloc|pgscan_kswapd|pgsteal_kswapd|pgscan_direct|allocstall_normal) / {printf "%s=%s ", $1, $2}' /proc/vmstat
+  awk '/^ *TLB:/ {s = 0; for (i = 2; i <= NF; i++) if ($i ~ /^[0-9]+$/) s += $i; printf "tlb_shootdowns=%d ", s}' /proc/interrupts
+  for p in $(pgrep -x kcompactd0) $(pgrep -x khugepaged); do awk -v p="$p" '{printf "%s_cpu_s=%.0f ", $2, ($14 + $15) / 100}' "/proc/$p/stat" 2>/dev/null; done
+  echo
+}
+memdelta() {  # memdelta "<snap a>" "<snap b>" -> the differences of every counter
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    n = split(a, A, " "); for (i = 1; i <= n; i++) { split(A[i], kv, "="); va[kv[1]] = kv[2] }
+    n = split(b, B, " "); for (i = 1; i <= n; i++) { split(B[i], kv, "="); if (kv[1] in va) printf "%s %+d  ", kv[1], kv[2] - va[kv[1]] }
+    print "" }'
+}
+SNAP0=$(memsnap)
+# DROP_CACHES=1: the boot pins ~400 GB and evicts the page cache anyway; doing it first spares the loader the direct-reclaim
+# storm (10-25 boot: pgscan_direct +162 M pages, allocstall +100 K, compact_stall +68 K; the 48 safetensors shards
+# re-read from NVMe at 36-40 GB/s cost nothing against the loader's own pace)
+if [[ "${DROP_CACHES:-0}" == "1" ]]; then
+  sync; echo 3 > /proc/sys/vm/drop_caches; note "page cache dropped before the boot: $(free -g | awk '/^Mem:/ {print $6 " GB buff/cache, " $7 " GB available"}')"
+fi
+
+# 1b. BAKED=1 (the launcher's default since 10-28) runs the image's copy of tools/dsv41_5090: warn when it is not the worktree's
+# (a change committed or not, without `docker build` of the image) - the window would measure stale code
+cd "$REPO" || exit 1
+if [[ "${BAKED:-1}" == "1" ]]; then
+  # = the launcher's BAKED=1 default (the NVMe modes' default is the step-44 image: ENGRAM_MODE=nvme / STORE_NVME=1)
+  if [[ "${ENGRAM_MODE:-ram}" == "nvme" || "${STORE_NVME:-0}" == "1" ]]; then
+    img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb-engram}"
+    files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py engram_v2/*.py engram_v2/*.cpp engram_v2/*.cu engram_v2/*.h'
+  else
+    img="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23-hyb}"
+    files='cpu_tier/*.py cpu_tier/*.cpp cpu_tier/*.cu cpu_tier/*.h cpu_moe/*.cpp cpu_moe/*.h cpu_moe/*.py'
+  fi
+  # (both lists sorted: the container's C locale and the host's UTF-8 collation order a glob differently - engram_v2.py vs
+  # engram_v2_harness.py - which read as a stale file on 11-04)
+  stale=$(diff <(docker run --rm --entrypoint bash "$img" -c "cd /opt/vllm-moet/dsv41_5090 && md5sum $files 2>/dev/null" 2>/dev/null | sort -k2) \
+               <(cd tools/dsv41_5090 && eval md5sum $files 2>/dev/null | sort -k2) | grep '^>' | awk '{print $3}' | tr '\n' ' ')
+  if [[ -n "$stale" ]]; then
+    note "WARNING: the baked image $img differs from the worktree in: $stale(rebuild it, or run BAKED=0)"
+  else
+    note "baked image $img = the worktree's tools/dsv41_5090 (commit label: $(docker image inspect "$img" --format '{{index .Config.Labels "com.vllm-moet.cpu-tier-commit"}}' 2>/dev/null), HEAD $(git rev-parse --short HEAD))"
+  fi
+fi
+
+# 2. boot
+# PROFILE_STEPS=N: vLLM's torch profiler in the serve (traces under $CACHE_DIR/dot-cache/prof = /root/.cache/prof in the
+# container), used after the decode measurements: N steps of one 'def fib(n):' request, analysed by profile_anatomy.py
+PROF_DIR="${CACHE_DIR:-$PWD/cache-$NAME}/dot-cache/prof"
+if [[ -n "${PROFILE_STEPS:-}" ]]; then
+  mkdir -p "$PROF_DIR"
+  export EXTRA_ARGS="${EXTRA_ARGS:-} --profiler-config.profiler=torch --profiler-config.torch_profiler_dir=/root/.cache/prof"
+fi
+bash docker/sm120/run-dsv41-5090.sh > >(tee -a "$SUMMARY") 2>&1 || { note "launcher failed"; exit 1; }   # its lines (the image, STORE_DRAM_RECORDS=auto's N) into the summary
+t0=$(date +%s)
+ready=0
+dropped2=0
+while (( $(date +%s) - t0 < READY_TIMEOUT )); do
+  if ! docker ps -q -f name="^${NAME}$" | grep -q .; then
+    note "container exited during startup after $(( $(date +%s) - t0 )) s"; break
+  fi
+  if curl -sf -m 3 "http://127.0.0.1:$PORT/v1/models" > /dev/null 2>&1; then ready=1; break; fi
+  # the second drop: the weight loading leaves ~290 GB of clean shard pages in the cache and the store pinning (260 GB
+  # of cudaHostAlloc) then reclaims them under pressure - 10-26: 16 min stuck in direct reclaim with another line's
+  # docker pulls dirtying the cache in parallel; dropping right after the weights are read frees the pages at once
+  if [[ "${DROP_CACHES:-0}" == "1" && $dropped2 == 0 ]] && docker logs "$NAME" 2>&1 | grep -q "Loading weights took"; then
+    sync; echo 3 > /proc/sys/vm/drop_caches; dropped2=1
+    note "page cache dropped again after the weights were read ($(( $(date +%s) - t0 )) s): $(free -g | awk '/^Mem:/ {print $7 " GB available"}')"
+  fi
+  sleep 10
+done
+docker logs "$NAME" > "$LOG" 2>&1
+if (( ready == 0 )); then
+  note "NOT READY after $(( $(date +%s) - t0 )) s; last log lines:"
+  grep -v "it/s\]" "$LOG" | tail -40 | tee -a "$SUMMARY"
+  docker stop -t 30 "$NAME" > /dev/null 2>&1; docker logs "$NAME" > "$LOG" 2>&1; docker rm -f "$NAME" > /dev/null 2>&1
+  if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` did not come up; GPUs released)." >> "$BOARD"; fi
+  exit 1
+fi
+note "ready after $(( $(date +%s) - t0 )) s"
+SNAP1=$(memsnap)
+note "memory management during the boot: $(memdelta "$SNAP0" "$SNAP1")"
+if [[ "${PIN_ENGINE:-1}" == "1" ]]; then
+  # the engine core and the API server off the kernel pools' cores (the workers pin their own threads). TP1: vLLM runs the
+  # model in the EngineCore process itself (uniproc executor) - its threads are the tier's pools and dispatchers, pinned by
+  # the runtime; only the API server is moved. The kernel's memory-management threads go with them: kcompactd grinds against the
+  # pinned pages after a few pin / unpin cycles and, on a pool core's SMT sibling, halves that core (+10-20 % per expert; 11-04).
+  # docker/sm120/host/kthread-affinity.sh does the same at boot.
+  engine_pids=$(pgrep -f "VLLM::EngineCore")
+  [[ "$TP" == "1" ]] && engine_pids=""
+  for p in $engine_pids $(docker inspect --format '{{.State.Pid}}' "$NAME") $(pgrep -x kcompactd0) $(pgrep -x kswapd0) $(pgrep -x khugepaged); do
+    taskset -a -cp "${ENGINE_CPUS:-32,33,40,41,48,49,56,57}" "$p" > /dev/null 2>&1 && note "pinned pid $p ($(cat /proc/$p/comm 2>/dev/null)) to ${ENGINE_CPUS:-32,33,40,41,48,49,56,57}"
+  done
+fi
+grep -E "moet-cpu-tier\] rank 0: (store|tier started|layer language_model.model.layers.0.ffn)|Model loading took|Available KV cache memory|GPU KV cache size|init engine" "$LOG" | cut -c1-220 | tee -a "$SUMMARY"
+nvidia-smi -i "$GPUS" --query-gpu=index,memory.used,memory.total --format=csv,noheader | tee -a "$SUMMARY"
+ps -eo pid,rss,comm,args | grep -E "VLLM|EngineCore|vllm" | grep -v grep | awk '{printf "  pid %s rss %.1f GB %s\n", $1, $2/1048576, $3}' | tee -a "$SUMMARY"
+free -g | head -2 | tee -a "$SUMMARY"
+# where the host RAM goes (the RAM budget is an open item): meminfo + the workers' smaps_rollup
+grep -E "^(MemAvailable|Shmem|AnonPages|Mapped|Cached|Unevictable|Mlocked|KernelStack|PageTables|VmallocUsed):" /proc/meminfo | awk '{printf "  %s %.1f GB\n", $1, $2/1048576}' | tr '\n' ' ' | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"
+for p in $(pgrep -f "VLLM::Worker_TP" | head -4); do
+  awk -v p="$p" '/^(Rss|Pss|Shared_Clean|Shared_Dirty|Private_Dirty|Anonymous|Shmem.*Rss|Locked):/ {printf "%s %.1f GB  ", $1, $2/1048576} END {print "(pid " p ")"}' "/proc/$p/smaps_rollup" 2>/dev/null | tee -a "$SUMMARY"
+done
+# the RAM item: Shmem (458 GB) exceeds the pinned store + Engram (411) and the workers' RSS differ by rank - the biggest
+# mappings of the first and the third worker (size / rss / name) show what the rest is
+for p in $(pgrep -f "VLLM::Worker_TP" | sed -n '1p;3p'); do
+  echo "  pid $p largest mappings (size GB / rss GB / path):" | tee -a "$SUMMARY"
+  awk '/^[0-9a-f]+-[0-9a-f]+ / {path = (NF >= 6) ? $6 : "[anon]"} /^Size:/ {sz = $2} /^Rss:/ {if (sz > 1048576) printf "    %6.1f %6.1f %s\n", sz / 1048576, $2 / 1048576, path}' "/proc/$p/smaps" 2>/dev/null | sort -rn | head -8 | tee -a "$SUMMARY"
+done
+
+# 3. measurements: the identity client (10 short prompts x 48 tokens, saved), then decode tok/s on longer generations
+MODEL="deepseek-ai/DeepSeek-V4.1-Flash"
+$PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --port "$PORT" --model "$MODEL" --out "/tmp/ds41-hyb-$TAG-outputs.json" 2>&1 | tee -a "$SUMMARY"
+# IDENTITY_REPEAT=2: the same 12 prompts again and the two runs compared (run-to-run determinism of THIS boot: the compact
+# path is deterministic, the > 8-token prompts only with B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1 - 10-28)
+if [[ "${IDENTITY_REPEAT:-1}" == "2" ]]; then
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --port "$PORT" --model "$MODEL" --out "/tmp/ds41-hyb-$TAG-outputs2.json" > /dev/null 2>&1
+  note "identity prompts, run 1 vs run 2 of this boot:"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/compare_mini_outputs.py" --compare "/tmp/ds41-hyb-$TAG-outputs.json" "/tmp/ds41-hyb-$TAG-outputs2.json" 2>&1 | grep -E "DIFFER|prompts differ" | tee -a "$SUMMARY"
+fi
+# who runs on which CPU while the first decode runs (foreign threads on the pool cores / their SMT siblings slow the kernel)
+( sleep 2; bash "$REPO/tools/dsv41_5090/cpu_tier/cpu_placement_probe.sh" "${PLACEMENT_SAMPLES:-40}" 0.1 > "/tmp/ds41-hyb-$TAG-placement.txt" 2>&1 ) &
+for p in "Hello" "def fib(n):"; do
+  $PY - "$PORT" "$MODEL" "$p" "$GEN_TOKENS" <<'EOF' 2>&1 | tee -a "$SUMMARY"
+import json, sys, time, urllib.request
+port, model, prompt, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+body = dict(model=model, prompt=prompt, max_tokens=n, temperature=0, seed=0, ignore_eos=True)
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+t0 = time.time()
+r = json.load(urllib.request.urlopen(req, timeout=1800))
+dt = time.time() - t0
+u = r.get("usage", {})
+print(f"  decode {prompt!r}: {u.get('completion_tokens')} tokens in {dt:.1f} s = {u.get('completion_tokens', 0) / dt:.1f} tok/s (prompt {u.get('prompt_tokens')} tokens); text {r['choices'][0]['text'][:60]!r}")
+EOF
+done
+docker logs "$NAME" > "$LOG" 2>&1
+SNAP2=$(memsnap)
+note "memory management during the measurements: $(memdelta "$SNAP1" "$SNAP2")"
+grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -3 | cut -c1-300 | tee -a "$SUMMARY"
+for r in $RANKS; do printf "  rank $r in-kernel us per expert (KPI lines): " | tee -a "$SUMMARY"; grep -o "rank $r: step [0-9]*:.*in-kernel [0-9]* us\( (per virtual rank \[[0-9, ]*\])\)\?" "$LOG" | grep -v "step [0-9]:" | sed -E 's/.*in-kernel ([0-9]+) us( \(per virtual rank (\[[0-9, ]*\])\))?/\1\3/' | tr '\n' ' ' | tee -a "$SUMMARY"; echo | tee -a "$SUMMARY"; done
+wait  # the placement probe
+if [[ -s "/tmp/ds41-hyb-$TAG-placement.txt" ]]; then
+  note "CPU placement during decode (pool cores and their siblings; full list /tmp/ds41-hyb-$TAG-placement.txt):"
+  # pool cores 8r+2..8r+7 and their siblings 8r+34..8r+39 are exactly the CPUs with cpu % 8 >= 2
+  awk '/^  cpu/ {cpu = $2 + 0; if (cpu % 8 >= 2) print}' "/tmp/ds41-hyb-$TAG-placement.txt" | head -48 | tee -a "$SUMMARY"
+fi
+# optional: PROFILE_STEPS=N - a torch-profiler trace of the first N engine iterations of one 'def fib(n):' request (the
+# prefill step + N-1 decode steps; /start_profile with max_iterations stops the profiler by itself, /stop_profile flushes),
+# one trace per TP rank under $PROF_DIR; rank 0's analysed into the summary (GPU busy vs idle per step, the hybrid's
+# publish / wait-inject kernels, b12x, NCCL, attention), all traces copied to boots/
+if [[ -n "${PROFILE_STEPS:-}" ]]; then
+  rm -f "$PROF_DIR"/*"$TAG"* 2>/dev/null
+  note "profile: $PROFILE_STEPS engine iterations of a 'def fib(n):' request (torch profiler, prefix $TAG)"
+  curl -sf -m 60 -X POST "http://127.0.0.1:$PORT/start_profile" -H 'Content-Type: application/json' \
+    -d "{\"profile_prefix\": \"$TAG\", \"max_iterations\": $PROFILE_STEPS}" > /dev/null || note "start_profile failed"
+  $PY - "$PORT" "$MODEL" "def fib(n):" $((PROFILE_STEPS + 16)) <<'EOF' 2>&1 | tee -a "$SUMMARY"
+import json, sys, time, urllib.request
+port, model, prompt, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+body = dict(model=model, prompt=prompt, max_tokens=n, temperature=0, seed=0, ignore_eos=True)
+req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/completions", data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+t0 = time.time()
+r = json.load(urllib.request.urlopen(req, timeout=1800))
+dt = time.time() - t0
+u = r.get("usage", {})
+print(f"  profiled decode {prompt!r}: {u.get('completion_tokens')} tokens in {dt:.1f} s = {u.get('completion_tokens', 0) / dt:.1f} tok/s (profiler on)")
+EOF
+  curl -sf -m 900 -X POST "http://127.0.0.1:$PORT/stop_profile" > /dev/null 2>&1 || note "stop_profile returned an error (already stopped by max_iterations?)"
+  for i in $(seq 1 60); do (( $(ls "$PROF_DIR"/*"$TAG"*tp0*.json* 2>/dev/null | wc -l) >= 1 )) && break; sleep 5; done
+  sleep 5
+  ls -la "$PROF_DIR"/ 2>/dev/null | grep -- "$TAG" | awk '{printf "  %s %s\n", $5, $9}' | tee -a "$SUMMARY"
+  for f in "$PROF_DIR"/*"$TAG"*tp0*.json*; do
+    [[ -s "$f" ]] || continue
+    note "profile anatomy of $(basename "$f") (rank 0):"
+    $PY "$REPO/tools/dsv41_5090/cpu_tier/profile_anatomy.py" "$f" --steps "$PROFILE_STEPS" --top 30 2>&1 | tee -a "$SUMMARY"
+  done
+  mkdir -p "$KEEP" 2>/dev/null && cp -f "$PROF_DIR"/*"$TAG"* "$KEEP/" 2>/dev/null
+fi
+# optional: HARD_PROBE=humaneval,math500 - hard_probe.py from PROBE_DIR (with the native references next to it): greedy, thinking off; HumanEval executed (164 items), MATH-500 level 5 (60 items); paired
+# comparison against native (McNemar). ~8 + ~12 min at ~100 tok/s; decode-dominated (prompts of a few hundred tokens)
+if [[ -n "${HARD_PROBE:-}" ]]; then
+  PROBE="${PROBE_DIR:?PROBE_DIR (directory with hard_probe.py and the native references) is required for HARD_PROBE}"
+  for suite in ${HARD_PROBE//,/ }; do
+    # math500: the native fin01 reference = the first 60 level-5 items at --max-tokens 2500 (the probe's default 1200
+    # truncates a third of them: 10-26); humaneval: all 164 at the default 768
+    lv=(); [[ "$suite" == "math500" ]] && lv=(--levels 5 --n "${PROBE_MATH_N:-60}" --max-tokens "${PROBE_MATH_TOKENS:-2500}")
+    note "hard probe $suite (tag $TAG) ..."
+    ( cd "$PROBE" && $PY hard_probe.py run "http://127.0.0.1:$PORT" "$MODEL" "$suite" "$TAG" --conc "${PROBE_CONC:-1}" "${lv[@]}" 2>&1 | tail -4 | cut -c1-300 ) | tee -a "$SUMMARY"
+    note "hard probe $suite vs native fin01:"
+    ( cd "$PROBE" && $PY hard_probe.py compare "hard_${suite}_native_fin01.jsonl" "hard_${suite}_${TAG}.jsonl" 2>&1 | tail -12 | cut -c1-300 ) | tee -a "$SUMMARY"
+    docker logs "$NAME" > "$LOG" 2>&1
+    grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+  done
+fi
+# optional (phase 3): NEEDLE_LENGTHS=32768,65536 - a code word planted at NEEDLE_DEPTHS (0.1,0.5,0.9) of long fillers,
+# asked back (needle_probe.py); SOAK_MINUTES=120 SOAK_CONC=4 - concurrent mixed-prompt streams (soak_probe.py; the
+# server needs MAX_NUM_SEQS >= SOAK_CONC); the tier's error counter and hit rate from the KPI lines after each
+if [[ -n "${NEEDLE_LENGTHS:-}" ]]; then
+  note "needle probe: lengths $NEEDLE_LENGTHS, depths ${NEEDLE_DEPTHS:-0.1,0.5,0.9}"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/needle_probe.py" --port "$PORT" --model "$MODEL" --lengths "$NEEDLE_LENGTHS" \
+    --depths "${NEEDLE_DEPTHS:-0.1,0.5,0.9}" --out "/tmp/ds41-hyb-$TAG-needle.json" 2>&1 | tee -a "$SUMMARY"
+  docker logs "$NAME" > "$LOG" 2>&1
+  grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+fi
+if [[ -n "${SOAK_MINUTES:-}" ]]; then
+  note "soak: $SOAK_MINUTES min x ${SOAK_CONC:-4} streams, max_tokens ${SOAK_TOKENS:-256}"
+  # the host's thermal / power / clock trace during the soak (11-02: the 60-min soak's kernel went 121 -> 155 us per
+  # expert after ~15 min with the hot spin + DRAM stream on 24 cores; the socket's PPT is 350 W, Tctl idles at ~70 C):
+  # every 30 s Tctl, the socket's HSMP power, the pool cores' MHz (mean of the 24), the GPUs' power
+  THERM="/tmp/ds41-hyb-$TAG-thermal.txt"
+  # the hwmon numbers change between boots (11-03: k10temp hwmon4 -> hwmon5): resolve by name
+  HW_K10=$(grep -l '^k10temp$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs -r dirname)
+  HW_HSMP=$(grep -l '^amd_hsmp_hwmon$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs -r dirname)
+  HW_EC=$(grep -l '^asusec$' /sys/class/hwmon/hwmon*/name 2>/dev/null | head -1 | xargs -r dirname)
+  ( echo "t_s Tctl_C socket_W pool_MHz_mean gpu_W_sum gpu_C_max gpu_sm_MHz_min gpu_throttle cpu_pkg_C vrm_C"; t0=$(date +%s); while :; do
+      tctl=$(( $(cat "$HW_K10/temp1_input" 2>/dev/null || echo 0) / 1000 ))
+      sw=$(( $(cat "$HW_HSMP/power1_input" 2>/dev/null || echo 0) / 1000000 ))
+      pkg=$(( $(cat "$HW_EC/temp1_input" 2>/dev/null || echo 0) / 1000 )); vrm=$(( $(cat "$HW_EC/temp4_input" 2>/dev/null || echo 0) / 1000 ))
+      mhz=$(awk '/^cpu MHz/ {n++; if ((n-1)%8 >= 2) {s += $4; k++}} END {if (k) printf "%d", s / k; else print 0}' /proc/cpuinfo)
+      g=$(nvidia-smi --query-gpu=power.draw,temperature.gpu,clocks.sm,clocks_throttle_reasons.active --format=csv,noheader,nounits 2>/dev/null | \
+          awk -F', *' '{w += $1; if ($2 > t) t = $2; if (m == "" || $3 < m) m = $3; r = r $4 ","} END {printf "%d %d %d %s", w, t, m, r}')
+      echo "$(( $(date +%s) - t0 )) $tctl $sw $mhz $g $pkg $vrm"; sleep 30; done ) > "$THERM" 2>/dev/null &
+  THERM_PID=$!
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/soak_probe.py" --port "$PORT" --model "$MODEL" --minutes "$SOAK_MINUTES" \
+    --conc "${SOAK_CONC:-4}" --max-tokens "${SOAK_TOKENS:-256}" --out "/tmp/ds41-hyb-$TAG-soak.json" 2>&1 | tail -8 | tee -a "$SUMMARY"
+  kill $THERM_PID 2>/dev/null; wait $THERM_PID 2>/dev/null
+  note "thermal trace ($THERM): $(awk 'NR == 2 {a = $0} END {print "start [" a "]  end [" $0 "]"}' "$THERM")  (t_s Tctl_C socket_W pool_MHz gpu_W gpu_C_max gpu_sm_MHz_min throttle)"
+  awk 'NR > 1 {if ($2 > t) t = $2; if ($3 > w) w = $3; s += $4; n++; if ($6 > gt) gt = $6; if (gm == "" || $7 < gm) gm = $7} END {if (n) printf "  Tctl max %d C, socket W max %d, pool MHz mean %d, GPU max %d C, GPU SM MHz min %d over %d samples\n", t, w, s / n, gt, gm, n}' "$THERM" | tee -a "$SUMMARY"
+  docker logs "$NAME" > "$LOG" 2>&1
+  grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+  note "server log: error / traceback lines after the soak: $(grep -ciE "error word|fail.*closed|Traceback" "$LOG")"
+  free -g | head -2 | tail -1 | tee -a "$SUMMARY"
+fi
+# optional (phase 2.5): TTFT / prefill rate on long prompts, e.g. TTFT_LENGTHS=2048,14336,30720 (needs SCRATCH > 0 for
+# correct outputs; MAX_NUM_BATCHED_TOKENS sets the chunk)
+if [[ -n "${TTFT_LENGTHS:-}" ]]; then
+  note "TTFT probe: lengths $TTFT_LENGTHS, gen ${TTFT_GEN:-64}, repeat ${TTFT_REPEAT:-2}"
+  $PY "$REPO/tools/dsv41_5090/cpu_tier/ttft_probe.py" --port "$PORT" --model "$MODEL" --lengths "$TTFT_LENGTHS" \
+    --gen "${TTFT_GEN:-64}" --repeat "${TTFT_REPEAT:-2}" --vary-repeats --out "/tmp/ds41-hyb-$TAG-ttft.json" 2>&1 | tee -a "$SUMMARY"
+  docker logs "$NAME" > "$LOG" 2>&1
+  grep -E "moet-cpu-tier\] rank 0: (prefill call|scratch pool|DEBUG prefill|[0-9]+-token MoE call)" "$LOG" | tail -8 | cut -c1-600 | tee -a "$SUMMARY"
+  grep "moet-cpu-tier\] rank 0: step" "$LOG" | tail -1 | cut -c1-300 | tee -a "$SUMMARY"
+fi
+note "tier warnings in the log: $(grep -c "moet-cpu-tier\] rank 0: WARNING" "$LOG")"
+if [[ "${DEBUG_COMPACT:-0}" == "1" ]]; then
+  # the within-boot identity check (every compact call vs all its experts in one b12x run): totals per rank, mismatches
+  for r in $RANKS; do grep -o "rank $r: step [0-9]*:.*compact check: .*" "$LOG" | tail -1 | sed -E "s/(rank $r: step [0-9]+):.*compact check:/\1 compact check:/" | tee -a "$SUMMARY"; done
+  note "compact check MISMATCH lines (all ranks): $(grep -c "DEBUG compact.*MISMATCH" "$LOG")"
+  grep "DEBUG compact.*MISMATCH" "$LOG" | head -5 | cut -c1-300 | tee -a "$SUMMARY"
+  note "compact check skipped lines: $(grep -c "DEBUG compact.*check skipped" "$LOG")"
+fi
+grep -i "fail\|error word\|Traceback" "$LOG" | grep -v "errors 0" | head -5 | tee -a "$SUMMARY"
+
+# 4. stop, release
+docker stop -t 60 "$NAME" > /dev/null 2>&1
+docker logs "$NAME" > "$LOG" 2>&1
+docker rm -f "$NAME" > /dev/null 2>&1
+note "window end: $TAG stopped; log $LOG"
+if [[ -n "$BOARD" ]]; then echo "- $(date -u '+%Y-%m-%d %H:%M') UTC — $WHO: window ended (boot \`$TAG\` stopped; GPUs released; summary $SUMMARY)." >> "$BOARD"; fi
+exit 0

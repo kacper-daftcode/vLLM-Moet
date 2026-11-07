@@ -30,7 +30,12 @@ H = int(os.environ.get("VLLM_MOET_P2P_AR_H", "5120"))
 if H % 128 != 0 or H <= 0:
     raise ValueError(f"VLLM_MOET_P2P_AR_H={H}: the kernels need a multiple of 128 (H/16 threads per row, H/32 per slice)")
 NSLOTS = 4
-M_MAX = 64
+# Rows the symmetric buffers hold (and the NCCL order tables cover); the kernels take it at runtime. 64 = the DeepSeek
+# decode shapes; a dense TP4 model at k = 7 and 32 requests all-reduces [256, H] per step (VLLM_MOET_P2P_AR_M_MAX=256,
+# with VLLM_MOET_P2P_AR_MAX_ROWS raised alongside). Buffers: NSLOTS * 4 * M_MAX * H * 2 bytes per kind (10.5 MB at 64).
+M_MAX = int(os.environ.get("VLLM_MOET_P2P_AR_M_MAX", "64"))
+if M_MAX <= 0:
+    raise ValueError(f"VLLM_MOET_P2P_AR_M_MAX={M_MAX}: needs a positive row count")
 _state: dict | None = None
 _disabled_reason: str | None = None
 
@@ -45,8 +50,8 @@ def oneshot_max_rows() -> int:
 
 
 def max_rows() -> int:
-    """Rows up to which the two-shot (reduce-scatter + all-gather) push is used above the one-shot range."""
-    return int(os.environ.get("VLLM_MOET_P2P_AR_MAX_ROWS", "64"))
+    """Rows up to which the two-shot (reduce-scatter + all-gather) push is used above the one-shot range (<= M_MAX)."""
+    return min(int(os.environ.get("VLLM_MOET_P2P_AR_MAX_ROWS", "64")), M_MAX)
 
 
 def _build():

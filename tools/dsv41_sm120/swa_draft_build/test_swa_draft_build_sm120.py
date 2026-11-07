@@ -6,7 +6,7 @@ torch.ge(slot_mapping, 0, out=is_valid_token), compute_token_to_req_indices and 
 mappings and query_start_loc buffers, invalid rows, several window / block sizes, short and long prefixes), inside the
 image with sparse_swa.py patched. The validity buffer, the token -> request map, the lens and the index rows must be
 identical byte for byte; then both are timed for the served step (three builders, 7 draft tokens), eager and in a
-CUDA graph (where the update runs in production).
+CUDA graph (where the update runs when serving).
 usage: python3 test_swa_draft_build_sm120.py [--cases N]
 """
 import argparse

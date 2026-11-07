@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The target model's lm_head at decode token counts as an MXFP8 GEMV on sm_120 (DeepSeek-V4.1-Flash) - step 18 for the target.
 
-Owner's decision 2026-10-20 ("jedziemy całość"): the target's logits may change (MXFP8 weight + activation quantization,
+A deliberate, gated output change: the target's logits may change (MXFP8 weight + activation quantization,
 ~3.8 % relative error on the logits, top-5 overlap 0.96 on random data - step 18's measurements), gated by GSM8K-200
 (McNemar), needle, tools/json/vision and the agreement battery. The BF16 lm_head ([32320, 5120] per TP4 rank, 331 MB)
 runs once per decode step OUTSIDE the CUDA graphs and streams in ~214 us (torch profile run30_df3b_b12x_c1, 2.2 % of
@@ -27,7 +27,7 @@ DEFAULT_PATH = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/deepsee
 MARKER = "[vllm-moet] sm_120 target lm_head MXFP8"
 
 CLASS_ANCHOR = "class DeepseekV41LLMForCausalLM(\n"
-HELPER = f'''# {MARKER}: the target's logits for decode-sized row counts on the MXFP8 GEMV (owner-approved output change,
+HELPER = f'''# {MARKER}: the target's logits for decode-sized row counts on the MXFP8 GEMV (a gated output change,
 # gated by GSM8K-200 / needle / tools; VLLM_MOET_TARGET_LM_HEAD_MXFP8=1 enables it).
 _MOET_LM_HEAD_MXFP8_CACHE: dict = {{}}
 

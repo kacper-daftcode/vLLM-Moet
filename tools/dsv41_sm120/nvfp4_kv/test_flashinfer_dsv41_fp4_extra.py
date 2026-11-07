@@ -7,7 +7,7 @@ Upstream reads the compressed cache in its training-format record directly:
 ``kv_cache_format="fp8_dsv41_fp4_ca"`` = a 528 B V4.1 fp8 sliding-window cache (512 fp8 + 16 UE8M0/32) plus a
 288 B FP4 compressed cache (256 B e2m1 pairs + 32 e4m3/16, vLLM main's ``nvfp4_ds_mla``), the FP4 rows converted
 to fp8/UE8M0-32 tiles on chip (``kernels/dsv41_fp8/convert.cuh``). This is the kernel the section-5 project of
-HANDOFF_2026-09-21 set out to write. This test asks whether it serves our deployment:
+an earlier plan set out to write. This test asks whether it serves our deployment:
 
   BYTES  our ``rope_quant_insert_packed`` (288 B record, bit-exact with the checkpoint's fp4_act_quant) writes the
          same bytes as upstream's ``dsv41_fp4_quantize_pack_sparse_mla_cache``; our 528 B record == the torch

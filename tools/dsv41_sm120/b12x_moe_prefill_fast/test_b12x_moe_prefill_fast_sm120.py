@@ -12,8 +12,10 @@ against spec B (../b12x_moe_prefill_spec), bit for bit, with the spec harness's 
    output; ours must equal b12x and the spec.
 Per case: route rows of the valid pairs (torch.equal on int16 views) vs b12x and vs spec, output vs b12x / spec / dump,
 the intermediates vs spec (a_values, a_scales, the MXFP8 intermediate rows and scale bytes of the valid pairs, and the
-expert-sorted row_pair table vs the spec's expert_sorted_rows), and determinism: `--repeats` runs identical (route rows,
-output, intermediate). Exit 0 only if everything is identical.
+expert-sorted row_pair table vs the spec's expert_sorted_rows), determinism: `--repeats` runs identical (route rows,
+output, intermediate), and - when the extension has the entry - the pre-quantized rows path (the run's own a_values /
+a_scales fed back, the quant stage skipped) gives the same route rows / output / intermediate. Exit 0 only if everything
+is identical.
 """
 from __future__ import annotations
 
@@ -45,7 +47,7 @@ def main() -> int:
     a = ap.parse_args()
     os.environ.setdefault("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     import torch
-    from b12x_moe_prefill_fast_sm120 import moe_prefill_fast
+    from b12x_moe_prefill_fast_sm120 import moe_prefill_fast, prequant_rows_supported, strided_rows_supported
     from b12x_moe_prefill_spec_sm120 import expert_sorted_rows, moe_prefill_spec
     from test_b12x_moe_prefill_spec_sm120 import _planes, _served
     import b12x.moe.fused_moe._impl as impl
@@ -159,6 +161,26 @@ def main() -> int:
                 msg.append(f"run {ri}: " + "; ".join(parts))
         msg.append(f"{len(runs)} runs {'identical' if det else 'DIFFER'}")
         ok &= det
+        # the pre-quantized-rows entry (the MXFP8 all-gather): the same rows fed back as a_values / a_scales must give
+        # the same route rows and output (the quant stage is skipped, everything else is the same code)
+        if prequant_rows_supported():
+            res_q = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=av_m, a_scales=as_m, **kw)
+            torch.cuda.synchronize()
+            pq_ok = same(res_q[0], out_m) and same(res_q[1][valid], route_m[valid]) and same(res_q[4][valid, :N], inter_m[valid, :N])
+            msg.append(f"pre-quantized rows entry {'identical' if pq_ok else 'DIFFER'}")
+            ok &= pq_ok
+            # the same rows as row-strided views of ONE buffer (the one-all-gather layout: per row the K e4m3 bytes,
+            # the K/32 scale bytes, then 48 bytes of top-k ids / weights - here random garbage the kernels must not read)
+            if strided_rows_supported():
+                Tq, Kq = av_m.shape
+                buf = torch.randint(0, 256, (Tq, Kq + Kq // 32 + 48), device=av_m.device, dtype=torch.uint8)
+                buf[:, :Kq] = av_m
+                buf[:, Kq:Kq + Kq // 32] = as_m
+                res_s = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=buf[:, :Kq], a_scales=buf[:, Kq:Kq + Kq // 32], **kw)
+                torch.cuda.synchronize()
+                st_ok = same(res_s[0], out_m) and same(res_s[1][valid], route_m[valid]) and same(res_s[4][valid, :N], inter_m[valid, :N])
+                msg.append(f"strided rows (one-buffer layout, row stride {Kq + Kq // 32 + 48}) {'identical' if st_ok else 'DIFFER'}")
+                ok &= st_ok
         msg.append(f"time b12x {tb:.2f} ms, ours {min(t for _, t in runs):.2f} ms (eager, host included)")
         print(" | ".join(msg))
         sys.stdout.flush()

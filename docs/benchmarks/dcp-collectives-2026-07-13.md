@@ -97,7 +97,7 @@ noise as DCP1-vs-DCP4 tie-breaks (task sheet) - now with a bigger lever.
   519,153 / **1,038,717** prompt tokens.
 - arithmetic 5/5, coherence 0/12 degenerate.
 - depth flatness: steps/s 17.6 @8K -> 17.2 @497K (-2.3%, criterion +-10%)
-  at k=5; 26.2 -> 25.7 (-1.9%) at k=2. (Session B measured -8% at 891K on
+  at k=5; 26.2 -> 25.7 (-1.9%) at k=2. (An earlier run measured -8% at 891K on
   real corpus - indexer local-shard scoring grows with depth; still
   inside +-10%.)
 - A/B greedy a2a vs ag_rs (k=2, delta=0): fox byte-identical; refactor

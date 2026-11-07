@@ -325,6 +325,90 @@ RUN if [ "$VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH" = "1" ]; then python3 /opt/vll
     && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_prefill_fast'); import b12x_moe_prefill_fast_sm120 as f; e = f._ext(); assert hasattr(e, 'moe_prefill_fast'); print('sm120 fast prefill MoE extension built')" \
     && ls /opt/vllm-moet/torch_extensions/vllm_moet_b12x_moe_prefill_fast_sm120/*.so; fi
 
+# 43. The MoET hybrid: the CPU expert tier inside the b12x MoE path (tools/dsv41_5090/, docs/moet-hybrid.md). The patcher
+#     installs the runtime into /opt/vllm-moet/cpu_tier (+ a .pth), builds libcpu_tier.so (the CPU expert kernel, bit-identical
+#     to b12x's compact W4A8 path; VLLM_MOET_CPU_TIER_ARCH is the -march of the serving host's CPU) and patches mxfp4.py /
+#     b12x.py / w4a8_compact_micro.py / the model runner with markers. Inert unless VLLM_MOET_MOE_CPU_TIER=1 (the launcher
+#     docker/sm120/run-dsv41-5090.sh sets it and mounts the expert store, the placement and the kernel tables). Default 0:
+#     the 4x RTX PRO 6000 image is built without it; the hybrid image (-hyb tags) with --build-arg VLLM_MOET_CPU_TIER_PATCH=1.
+COPY tools/dsv41_5090/ /opt/vllm-moet/dsv41_5090/
+ARG VLLM_MOET_CPU_TIER_PATCH=0
+ARG VLLM_MOET_CPU_TIER_ARCH=znver4
+RUN if [ "$VLLM_MOET_CPU_TIER_PATCH" = "1" ]; then python3 /opt/vllm-moet/dsv41_5090/cpu_tier/patch_vllm_moe_cpu_tier.py --arch "$VLLM_MOET_CPU_TIER_ARCH" \
+    && for f in vllm/model_executor/layers/quantization/mxfp4.py vllm/model_executor/layers/fused_moe/b12x.py \
+                flashinfer/experimental/b12x/moe/_shared/kernels/w4a8_compact_micro.py vllm/v1/worker/gpu/model_runner.py; do \
+         grep -q "\[vllm-moet\] cpu tier" /usr/local/lib/python3.12/dist-packages/$f || exit 1; done \
+    && ls /opt/vllm-moet/cpu_tier/libcpu_tier.so \
+    && python3 -c "import vllm_moet_cpu_tier, cpu_tier, placement_manager; print('cpu tier runtime importable')"; fi
+
+# 44. The hybrid on hosts with less RAM (docs/moet-hybrid.md "Hosts with less RAM"): Engram v2 - the Engram tables stay on NVMe, a
+#     DRAM row cache + an io_uring fetcher per rank serve the rows and vLLM's own lookup kernel dequantizes them from a device
+#     landing buffer (bit-identical rows; tools/dsv41_5090/engram_v2/). The patcher installs the runtime into /opt/vllm-moet/engram_v2
+#     (+ a .pth), builds libengram_v2.so (io_uring on raw syscalls, no liburing) and patches engram.py / ep_weight_filter.py / the
+#     model runner with markers; the CUDA extension is JIT-built at the first lookup (~30 s once, cached under /root/.cache). The
+#     expert store's NVMe tail (STORE_NVME) lives in step 43's tier. Inert unless VLLM_MOET_ENGRAM_MODE=nvme (the launcher's
+#     ENGRAM_MODE=nvme / STORE_NVME=1, which also pass docker/sm120/seccomp-io_uring.json - docker's default seccomp profile denies
+#     io_uring). Needs step 43. Default 0; the -hyb-engram tags are built with --build-arg VLLM_MOET_ENGRAM_V2_PATCH=1.
+ARG VLLM_MOET_ENGRAM_V2_PATCH=0
+RUN if [ "$VLLM_MOET_ENGRAM_V2_PATCH" = "1" ]; then [ "$VLLM_MOET_CPU_TIER_PATCH" = "1" ] || { echo "step 44 (Engram v2) needs step 43 (the CPU tier)"; exit 1; } \
+    && python3 /opt/vllm-moet/dsv41_5090/engram_v2/patch_vllm_engram_v2.py \
+    && for f in vllm/models/deepseek_v41/common/engram.py vllm/model_executor/model_loader/ep_weight_filter.py vllm/v1/worker/gpu/model_runner.py; do \
+         grep -q "\[vllm-moet\] engram v2" /usr/local/lib/python3.12/dist-packages/$f || exit 1; done \
+    && ls /opt/vllm-moet/engram_v2/libengram_v2.so \
+    && python3 -c "import vllm_moet_engram_v2, engram_v2; import cpu_tier; assert hasattr(cpu_tier.CpuTier, 'store_tail_init'); print('engram v2 runtime importable, the tier has the store tail')"; fi
+
+# 45. The sequence-parallel prefill's MoE input all-gathered in MXFP8 + the shard's top-6 instead of bf16 (runtime switch
+#     VLLM_MOET_PREFILL_SP_GATHER=mxfp8, default bf16 = step 41's path; needs steps 41 and 42). Bit-identical to the served
+#     r23 configuration: FlashInfer's mxfp8 quantizer on the shard equals b12x's quant_row and the shared expert's own
+#     quantization, the router GEMM runs with M = T on a [T, 5120] stand-in buffer (cuBLAS picks another kernel at M = T/4),
+#     the top-6 on the shard; e4m3 [T, 5120] + [T, 208] (scales, ids, weights) travel instead of bf16 [T, 5120] (0.52x the
+#     bytes). TP4 microbench (torchrun x4, tools/dsv41_sm120/sp_moe_gather/test_prefill_sp_gather_tp4.py): EQUAL on every
+#     shard-side step incl. the served dump; boundary 2 at 4096 rows 2028 -> 1741 us. Real model (4x RTX PRO 6000,
+#     same image + same files in both arms, FAST=1 DET_TOPK=1): fresh prefill 163K 7.58 -> 7.29 s (-3.8 %), 19K 0.892 -> 0.860 s;
+#     long_agree 0 / 30 137 positions, greedy + agree_client ALL IDENTICAL, run-to-run identical. The runtime raises if a MoE
+#     consumer did not take its gathered piece (no silent compute on the stand-in). GPU test (four GPUs, with the served dumps):
+#     torchrun --nproc_per_node=4 /opt/vllm-moet/dsv41_sm120/sp_moe_gather/test_prefill_sp_gather_tp4.py --dumps DIR
+ARG VLLM_MOET_PREFILL_SP_GATHER_PATCH=1
+RUN if [ "$VLLM_MOET_PREFILL_SP_GATHER_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_PATCH" = "1" ] && [ "$VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH" = "1" ]; then \
+       python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_sp_gather_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_sp_gather_sm120.py --check \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/sp_moe_gather'); import sp_moe_gather_sm120 as g; print('sp MoE gather runtime importable')" \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/b12x_moe_prefill_fast'); import b12x_moe_prefill_fast_sm120 as f; assert f.prequant_rows_supported(); print('fast MoE loader: pre-quantized rows entry present')"; fi
+
+# 46. The DeepSeek-V4.1 sparse-MLA prefill attention on the cubit-assembled SASS kernel (runtime switch
+#     VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1, default off; needs step 40). kernels/sass/sparse_mla_prefill_v41.sass (generator
+#     kernels/gen/gen_sparse_mla_prefill_v41.py) is the frozen-spec arithmetic of FlashInfer's full-BF16 kernel (step 40 = spec B)
+#     hand-scheduled: bit-identical (torch.equal, output + lse) on 8 synthetic cases and 8 dumps of a real 19K/163K prefill;
+#     0.66-0.72x of spec B's time on the harness; in situ (4x RTX PRO 6000 SE) fresh prefill 163K
+#     7.70 -> 7.30 s (-5.2 %), 19K -5.0 %, long_agree + agree ALL IDENTICAL. Chunks <= 64 rows stay on FlashInfer (its decode
+#     kernel, as served); any launch problem disables the route after one warning. The cubin ships in the repo
+#     (kernels/cubins-sm120/, sha256 in kernels/MANIFEST.md; strict round trip through cubit 2 663 / 2 663).
+COPY kernels/cubins-sm120/sparse_mla_prefill_v41.cubin /opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin
+ARG VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH=1
+RUN if [ "$VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH" = "1" ] && [ "$VLLM_MOET_SPARSE_MLA_PREFILL_BF16_PATCH" = "1" ]; then \
+       python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_sparse_mla_prefill_sass_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_sparse_mla_prefill_sass_sm120.py --check \
+    && grep -q "sparse-MLA prefill SASS kernel" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py \
+    && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin', 'rb').read()).hexdigest(); assert h.startswith('c896234bc76d6938'), h; print('sparse-MLA prefill SASS cubin', h[:16])"; fi
+
+# 47. The pipelined sequence-parallel prefill (runtime switch VLLM_MOET_PREFILL_PIPE=2 with --max-num-batched-tokens 8192,
+#     default off; needs steps 41 and 45). An eager step of > 4096 tokens is split into two 4096-row groups run one layer apart
+#     on two threads (vLLM's DBO hand-off protocol without the DBO runner): the SP reduce-scatter -> mHC -> projections ->
+#     all-gather chain of one group on a comm stream under the other's attention / MoE on the compute stream; group B's layer L
+#     always after group A's layer L (B's attention reads the KV A wrote). Every kernel keeps today's launch shape and inputs,
+#     so the bits are the served bits by construction: 4x RTX PRO 6000 SE long_agree x2 / agree /
+#     run-to-run ALL IDENTICAL and 800/800 per-layer dump hashes identical vs the 4096 path on 4 ranks; fresh prefill 163K
+#     6947 -> 5360-5392 ms (-22.4..-22.9 %), 19K 819 -> 671 ms (NCCL was 38 % of the prefill on one stream). Any unmet
+#     dependency is a RuntimeError, never a silent fallback. Costs: a 268 ms prefill step instead of 174 ms for a concurrent
+#     decode, KV 12.54 -> 11.31 GiB at 8192 batched tokens.
+ARG VLLM_MOET_PREFILL_PIPE_PATCH=1
+RUN if [ "$VLLM_MOET_PREFILL_PIPE_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_GATHER_PATCH" = "1" ]; then \
+       python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_pipe_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_prefill_pipe_sm120.py --check \
+    && python3 -c "from vllm.v1.worker import moet_prefill_pipe as p; assert hasattr(p, 'step_context') and hasattr(p, 'record_for_comm'); print('prefill pipeline runtime importable')" \
+    && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py \
+    && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/model.py; fi
+
 # Labels: the launcher reads kv-mode and v41-kv-records; the tests and docs read the step flags.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="DeepSeek-V4.1-Flash on sm_120: vllm/vllm-openai nightly df3bd094 with the sm_120 gaps closed and the decode / prefill kernels of vLLM-Moet (docs/dsv41-sm120.md)" \
@@ -363,4 +447,9 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.sparse-mla-prefill-bf16="${VLLM_MOET_SPARSE_MLA_PREFILL_BF16_PATCH}" \
       com.vllm-moet.prefill-sp="${VLLM_MOET_PREFILL_SP_PATCH}" \
       com.vllm-moet.b12x-moe-prefill-fast="${VLLM_MOET_B12X_MOE_PREFILL_FAST_PATCH}" \
-      com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}"
+      com.vllm-moet.prefill-sp-gather="${VLLM_MOET_PREFILL_SP_GATHER_PATCH}" \
+      com.vllm-moet.sparse-mla-prefill-sass="${VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH}" \
+      com.vllm-moet.prefill-pipe="${VLLM_MOET_PREFILL_PIPE_PATCH}" \
+      com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}" \
+      com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}" \
+      com.vllm-moet.engram-v2="${VLLM_MOET_ENGRAM_V2_PATCH}"

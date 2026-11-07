@@ -1,147 +1,94 @@
-# AGENTS.md — the commit contract
+# AGENTS.md — the contract for agents and contributors
 
-Multiple agents and humans work on this project concurrently, often in the
-**same checkout**. Work has been lost here three separate times by treating
-the generated patch as a source file. Read this before your first commit;
-every rule below traces back to a real incident.
+This repository is a publication: the kernels, patchers, images, launchers and documentation of
+several lines of work. More than one agent may edit it at a time. The rules below keep the published
+tree correct and readable; the maintainers' operational notes live outside the repository.
 
 ## The lines of work and where their code lives
 
 | line | source of truth | how a change ships |
 |---|---|---|
-| DeepSeek-V4.1-Flash on 4× RTX PRO 6000 (active) | `tools/dsv41_sm120/` + `Dockerfile.sm120-dsv41-nightly` | a numbered Dockerfile step: an anchored patcher, a kernel with its op-level test, a build arg and a `com.vllm-moet.*` label, a runtime switch (`VLLM_MOET_*`, off by default until validated); `cubit_gate.py` on the built image; the step's row in `docs/dsv41-sm120.md` and `tools/dsv41_sm120/README.md` |
-| MoET hybrid on 4× RTX 5090 | `tools/dsv41_5090/` + the Dockerfile's CPU-tier step, `docker/sm120/run-dsv41-5090.sh` | the same; identity against the all-resident path is the gate |
-| 2-bit experts on vLLM v0.24.0 (frozen) | the vllm fork branch `moet-v0.24.0`; `patch/` is **generated** from it | the procedure below — never the patch file |
+| DeepSeek-V4.1-Flash on 4× RTX PRO 6000 | `tools/dsv41_sm120/` + `Dockerfile.sm120-dsv41-nightly` | a numbered Dockerfile step: an anchored patcher, a kernel with its op-level test, a build arg and a `com.vllm-moet.*` label, a runtime switch (`VLLM_MOET_*`, off by default until validated); `cubit_gate.py` on the built image; the step's row in `docs/dsv41-sm120.md` and `tools/dsv41_sm120/README.md` |
+| MoET hybrid on 1–4× RTX 5090 | `tools/dsv41_5090/` (index in its README) + the Dockerfile's steps 43 (CPU tier) and 44 (Engram v2), `docker/sm120/run-dsv41-5090.sh` | the same; identity against the all-resident path (`DEBUG_COMPACT=1` in a `tp4_window.sh` boot) is the gate, at every TP and RAM tier a change touches |
+| 2-bit experts on vLLM v0.24.0 (frozen) | the fork branch `moet-v0.24.0` of [`kacper-daftcode/vllm-tmp`](https://github.com/kacper-daftcode/vllm-tmp); `patch/` is **generated** from it | the procedure below — never the patch file |
 | Qwen3.8-Flash-Next-FP8 | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` | as the first line |
+| Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000 | `tools/ripple_sm120/` + `Dockerfile.sm120-ripple` (+ `tools/dsv41_sm120/p2p_ar/`, shared) | as the first line; steps numbered from 0 (the vLLM wheel) |
 
 ## The iron rule
 
-`patch/vllm-moet-v0.24.0.patch` is a **generated artifact**: byte-for-byte
-`git diff v0.24.0 moet-v0.24.0` from the vllm fork clone. It is **never
-edited by hand**, never patched incrementally, never regenerated from
-anything but the fork branch. The only sanctioned way to change it:
+`patch/vllm-moet-v0.24.0.patch` is a **generated artifact**: byte-for-byte `git diff v0.24.0
+moet-v0.24.0` from the fork branch. It is **never edited by hand**, never patched incrementally,
+never regenerated from anything but the fork branch. The only sanctioned way to change it:
 
 ```bash
 python3 tools/check_patch_files.py --update
 ```
 
-If your change touches vLLM code, it goes to the **fork branch first**; the
-patch is derived afterwards. A change that exists only inside the patch file
-WILL be erased by somebody's next regeneration.
-
-## The two repos on this box
-
-| repo | path | branch | role |
-|---|---|---|---|
-| **vLLM-Moet** (this one, public) | `/workspace/vllm-moet` | `main` | publication: generated patch, kernels + cubins, bench system, docs |
-| **vllm fork clone** | `/workspace/vllm-v0.24.0` | `moet-v0.24.0` | **source of truth for ALL vLLM code**; remotes: `fork` = `kacper-daftcode/vllm-tmp` (standalone — the old GitHub fork `kacper-daftcode/vllm` was deleted, replaced 2026-08-10), `origin` = `vllm-project/vllm` |
-
-`/root/workspace` used to be a symlink to `/workspace`; it was **removed
-2026-08-07** (IDE workspace scans followed it into 4.3 TB and choked the
-sessions). Always use `/workspace` paths directly. Upstream-PR branches
-and experiments live in worktrees off the same clone
-(`git -C /workspace/vllm-v0.24.0 worktree list`).
-
-`moet-v0.24.0` is the ship lineage: everything committed there is meant to
-ship in the next patch regen. Park half-done work on a side branch or
-worktree, not on `moet-v0.24.0`.
+If your change touches vLLM code of the 2-bit line, it goes to the **fork branch first**; the patch
+is derived afterwards. A change that exists only inside the patch file will be erased by the next
+regeneration.
 
 ## Where a change goes
 
 | change | commit where | must also update |
 |---|---|---|
-| vLLM runtime code (`moe_w2_*`, loaders, runner, attention, …) | fork branch `moet-v0.24.0` | regen the patch here — procedure below |
+| vLLM runtime code of the 2-bit line | fork branch `moet-v0.24.0` | regenerate the patch here — procedure below |
+| a kernel-side change of the other lines | the line's `tools/<line>/` + a Dockerfile step | the switch row in the line's doc, the tools README, `CHANGELOG.md` when an image ships |
 | SASS kernels / cubins | `kernels/` | a `kernels/MANIFEST.md` row (generator + validation status) |
 | serve configs | `bench/recipes/` | `bench/models.yaml`, `bench/matrix.yaml`; run `bench/runner/lint.py` |
 | bench results | `bench/results/<release>/` | `bench/runner/render.py` — the tables in `docs/v024-2bit.md` and the per-release report are **generated**; never hand-edit the marked blocks |
 | docs | `docs/` (one doc per line + `docs/benchmarks/` records), `README.md` | — |
-| session notes / handoffs / experiment logs / coordination | `internal/` (gitignored, its own private repo) | never into `docs/` |
+| session notes, experiment logs, hand-offs, coordination, deployment specifics | **not in this repository** | — |
 
-Public docs are reference, not a journal: present tense, no dates outside
-`CHANGELOG.md` and `docs/benchmarks/`, no host paths, no session letters, no
-`internal/` references, one place per fact (a switch is described in the
-switch table of its line's doc and nowhere else). A measurement worth keeping
-is a record in `docs/benchmarks/<topic>-<date>.md`; the reasoning behind a
-change is a paragraph in `docs/<line>-internals.md`, not a dated section.
+## Documentation is reference, not a journal
 
-Never commit: wheels (`patch/*.whl` is ignored), checkpoints, expert packs,
-smoke results (`bench/results/smoke/`).
+Public docs describe what the code does, how to run it and what was measured — in the present
+tense, with the method next to every number. They do not carry: dates or times of deployments,
+decision narratives ("decided", "approved", who asked for what), session letters or names, machine
+names, host paths, deployment addresses, references to private notes, or "next session" plans.
+A measurement worth keeping is a record in `docs/benchmarks/<topic>-<date>.md`; the reasoning behind
+a design is a paragraph in the line's internals doc, not a dated section. One place per fact: a switch
+is described in the switch table of its line's doc and nowhere else. The same applies to comments and
+docstrings in code and to commit messages.
 
-## Shipping a vLLM code change — the procedure
+`python3 tools/docs_lint.py` enforces the mechanical part (host paths, session jargon, deployment
+narrative, private references, broken links, `py_compile`, `bash -n`); CI runs it on every push and
+it must pass before one.
 
-1. **Commit on the fork branch** (`/workspace/vllm-v0.24.0`,
-   `moet-v0.24.0`). If the remote may have moved, fetch and merge first —
-   the regen tool refuses to run when the local branch is missing pushed
-   commits.
-2. **Regenerate** from this repo:
+Never commit: wheels (`patch/*.whl` is ignored), checkpoints, expert packs, smoke results
+(`bench/results/smoke/`).
 
-   ```bash
-   python3 tools/check_patch_files.py --update
-   ```
+## Shipping a vLLM code change on the 2-bit line
 
-   This rewrites the patch from the branch tip and updates the two
-   committed fingerprints: `patch/FILES.txt` (file list) and
-   `patch/SOURCE.txt` (the fork SHA the patch was generated from). It
-   refuses to move `SOURCE.txt` backwards along the branch, so a
-   regeneration can never roll back work that already shipped.
-3. **Review `git diff patch/`.** An entry *vanishing* from `FILES.txt`
-   means the patch carried work that never reached the fork branch —
-   someone skipped step 1. **Stop and merge that work into the branch**;
-   never ship the loss, never `--update` a second time to silence it.
-4. **Validate what the change class requires.** Byte-exact generation from
-   the branch already guarantees `git apply --check` on the tag. For
-   GPU-relevant changes run the relevant suites
-   (`tools/test_moe_w2_forward.py`, `tools/test_store_backends.py`, the
-   three-tier tests) and put the results in the commit message, as the
-   existing history does.
-5. **Commit both repos, cross-referenced.** The vLLM-Moet commit that ships
-   a regen names the fork SHA, following the established style:
+1. **Commit on the fork branch** `moet-v0.24.0`. If the remote may have moved, fetch and merge first —
+   the regen tool refuses to run when the local branch is missing pushed commits.
+2. **Regenerate** from this repo: `python3 tools/check_patch_files.py --update`. This rewrites the patch
+   from the branch tip and updates the two committed fingerprints, `patch/FILES.txt` (file list) and
+   `patch/SOURCE.txt` (the fork SHA the patch was generated from). It refuses to move `SOURCE.txt`
+   backwards along the branch, so a regeneration can never roll back work that already shipped.
+3. **Review `git diff patch/`.** An entry *vanishing* from `FILES.txt` means the patch carried work that
+   never reached the fork branch. Stop and merge that work into the branch; never ship the loss, never
+   `--update` a second time to silence it.
+4. **Validate what the change class requires** (`tools/test_moe_w2_forward.py`,
+   `tools/test_store_backends.py`, the three-tier tests for GPU-relevant changes) and put the verdicts in
+   the commit body.
+5. **Commit both repos, cross-referenced**: the commit that ships a regeneration names the fork SHA.
+6. **Push both together** once the pre-push checklist passes — or leave both unpushed.
 
-   > `Three-tier starvation fix ships: step-scoped seen windows (vllm 9736e4d34)`
+## Several agents, one checkout
 
-6. **Push both together** (`fork moet-v0.24.0` + `origin main`) once the
-   pre-push checklist passes — or leave both unpushed. Avoid a lasting
-   state where only one side is pushed.
-
-## Concurrency — several agents, one checkout
-
-- `git status` before you start. Dirty paths you did not create belong to
-  another live session: **leave them alone**. No `git add -A`, no
-  `git commit -a`, no `git stash`, no `git checkout --` / `git reset` over
-  someone else's files, ever.
+- `git status` before you start. Dirty paths you did not create belong to another live session: leave
+  them alone. No `git add -A`, no `git commit -a`, no `git stash`, no `git checkout --` / `git reset`
+  over someone else's files.
 - Stage **explicit paths only**: `git add <file> <file> …`.
-- `main` and `moet-v0.24.0` are shared trunks: no amending commits you did
-  not just create, no rebase, no force-push, no history rewrite.
-- The `patch/` trio (patch, `FILES.txt`, `SOURCE.txt`) changes **only** via
-  `--update`. If your commit would touch any of them for another reason,
-  you are doing something wrong.
-- **Hardware is shared too, and a written claim is not a lock.** Two sessions
-  landed on the same GPU 48 s apart on 2026-07-25 because both had surveyed
-  free cards minutes earlier. Re-check `docker ps` and `nvidia-smi` **in the
-  same command that launches**, and again ~15 s after the container is up; if
-  a foreign container holds your GPU, **whoever started later kills their
-  own**. The rule caught the next collision the same day, at the preflight,
-  with no container created.
-- Name containers with a per-session prefix so ownership is readable straight
-  from `docker ps`, and never remove another session's container — dump its
-  log first even when it is your own, because a crashed engine's stack trace
-  lives only there.
-- Long-lived cross-session state (who holds what, findings that change how the
-  other session should read its numbers) goes in an `internal/COORDINATION_*.md`
-  with an append-only message log. Read it when you start a work block.
-- A pre-commit hook in this checkout runs the patch guard whenever `patch/`
-  is staged. Do not bypass it with `--no-verify`.
-- Commit identity: no global git identity is configured on this box —
-  pass the session identity per command, matching the existing history:
+- `main` and `moet-v0.24.0` are shared trunks: no amending commits you did not just create, no rebase,
+  no force-push, no history rewrite.
+- The `patch/` trio (patch, `FILES.txt`, `SOURCE.txt`) changes **only** via `--update`. The pre-commit
+  hook runs the patch guard whenever `patch/` is staged; do not bypass it with `--no-verify`.
+- Shared GPUs: re-check `docker ps` and `nvidia-smi` in the same command that launches a container, name
+  containers with a per-session prefix, and never remove another session's container.
 
-  ```bash
-  git -c user.name=vllm-moet -c user.email=moet@local commit ...
-  ```
-
-  Upstream PRs use the user's public identity + DCO instead — see
-  `internal/UPSTREAM_PRS.md`. Never edit git config.
-
-## Pre-push checklist (mirrors CI `bench-lint`)
+## Pre-push checklist (mirrors CI)
 
 ```bash
 python3 tools/check_patch_files.py       # patch <-> FILES.txt <-> SOURCE.txt
@@ -149,31 +96,13 @@ python3 bench/runner/lint.py             # recipes/boxes/suites/results schemas
 python3 bench/runner/lint.py --release current  # strict live release gate
 python3 -m unittest discover -s bench/tests -p 'test_*.py' -v
 python3 bench/runner/render.py --check   # docs/v024-2bit.md tables == committed results
+python3 tools/docs_lint.py               # public-tree hygiene
 ```
 
-Plus `python3 docker/serve_recipe.py <recipe> --print` if you touched
-recipes or the launcher.
-
-## The incidents these rules come from
-
-- **Kimi-K2.7 bring-up** — landed in the patch without its commits reaching
-  the fork branch; the next regeneration erased it; caught by hand, folded
-  back in `81c1b34`.
-- **DSpark backport** — `ad7f29a` regenerated from a branch that lacked the
-  DSpark line and silently dropped it; repaired by merging DSpark *into the
-  generating branch* and regenerating the union (`8aff1b7`).
-- **Stream-build hunks** — lost to a merge-side resolution inside the patch
-  file; restored by hand in `8f50e57`. Hunk-level losses inside an
-  unchanged file set are invisible to `FILES.txt` — that class is what the
-  `SOURCE.txt` byte-verification catches.
-
-**A failing guard means work would be lost.** The fix is always to move the
-work onto the fork branch — never to edit the patch, `FILES.txt` or
-`SOURCE.txt` into agreement.
+Plus `python3 docker/serve_recipe.py <recipe> --print` if you touched recipes or the launcher.
 
 ## Commit style
 
-Match `git log`. Subject: declarative, what ships / what changed, no
-prefixes. Body: the why, the evidence (measured numbers, test verdicts),
-and for regens the fork SHA. On the fork branch, upstream-style component
-prefixes are fine (`DCP DSA indexer: …`).
+Subject ≤ 72 characters, declarative, what changed (`Ripple: two-microbatch decode for TP (step 3)`).
+The body carries the why and the evidence — measured numbers with their configuration, test verdicts,
+the fork SHA for a regeneration. No timestamps, no deployment narrative, no session letters.

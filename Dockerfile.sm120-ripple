@@ -1,0 +1,87 @@
+# vLLM-Moet: Ripple-65B Preview (ricursiveAI; ModelOpt NVFP4 MLPs, BF16 attention / embeddings / lm_head) on sm_120
+# (4x RTX PRO 6000 Blackwell), TP4, with the DFlash2 drafter. Launcher: docker/sm120/run-ripple.sh; docs: docs/ripple-sm120.md.
+#
+# The official vllm/vllm-openai nightly a2bcb565 (torch 2.14.0+cu130, FlashInfer 0.7.2) predates
+# RicursiveForCausalLM: vllm#65745 (the model, the `ripple` reasoning / tool-call parsers, the DFlash2 draft with NoPE
+# layers) merged as 03bd3c68, 56 commits after the base with no change under requirements/. Step 0
+# replaces the base's vllm package with the per-commit wheel of 03bd3c68 from wheels.vllm.ai (--no-deps: the pins are
+# the base's; the compiled _C / _moe_C / cumem ops come with the wheel, built against the same torch). The base's Rust
+# frontend binary stays at a2bcb565 and is not used (Python frontend).
+#
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-ripple -t vllm-moet-sm120:ripple-nightly-a2bcb565-r6 .
+#   MODEL_DIR=/srv/models/Ripple-65B-Preview-NVFP4 DRAFT_DIR=/srv/models/Ripple-65B-Preview-DFlash2 docker/sm120/run-ripple.sh
+#
+# Steps are numbered like Dockerfile.sm120-dsv41-nightly's (a build arg each, a com.vllm-moet.ripple.* label the launcher
+# and the tests read); the sm_120 kernels for this line go to tools/ripple_sm120/ as they are measured in.
+
+ARG BASE_IMAGE=vllm/vllm-openai:nightly-a2bcb5657a881a002e79d0adab3c6b5e39436121@sha256:bd419f1669b420e7dfcfa2545a9f3b05c2312c858a215b1f287284d7398d3367
+FROM ${BASE_IMAGE}
+
+# 0. vLLM at 03bd3c68 (Ripple support) on a base that predates it: the per-commit wheel, its sha256 pinning the bytes
+#    (VLLM_MOET_RIPPLE_STEP0_WHEEL=1, the a2bcb565 base). On a base that has Ripple natively (nightly-4fab5a07 of
+#    2026-11-06 and later: vLLM 0.33.0rc1.dev910+, FlashInfer 0.7.3) build with --build-arg VLLM_MOET_RIPPLE_STEP0_WHEEL=0
+#    and the new BASE_IMAGE; the registry check below runs either way and fails the build if the architecture, the
+#    parsers or the draft class are missing (the CUDA ops library needs libcuda, which docker build has not: the first
+#    GPU start loads it - tools/ripple_sm120/image_check.sh).
+ARG VLLM_MOET_RIPPLE_STEP0_WHEEL=1
+ARG VLLM_COMMIT=03bd3c68487fe2b957058ab2ce4bc5212a91aa89
+ARG VLLM_WHEEL=vllm-0.33.0rc1.dev862+g03bd3c684-cp38-abi3-manylinux_2_28_x86_64.whl
+ARG VLLM_WHEEL_URL=https://wheels.vllm.ai/03bd3c68487fe2b957058ab2ce4bc5212a91aa89/vllm-0.33.0rc1.dev862%2Bg03bd3c684-cp38-abi3-manylinux_2_28_x86_64.whl
+ARG VLLM_WHEEL_SHA256=eb9fc1d9248c4815088da8b24a1c5f7fa99af994597b7d0856e2808f6e850c1d
+RUN if [ "$VLLM_MOET_RIPPLE_STEP0_WHEEL" = "1" ]; then curl -fsSL -o /tmp/${VLLM_WHEEL} "${VLLM_WHEEL_URL}" \
+    && echo "${VLLM_WHEEL_SHA256}  /tmp/${VLLM_WHEEL}" | sha256sum -c - \
+    && uv pip install --system --no-deps /tmp/${VLLM_WHEEL} && rm -f /tmp/${VLLM_WHEEL} \
+    && python3 -c "import vllm; assert vllm.__version__.startswith('0.33.0rc1.dev862'), vllm.__version__; print('vllm', vllm.__version__)"; fi \
+    && python3 -c "from vllm.model_executor.models.registry import ModelRegistry as R; a = R.get_supported_archs(); assert 'RicursiveForCausalLM' in a and 'DFlash2RicursiveDraftModel' in a, sorted(x for x in a if 'icursive' in x); import vllm.parser.ripple, vllm.model_executor.models.ricursive_dflash2, vllm.transformers_utils.configs.ricursive; print('RicursiveForCausalLM + DFlash2RicursiveDraftModel registered, ripple parser importable')" \
+    && python3 -c "import os, torch, vllm; d = os.path.dirname(vllm.__file__); so = [f for f in os.listdir(d) if f.endswith('.abi3.so')]; assert {'_C_stable_libtorch.abi3.so', '_moe_C_stable_libtorch.abi3.so', 'cumem_allocator.abi3.so'} <= set(so), so; print('vllm', vllm.__version__, 'torch', torch.__version__, 'ops present:', sorted(so))"
+
+ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
+COPY tools/ripple_sm120/ /opt/vllm-moet/ripple_sm120/
+COPY tools/dsv41_sm120/p2p_ar/ /opt/vllm-moet/dsv41_sm120/p2p_ar/
+
+# 1. The TP group's all-reduces on the sm_120 P2P push with NCCL's summation order (runtime switch VLLM_MOET_P2P_AR=1,
+#    default off): the DeepSeek line's p2p_ar module (step 23 there; H = 5120 = Ripple's d_model, so the extension name
+#    and flags are the shipped ones) behind a generic hook in GroupCoordinator._all_reduce_out_place - 160 all-reduces per
+#    decode step on 80 dense layers + the drafter's 10, all on PyNCCL otherwise (vLLM's custom all-reduce refuses >2 PCIe
+#    GPUs). The extension is compiled here so the first serving call does not build it. Served with
+#    VLLM_MOET_P2P_AR_M_MAX=128 VLLM_MOET_P2P_AR_MAX_ROWS=128: the push wins up to ~128 rows (C8 x k11 = 96), NCCL is
+#    faster at 256 rows (C32 x k7) - measured on rtx, docs/ripple-sm120.md.
+ARG VLLM_MOET_RIPPLE_P2P_AR_PATCH=1
+RUN if [ "$VLLM_MOET_RIPPLE_P2P_AR_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_p2p_allreduce_tp_sm120.py \
+    && python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/p2p_ar'); import p2p_allreduce_sm120 as m; e = m._build(); assert hasattr(e, 'all_reduce_twoshot') and hasattr(e, 'push'); print('sm120 P2P all-reduce extension built')" \
+    && python3 -c "import vllm.distributed.parallel_state as p; assert hasattr(p, '_moet_p2p_try_all_reduce'); print('TP all-reduce hook patched')" \
+    && ls /opt/vllm-moet/torch_extensions/p2p_allreduce_sm120/*.so; fi
+
+# 2. The DFlash2 drafter drafts the step's k under the dynamic schedule (num_speculative_tokens_per_batch_size) instead
+#    of the maximum: 1 + k query rows per request through its 5 layers (the grouped convolutions read each row's offset
+#    in its request's block from the speculator instead of row % 16), k sample rows, (1 + k) x requests context rows,
+#    CUDA graphs per query width as the target's. The greedy output is the target's argmax whatever the drafter
+#    proposes (parity identical). Measured: +6.5 % at 32 requests (code 4738 -> 5045 tok/s, the static-k7 level with
+#    k 15 kept at 1 request), the same at 1-8. No runtime switch: without a schedule every step has k = N as before.
+ARG VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH=1
+RUN if [ "$VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_dflash_dynamic_k_sm120.py \
+    && python3 -c "from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import DFlash2Speculator as S; assert S._dynamic_query_width is True and 'load_draft_model' in S.__dict__; import vllm.model_executor.models.qwen3_dflash2 as m; assert 'offsets' in m.dflash2_grouped_conv_impl.__code__.co_varnames; print('DFlash2 dynamic-k patch importable')"; fi
+
+# 3. Two-microbatch decode for TP without DP (vLLM's DBO machinery unlocked for a dense TP model: one half's TP
+#    all-reduces on the comm stream under the other half's GEMMs), behind VLLM_MOET_DECODE_UBATCH=2 at runtime (default
+#    off: the image behaves as -r4). Measured on rtx at 32 requests: +4-5 % steps/s - the all-reduce hides completely,
+#    but the decode GEMMs are weight-bandwidth-bound, so two halves of 128 rows cost what one batch of 256 does
+#    (docs/ripple-sm120.md). The patcher also gives the p2p_ar module's _run an `out` argument.
+ARG VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH=1
+RUN if [ "$VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_decode_ubatch_tp_sm120.py \
+    && python3 -c "import vllm.distributed.parallel_state as p; assert hasattr(p, '_moet_dbo_all_reduce'); import vllm.v1.worker.gpu_worker as w; assert hasattr(w, '_moet_maybe_enable_decode_ubatching'); print('TP decode microbatching patched (runtime VLLM_MOET_DECODE_UBATCH=2)')"; fi
+
+ARG VLLM_COMMIT
+ARG VLLM_MOET_RIPPLE_STEP0_WHEEL
+ARG VLLM_MOET_RIPPLE_P2P_AR_PATCH
+ARG VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH
+ARG VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH
+ARG BASE_IMAGE
+LABEL org.opencontainers.image.title="vLLM-Moet Ripple-65B Preview SM120 (vLLM main)" \
+      org.opencontainers.image.description="Ripple-65B Preview on sm_120: vllm/vllm-openai nightly a2bcb565 with vLLM 03bd3c68 (vllm#65745: RicursiveForCausalLM, ripple parsers, DFlash2 draft) and the sm_120 steps of vLLM-Moet (docs/ripple-sm120.md)" \
+      com.vllm-moet.ripple.vllm-commit="${VLLM_COMMIT}" \
+      com.vllm-moet.ripple.base="${BASE_IMAGE}" \
+      com.vllm-moet.ripple.step0-wheel="${VLLM_MOET_RIPPLE_STEP0_WHEEL}" \
+      com.vllm-moet.ripple.p2p-ar="${VLLM_MOET_RIPPLE_P2P_AR_PATCH}" \
+      com.vllm-moet.ripple.dflash-dynk="${VLLM_MOET_RIPPLE_DFLASH_DYNK_PATCH}" \
+      com.vllm-moet.ripple.decode-ubatch="${VLLM_MOET_RIPPLE_DECODE_UBATCH_PATCH}"

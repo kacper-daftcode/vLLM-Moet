@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Watchdog for the served DeepSeek-V4.1 container (and the Qwen3.8 one) on the serving host. The containers run with
-# --restart no on purpose (maintenance windows stop and replace them), so a crash - the host's OOM killer took the
-# production worker on 2026-10-14 23:02Z while a second server was starting - stayed unnoticed for 14 hours. Run from
-# cron every minute:
-#   * * * * * /bin/bash /mnt/k3x/vllm-moet/docker/sm120/ds41-watchdog.sh >> /mnt/k3x/logs/watchdog.log 2>&1
+# --restart no on purpose (maintenance windows stop and replace them), so a crash - e.g. the host's OOM killer taking
+# a worker while a second server starts - would otherwise stay unnoticed for hours. Run from cron every minute:
+#   * * * * * WRAPPER_DIR=/srv/ds41 LOG_DIR=/srv/ds41/logs /bin/bash /srv/vllm-moet/docker/sm120/ds41-watchdog.sh >> /srv/ds41/logs/watchdog.log 2>&1
 # What it does, per container:
 #   - not running (exited / dead / missing) -> saves its log and `docker inspect` to LOG_DIR (<name>-crash-<UTC>.log),
 #     renames it <name>-crash-<UTC> (the log stays readable with `docker logs`), starts a new one with the wrapper
@@ -24,7 +23,7 @@ STATE_DIR="${STATE_DIR:-$WRAPPER_DIR/.watchdog}"
 MAINTENANCE="${MAINTENANCE:-$WRAPPER_DIR/MAINTENANCE}"
 NAME="${NAME:-ds41-flash}"; PORT="${PORT:-8001}"
 QWEN="${QWEN:-qwen38}"; QWEN_PORT="${QWEN_PORT:-8000}"
-STARTUP_GRACE_MIN="${STARTUP_GRACE_MIN:-35}"   # a DeepSeek start takes 17-25 min on this host
+STARTUP_GRACE_MIN="${STARTUP_GRACE_MIN:-35}"   # a DeepSeek start takes 17-25 min on 4x RTX PRO 6000
 PROBE_FAILS="${PROBE_FAILS:-3}"
 COOLDOWN_MIN="${COOLDOWN_MIN:-30}"
 MAX_RESTARTS="${MAX_RESTARTS:-3}"              # per 6 h, per container

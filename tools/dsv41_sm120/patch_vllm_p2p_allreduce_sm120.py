@@ -5,7 +5,7 @@ Where: the three all-reduce sites of the overlap path (step 10) in vllm/models/d
 the sublayer boundary in front of mhc_post_norm, the Engram layers' post, the last layer's post. The module p2p_ar/
 (p2p_allreduce_sm120.cu + .py) picks by shape: rows <= VLLM_MOET_P2P_AR_ONESHOT_MAX_ROWS (default 0) one-shot push,
 rows <= VLLM_MOET_P2P_AR_MAX_ROWS (default 64) two-shot (reduce-scatter + all-gather, each phase to one peer at a time -
-on this host a kernel writing to several peers concurrently is ~16x slower), anything else and every failure NCCL.
+on 4 PCIe GPUs a kernel writing to several peers concurrently is ~16x slower), anything else and every failure NCCL.
 The sum is taken in fixed source order in fp32 and rounded once, so the result is deterministic and identical on every
 rank - but its bits differ from NCCL's ring order: an output change, gated like every all-reduce change (GSM8K-200 at
 concurrency 4 exercises the two-shot path, needle, tools).
