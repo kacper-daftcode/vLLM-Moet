@@ -20,6 +20,12 @@ skips the front-end's rows quant stage and feeds FC1 the given rows (the same by
 FlashInfer's mxfp8 quantizer, see sp_moe_gather/test_prefill_sp_gather_tp4.py). `prequant_rows_supported()` tells whether the
 built extension has that entry; without it the caller must pass bf16 rows. VLLM_MOET_B12X_MOE_PREFILL_FAST_NAME overrides the
 extension's build name (a kernel variant next to the image's prebuilt one).
+
+v9 (K-4): the producer-warp kernels (one warp issues the TMA / cp.async copies, 8 consumer warps never stop for a barrier or
+address work; bit-identical to v8 by the harness) are selected per kernel by VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1 (fc1) /
+_WS2 (fc2): 0 = v8 (default), a mode = the ring (stages, CTAs per SM) - see the .cu; measured best fc1 2 (6 stages, 1 CTA/SM,
+-4 % at 4096 rows), fc2 3 (4 stages, 2 CTAs/SM, -16 %); fc1 below _WS1_MIN_ROWS (256) rows stays on v8 (the 128-row replay
+layers are at the DRAM floor).
 """
 from __future__ import annotations
 
