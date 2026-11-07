@@ -1742,6 +1742,366 @@ __global__ void __launch_bounds__(8 * MH * 32 + 32 * kFc1Producers, MINB) fc1_ke
   }
 }
 
+// ------------------------------------------------------------------- 5b. v10: fc1 as three warpgroups with setmaxnreg (K-5, 7.11)
+// The v9 skeleton's fc1 problem (K/REPORT.md §6.2.3 / §6.2.6, ncu §7.1): the fc1 consumer wants ~110-150 registers, so 9- or
+// 10-warp CTAs fit two per SM only at 96 registers (spills) and one CTA per SM leaves 2 consumer warps per SM sub-partition
+// (tensor pipe 58 % vs v8's 64 %). Here the CTA is 12 warps = 3 warpgroups: warps 0-7 consumers (v8's retile, all 4 m-tiles
+// of an n16 slice), warps 8-11 producers. Launched for 2 CTAs/SM (80 registers per thread, 2 x 384 x 80 = 61 440), the
+// producer warpgroup gives registers back (`setmaxnreg.dec 32`) and the consumer warpgroups take them (`setmaxnreg.inc 104`:
+// 128 x 32 + 256 x 104 = 30 720 = 384 x 80 exactly). 16 consumer warps per SM = 4 per sub-partition as v8, without v8's
+// barrier + issue phase (ncu: barrier + mio_throttle = 24 % of v8's stall cycles) and without the 96-register spills.
+// Producers: warp 8 = the A rows of m-tiles 0-1 + the scale words of rows 0-31 + the item hand-off (ProducerNext, published to
+// the other producers through bar_meta), warp 9 = A m-tiles 2-3 + scale rows 32-63, warps 10 / 11 = B projection 0 / 1 + its
+// column scales (8 + 1 cp.async16 per lane per stage). A is copied with 8-B cp.asyncs into a fragment-order layout the
+// consumer reads with one LDS.128 per (m-tile, k32): [mt][kk][q][c][row q words 2c, 2c+1 | row q + 8 words 2c, 2c+1] =
+// (a0, a2, a1, a3) - the same four words as v8's LDS.128 / v9's two LDS.64, in a 16-B unit that 8-B copies can fill (v8's word
+// interleave needs 4-B copies: 32 per lane per stage, the v9a limit). The LDGSTS writes are bank-conflict-free: a half-warp
+// covers (q & 1, c, row half) once each. Bits: the QMMA chain, operands and epilogue are v8's; only the copy issue and the
+// stage hand-off differ (harness). Design note: /workspace/tmp/par31/K/k5/DESIGN_v10_setmaxnreg.md.
+constexpr int kWgThreads = 384;        // 8 consumer warps + 4 producer warps
+constexpr int kWgConsumers = 8;
+constexpr int kWgProducers = 4;
+constexpr int kWgRegsProducer = 32;    // setmaxnreg.dec (multiple of 8, >= 24)
+constexpr int kWgRegsConsumer = 104;   // setmaxnreg.inc: (384 x 80 - 128 x 32) / 256
+
+__device__ __forceinline__ void cp_async8_zfill(uint32_t dst, const void* src, int src_bytes) {
+  asm volatile("cp.async.ca.shared.global [%0], [%1], 8, %2;\n" ::"r"(dst), "l"(src), "r"(src_bytes) : "memory");
+}
+template <int N>
+__device__ __forceinline__ void setmaxnreg_inc() { asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(N)); }
+template <int N>
+__device__ __forceinline__ void setmaxnreg_dec() { asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(N)); }
+// mbarrier wait with a suspend-time hint: the thread sleeps until the phase completes (or the hint expires) instead of spinning
+// on try_wait - the v9 / v10a producers spin on `empty` most of the time and take issue slots from the consumers (ncu: branch_resolving
+// 0.75-1.2 warps per issue cycle, m8 50 % issue-busy). The hint is CUTLASS's ClusterBarrier::wait value (10 ms).
+__device__ __forceinline__ void mbar_wait_sleep(uint32_t bar, uint32_t parity) {
+  asm volatile(
+      "{\n.reg .pred p;\n"
+      "WAIT_%=:\n"
+      "mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1, %2;\n"
+      "@!p bra WAIT_%=;\n"
+      "}\n" ::"r"(bar), "r"(parity), "r"(0x989680u) : "memory");
+}
+
+// the v10 A fragment unit of (m-tile, k32 block kk, quad row q, c): 16 B at mt * 1024 + kk * 512 + q * 64 + c * 16
+__device__ __forceinline__ uint32_t a10_frag(int mt, int kk, int q, int c) { return (uint32_t)(mt * 1024 + kk * 512 + q * 64 + c * 16); }
+
+// A producer warp w (0 / 1 = m-tiles 2w, 2w + 1): instruction i (0..7) copies the k64 of the four rows {2p, 2p + 1, 2p + 8, 2p + 9}
+// (p = i & 3) of m-tile 2w + (i >> 2) as 32 x 8 B: lane = (kk = lane >> 4, j = (lane >> 2) & 3 -> row half hi = j >> 1, q = 2p + (j & 1),
+// c = lane & 3). Global: each row's 64 B by 8 lanes (2 sectors); shared: a half-warp writes 16 distinct bank pairs.
+struct WgRows {
+  uint32_t a[8];  // the lane's row offset per instruction (0xFFFFFFFF: padding / tile >= m_tiles)
+  uint32_t sf;    // the scale row 32w + lane
+  __device__ __forceinline__ void load(const uint32_t* aoff64, int w, int lane) {
+    const int j = (lane >> 2) & 3, hi = j >> 1, qo = j & 1;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) a[i] = aoff64[(2 * w + (i >> 2)) * 16 + hi * 8 + 2 * (i & 3) + qo];
+    sf = aoff64[32 * w + lane];
+  }
+};
+__device__ __forceinline__ void wg_copy_a(uint32_t sb_a, const uint8_t* a_base, const WgRows& rows, int w, int t, int lane) {
+  const int kk = lane >> 4, j = (lane >> 2) & 3, hi = j >> 1, qo = j & 1, c = lane & 3;
+  const uint32_t stage_off = (uint32_t)(t * 64 + kk * 32 + c * 8);
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    const uint32_t off = rows.a[i];
+    const bool on = off != 0xFFFFFFFFu;
+    // the source address as base + one 32-bit sum (wrapping): ptxas cannot hoist eight 64-bit row pointers out of the stage loop
+    // (at 32 registers it spilled them and reloaded five per stage)
+    cp_async8_zfill(sb_a + a10_frag(2 * w + (i >> 2), kk, 2 * (i & 3) + qo, c) + hi * 8, a_base + ((on ? off : 0u) + stage_off), on ? 8 : 0);
+  }
+}
+
+template <int STAGES, int MINB>
+__global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
+  constexpr int NCW = kWgConsumers;
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ ItemRing ring;
+  __shared__ __align__(8) uint64_t bar_full[STAGES], bar_empty[STAGES];
+  __shared__ __align__(8) uint64_t bar_meta[2];  // producer 8 -> producers 9-11: ring.meta[slot] / aoff[slot] of the next item are written
+  __shared__ float s_amax[4][NCW][16];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int K = a.K, n_stages = K / 64;
+  const uint32_t sbase0 = smem_addr(smem);
+  const int n_items = a.counts[1];
+  if (tid < STAGES) {
+    mbar_init(smem_addr(&bar_full[tid]), 32 * kWgProducers + 1);  // every producer lane's cp.async arrive + producer 8 lane 0's release arrive
+    mbar_init(smem_addr(&bar_empty[tid]), NCW);
+  }
+  if (tid < 2) mbar_init(smem_addr(&bar_meta[tid]), 1);
+  if (warp == NCW) {  // the first item straight from global memory
+    int4 m = make_int4(0, 0, 0, 0);
+    const int item = blockIdx.x;
+    if (item < n_items) {
+      const int w = lane < 4 ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + lane) : 0;
+      m = make_int4(__shfl_sync(0xffffffffu, w, 0), __shfl_sync(0xffffffffu, w, 1), __shfl_sync(0xffffffffu, w, 2),
+                    __shfl_sync(0xffffffffu, w, 3));
+    }
+    const int rows = m.z * 16;
+    const int p0 = lane < rows ? __ldg(a.row_pair + m.y + lane) : -1;
+    const int p1 = lane + 32 < rows ? __ldg(a.row_pair + m.y + lane + 32) : -1;
+    if (lane == 0) ring.meta[0] = m;
+    ring.pairs[0][lane] = p0;
+    ring.pairs[0][lane + 32] = p1;
+    ring.aoff[0][lane] = p0 >= 0 ? (uint32_t)(p0 / a.topk) * (uint32_t)K : 0xFFFFFFFFu;
+    ring.aoff[0][lane + 32] = p1 >= 0 ? (uint32_t)(p1 / a.topk) * (uint32_t)K : 0xFFFFFFFFu;
+  }
+  __syncthreads();  // barriers initialised, item 0 in the ring; from here on the roles only meet through the barriers
+
+  if (warp >= NCW) {
+    // ================================================================================ the producer warpgroup (warps 8-11)
+    if constexpr (MINB >= 2) setmaxnreg_dec<kWgRegsProducer>();
+    const int role = warp - NCW;  // 0 / 1: A m-tiles (2 role, 2 role + 1) + scale rows 32 role..; 2 / 3: B projection role - 2
+    const uint32_t wproj_b = (uint32_t)kN * (K / 32) * 16;
+    const uint32_t sproj_b = (uint32_t)kN * (K / 32);
+    RingPos pos;
+    int round0 = STAGES, k = 0;
+    if (role == 0) {
+      const int claim_at = n_stages - 10;
+      const auto aoff_of = [&](int pair) { return (uint32_t)(pair / a.topk) * (uint32_t)K; };
+      const auto meta_extra = [&](int d, int nb, int, int) {
+        if (d == 6) {
+          __syncwarp();  // every lane's ring writes precede lane 0's release arrive
+          if (lane == 0) mbar_arrive(smem_addr(&bar_meta[nb]));
+        }
+      };
+      const uint8_t* a_base = reinterpret_cast<const uint8_t*>(a.a_values);
+      int item = blockIdx.x;
+      ProducerNext nx;
+      while (true) {
+        const int4 it = ring.meta[k & 1];
+        if (it.z == 0) {  // no item: one more phase of `full` so that the consumers read the terminator, then leave
+          if (round0 == 0) mbar_wait_sleep(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
+          __syncwarp();
+          if (lane == 0) mbar_arrive(smem_addr(&bar_full[pos.buf]));
+          cp_async_mbar_arrive_noinc(smem_addr(&bar_full[pos.buf]));
+          break;
+        }
+        const int slot = k & 1, nb = slot ^ 1;
+        WgRows rows;
+        rows.load(ring.aoff[slot], 0, lane);
+#pragma unroll 1
+        for (int t = 0; t < n_stages; ++t) {
+          if (round0 > 0) --round0;
+          else mbar_wait_sleep(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
+          const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
+          producer_stage_next(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 3, a.dynamic_schedule,
+                              aoff_of, meta_extra);
+          __syncwarp();  // the ring writes of this stage (if any) precede lane 0's release arrive
+          if (lane == 0) mbar_arrive(full);
+          wg_copy_a(sb + kF1B, a_base, rows, 0, t, lane);
+          {
+            const uint32_t off = rows.sf;
+            const bool on = off != 0xFFFFFFFFu;
+            cp_async4_zfill(sb + kF1B + kF1A + lane * 4, a.a_scales + ((on ? off : 0u) >> 5) + (t >> 1) * 4, on ? 4 : 0);
+          }
+          cp_async_mbar_arrive_noinc(full);
+          pos.advance<STAGES>();
+        }
+        item = nx.item;
+        ++k;
+      }
+    } else {
+      const uint8_t* a_base = reinterpret_cast<const uint8_t*>(a.a_values);
+      const int proj = role - 2;
+      while (true) {
+        // producer 8 has written meta[k & 1] (its arrive at d == 6 of item k - 1): bar_meta[s] serves the items k = s, s + 2, ... with
+        // k >= 1, i.e. its phase for item k is ((k - 1) >> 1) & 1 (a fresh barrier returns at once on the other parity: K-4's v9j hang)
+        if (k > 0) mbar_wait_sleep(smem_addr(&bar_meta[k & 1]), (uint32_t)((k - 1) >> 1) & 1u);
+        const int4 it = ring.meta[k & 1];
+        if (it.z == 0) {
+          if (round0 == 0) mbar_wait_sleep(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
+          cp_async_mbar_arrive_noinc(smem_addr(&bar_full[pos.buf]));
+          break;
+        }
+        const int e = it.x, tile = it.w;
+        const bool wide = tile != kN1Tiles - 1;
+        const uint8_t* iss_b = reinterpret_cast<const uint8_t*>(a.w13) + (size_t)e * 2 * wproj_b + (size_t)tile * 128 * (K / 32) * 16 +
+                               (size_t)(proj > 0 ? proj : 0) * wproj_b;
+        const uint8_t* iss_sfb = reinterpret_cast<const uint8_t*>(a.w13_sf) + (size_t)e * 2 * sproj_b + (size_t)tile * 128 * (K / 32) +
+                                 (size_t)(proj > 0 ? proj : 0) * sproj_b;
+        WgRows rows;
+        if (role == 1) rows.load(ring.aoff[k & 1], 1, lane);
+#pragma unroll 1
+        for (int t = 0; t < n_stages; ++t) {
+          if (round0 > 0) --round0;
+          else mbar_wait_sleep(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
+          const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
+          if (role == 1) {
+            wg_copy_a(sb + kF1B, a_base, rows, 1, t, lane);
+            const uint32_t off = rows.sf;
+            const bool on = off != 0xFFFFFFFFu;
+            cp_async4_zfill(sb + kF1B + kF1A + (32 + lane) * 4, a.a_scales + ((on ? off : 0u) >> 5) + (t >> 1) * 4, on ? 4 : 0);
+          } else if (wide) {  // B projection `proj`: 4 KB contiguous per stage + its 512 B of column scales per K128
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+              const uint32_t o = (lane + 32 * i) * 16;
+              cp_async16(sb + proj * 4096 + o, iss_b + (size_t)t * 4096 + o);
+            }
+            cp_async16(sb + kF1B + kF1A + kF1SFA + proj * 512 + lane * 16, iss_sfb + (t >> 1) * 512 + lane * 16);
+          } else {  // the 64-column tile: 2 x 1 KB per projection per stage, 256 B of column scales
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              const uint32_t j = lane + 32 * i, kk = j >> 6, rem = j & 63;
+              cp_async16(sb + proj * 4096 + kk * 2048 + rem * 16, iss_b + (size_t)t * 2048 + kk * 1024 + rem * 16);
+            }
+            if (lane < 16) cp_async16(sb + kF1B + kF1A + kF1SFA + proj * 512 + lane * 16, iss_sfb + (t >> 1) * 256 + lane * 16);
+          }
+          cp_async_mbar_arrive_noinc(full);
+          pos.advance<STAGES>();
+        }
+        ++k;
+      }
+    }
+    cp_async_wait<0>();
+    return;
+  }
+
+  // ================================================================================ the consumer warpgroups (warps 0-7): v8's compute + epilogue
+  if constexpr (MINB >= 2) setmaxnreg_inc<kWgRegsConsumer>();
+  const int q = lane >> 2, c = lane & 3;
+  RingPos pos;
+  int k = 0;
+  while (true) {
+    mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par);  // stage 0 of item k (or the terminator): meta[k & 1] is published
+    const int4 it = ring.meta[k & 1];
+    const int e = it.x, m_tiles = it.z, tile = it.w;
+    if (m_tiles == 0) break;
+    const bool wide = tile != kN1Tiles - 1;
+    // warp tiling = v8's: 128-column tiles: n16 slice = warp, all m-tiles; the 64-column tile: slice = warp & 3, m-tiles 2 (warp >> 2), +1
+    const int ns16 = wide ? warp : (warp & 3);
+    const int mt_lo = wide ? 0 : 2 * (warp >> 2), mt_hi = wide ? 4 : mt_lo + 2;
+    bool act[4];
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) act[mt] = mt >= mt_lo && mt < mt_hi && mt < m_tiles;  // warp-uniform
+    const float alpha = fmul(__ldg(a.alpha + e), __ldg(a.input_global_scale + (a.igs_per_expert ? e : 0)));
+
+    float acc[4][2][2][4];
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+      for (int p = 0; p < 2; ++p)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int r = 0; r < 4; ++r) acc[mt][p][nt][r] = 0.f;
+
+    const uint32_t a_off = kF1B + a10_frag(0, 0, q, c);                      // + mt * 1024 + kk * 512
+    const uint32_t sfa_off = kF1B + kF1A + (q + ((lane & 1) << 3)) * 4;     // + mt * 64
+    const uint32_t b_off = (ns16 >> 1) * 512 + lane * 16 + (ns16 & 1) * 8;  // + p * 4096 + kk * 2048
+    const uint32_t sfb_off = kF1B + kF1A + kF1SFA + (ns16 * 16 + q) * 4;    // + p * 512 + nt * 32
+
+    // = v8's compute_stage (the A fragment from the v10 unit: (a0, a2, a1, a3) = .x .y .z .w)
+    auto compute_stage = [&](const uint8_t* sp, auto kb_tag) {
+      constexpr int KB0 = decltype(kb_tag)::value;
+      uint32_t sfb[2][2], sfa[4];
+#pragma unroll
+      for (int p = 0; p < 2; ++p)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) sfb[p][nt] = *reinterpret_cast<const uint32_t*>(sp + sfb_off + p * 512 + nt * 32);
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        uint32_t b[2][2][2];
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+          const uint2 w = *reinterpret_cast<const uint2*>(sp + p * 4096 + kk * 2048 + b_off);
+          spread_e2m1x8(w.x, b[p][0][0], b[p][0][1]);
+          spread_e2m1x8(w.y, b[p][1][0], b[p][1][1]);
+        }
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+          if (act[mt]) {
+            const uint4 af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
+#pragma unroll
+            for (int p = 0; p < 2; ++p)
+#pragma unroll
+              for (int nt = 0; nt < 2; ++nt)
+                qmma_kk<KB0>(kk, acc[mt][p][nt], af.x, af.z, af.y, af.w, b[p][nt][0], b[p][nt][1], sfa[mt], sfb[p][nt]);
+          }
+        }
+      }
+    };
+    auto step = [&](auto kb_tag) {
+      mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par);
+      compute_stage(smem + pos.buf * kF1Stage, kb_tag);
+      __syncwarp();  // the warp's LDS of this buffer precede lane 0's release arrive
+      if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+      pos.advance<STAGES>();
+    };
+#pragma unroll 1
+    for (int t = 0; t < n_stages; t += 2) {
+      step(std::integral_constant<int, 0>{});
+      step(std::integral_constant<int, 2>{});
+    }
+
+    // ---- epilogue = v8's arithmetic (the partner-warp amax exchange through s_amax), with ONE named barrier of the consumers per
+    // item instead of one per m-tile: every m-tile's partial amax is written first (s_amax has a slot per m-tile), then the
+    // exchange. The max is exact and commutative - the same block amax, scale byte and e4m3 bytes as v8. The barrier of item k's
+    // epilogue also orders the consumers' s_amax reads of item k - 1 before item k's writes (no warp can be an item ahead of another).
+    const int pslot = k & 1;
+    float v[4][2][4], am[4][2];
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) {
+      am[mt][0] = am[mt][1] = 0.f;
+      if (mt >= m_tiles) continue;  // CTA-uniform
+      if (act[mt]) {
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+          for (int nt = 0; nt < 2; ++nt) {
+            const float x0 = activated_value(acc[mt][1][nt][2 * hf], acc[mt][0][nt][2 * hf], alpha, a.limit);
+            const float x1 = activated_value(acc[mt][1][nt][2 * hf + 1], acc[mt][0][nt][2 * hf + 1], alpha, a.limit);
+            const uint32_t pk = pack_bf16x2(x0, x1);
+            v[mt][hf][2 * nt] = __uint_as_float(pk << 16);
+            v[mt][hf][2 * nt + 1] = __uint_as_float(pk & 0xFFFF0000u);
+          }
+          float amax = 0.f;
+#pragma unroll
+          for (int kx = 0; kx < 4; ++kx) amax = fmax_plain(amax, fabs_plain(v[mt][hf][kx]));
+          amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+          amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+          am[mt][hf] = amax;
+          if (c == 0) s_amax[mt][warp][q + hf * 8] = amax;
+        }
+      }
+    }
+    consumers_sync<NCW>();
+#pragma unroll
+    for (int mt = 0; mt < 4; ++mt) {
+      if (mt >= m_tiles) continue;  // CTA-uniform
+      if (act[mt]) {
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+          const int row = mt * 16 + q + hf * 8;
+          const int pair = ring.pairs[pslot][row];
+          const float amax = fmax_plain(am[mt][hf], s_amax[mt][warp ^ 1][q + hf * 8]);
+          float inv;
+          const uint32_t byte = mx_scale(amax, inv);
+          uint32_t h[4] = {cvt_e4m3x2(fmul(v[mt][hf][0], inv), fmul(v[mt][hf][1], inv)),
+                           cvt_e4m3x2(fmul(v[mt][hf][2], inv), fmul(v[mt][hf][3], inv)), 0u, 0u};
+          uint32_t o0, o1;
+          quad_transpose16(h, c, o0, o1);
+          if (pair >= 0) {
+            if (c < 2) {
+              uint2* dst = reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(a.inter) + (size_t)pair * kInterBytes +
+                                                   tile * 128 + ns16 * 16 + c * 8);
+              *dst = make_uint2(o0, o1);
+            }
+            if ((ns16 & 1) == 0) {
+              uint8_t* sf = a.inter_sf + (size_t)pair * (kSlices * 4) + tile * 4;
+              if (c == 0) sf[ns16 >> 1] = (uint8_t)byte;
+              if (!wide && c == 1) sf[(ns16 >> 1) + 2] = 0;
+            }
+          }
+        }
+      }
+    }
+    ++k;
+  }
+}
+
 // FC2 with the producer-warp skeleton (the fused top-k sum is not carried: the host runs the v8 fc2 when it is on)
 template <int STAGES, int MINB>
 __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
@@ -1976,7 +2336,9 @@ namespace {
 // (stages, CTAs per SM) and, for fc1, the consumer layout: 1 = (3, 2) with 8 consumer warps [2 CTAs x 9 warps: ptxas caps the
 // registers at 96 - fc1 spills, fc2 (93 registers) does not], 2 = (6, 1), 3 = (4, 1), 4 = (7, 1) with 8 consumer warps [fc2 at (4, 1)
 // still fits 2 CTAs/SM by shared memory], 5 = (6, 1), 6 = (4, 1), 7 = (7, 1) with 16 consumer warps x 2 m-tiles (fc1 only: 17 warps,
-// 1 CTA/SM, 4 consumer warps per sub-partition). Every configuration computes the same bits (harness).
+// 1 CTA/SM, 4 consumer warps per sub-partition); fc1 modes 8 = (3, 2), 9 = (4, 1), 10 = (6, 1), 11 = (7, 1) are the v10 warpgroup kernel
+// fc1_kernel_wg (K-5: 12 warps; at 2 CTAs/SM setmaxnreg = 16 consumer warps per SM at 104 registers, at 1 CTA/SM 148 registers).
+// Every configuration computes the same bits (harness).
 static int ws_env(const char* name) {
   const char* v = std::getenv(name);
   return v ? std::atoi(v) : 0;
@@ -2003,6 +2365,22 @@ struct WsLaunch1 {
   }
 };
 template <int S, int MB>
+struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2)
+  static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
+  static int grid(int sms) {
+    using namespace b12x_moe_prefill_fast;
+    int occ = 0;
+    static bool done = false;
+    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB>, kT, S * kF1Stage);
+    return sms * (occ > 0 ? occ : 1);
+  }
+  static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
+    using namespace b12x_moe_prefill_fast;
+    fc1_kernel_wg<S, MB><<<grid, kT, S * kF1Stage, stream>>>(f1);
+  }
+};
+template <int S, int MB>
 struct WsLaunch2 {
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
@@ -2026,7 +2404,11 @@ static void with_ws1(int mode, Fn fn) {
     case 4: fn(WsLaunch1<7, 1, 1>{}); break;
     case 5: fn(WsLaunch1<6, 1, 2>{}); break;
     case 6: fn(WsLaunch1<4, 1, 2>{}); break;
-    default: fn(WsLaunch1<7, 1, 2>{}); break;
+    case 7: fn(WsLaunch1<7, 1, 2>{}); break;
+    case 8: fn(WgLaunch1<3, 2>{}); break;
+    case 9: fn(WgLaunch1<4, 1>{}); break;
+    case 10: fn(WgLaunch1<6, 1>{}); break;
+    default: fn(WgLaunch1<7, 1>{}); break;
   }
 }
 template <typename Fn>
