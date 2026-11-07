@@ -304,7 +304,7 @@ wrapper) - **served on hgx-02 since 2026-10-28, 08:23 UTC** (first probes on the
 * `tools/k3_b300/patch_vllm_swa_draft_dcp.py` - the RedHat draft under DCP (§3b steps 1-3), the fine-grained
   `SlidingWindowManager` (step 4) and the scheduler's Mamba chunking on the Mamba block (step 5); idempotent, `--check`.
 * `Dockerfile.b300-k3` - `vllm/vllm-openai:v0.32.0` + the patches (`vllm-moet-b300:k3-v0.32.0-r1` = RecoverSSM
-  only, served 2026-10-25..28; `-r5` = both, served since 2026-10-28 with RedHat k = 5; `-r3`/`-r4` have a broken step 5 and must not be served).
+  only; `-r5` = both, the served image with RedHat k = 5; `-r3`/`-r4` have a broken step 5 and must not be served).
 * `docker/b300/run-k3.sh` - the launcher with `USE_RECOVERSSM` and `MAMBA_SSM_CACHE_DTYPE`.
 * `tools/k3_b300/kv_model.py` - the budget model (`--kv-gib 46.98` reproduces every row above).
 * `tools/k3_b300/k3_code_bench.py`, `k3_matrix.py`, `capacity_probe.py`, `gsm8k_probe.py`, `ref_outputs.py` - the
