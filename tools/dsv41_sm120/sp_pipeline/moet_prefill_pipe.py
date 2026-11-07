@@ -1236,12 +1236,14 @@ def capture_phase_graphs(runner: Any, profile_only: bool = False) -> None:
         return
     if kv_connector_policy() == "refuse" and _kv_connector_configured(runner):
         return
-    if _RUNNER is None:
-        _RUNNER = PipeRunner(runner)
+    if _RUNNER is not None and _RUNNER.phase_graph is not None:
+        _RUNNER.phase_graph.release()
+        _RUNNER.phase_graph = None
+    # built anew at every capture pass: the memory-profiling pass runs on a minimal KV cache and its own attention groups /
+    # kv_cache_config, which the per-slot builders and the slot mappings of a PipeRunner created then would keep (the real
+    # pass sees the real ones; the first real step reuses the runner of the real pass)
+    _RUNNER = PipeRunner(runner)
     pr = _RUNNER
-    if pr.phase_graph is not None:
-        pr.phase_graph.release()
-        pr.phase_graph = None
     try:
         pr.capture_phase_graph(runner)
     except Exception as exc:  # noqa: BLE001 - the server comes up eagerly, loudly
