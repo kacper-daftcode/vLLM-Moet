@@ -1065,6 +1065,45 @@ class PhaseGraph:
         self.inputs, self.contexts, self.meta, self.outputs, self.out_static, self.plans = [], [], [], [], [], []
 
 
+def _phase_graph_static_plan() -> bool:
+    """Whether the attention metadata being built belongs to a row group whose step may run as the phase graph: the
+    indexer's prefill plan is then made context-independent (indexer_logits_budget, indexer_row_shard), so a real step's
+    metadata has the structure of the captured one. Off = today's plan (slot 0, the whole step; the pipeline off)."""
+    return mode() == 2 and phase_graphs() != "0" and prepare_slot() != 0
+
+
+def indexer_logits_budget(budget_bytes: int, compressed_seq_lens_cpu: Any, compress_ratio: int) -> int:
+    """The indexer builder's logits budget for the prefill chunk plan. Today's plan splits a request's query rows into
+    sub-chunks of max_q = budget / (4 B x context) rows, so the number of chunks - and with it the number of logits
+    kernels, the chunk metadata tensors and the graph's structure - changes with the context. For a phase-graph group
+    the budget is scaled so that max_q is the one of the captured maximum context (PHASE_GRAPH_MAX_CTX / compress ratio):
+    the same chunk boundaries at every context, each chunk's logits buffer smaller at a shorter context (the kernels
+    bound the K extent on the device). Bits are untouched: every row's logits and top-k are computed independently of
+    how the rows are grouped into launches. Returns budget_bytes unchanged outside a phase-graph group."""
+    if not _phase_graph_static_plan() or compress_ratio is None:
+        return budget_bytes
+    try:
+        n_real = int(compressed_seq_lens_cpu.max()) if compressed_seq_lens_cpu.numel() else 0
+    except Exception:  # noqa: BLE001 - an unexpected type: today's plan
+        return budget_bytes
+    if n_real <= 0:
+        return budget_bytes
+    n_plan = max(phase_graph_max_ctx() // max(int(compress_ratio), 1), 1)
+    max_q = max((budget_bytes // 4) // n_plan, 1)
+    return 4 * max_q * n_real
+
+
+def indexer_row_shard(sizes: list[int] | None, num_rows: int, tp_size: int) -> list[int] | None:
+    """The indexer's TP row shard for a phase-graph group: equal contiguous shards instead of the work-balanced ones
+    (balanced_prefill_row_shard weighs a row by its context, so the shard sizes - and the all_gatherv byte counts captured
+    in the graph - would change with the context). Bits are untouched (which rank scores a row does not change the row);
+    the balance matters only in a request's first step, where the contexts are short. None (sharding off) stays None."""
+    if sizes is None or not _phase_graph_static_plan() or tp_size < 2 or num_rows < tp_size:
+        return sizes
+    base, rem = divmod(int(num_rows), int(tp_size))
+    return [base + (1 if i < rem else 0) for i in range(tp_size)]
+
+
 def _wait_engram_prefetch(runner: "PipeRunner", stream: torch.cuda.Stream) -> None:
     """The Engram lookups of the head run on a prefetch stream (CPU-offloaded tables) and the layer waits for their event;
     inside the graph that wait is skipped (phase_graph_capturing), so the compute stream waits here, before the launch."""

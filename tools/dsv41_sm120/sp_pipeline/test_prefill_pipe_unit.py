@@ -544,8 +544,8 @@ def make_ctx(ctx_len: int, fresh_ke: torch.Tensor | None = None, extra: bool = F
                           ctx_len // 2, 0)],
     )
     attn = {"layers.0": meta}
-    if extra:
-        attn["layers.1"] = meta
+    if extra:  # a distinct object: the walk dedups shared objects by identity
+        attn["layers.1"] = FakeMeta(persistent_bt, persistent_sl, torch.tensor([ctx_len]), prefills, [])
     return FakeCtx(attn_metadata=attn, slot_mapping={"layers.0": persistent_slots[:, :4]}, batch_descriptor=(4,))
 
 
@@ -683,7 +683,15 @@ out_p = pipe.run_groups(make_graph_groups(ctx_len=900), full_fn, pipelined=True,
 torch.cuda.synchronize()
 st = pipe.stats()
 hooks.section = saved_section
-check(st["phase_graph_mismatch"] == 1 and torch.equal(pipe.merge_outputs(out_p), section_reference(hs_steps[2]) + 1.0),
+def section_reference_planted(hs):  # the rest's own evaluation order: hidden + (residual + 1) + aux
+    x = hs
+    for layer in range(3):
+        x = torch.tanh(torch.tanh(x @ WG[layer]) @ WG[layer].t())
+    return x + (x * 2 + 1.0) + (x + 1)
+
+
+check(st["phase_graph_mismatch"] == 1 and pg.num_launches == 3
+      and torch.equal(pipe.merge_outputs(out_p), section_reference_planted(hs_steps[2])),
       f"(9) verify mode reports a mismatch (count {st['phase_graph_mismatch']}) and the tails use the eager outputs")
 os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "1"
 # fallbacks: a context beyond the capture's, a different group shape, a missing replay batch -> eager, counted, loud once
@@ -696,12 +704,12 @@ FakeReplayLayers._moet_replay_batches = {1: object()}
 out_e3 = pipe.run_groups(make_graph_groups(), full_fn, pipelined=True, phase=hooks)
 FakeReplayLayers._moet_replay_batches = {1: object(), 2: object()}
 torch.cuda.synchronize()
-check(pipe.stats()["phase_graph_eager"] == eager0 + 3 and pg.num_launches == 2
+check(pipe.stats()["phase_graph_eager"] == eager0 + 3 and pg.num_launches == 3
       and all(torch.equal(pipe.merge_outputs(o), section_reference(hs_steps[2])) for o in (out_e, out_e2, out_e3)),
       "(9) a step the graph does not serve (context, request slice, replay batch) runs eagerly with today's results")
 os.environ["VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS"] = "0"
 out_off = pipe.run_groups(make_graph_groups(), full_fn, pipelined=True, phase=hooks)
-check(pg.num_launches == 2 and torch.equal(pipe.merge_outputs(out_off), section_reference(hs_steps[2])),
+check(pg.num_launches == 3 and torch.equal(pipe.merge_outputs(out_off), section_reference(hs_steps[2])),
       "(9) PHASE_GRAPHS=0: the graph is never launched, today's path")
 os.environ.pop("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS", None)
 pg.release()

@@ -29,6 +29,8 @@ Patched files (anchor-based, idempotent, after steps 10/39/41/45; the installed 
   vllm/models/deepseek_v41/decoder_replay_layers.py the replay batch per slot (the thread's group)
   vllm/models/deepseek_v41/common/engram.py         the Engram rows at the group's row offset; K-8: no wait on the prefetch
                                                     event inside the phase graph's capture (the module waits before the launch)
+  vllm/v1/attention/backends/mla/indexer.py         K-8 only: a context-independent prefill plan (sub-chunks of the captured
+                                                    maximum context, equal TP row shards) for a phase-graph row group
   (and tools/dsv41_sm120/sp_moe_gather/sp_moe_gather_sm120.py: one MoE gather in flight per stand-in, not per process)
 
 The K-8 edits (VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS, marker "... phase graph") form a second stage applied after the first:
@@ -631,6 +633,62 @@ ENGRAM_EDITS_K8 = [
     ),
 ]
 
+# ---------------------------------------------------------------------------------------------------------------
+# vllm/v1/attention/backends/mla/indexer.py (K-8 only)
+# ---------------------------------------------------------------------------------------------------------------
+# The indexer's prefill plan depends on the context: the query rows are split into sub-chunks of budget / (4 B x context)
+# rows (the number of logits kernels and chunk tensors changes with the context) and the TP row shard is balanced by the
+# rows' contexts (the all_gatherv byte counts change). For a phase-graph row group both are made context-independent -
+# the chunk boundaries of the captured maximum context, equal shards - so a real step's metadata has the captured
+# structure; bits are untouched (rows are scored independently of their grouping and of the rank that scores them).
+INDEXER_EDITS_K8 = [
+    (
+        "import",
+        "from vllm.logger import init_logger\n",
+        "from vllm.logger import init_logger\n" + IMPORT,
+    ),
+    (
+        "static chunk plan",
+        "                chunk_specs = self._split_indexer_prefill_chunks(\n"
+        "                    self._prefill_split_seq_lens(compressed_seq_lens_cpu[num_decodes:]),\n"
+        "                    prefill_query_lens_cpu,\n"
+        "                    self.max_prefill_buffer_size,\n"
+        "                    max_logits_bytes,\n"
+        "                    request_offset=num_decodes,\n"
+        "                )\n",
+        "                _moet_split_lens = self._prefill_split_seq_lens(compressed_seq_lens_cpu[num_decodes:])\n"
+        "                chunk_specs = self._split_indexer_prefill_chunks(\n"
+        "                    _moet_split_lens,\n"
+        "                    prefill_query_lens_cpu,\n"
+        "                    self.max_prefill_buffer_size,\n"
+        f"                    # {MARKER2}: a phase-graph group plans its sub-chunks for the captured maximum context\n"
+        "                    _moet_pipe.indexer_logits_budget(max_logits_bytes, _moet_split_lens, self.compress_ratio),\n"
+        "                    request_offset=num_decodes,\n"
+        "                )\n",
+    ),
+    (
+        "static row shard",
+        "                row_shard_sizes = balanced_prefill_row_shard(\n"
+        "                    seq_lens_cpu[num_decodes:],\n"
+        "                    prefill_query_lens_cpu,\n"
+        "                    self.compress_ratio,\n"
+        "                    self.tp_size,\n"
+        "                    self.vllm_config.attention_config.indexer_tp_shard_min_rows,\n"
+        "                )\n",
+        f"                row_shard_sizes = _moet_pipe.indexer_row_shard(  # {MARKER2}: equal shards for a phase-graph group\n"
+        "                    balanced_prefill_row_shard(\n"
+        "                        seq_lens_cpu[num_decodes:],\n"
+        "                        prefill_query_lens_cpu,\n"
+        "                        self.compress_ratio,\n"
+        "                        self.tp_size,\n"
+        "                        self.vllm_config.attention_config.indexer_tp_shard_min_rows,\n"
+        "                    ),\n"
+        "                    int(prefill_query_lens_cpu.sum()),\n"
+        "                    self.tp_size,\n"
+        "                )\n",
+    ),
+]
+
 FILES = [
     ("v1/worker/gpu/model_runner.py", RUNNER_EDITS, RUNNER_EDITS_K8),
     ("models/deepseek_v41/nvidia/model.py", MODEL_EDITS, MODEL_EDITS_K8),
@@ -638,6 +696,7 @@ FILES = [
     ("models/deepseek_v41/nvidia/model_state.py", MODEL_STATE_EDITS, []),
     ("models/deepseek_v41/decoder_replay_layers.py", REPLAY_EDITS, []),
     ("models/deepseek_v41/common/engram.py", ENGRAM_EDITS, ENGRAM_EDITS_K8),
+    ("v1/attention/backends/mla/indexer.py", [], INDEXER_EDITS_K8),
 ]
 
 
