@@ -17,6 +17,14 @@
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 #
 # Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 8192 with PREFILL_PIPE=2)
+#            PREFILL_PIPE (0)        2 = step 47, the pipelined sequence-parallel prefill (two 4096-row groups of one 8192-token step
+#                        one layer apart; needs SERVED=1 for the steps it builds on); MAX_NUM_BATCHED_TOKENS then defaults to 8192
+#            PREFILL_PIPE_REPLAY_GRAPHS (1 with PREFILL_PIPE=2, else 0)  the 128-row replay layers 20-39 of every step as CUDA graphs
+#                        (vLLM's decoder-replay graphs, captured per row-group slot as well): the pipelined step's two replay tails
+#                        are ~1,400 launches each and CPU-bound when the host's cores are loaded - the 2026-11-07 production window
+#                        (+31 % at 163K, rolled back) was that; measured under 100 nice'd CPU hogs +3.3 % with the graphs vs +26.6 %
+#                        without, bits identical, -1 GiB KV per GPU. Passes --compilation-config decoder_replay_cudagraph_capture_sizes
+#                        [REPLAY_CAPTURE_SIZES (128,256)]; vLLM's default captures none under --max-cudagraph-capture-size 64
 #            GPU_MEM_UTIL (0.94)     0.92 for the very first start (the autotune sweep OOMs at 0.95 on a cold CACHE_DIR)
 #            SPEC_TOKENS (5; 7 with SERVED=1)  DSpark draft tokens, 0 = no drafter (-2.4 GiB per GPU)
 #            MOE_BACKEND ("" ; b12x with SERVED=1)  --moe-backend; b12x = FlashInfer's W4A8 compact path the fused
@@ -60,10 +68,23 @@ CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
 SERVED_NAME="${SERVED_NAME:-deepseek-ai/DeepSeek-V4.1-Flash}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
-# Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is measured -22.6 % at 163K WITHOUT the KV offload tier (test host) and +31 % WITH it
-# (production, 2026-11-07, rolled back): off by default until the pipeline and the offload connector are reconciled (r26b).
-# PREFILL_PIPE=2 MAX_NUM_BATCHED_TOKENS=8192 turns it on for deployments without KV offload.
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+# Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is -22.6 % at 163K on an idle host and was +31 % in the production window of
+# 2026-11-07 (rolled back): not the KV offload tier (with it: +0.5 %) but the host's CPUs, loaded by other processes on the server's
+# NUMA node - the pipelined step's eager replay tails are launch-bound. The -r26b image's PREFILL_PIPE_REPLAY_GRAPHS=1 runs those
+# tails as CUDA graphs (+3.3 % under 100 nice'd hogs instead of +26.6 %). Off in the served profile until its production window.
+PREFILL_PIPE="${PREFILL_PIPE:-0}"
+case "$PREFILL_PIPE" in
+  0|2) ;;
+  *) echo "PREFILL_PIPE must be 0 or 2, got $PREFILL_PIPE" >&2; exit 1 ;;
+esac
+if [[ "$PREFILL_PIPE" == "2" ]]; then
+  MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+  PREFILL_PIPE_REPLAY_GRAPHS="${PREFILL_PIPE_REPLAY_GRAPHS:-1}"
+else
+  MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+  PREFILL_PIPE_REPLAY_GRAPHS="${PREFILL_PIPE_REPLAY_GRAPHS:-0}"
+fi
+REPLAY_CAPTURE_SIZES="${REPLAY_CAPTURE_SIZES:-128,256}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 SERVED="${SERVED:-0}"
 case "$SERVED" in
@@ -81,7 +102,7 @@ SERVED_SWITCHES=(
   VLLM_MOET_MHC_MXFP8=1 VLLM_MOET_MHC_SIDE_DEFER=1
   VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1
   VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
-  VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE:-0}
+  VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE} VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=${PREFILL_PIPE_REPLAY_GRAPHS}
 )
 if [[ "$SERVED" == "1" ]]; then
   : "${SPEC_TOKENS:=7}"
@@ -122,6 +143,11 @@ if [[ "$SPEC_TOKENS" != "0" ]]; then
     "{\"method\":\"dspark\",\"num_speculative_tokens\":${SPEC_TOKENS},\"draft_sample_method\":\"probabilistic\",\"rejection_sample_method\":\"block\",\"enable_adaptive_verification\":false${SPEC_MOE}}")
 fi
 [[ "$LANGUAGE_ONLY" == "1" ]] && ARGS+=(--language-model-only)
+case "$PREFILL_PIPE_REPLAY_GRAPHS" in
+  0) ;;
+  1) ARGS+=(--compilation-config "{\"decoder_replay_cudagraph_capture_sizes\":[${REPLAY_CAPTURE_SIZES}]}") ;;  # EXTRA_ARGS must not carry a second one
+  *) echo "PREFILL_PIPE_REPLAY_GRAPHS must be 0 or 1, got $PREFILL_PIPE_REPLAY_GRAPHS" >&2; exit 1 ;;
+esac
 case "$PREFILL_DBO" in
   0) ;;
   1)
