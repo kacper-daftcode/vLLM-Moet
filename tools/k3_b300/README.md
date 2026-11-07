@@ -18,6 +18,8 @@ how the KDA speculative state slots are removed). Image: `Dockerfile.b300-k3`; l
 | `gsm8k_probe.py` | GSM8K first-N accuracy (greedy, concurrent) over the chat API; caches the test set next to itself. |
 | `ref_outputs.py` | greedy reference outputs for four fixed prompts and a `--compare` against a saved run (token parity / divergence point). |
 | `prefix_probe.py` | cold vs GPU-warm TTFT and output on a long prompt, prefix-hit counters, and a multi-turn continuation (with `reasoning_content` sent back, as K3 requires). |
+| `prefill_bench.py` | fresh-prefill throughput over the chat API: unique prompts (nonce + random words, no prefix hits), `max_tokens=1`, single stream at 1K/2K/8K/16K/64K tokens (median of 2) and C=4 / C=8 streams of 16K (aggregate tok/s, TTFT median); one summary line + JSON. The prefill counterpart of `k3_code_bench.py`'s steps/s. |
+| `profile_prefill.py` | torch-profiler capture of one fresh prefill (server started with `--profiler-config`): `/start_profile`, one 16K and one 64K prompt, `/stop_profile`, then the rank-0 trace by category (MoE / dense GEMM / sparse MLA / indexer / KDA / collectives / norm), GPU busy vs idle, kernels per chunk, top kernels, us of GPU time per prompt token. `--analyze-only TRACE` re-reads a saved trace. |
 | `evict_probe.py` | KV offload round trip: cold, GPU-warm, evicted by a stream of large prompts, then restored through the connector; external hit counters, TTFT and output / continuation parity. Run against `--kv-cache-memory <small>` so the eviction is quick. |
 
 Build and serve (hgx-02 paths; every knob is documented in the launcher header):
