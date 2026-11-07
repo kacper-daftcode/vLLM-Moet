@@ -26,6 +26,11 @@ address work; bit-identical to v8 by the harness) are selected per kernel by VLL
 _WS2 (fc2): 0 = v8 (default), a mode = the ring (stages, CTAs per SM) - see the .cu; measured best fc1 2 (6 stages, 1 CTA/SM,
 -4 % at 4096 rows), fc2 3 (4 stages, 2 CTAs/SM, -16 %); fc1 below _WS1_MIN_ROWS (256) rows stays on v8 (the 128-row replay
 layers are at the DRAM floor).
+
+v10 (K-5): fc1 as three warpgroups (`fc1_kernel_wg`: 8 consumer warps + 4 producer warps, one LDS.128 per A fragment from a layout
+8-B cp.asyncs fill; at 2 CTAs/SM `setmaxnreg` 32 / 104) = WS1 modes 8 (3 stages, 2 CTAs/SM), 9 (4, 1), 10 (6, 1), 11 (7, 1); measured
+best mode 9: fc1 -10.6 % at 4096 rows in the harness (913 vs 1 021 us), bit-identical; in situ (pipelined r26 step, WS1=9 WS2=3)
+the 4096-row fc1 launches are -10.5 % (887 -> 794 us) but the 163K / 19K walls move <= 0.3 % (K/REPORT.md 7.4).
 """
 from __future__ import annotations
 
