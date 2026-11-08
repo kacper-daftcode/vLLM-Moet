@@ -540,6 +540,12 @@ def step_done() -> None:
         _STATS["watchdog"] = dict(what=rec[1], expected=rec[2], seen=rec[3], cta=rec[4], rank=rec[5], g=rec[6], pseq=rec[7], waited_ms=rec[8] / 1e6)
         raise RuntimeError(f"vllm-moet sm_120 device comm: a device-side wait expired and the kernel trapped: {_STATS['watchdog']}")
     if mode() == "verify" or _STATS["verify_rs"] or _STATS["verify_ag"]:
+        try:  # the counters were written on the pipeline's comm stream; order the read after it
+            comm_stream = getattr(_pipe()._RUNNER, "comm_stream", None)
+            if comm_stream is not None:
+                torch.cuda.current_stream().wait_stream(comm_stream)
+        except Exception:  # noqa: BLE001 - unit tests without the pipeline
+            pass
         n = int(st.v_n.item())
         bad_rs, bad_ag = (int(v) for v in st.v_bad.tolist())
         _STATS["verify_rs_mismatch"], _STATS["verify_ag_mismatch"] = bad_rs, bad_ag
