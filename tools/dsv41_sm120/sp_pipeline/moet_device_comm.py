@@ -35,10 +35,12 @@ compares EVERY collective and always consumes NCCL's result (counters in stats()
 Switches: VLLM_MOET_PREFILL_PIPE_DEVICE_COMM=0|1|verify (0); _PUSH_CTAS (16), _RED_CTAS (128: the reduce is issue-bound at one warp
 per SM - 32 reducers took 830 us for 42 MB, MK/mk4/out/unit2.log), _PIECES (8, 1..32: the most pieces per push phase = the landing
 granularity the reducers overlap with; each costs a sys fence per pusher), _PIECE_KB (512: a launch uses bytes-per-phase / this pieces,
-so a 213-KB gather takes one piece and a 10.5-MB reduce-scatter eight), _UNROLL (4: 16-B loads in flight per
+so a 213-KB gather takes one piece and a 10.5-MB reduce-scatter eight), _SPLIT (1: pushers-only resident, 1-CTA bounded waits, a transient
+256-thread reduce; 0 = the resident 144-CTA instance of the first in-situ arms), _PUSH_WARPS (4: warps per pusher CTA in split mode),
+_REDUCE_GRID (376), _UNROLL (4: 16-B loads in flight per
 pusher lane), _LINK_TOKEN (1: the two groups' instances take turns per push phase - one destination per GPU at a time), _ARENA_MB (48:
 the gather arena per group and parity; a gather that does not fit stays on NCCL), _SLOT_ROWS (1024: the receive slot per source =
-the largest shard), _STREAM_PRIORITY (0), _WATCHDOG_S (30), _VERIFY_FIRST (3), _RS=0|1 and _AG=0|1 (1: per-kind master switches).
+the largest shard), _STREAM (own | comm: a comm-kernel stream per group, or the pipeline's comm stream itself), _STREAM_PRIORITY (0), _WATCHDOG_S (30), _VERIFY_FIRST (3), _RS=0|1 and _AG=0|1 (1: per-kind master switches).
 """
 from __future__ import annotations
 
@@ -123,6 +125,31 @@ def slot_rows() -> int:
 
 def stream_priority() -> int:
     return _int("STREAM_PRIORITY", 0)
+
+
+def split_mode() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_SPLIT=1 (default): only the pushers are resident during a transfer; the landing is awaited by one
+    bounded CTA on the comm stream and the reduce is a transient 256-thread kernel behind it (MK/REPORT.md 4.6 item 1). 0 = the first
+    form: pushers + resident single-warp reducers in one instance (MK/REPORT.md 4.5: starves NCCL's remaining kernel of empty SMs)."""
+    return bool(_int("SPLIT", 1))
+
+
+def push_warps() -> int:
+    """Warps per pusher CTA in split mode (1..4; 4 = 4 096 registers per CTA: co-resident with fc1 at 120 registers, attention, fc2, cuBLAS,
+    not with the CUTLASS GEMMs - 16 such CTAs find an SM anyway)."""
+    return max(1, min(4, _int("PUSH_WARPS", 4)))
+
+
+def reduce_grid() -> int:
+    return max(1, min(2048, _int("REDUCE_GRID", 376)))
+
+
+def stream_mode() -> str:
+    """VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_STREAM: "own" (default) = one comm-kernel stream per group (the two groups' instances can run
+    concurrently; two more streams on the hardware queues), "comm" = the instances run on the pipeline's comm stream itself (NCCL's place
+    today: no new streams, no cross-group concurrency, no event hops)."""
+    v = os.environ.get(f"{_ENV}_STREAM", "own")
+    return v if v in ("own", "comm") else "own"
 
 
 def watchdog_s() -> float:
@@ -308,19 +335,24 @@ def _init() -> _State | None:
             st.ext, st.tp, st.rank, st.world, st.device = ext, tp, tp.rank_in_group, tp.world_size, dev
             st.slot_bytes, st.arena_bytes = slot_bytes, arena_bytes
             st.streams = [torch.cuda.Stream(device=dev, priority=stream_priority()) for _ in range(2)]
+            if split_mode():
+                ext.set_push_warps(push_warps())
             st.v_n = torch.zeros((), dtype=torch.int64, device=dev)
             st.v_bad = torch.zeros(2, dtype=torch.int64, device=dev)
-            regs, smem_static, smem_dyn, local, per_sm = ext.func_info()
-            _STATS["kernel"] = dict(regs=regs, smem=smem_static + smem_dyn, local=local, ctas_per_sm=per_sm,
-                                    n_push=n_push(), n_red=n_red(), pieces=pieces(), unroll=unroll(), link_token=link_token(),
-                                    region_mb=total / 1e6, build_s=round(time.perf_counter() - t0, 1))
+            regs, smem_static, smem_dyn, local, per_sm, red_regs = ext.func_info()
+            _STATS["kernel"] = dict(regs=regs, smem=smem_static + smem_dyn, local=local, ctas_per_sm=per_sm, reduce_regs=red_regs,
+                                    split=split_mode(), push_warps=push_warps() if split_mode() else 1, reduce_grid=reduce_grid(),
+                                    n_push=n_push(), n_red=0 if split_mode() else n_red(), pieces=pieces(), unroll=unroll(), link_token=link_token(),
+                                    stream=stream_mode(), region_mb=total / 1e6, build_s=round(time.perf_counter() - t0, 1))
             _STATE = st
             logger.info(
                 "vllm-moet sm_120 device comm (MK-4 hybrid, %s): rank %d of %d, region %.0f MB (%d receive slots x %.1f MB, 4 gather "
-                "arenas x %d MB), kernel %d regs / %d B smem / %d B local / %d CTAs per SM at 32 threads, %d pushers + %d reducers, %d pieces, "
-                "unroll %d, link token %d, watchdog %.0f s, built in %.1f s (VLLM_MOET_PREFILL_PIPE_DEVICE_COMM=0 turns it off)",
+                "arenas x %d MB), kernel %d regs / %d B smem / %d B local / %d CTAs per SM at 32 threads, %s, %d pieces, "
+                "unroll %d, link token %d, streams %s, watchdog %.0f s, built in %.1f s (VLLM_MOET_PREFILL_PIPE_DEVICE_COMM=0 turns it off)",
                 mode(), st.rank, st.world, total / 1e6, 2 * 2 * NSRC, slot_bytes / 1e6, arena_bytes >> 20, regs, smem_static + smem_dyn, local,
-                per_sm, n_push(), n_red(), pieces(), unroll(), link_token(), watchdog_s(), time.perf_counter() - t0)
+                per_sm, (f"split: {n_push()} pushers x {push_warps()} warps resident, 1-CTA waits + a transient {reduce_grid()}-CTA reduce ({red_regs} regs)"
+                         if split_mode() else f"{n_push()} pushers + {n_red()} reducers resident"), pieces(), unroll(), link_token(), stream_mode(),
+                watchdog_s(), time.perf_counter() - t0)
             if regs > 32 or local > 0:
                 logger.warning("vllm-moet sm_120 device comm: the kernel takes %d registers / %d B local memory - the 1 024-register "
                                "co-residency budget (MK-4 item 2) is not met", regs, local)
@@ -431,21 +463,26 @@ def reduce_scatter(x: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Ten
     x = x.contiguous()
     out = torch.empty((c, h), dtype=x.dtype, device=x.device)
     comm = torch.cuda.current_stream()
-    kst = st.streams[gidx]
+    kst = comm if stream_mode() == "comm" else st.streams[gidx]
     pseq = st.pseq[gidx]
     use_key = (gidx, pseq & 1, 0)
-    npush, nred, npieces = n_push(), n_red(), pieces_for(c * h * 2)
+    split = split_mode()
+    npush, nred, npieces = n_push(), (0 if split else n_red()), pieces_for(c * h * 2)
     st.use[use_key] = st.use.get(use_key, 0) + 1
     st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
-    st.cum_red[use_key] = st.cum_red.get(use_key, 0) + npieces * nred
-    ev_in = torch.cuda.Event()
-    ev_in.record(comm)
-    kst.wait_event(ev_in)
+    st.cum_red[use_key] = st.cum_red.get(use_key, 0) + (reduce_grid() if split else npieces * nred)
+    if kst is not comm:
+        ev_in = torch.cuda.Event()
+        ev_in.record(comm)
+        kst.wait_event(ev_in)
     st.ext.rs_launch(kst.cuda_stream, x, out, table, gidx, pseq, st.use[use_key], st.cum_push[use_key], st.cum_red[use_key], npieces,
                      npush, nred, unroll(), link_token(), watchdog_s())
-    ev_out = torch.cuda.Event()
-    ev_out.record(kst)
-    comm.wait_event(ev_out)
+    if split:  # the bounded wait for the peers' pieces + the transient reduce, on the comm stream (concurrent with my pushes on kst)
+        st.ext.rs_wait_reduce(comm.cuda_stream, x, out, table, gidx, pseq, st.use[use_key], st.cum_red[use_key], npieces, reduce_grid(), watchdog_s())
+    if kst is not comm:
+        ev_out = torch.cuda.Event()
+        ev_out.record(kst)
+        comm.wait_event(ev_out)  # x stays alive until my pushes are done
     st.pseq[gidx] = pseq + 1
     st.cur_pseq[gidx] = pseq
     st.arena_cursor[gidx] = 0
@@ -501,21 +538,28 @@ def all_gather(t: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]
     st.ag_index[gidx] += 1
     st.arena_cursor[gidx] = (off + nbytes + 255) & ~255
     use_key = (gidx, pseq & 1, slot)
-    npush, nred, npieces = n_push(), n_red(), ag_pieces()  # a gather's receiver only waits for the whole: one piece = 3 fences per pusher
+    split = split_mode()
+    npush, nred, npieces = n_push(), (0 if split else n_red()), ag_pieces()  # a gather's receiver only waits for the whole: one piece = 3 fences per pusher
     st.use[use_key] = st.use.get(use_key, 0) + 1
     st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
-    st.cum_red[use_key] = st.cum_red.get(use_key, 0) + npieces * nred
+    st.cum_red[use_key] = st.cum_red.get(use_key, 0) + max(1, npieces * nred)
     comm = torch.cuda.current_stream()
-    kst = st.streams[gidx]
-    ev_in = torch.cuda.Event()
-    ev_in.record(comm)
-    kst.wait_event(ev_in)
+    kst = comm if stream_mode() == "comm" else st.streams[gidx]
+    view = st.ext.arena_view(gidx, pseq & 1, off, NSRC * c, k, t)
+    if split:
+        view[st.rank * c:(st.rank + 1) * c].copy_(t)  # my own shard into my arena (the pushers only serve the peers)
+    if kst is not comm:
+        ev_in = torch.cuda.Event()
+        ev_in.record(comm)
+        kst.wait_event(ev_in)
     st.ext.ag_launch(kst.cuda_stream, t, off, gidx, pseq, slot, st.use[use_key], st.cum_push[use_key], st.cum_red[use_key], npieces,
                      npush, nred, unroll(), link_token(), watchdog_s())
-    ev_out = torch.cuda.Event()
-    ev_out.record(kst)
-    comm.wait_event(ev_out)
-    view = st.ext.arena_view(gidx, pseq & 1, off, NSRC * c, k, t)
+    if split:
+        st.ext.ag_wait(comm.cuda_stream, c, row_bytes, gidx, pseq, slot, st.use[use_key], npieces, watchdog_s())
+    if kst is not comm:
+        ev_out = torch.cuda.Event()
+        ev_out.record(kst)
+        comm.wait_event(ev_out)
     _STATS["ag_device"] += 1
     key = ("ag", c)
     if mode() == "verify" or (mode() == "1" and not st.trusted.get(key)):
@@ -539,7 +583,7 @@ def step_done() -> None:
     if rec[0]:
         _STATS["watchdog"] = dict(what=rec[1], expected=rec[2], seen=rec[3], cta=rec[4], rank=rec[5], g=rec[6], pseq=rec[7], waited_ms=rec[8] / 1e6)
         raise RuntimeError(f"vllm-moet sm_120 device comm: a device-side wait expired and the kernel trapped: {_STATS['watchdog']}")
-    if mode() == "verify" or _STATS["verify_rs"] or _STATS["verify_ag"]:
+    if mode() == "verify" or st.v_pending:  # mode 1: only while first-N comparisons are open (a host sync per step otherwise)
         try:  # the counters were written on the pipeline's comm stream; order the read after it
             comm_stream = getattr(_pipe()._RUNNER, "comm_stream", None)
             if comm_stream is not None:

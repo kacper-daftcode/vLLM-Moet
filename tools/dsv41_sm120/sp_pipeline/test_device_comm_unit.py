@@ -79,12 +79,23 @@ class FakeExt:
         c, k = src.shape
         rb = k * src.element_size()
         for r in range(4):  # every rank's shard: the test's world holds identical shards rotated by rank
+            if n_red == 0 and r == self.rank:
+                continue  # split mode: the module copies the own shard itself
             rows = self.peer_shard(src, r)
             self.arena[g][pseq & 1][off + r * c * rb: off + (r + 1) * c * rb] = rows.contiguous().view(torch.uint8).reshape(-1)
 
     @staticmethod
     def peer_shard(src: torch.Tensor, r: int) -> torch.Tensor:
         return torch.roll(src, shifts=r, dims=0)
+
+    def set_push_warps(self, w):
+        self.push_warps = w
+
+    def rs_wait_reduce(self, stream, x, out, table, g, pseq, use, red_target, pieces, grid, wd):
+        self.launches.append(("rs_wait_reduce", g, pseq, use, grid))
+
+    def ag_wait(self, stream, c, row_bytes, g, pseq, slot, use, pieces, wd):
+        self.launches.append(("ag_wait", g, pseq, slot, use))
 
     def arena_view(self, g, par, off, rows, cols, like):
         n = rows * cols * like.element_size()
@@ -205,8 +216,9 @@ class DeviceCommUnit(unittest.TestCase):
                 self.assertEqual(calls, [], i)  # trusted: the device result alone
         self.assertTrue(self.st.trusted[("rs", self.m)])
         self.assertEqual(self.st.pseq[0], 4)
-        self.assertEqual([l[:2] for l in self.ext.launches], [("rs", 0)] * 4)
-        self.assertEqual([l[3] for l in self.ext.launches], [1, 1, 2, 2])  # use counts per parity
+        rs = [l for l in self.ext.launches if l[0] == "rs"]
+        self.assertEqual([l[:2] for l in rs], [("rs", 0)] * 4)
+        self.assertEqual([l[3] for l in rs], [1, 1, 2, 2])  # use counts per parity
         self.assertEqual(dc._STATS["rs_device"], 4)
         self.assertEqual(dc._STATS["verify_rs"], 2)
 
@@ -223,7 +235,7 @@ class DeviceCommUnit(unittest.TestCase):
                 self.assertIsNone(out)  # after the verdict: NCCL alone (the caller runs it), no device launch
         self.assertFalse(self.st.trusted[("rs", self.m)])
         self.assertEqual(int(self.st.v_bad[0]), 2)  # the first N comparisons recorded the mismatch
-        self.assertEqual(len(self.ext.launches), 2)
+        self.assertEqual(len([l for l in self.ext.launches if l[0] == "rs"]), 2)
         self.assertEqual(dc._STATS["fallback_reasons"].get(f"device RS at M={self.m} differed from NCCL"), 1)
 
     def test_verify_mode_returns_nccl_and_counts(self):
@@ -272,13 +284,16 @@ class DeviceCommUnit(unittest.TestCase):
         self.assertEqual(dc._STATS["fallback_reasons"].get("arena full"), 1)
         t = torch.randint(0, 256, (c, 64), dtype=torch.uint8)
         dc.all_gather(t, nccl)
-        self.assertEqual(self.ext.launches[-1][3:6], (1, 1, 0))  # slot 1 again, offset 0, its first use on parity 1
+        ags = [l for l in self.ext.launches if l[0] == "ag"]
+        self.assertEqual(ags[-1][3:6], (1, 1, 0))  # slot 1 again, offset 0, its first use on parity 1
         parts, ref, fb, calls = self._rs(302)
         dc.reduce_scatter(parts[0], fb)
         dc.all_gather(t, nccl)
-        self.assertEqual(self.ext.launches[-1][3:6], (1, 2, 0))  # parity 0 again: slot 1's second use
+        ags = [l for l in self.ext.launches if l[0] == "ag"]
+        self.assertEqual(ags[-1][3:6], (1, 2, 0))  # parity 0 again: slot 1's second use
         # the slot / arena parity alternates with the phase sequence
         self.assertEqual([l[2] & 1 for l in self.ext.launches if l[0] == "rs"], [0, 1, 0])
+        self.assertEqual(len([l for l in self.ext.launches if l[0] == "rs_wait_reduce"]), 3)  # split mode: a wait + reduce per RS
 
     def test_ag_without_device_phase_falls_back(self):
         t = torch.randint(0, 256, (16, 64), dtype=torch.uint8)

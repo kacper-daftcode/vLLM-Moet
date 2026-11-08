@@ -176,21 +176,22 @@ __device__ __forceinline__ uint32_t* word(uint8_t* base, size_t off) { return re
 // units [u0, u1) of 16 B from src to dst, interleaved over the n_push pushers: unit = base + (u * n_push + k) * 32 + lane
 template <int U>
 __device__ __forceinline__ void push_range(const uint4* __restrict__ src, uint4* __restrict__ dst, size_t u0, size_t u1, int k, int n_push) {
-  const int lane = threadIdx.x;
-  const size_t stripe = (size_t)n_push * kThreads * U;
+  // lanes = the CTA's threads (1..4 warps per pusher CTA: more bytes in flight under the compute's DRAM load)
+  const int lane = threadIdx.x, nthr = blockDim.x;
+  const size_t stripe = (size_t)n_push * nthr * U;
   size_t base = u0;
   for (; base + stripe <= u1; base += stripe) {
     uint4 v[U];
 #pragma unroll
-    for (int u = 0; u < U; ++u) v[u] = src[base + ((size_t)u * n_push + k) * kThreads + lane];
+    for (int u = 0; u < U; ++u) v[u] = src[base + ((size_t)u * n_push + k) * nthr + lane];
 #pragma unroll
     for (int u = 0; u < U; ++u) {
-      const size_t i = base + ((size_t)u * n_push + k) * kThreads + lane;
+      const size_t i = base + ((size_t)u * n_push + k) * nthr + lane;
       asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};" ::"l"(dst + i), "r"(v[u].x), "r"(v[u].y), "r"(v[u].z), "r"(v[u].w) : "memory");
     }
   }
-  // tail: unit-rows of 32 units, round-robin over the pushers
-  for (size_t row = base + (size_t)k * kThreads; row < u1; row += (size_t)n_push * kThreads) {
+  // tail: rows of nthr units, round-robin over the pushers
+  for (size_t row = base + (size_t)k * nthr; row < u1; row += (size_t)n_push * nthr) {
     const size_t i = row + lane;
     if (i < u1) { const uint4 v = src[i]; asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};" ::"l"(dst + i), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory"); }
   }
@@ -220,6 +221,7 @@ __device__ void pusher(const Args& a) {
       if (a.kind == K_RS) wait_ge_sys(a, word(peer, off_ctrl(a.L, a.g, 0)), a.pseq - 1, E_REUSE_RS);
       else wait_ge_sys(a, word(peer, off_ctrl(a.L, a.g, 1)), a.pseq - 1, E_REUSE_AG);
     }
+    if (a.kind == K_RS && k == 0 && lane == 0 && a.n_red == 0) st_release_sys(word(my, off_ctrl(a.L, a.g, 1)), a.pseq);  // split mode: consumed[g] = pseq
     // the team enters the phase together (one destination per team at a time); CTA 0 takes the per-GPU link token first
     uint32_t* go = word(my, off_cnt(a.L, a.g, par, a.slot, kCntGo + ph));
     if (lane == 0) {
@@ -237,7 +239,7 @@ __device__ void pusher(const Args& a) {
         wait_ge_gpu(a, go, use, E_GO);
       }
     }
-    __syncwarp();
+    __syncthreads();
     const uint4* src; uint4* dst;
     if (a.kind == K_RS) {
       src = reinterpret_cast<const uint4*>(a.x + (size_t)p * a.c * a.row_bytes);
@@ -250,7 +252,7 @@ __device__ void pusher(const Args& a) {
       size_t u0, u1; piece_range(total_u, piece, a.pieces, u0, u1);
       if (a.unroll >= 4) push_range<4>(src, dst, u0, u1, k, a.n_push);
       else push_range<2>(src, dst, u0, u1, k, a.n_push);
-      __syncwarp();
+      __syncthreads();
       if (lane == 0) {
         __threadfence_system();  // my stores to the peer are performed at system scope before I count
         // per-piece arrival: the last of the n_push pushers resets the word for the next use (the next instance of this (g, par, slot)
@@ -272,7 +274,7 @@ __device__ void pusher(const Args& a) {
       wait_ge_gpu(a, team, a.arrive_target, E_TEAM);
       if (k == 0 && a.link_token) { __threadfence(); atomicExch(token, 0u); }
     }
-    __syncwarp();
+    __syncthreads();
   }
 }
 
@@ -382,6 +384,56 @@ __global__ void __maxnreg__(32) comm_kernel(Args a) {
   else reducer_ag(a);
 }
 
+// ---- split mode (MK-4 §4.6 item 1): only the pushers stay resident during the transfer; the landing is awaited by one bounded CTA on
+// the pipeline's comm stream and the reduce runs as a transient full-occupancy kernel behind it (no co-residency constraint: it exits in
+// 40-80 us), so NCCL's remaining kernels and the CUTLASS GEMMs see <= n_push occupied SMs instead of 144.
+__global__ void __maxnreg__(32) wait_kernel(Args a) {
+  if (threadIdx.x == 0) {
+    const int par = a.pseq & 1;
+    for (int piece = 0; piece < a.pieces; ++piece)
+      for (int r = 0; r < kWorld; ++r) if (r != a.rank) wait_ge_sys(a, word(a.my, off_flag(a.L, a.g, par, a.slot, r, piece)), a.use, a.kind == K_RS ? E_FLAG_RS : E_FLAG_AG);
+    fence_acq_rel_sys();
+  }
+}
+constexpr int kRedThreads = 256;
+__global__ void __launch_bounds__(kRedThreads) reduce_kernel(Args a) {
+  const int par = a.pseq & 1;
+  const uint8_t* op[kWorld];
+  for (int r = 0; r < kWorld; ++r) op[r] = (r == a.rank) ? a.x + (size_t)a.rank * a.c * a.row_bytes : a.my + off_slot(a.L, a.g, par, r);
+  const size_t total_u = (size_t)a.c * a.row_bytes / 16;
+  for (size_t u = (size_t)blockIdx.x * kRedThreads + threadIdx.x; u < total_u; u += (size_t)gridDim.x * kRedThreads) {
+    uint4 v[kWorld];
+#pragma unroll
+    for (int r = 0; r < kWorld; ++r) v[r] = *reinterpret_cast<const uint4*>(op[r] + u * 16);
+    const uint16_t codes = *reinterpret_cast<const uint16_t*>(a.table + u * 2);  // 2 bytes: the two 4-element halves of this 16-B unit
+    uint2 o2[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t code = (codes >> (8 * h)) & 0xFFu;
+      const uint2 h0 = h ? make_uint2(v[0].z, v[0].w) : make_uint2(v[0].x, v[0].y);
+      const uint2 h1 = h ? make_uint2(v[1].z, v[1].w) : make_uint2(v[1].x, v[1].y);
+      const uint2 h2 = h ? make_uint2(v[2].z, v[2].w) : make_uint2(v[2].x, v[2].y);
+      const uint2 h3 = h ? make_uint2(v[3].z, v[3].w) : make_uint2(v[3].x, v[3].y);
+      auto pick = [&](uint32_t r) -> uint2 { return r == 0 ? h0 : (r == 1 ? h1 : (r == 2 ? h2 : h3)); };  // selects, no local memory
+      uint2 acc = pick(code & 3u);
+      acc = hadd4(acc, pick((code >> 2) & 3u));
+      acc = hadd4(acc, pick((code >> 4) & 3u));
+      acc = hadd4(acc, pick((code >> 6) & 3u));
+      o2[h] = acc;
+    }
+    uint4 o; o.x = o2[0].x; o.y = o2[0].y; o.z = o2[1].x; o.w = o2[1].y;
+    *reinterpret_cast<uint4*>(a.out + u * 16) = o;
+  }
+  // the last CTA publishes rs_done (the peers' slot-reuse check); the kernel's exit is the host's completion signal
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    uint32_t* done = word(a.my, off_cnt(a.L, a.g, par, a.slot, kCntRed));
+    const uint32_t old = atomicAdd(done, 1u);
+    if (old + 1 == a.red_target) { __threadfence(); st_release_sys(word(a.my, off_ctrl(a.L, a.g, 0)), a.pseq + 1); }
+  }
+}
+
 // ------------------------------------------------------------------------------------------------------- host side
 struct State {
   Layout L; uint8_t* my = nullptr; uint8_t* peer[kWorld] = {nullptr, nullptr, nullptr, nullptr};
@@ -435,17 +487,18 @@ torch::Tensor arena_view(int64_t g, int64_t par, int64_t off, int64_t rows, int6
 std::vector<int64_t> func_info() {
   cudaFuncAttributes fa; CK(cudaFuncGetAttributes(&fa, comm_kernel));
   int per_sm = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, comm_kernel, kThreads, kSmemBytes));
-  return {(int64_t)fa.numRegs, (int64_t)fa.sharedSizeBytes, (int64_t)kSmemBytes, (int64_t)fa.localSizeBytes, (int64_t)per_sm};
+  cudaFuncAttributes fr; CK(cudaFuncGetAttributes(&fr, reduce_kernel));
+  return {(int64_t)fa.numRegs, (int64_t)fa.sharedSizeBytes, (int64_t)kSmemBytes, (int64_t)fa.localSizeBytes, (int64_t)per_sm, (int64_t)fr.numRegs};
 }
 
 static Args base_args(int kind, int64_t g, int64_t pseq, int64_t slot, int64_t use, int64_t arrive_target, int64_t red_target, int64_t pieces, int64_t n_push, int64_t n_red, int64_t unroll, int64_t link_token, double wd_s, int64_t c, int64_t row_bytes) {
   TORCH_CHECK(g_state.my != nullptr, "not initialised");
   for (int r = 0; r < kWorld; ++r) TORCH_CHECK(g_state.peer[r] != nullptr, "peer ", r, " not opened");
-  TORCH_CHECK(n_push >= 1 && n_red >= 1 && n_push + n_red <= 1024, "bad CTA counts");
+  TORCH_CHECK(n_push >= 1 && n_red >= 0 && n_push + n_red <= 1024, "bad CTA counts");
   TORCH_CHECK(row_bytes % 16 == 0, "row bytes must be a multiple of 16");
   TORCH_CHECK((size_t)c * row_bytes <= g_state.L.slot_bytes || kind == K_AG, "the shard exceeds the slot");
   TORCH_CHECK(slot >= 0 && slot < kSlots && (kind == K_RS) == (slot == 0), "slot 0 = RS, 1..4 = AG");
-  TORCH_CHECK(use >= 1 && arrive_target >= n_push && red_target >= pieces * n_red, "use / targets");
+  TORCH_CHECK(use >= 1 && arrive_target >= n_push && red_target >= 1, "use / targets");
   TORCH_CHECK(pieces >= 1 && pieces <= g_state.L.pieces, "pieces 1..", g_state.L.pieces);
   Args a; memset(&a, 0, sizeof(a));
   a.kind = kind; a.rank = g_state.rank; a.g = (int)g; a.pseq = (uint32_t)pseq; a.slot = (int)slot; a.use = (uint32_t)use;
@@ -457,6 +510,9 @@ static Args base_args(int kind, int64_t g, int64_t pseq, int64_t slot, int64_t u
   return a;
 }
 
+static int g_push_threads = kThreads;
+void set_push_warps(int64_t warps) { TORCH_CHECK(warps >= 1 && warps <= 4, "1..4 warps per pusher CTA"); g_push_threads = (int)warps * 32; }
+
 void rs_launch(int64_t stream, torch::Tensor x, torch::Tensor out, torch::Tensor table, int64_t g, int64_t pseq, int64_t use, int64_t arrive_target,
                int64_t red_target, int64_t pieces, int64_t n_push, int64_t n_red, int64_t unroll, int64_t link_token, double wd_s) {
   TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.dim() == 2 && x.dtype() == torch::kBFloat16, "x: contiguous 2-D bf16 CUDA");
@@ -466,7 +522,24 @@ void rs_launch(int64_t stream, torch::Tensor x, torch::Tensor out, torch::Tensor
   TORCH_CHECK(table.is_cuda() && table.dtype() == torch::kUInt8 && table.is_contiguous() && table.numel() >= c * row_bytes / 8, "table: u8 [>= c*H/4]");
   Args a = base_args(K_RS, g, pseq, 0, use, arrive_target, red_target, pieces, n_push, n_red, unroll, link_token, wd_s, c, row_bytes);
   a.x = reinterpret_cast<const uint8_t*>(x.data_ptr()); a.out = reinterpret_cast<uint8_t*>(out.data_ptr()); a.table = reinterpret_cast<const uint8_t*>(table.data_ptr());
-  comm_kernel<<<(unsigned)(n_push + n_red), kThreads, kSmemBytes, (cudaStream_t)stream>>>(a);
+  TORCH_CHECK(n_red == 0 || g_push_threads == kThreads, "multi-warp pushers only in split mode (n_red = 0)");
+  comm_kernel<<<(unsigned)(n_push + n_red), (unsigned)(n_red == 0 ? g_push_threads : kThreads), kSmemBytes, (cudaStream_t)stream>>>(a);
+  CK(cudaGetLastError());
+}
+// split mode: the bounded wait for the three sources' pieces (1 CTA) and the transient reduce (grid CTAs x 256), both on the comm stream
+void rs_wait_reduce(int64_t stream, torch::Tensor x, torch::Tensor out, torch::Tensor table, int64_t g, int64_t pseq, int64_t use, int64_t red_target,
+                    int64_t pieces, int64_t grid, double wd_s) {
+  const int64_t c = out.size(0), row_bytes = out.size(1) * 2;
+  Args a = base_args(K_RS, g, pseq, 0, use, 1, red_target, pieces, 1, 0, 4, 0, wd_s, c, row_bytes);
+  a.x = reinterpret_cast<const uint8_t*>(x.data_ptr()); a.out = reinterpret_cast<uint8_t*>(out.data_ptr()); a.table = reinterpret_cast<const uint8_t*>(table.data_ptr());
+  wait_kernel<<<1, 32, 0, (cudaStream_t)stream>>>(a);
+  CK(cudaGetLastError());
+  reduce_kernel<<<(unsigned)grid, kRedThreads, 0, (cudaStream_t)stream>>>(a);
+  CK(cudaGetLastError());
+}
+void ag_wait(int64_t stream, int64_t c, int64_t row_bytes, int64_t g, int64_t pseq, int64_t slot, int64_t use, int64_t pieces, double wd_s) {
+  Args a = base_args(K_AG, g, pseq, slot, use, 1, 1, pieces, 1, 0, 4, 0, wd_s, c, row_bytes);
+  wait_kernel<<<1, 32, 0, (cudaStream_t)stream>>>(a);
   CK(cudaGetLastError());
 }
 void ag_launch(int64_t stream, torch::Tensor src, int64_t arena_off, int64_t g, int64_t pseq, int64_t slot, int64_t use, int64_t arrive_target,
@@ -476,7 +549,8 @@ void ag_launch(int64_t stream, torch::Tensor src, int64_t arena_off, int64_t g, 
   TORCH_CHECK((size_t)arena_off + (size_t)kWorld * c * row_bytes <= g_state.L.arena_bytes, "the gather exceeds the arena");
   Args a = base_args(K_AG, g, pseq, slot, use, arrive_target, red_target, pieces, n_push, n_red, unroll, link_token, wd_s, c, row_bytes);
   a.src = reinterpret_cast<const uint8_t*>(src.data_ptr()); a.arena_off = (size_t)arena_off;
-  comm_kernel<<<(unsigned)(n_push + n_red), kThreads, kSmemBytes, (cudaStream_t)stream>>>(a);
+  TORCH_CHECK(n_red == 0 || g_push_threads == kThreads, "multi-warp pushers only in split mode (n_red = 0)");
+  comm_kernel<<<(unsigned)(n_push + n_red), (unsigned)(n_red == 0 ? g_push_threads : kThreads), kSmemBytes, (cudaStream_t)stream>>>(a);
   CK(cudaGetLastError());
 }
 std::vector<int64_t> err_check() {
@@ -502,6 +576,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("func_info", &func_info, "[regs, static smem, dynamic smem, local bytes, max CTAs per SM]");
   m.def("rs_launch", &rs_launch);
   m.def("ag_launch", &ag_launch);
+  m.def("rs_wait_reduce", &rs_wait_reduce, "split mode: the bounded wait + the transient reduce on the comm stream");
+  m.def("ag_wait", &ag_wait, "split mode: the bounded wait for the gathered pieces on the comm stream");
+  m.def("set_push_warps", &set_push_warps, "1..4 warps per pusher CTA (split mode)");
   m.def("err_check", &err_check);
   m.def("read_word", &read_word);
   m.def("ctrl_offsets", &ctrl_offsets);
