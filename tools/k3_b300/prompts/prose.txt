@@ -1,0 +1,1 @@
+Write a 1500-word essay for a general audience on how large language model inference engines manage GPU memory: paged KV caches, prefix caching, speculative decoding and offloading to host memory. Use concrete examples, avoid bullet lists, and end with a short outlook on what hybrid attention architectures change.

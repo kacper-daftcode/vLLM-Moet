@@ -1,0 +1,1 @@
+Let f(n) be the number of ordered pairs of positive integers (a, b) with a <= b such that lcm(a, b) = n. Compute f(2^6 * 3^4 * 5^2 * 7) and explain the derivation step by step. Then generalize: give a closed-form expression for f(n) in terms of the prime factorization of n and prove it.

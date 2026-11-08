@@ -1,0 +1,46 @@
+# vLLM-Moet: Kimi-K3 + DSpark on 8x B300 (HGX, sm_103) -- the official vLLM release plus the fixes it needs.
+#
+# Base: vllm/vllm-openai:v0.32.0, served on hgx-02 as TP8 + DCP8, fp8 KV, prefix caching, SimpleCPUOffloadConnector
+# (disk tier through the page cache), DSpark k = 4 (docker/b300/run-k3.sh). Everything else is the official image.
+#
+#   1. K3 RecoverSSM next to a KV connector (tools/k3_b300/patch_vllm_recoverssm_offload.py). `--use-replayssm`
+#      on K3 selects the KDA RecoverSSM verify, which drops the one-full-KDA-state-slot-per-draft-token that DSpark
+#      otherwise costs on every KDA layer (MambaSpec.num_speculative_blocks k -> 0: at k = 4, 12 blocks x 25.7 MB
+#      = 308 MB per request per GPU). v0.32.0 rejects the flag whenever a KV connector is configured, a rule
+#      written for Mamba2 ReplaySSM's deferred state store; K3's RecoverSSM commits the accepted state in the same
+#      step's postprocess, before the connector runs, so the patch lifts the check for `use_kda_recoverssm` only.
+#      Measured 2026-10-24: GPU KV 19.26M -> 21.61M tokens at 1M-token requests, a 32K request 539 -> 250 MB,
+#      single-stream code decode 227 -> 220 tok/s at the same accepted length, GSM8K-200 98.0%.
+#      docs/k3-b300-dspark-kv.md has the budget; tools/k3_b300/kv_model.py reproduces the engine's numbers.
+#   2. (-r2, -r3) A replicated sliding-window GQA draft under the DCP-sharded MLA target
+#      (tools/k3_b300/patch_vllm_swa_draft_dcp.py), for RedHatAI/Kimi-K3-speculator.dspark: the KV layout decided
+#      on the unified page sizes (layer-compact, so TOKENSPEED_MLA keeps its kernel-block split), the target's
+#      CUDA graph support judged on the target's layers only, and the draft's sliding-window block on
+#      trtllm-gen's 1024-token pages instead of 64-token blocks padded to the MLA page. Only reached when such a
+#      draft is configured; the Inferact MLA draft takes none of these paths.
+#   3. (-r3..-r5) Prefix caching with that draft: `SlidingWindowManager` with hash-unit (fine-grained) lookups and a
+#      copy-on-write partial tail, so the window's hits land on the prompt-end hash boundary where K3's KDA
+#      groups keep their state (the -r2 image lost every prefix hit with the draft's window in prefix caching,
+#      and found no KDA state with the window as per-request scratch). Entered only when the coordinator aligns
+#      hits below the block size, i.e. next to a Mamba "align" group; other models keep the upstream path.
+#   4. (-r5) The scheduler's Mamba "align" chunking on the Mamba group's block from the KV cache config: with the window group
+#      prefix-cacheable, cache_config.block_size became the window's 1024 and the KDA checkpoints were lost
+#      (turn 2 of an agent session hit 0 on -r3); cache_config.mamba_block_size is stale in the engine core (-r4 split every 16 tokens).
+#
+# Build:  docker build -f Dockerfile.b300-k3 -t vllm-moet-b300:k3-v0.32.0-r5 .   (~2 min; hgx-02 has no buildx:
+#         DOCKER_BUILDKIT=0)
+# Serve:  IMAGE=vllm-moet-b300:k3-v0.32.0-r5 USE_RECOVERSSM=1 ... docker/b300/run-k3.sh
+ARG BASE_IMAGE=vllm/vllm-openai:v0.32.0
+FROM ${BASE_IMAGE}
+
+COPY tools/k3_b300/ /opt/vllm-moet/k3_b300/
+RUN python3 /opt/vllm-moet/k3_b300/patch_vllm_recoverssm_offload.py --check \
+ && python3 /opt/vllm-moet/k3_b300/patch_vllm_recoverssm_offload.py \
+ && python3 /opt/vllm-moet/k3_b300/patch_vllm_swa_draft_dcp.py --check \
+ && python3 /opt/vllm-moet/k3_b300/patch_vllm_swa_draft_dcp.py \
+ && python3 -c "import vllm.config.vllm, vllm.v1.attention.backends.utils, vllm.model_executor.layers.attention.attention, vllm.v1.core.kv_cache_manager" \
+ && find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -prune -exec rm -rf {} +
+
+LABEL org.opencontainers.image.title="vLLM-Moet B300 Kimi-K3" \
+      org.opencontainers.image.description="vllm/vllm-openai:v0.32.0 + K3 RecoverSSM admitted next to KV connectors" \
+      org.opencontainers.image.source="https://github.com/kacper-daftcode/vLLM-Moet"
