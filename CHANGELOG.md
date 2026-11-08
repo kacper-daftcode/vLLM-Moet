@@ -5,6 +5,15 @@ commit an image was built from is in its release tag.
 
 ## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
 
+### `dsv41-nightly-df3bd094-r26b` — 2026-11-08
+- Step 47: the pipelined sequence-parallel prefill (`PREFILL_PIPE=2`: two 4 096-row groups of an 8 192-token step one
+  layer apart, the collectives of one group under the other's compute) with the groups' 128-row replay layers as CUDA
+  graphs per slot, and FC2 of step 42 on the producer-warp kernel (`_WS2=3`); fresh prefill 163K 6.6 → 5.6–5.8 s at
+  400 W (5.4 s on the second host), 19K 0.79 → 0.76 s, bit-identical to `-r25`; +1.7 % under 100 nice'd CPU hogs;
+  decode unchanged (129 steps/s); GPU KV 9.62M → 6.12M tokens (the 8 192-token step and the graphs cost 2 GiB per GPU).
+  `-r26` — the same without the replay graphs — is superseded: its eager replay tails are launch-bound and a host whose
+  cores other processes load pays +31 % at 163K.
+
 ### `dsv41-nightly-df3bd094-r25` — 2026-11-05
 - Step 46: the sparse-MLA prefill attention chunks on the cubit-assembled SASS kernel; fresh prefill 163K 6.8 → 6.6 s,
   bit-identical to `-r24`.
