@@ -124,6 +124,23 @@ def _one_all_gather() -> bool:
 
 
 _ONE_AG: bool | None = None
+_PIPE: Any = None  # the pipeline module (vllm.v1.worker.moet_prefill_pipe) when it is installed and asks for device gathers, else False
+
+
+def _pipe_module():
+    global _PIPE
+    if _PIPE is None:
+        _PIPE = False
+        try:
+            from vllm.v1.worker import moet_prefill_pipe as pipe
+
+            if getattr(pipe, "device_comm_mode", lambda: "0")() != "0":
+                _PIPE = pipe
+        except Exception:  # noqa: BLE001
+            _PIPE = False
+    return _PIPE or None
+
+
 _CTX: dict[tuple, dict[str, Any]] = {}  # (stand-in data_ptr, shape) -> the gathered pieces + consumption flags
 _ELIGIBLE: dict[int, bool] = {}  # id(ffn) -> decided once
 _STATS = {"calls": 0, "bf16_fallback": 0}
@@ -224,8 +241,18 @@ def gather_moe_input(ffn, x_shard: torch.Tensor, num_tokens: int, input_ids: tor
         _STATS["bf16_fallback"] += 1
         return None
     from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
-    from vllm.distributed import tensor_model_parallel_all_gather as all_gather
+    from vllm.distributed import tensor_model_parallel_all_gather as _nccl_all_gather
     from vllm.forward_context import get_forward_context, is_forward_context_available
+
+    def all_gather(t: torch.Tensor, dim: int) -> torch.Tensor:
+        """dim-0 all-gather: the device gather of MK-4 inside an open device phase of the pipelined step (moet_prefill_pipe.
+        device_all_gather, VLLM_MOET_PREFILL_PIPE_DEVICE_COMM != 0), else NCCL's as before."""
+        assert dim == 0
+        pipe = _pipe_module()
+        if pipe is not None:
+            return pipe.device_all_gather(t, lambda u: _nccl_all_gather(u, 0))
+        return _nccl_all_gather(t, 0)
+
     import vllm.envs as envs
     import vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router as ftb
 

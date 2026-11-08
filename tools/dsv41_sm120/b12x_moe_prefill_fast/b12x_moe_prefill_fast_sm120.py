@@ -61,7 +61,7 @@ def _ext():
     return load(
         name=os.environ.get("VLLM_MOET_B12X_MOE_PREFILL_FAST_NAME", "vllm_moet_b12x_moe_prefill_fast_sm120"),
         sources=[str(_HERE / "b12x_moe_prefill_fast_sm120.cu")],
-        extra_cuda_cflags=["-O3", "-std=c++20"],
+        extra_cuda_cflags=["-O3", "-std=c++20"] + os.environ.get("VLLM_MOET_B12X_MOE_PREFILL_FAST_NVCC_EXTRA", "").split(),
         extra_cflags=["-O3", "-std=c++20"],
         verbose=False,
     )

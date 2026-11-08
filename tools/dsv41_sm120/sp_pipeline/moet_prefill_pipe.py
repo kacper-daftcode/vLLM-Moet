@@ -43,7 +43,9 @@ step, see phase_graphs - K-8), VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX (26214
 VLLM_MOET_PREFILL_PIPE_SHARED_TAIL (0 | 1 | verify: the replay layers 20-39 + collapse of a full pipelined step run ONCE on the
 concatenation of both groups' replay rows (256) instead of once per group, the three row-count-dependent ops split per group so the
 bits stay today's, see shared_tail - K-9), VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS (all | shared: which slots get replay graphs
-with the shared tail on).
+with the shared tail on), VLLM_MOET_PREFILL_PIPE_DEVICE_COMM (0 | 1 | verify: the sequence-parallel reduce-scatters and all-gathers
+of a pipelined step as device-initiated PCIe pushes from a small kernel per collective instead of NCCL - moet_device_comm.py, MK-4;
+verify = every device collective compared with NCCL's on the same inputs, NCCL's result consumed, counters in stats()).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
@@ -910,6 +912,54 @@ def record_for_comm(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+# ------------------------------------------------------------------------------- device collectives (MK-4, moet_device_comm.py)
+def device_comm_mode() -> str:
+    """VLLM_MOET_PREFILL_PIPE_DEVICE_COMM: "0" (default) = NCCL as today; "1" = the SP reduce-scatters / all-gathers of a pipelined
+    step's comm phases from the device (a 64-CTA kernel per collective, PCIe P2P pushes, NCCL's summation order from a probed
+    table - moet_device_comm.py); "verify" = both, compared every time, NCCL's result consumed."""
+    value = os.environ.get("VLLM_MOET_PREFILL_PIPE_DEVICE_COMM", "0")
+    return value if value in ("0", "1", "verify") else "0"
+
+
+_DEVICE_COMM: Any = None  # the module, False when the import failed (said once)
+
+
+def _device_comm():
+    global _DEVICE_COMM
+    if _DEVICE_COMM is None:
+        try:
+            from vllm.v1.worker import moet_device_comm
+
+            _DEVICE_COMM = moet_device_comm
+        except Exception as exc:  # noqa: BLE001
+            _DEVICE_COMM = False
+            logger.warning("vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE_DEVICE_COMM=%s but moet_device_comm is not "
+                           "importable (%r) - NCCL's collectives stay", device_comm_mode(), exc)
+    return _DEVICE_COMM
+
+
+def device_reduce_scatter(x: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor | None:
+    """The model's reduce-scatter hook (_moet_sp_reduce_scatter): the device result inside an open comm phase of a pipelined
+    group when VLLM_MOET_PREFILL_PIPE_DEVICE_COMM != 0, else None (the caller runs NCCL's)."""
+    if device_comm_mode() == "0":
+        return None
+    dc = _device_comm()
+    if not dc:
+        return None
+    return dc.reduce_scatter(x, fallback)
+
+
+def device_all_gather(t: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]) -> torch.Tensor:
+    """The model's all-gather hook (sp_all_gather sites, sp_moe_gather_sm120): the gathered [4c, K] rows from the device inside
+    an open device phase, else fallback(t) (NCCL's all-gather)."""
+    if device_comm_mode() == "0":
+        return fallback(t)
+    dc = _device_comm()
+    if not dc:
+        return fallback(t)
+    return dc.all_gather(t, fallback)
+
+
 # ------------------------------------------------------------------------------------------------- model side
 def merge_outputs(outputs: list[Any]) -> Any:
     """The per-group model outputs in row order: tensors concatenate along the token dim, a tuple's list elements
@@ -1002,7 +1052,10 @@ def _run_groups(
                 group_rows(),
                 len(groups),
             )
-        return step.run(fn)
+        outputs = step.run(fn)
+        if device_comm_mode() != "0" and _device_comm():
+            _device_comm().step_done()  # the watchdog record (a trapped kernel = a failed step, loudly) + the verify counters
+        return outputs
     _STATS["sequential"] += 1
     if _STATS["sequential"] == 1:
         logger.info(
@@ -2431,7 +2484,10 @@ def plan_groups(runner: Any, input_batch: Any, batch_desc: Any, block_tables, sl
 
 
 def stats() -> dict:
-    return dict(_STATS)
+    d = dict(_STATS)
+    if device_comm_mode() != "0" and _DEVICE_COMM:
+        d["device_comm"] = _DEVICE_COMM.stats()
+    return d
 
 
 # ------------------------------------------------------------------------------------------------- bits harness

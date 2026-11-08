@@ -615,8 +615,16 @@ struct Fc1Args {
 // STRIDED: a_values / a_scales are row-strided views (lda / lds; the rows' scale offsets staged in s_aoff_sf); the contiguous
 // instantiation (the served path) derives the scale offset from the A offset as before - the same code as v8, bit for bit and
 // cycle for cycle (K 5.11: the strided code path costs fc1 +0.5 % on call1, so the served path does not carry it)
+// MK-4 (megakernel stage 3, the hybrid): -DMOET_FC1_MAXNREG=<n> caps v8's registers at n instead of launch_bounds' 65536 / (256 x MINB)
+// = 128, so that a 32-thread x 32-register comm CTA (1 024 registers) co-resides with the two fc1 CTAs of an SM (2 x 256 x 120 + 1 024
+// <= 65 536); the arithmetic is untouched (bits by construction, the harness confirms), the cost is measured on W's harness.
+#ifdef MOET_FC1_MAXNREG
+#define MOET_FC1_BOUNDS __maxnreg__(MOET_FC1_MAXNREG)
+#else
+#define MOET_FC1_BOUNDS __launch_bounds__(kThreads, MINB)
+#endif
 template <int STAGES, int MINB, bool STRIDED>
-__global__ void __launch_bounds__(kThreads, MINB) fc1_kernel(Fc1Args a) {
+__global__ void MOET_FC1_BOUNDS fc1_kernel(Fc1Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
   // STRIDED: byte offset of the rows' k32 scale bytes (row * lds; 0xFFFFFFFF: padding), staged like ring.aoff; the A rows and their
