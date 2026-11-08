@@ -61,7 +61,8 @@ def _ext():
     return load(
         name=os.environ.get("VLLM_MOET_B12X_MOE_PREFILL_FAST_NAME", "vllm_moet_b12x_moe_prefill_fast_sm120"),
         sources=[str(_HERE / "b12x_moe_prefill_fast_sm120.cu")],
-        extra_cuda_cflags=["-O3", "-std=c++20"] + os.environ.get("VLLM_MOET_B12X_MOE_PREFILL_FAST_NVCC_EXTRA", "").split(),
+        # MK-4: extra nvcc flags, space- or comma-separated (a docker -e value cannot carry spaces), e.g. -DMOET_FC1_MAXNREG=120
+        extra_cuda_cflags=["-O3", "-std=c++20"] + os.environ.get("VLLM_MOET_B12X_MOE_PREFILL_FAST_NVCC_EXTRA", "").replace(",", " ").split(),
         extra_cflags=["-O3", "-std=c++20"],
         verbose=False,
     )
