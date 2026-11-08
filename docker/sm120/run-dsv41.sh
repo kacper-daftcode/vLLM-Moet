@@ -9,7 +9,7 @@
 #                        SERVED_SWITCHES below; docs/dsv41-sm120.md explains each). EXTRA_DOCKER_ARGS="-e VAR=0" after it
 #                        overrides a single switch. 0 = vLLM's defaults plus the image's build-time changes only.
 #
-# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r23)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r26b)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
 #            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results + DeepGEMM JIT; the first start fills it (~22 min)
 #            SERVED_NAME (deepseek-ai/DeepSeek-V4.1-Flash)  the model name the API answers to
@@ -17,8 +17,8 @@
 #            EXTRA_ARGS / EXTRA_DOCKER_ARGS   appended to `vllm serve` / `docker run`
 #
 # Engine:    MAX_MODEL_LEN (524288)  MAX_NUM_SEQS (8)  MAX_NUM_BATCHED_TOKENS (4096: the prefill chunk; 8192 with PREFILL_PIPE=2)
-#            PREFILL_PIPE (0)        2 = step 47, the pipelined sequence-parallel prefill (two 4096-row groups of one 8192-token step
-#                        one layer apart; needs SERVED=1 for the steps it builds on); MAX_NUM_BATCHED_TOKENS then defaults to 8192
+#            PREFILL_PIPE (0; 2 with SERVED=1)  2 = step 47, the pipelined sequence-parallel prefill (two 4096-row groups of one
+#                        8192-token step one layer apart; needs the steps SERVED=1 turns on); MAX_NUM_BATCHED_TOKENS then defaults to 8192
 #            PREFILL_PIPE_REPLAY_GRAPHS (1 with PREFILL_PIPE=2, else 0)  the 128-row replay layers 20-39 of every step as CUDA graphs
 #                        (vLLM's decoder-replay graphs, captured per row-group slot as well): the pipelined step's two replay tails
 #                        are ~1,400 launches each and CPU-bound when the host's cores are loaded - the 2026-11-07 production window
@@ -58,7 +58,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r23}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r26b}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -68,11 +68,17 @@ CACHE_DIR="${CACHE_DIR:-$PWD/cache-$NAME}"
 SERVED_NAME="${SERVED_NAME:-deepseek-ai/DeepSeek-V4.1-Flash}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-524288}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+SERVED="${SERVED:-0}"
+case "$SERVED" in
+  0|1) ;;
+  *) echo "SERVED must be 0 or 1, got $SERVED" >&2; exit 1 ;;
+esac
 # Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is -22.6 % at 163K on an idle host and was +31 % in the production window of
 # 2026-11-07 (rolled back): not the KV offload tier (with it: +0.5 %) but the host's CPUs, loaded by other processes on the server's
 # NUMA node - the pipelined step's eager replay tails are launch-bound. The -r26b image's PREFILL_PIPE_REPLAY_GRAPHS=1 runs those
-# tails as CUDA graphs (+3.3 % under 100 nice'd hogs instead of +26.6 %). Off in the served profile until its production window.
-PREFILL_PIPE="${PREFILL_PIPE:-0}"
+# tails as CUDA graphs (+3.3 % under 100 nice'd hogs instead of +26.6 %); served since the 2026-11-08 window (163K 6.6 -> 5.6-5.8 s on
+# the production host, +1.7 % under 100 hogs, KV 12.5 -> 10.5 GiB). SERVED=1 turns it on (PREFILL_PIPE=0 keeps the one-group path).
+PREFILL_PIPE="${PREFILL_PIPE:-$([[ "$SERVED" == "1" ]] && echo 2 || echo 0)}"
 case "$PREFILL_PIPE" in
   0|2) ;;
   *) echo "PREFILL_PIPE must be 0 or 2, got $PREFILL_PIPE" >&2; exit 1 ;;
@@ -86,11 +92,6 @@ else
 fi
 REPLAY_CAPTURE_SIZES="${REPLAY_CAPTURE_SIZES:-128,256}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
-SERVED="${SERVED:-0}"
-case "$SERVED" in
-  0|1) ;;
-  *) echo "SERVED must be 0 or 1, got $SERVED" >&2; exit 1 ;;
-esac
 # The production configuration (docs/dsv41-sm120.md, "Switches"): the runtime switches of the image's steps that are
 # off by default, in the state production serves them. EXTRA_DOCKER_ARGS comes later on the docker command line, so
 # "-e VAR=0" there overrides one of these.
@@ -100,7 +101,7 @@ SERVED_SWITCHES=(
   VLLM_MOET_DFLASH_PREP_GROUPS=1 VLLM_MOET_CANDIDATE_DET_TOPK=1 VLLM_MOET_SWA_DECODE_BUILD=1
   VLLM_MOET_MOE_TOPKSUM_ADD=1 VLLM_MOET_SWA_DRAFT_BUILD=1 B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
   VLLM_MOET_MHC_MXFP8=1 VLLM_MOET_MHC_SIDE_DEFER=1
-  VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1
+  VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1 VLLM_MOET_B12X_MOE_PREFILL_FAST_WS2=3
   VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
   VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE} VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=${PREFILL_PIPE_REPLAY_GRAPHS}
 )
