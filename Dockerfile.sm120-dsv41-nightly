@@ -409,6 +409,23 @@ RUN if [ "$VLLM_MOET_PREFILL_PIPE_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_PAT
     && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py \
     && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/model.py; fi
 
+# 48. The KV offload connector's copy path off the runner's main thread (runtime switch VLLM_MOET_KV_SWAP_ASYNC=1, default off;
+#     K-10). Why: the connector's CPU region (/dev/shm, 17 GB) is cudaHostRegistered by the four TP workers at start-up and in
+#     14 of 14 r26/r27 server logs three of the four registrations failed (the pin of the whole range at once under the loaded
+#     host's memory state) - the region stays pageable on those ranks and cuMemcpyBatchAsync into pageable memory is
+#     host-synchronous, so rank 0 (the store writer) blocked 211-219 ms per 8192-token step when it lost the lottery (HOST_TIMING
+#     head 86 ms vs 0.9 ms). What: the registration under a cross-process flock in TP-rank order, in 2 GiB chunks with retries
+#     (4/4 ranks registered in situ), and a still-pageable rank's copies through pinned staging on the connector's own threads;
+#     the connector's save-before-evict invariant kept (a store completes only after the memmove). Unit test 37/37; in situ
+#     (as built on r27, 4x RTX PRO 6000 SE) bits identical, prefix hits identical. Patcher on v1/kv_offload/cpu/gpu_worker.py,
+#     helper kv_swap_async.py installed next to it.
+ARG VLLM_MOET_KV_SWAP_ASYNC_PATCH=1
+RUN if [ "$VLLM_MOET_KV_SWAP_ASYNC_PATCH" = "1" ]; then \
+       python3 /opt/vllm-moet/dsv41_sm120/kv_offload/patch_vllm_kv_swap_async_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/kv_offload/patch_vllm_kv_swap_async_sm120.py --check \
+    && grep -q "kv_swap_async" /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py \
+    && python3 -c "from vllm.v1.kv_offload.cpu import kv_swap_async; print('kv swap async helper importable')"; fi
+
 # Labels: the launcher reads kv-mode and v41-kv-records; the tests and docs read the step flags.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="DeepSeek-V4.1-Flash on sm_120: vllm/vllm-openai nightly df3bd094 with the sm_120 gaps closed and the decode / prefill kernels of vLLM-Moet (docs/dsv41-sm120.md)" \
@@ -450,6 +467,7 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.prefill-sp-gather="${VLLM_MOET_PREFILL_SP_GATHER_PATCH}" \
       com.vllm-moet.sparse-mla-prefill-sass="${VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH}" \
       com.vllm-moet.prefill-pipe="${VLLM_MOET_PREFILL_PIPE_PATCH}" \
+      com.vllm-moet.kv-swap-async="${VLLM_MOET_KV_SWAP_ASYNC_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}" \
       com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}" \
       com.vllm-moet.engram-v2="${VLLM_MOET_ENGRAM_V2_PATCH}"
