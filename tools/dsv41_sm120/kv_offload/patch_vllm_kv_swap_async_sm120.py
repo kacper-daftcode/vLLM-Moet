@@ -41,6 +41,11 @@ EDITS: list[tuple[str, str, str]] = [
         f"    async_state: \"_kv_swap_async.AsyncState | None\" = None  {MARKER}\n\n\ndef compute_sub_block_ptrs(\n",
     ),
     (
+        "pin_mmap_region: the registration chunk",
+        "    rows_per_chunk = max(MAX_HOST_REGISTER_CHUNK_BYTES // region._row_stride, 1)\n",
+        f"    rows_per_chunk = max(_kv_swap_async.pin_chunk_bytes(MAX_HOST_REGISTER_CHUNK_BYTES) // region._row_stride, 1)  {MARKER}\n",
+    ),
+    (
         "pin_mmap_region: lock + retries + skip",
         "    addresses: list[int] = []\n"
         "    registered_bytes = 0\n"

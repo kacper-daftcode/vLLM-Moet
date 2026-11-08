@@ -82,6 +82,19 @@ def pin_retries() -> int:
         return 3
 
 
+def pin_chunk_bytes(default_bytes: int) -> int:
+    """The host registration's chunk (VLLM_MOET_KV_SWAP_PIN_CHUNK_GIB, default 2 GiB with the switch on; 0 = vLLM's 64 GiB = the
+    whole 17 GB region in one cudaHostRegister). The live server's failures are the kernel's "Cannot map memory with base addr
+    ... and size of 0x3ffffb pages" = the whole range at once; smaller ranges localize a failure and cost less when one fails."""
+    if not enabled():
+        return default_bytes
+    try:
+        gib = float(os.environ.get("VLLM_MOET_KV_SWAP_PIN_CHUNK_GIB", "2"))
+    except ValueError:
+        gib = 2.0
+    return default_bytes if gib <= 0 else int(gib * (1 << 30))
+
+
 def staging_budget_bytes() -> int:
     """Pinned staging memory per direction and worker (default 256 MB; a transfer above it is split into chunks)."""
     try:
@@ -135,9 +148,10 @@ def register_with_retries(host_register: Callable[[int, int], bool], address: in
     """host_register with retries (the registration race leaves a transient failure; a later attempt succeeds)."""
     n = pin_retries() if enabled() else 1
     for attempt in range(1, n + 1):
+        t0 = time.monotonic()
         if host_register(address, size):
-            if attempt > 1:
-                logger.info("KV offload: host registration succeeded on attempt %d", attempt)
+            if enabled():
+                logger.info("KV offload: host-registered %.2f GB at 0x%x in %.1f s (attempt %d)", size / 1e9, address, time.monotonic() - t0, attempt)
             return True
         if attempt < n:
             time.sleep(0.5 * attempt)
