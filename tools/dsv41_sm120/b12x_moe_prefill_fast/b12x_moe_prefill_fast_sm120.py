@@ -31,6 +31,15 @@ v10 (K-5): fc1 as three warpgroups (`fc1_kernel_wg`: 8 consumer warps + 4 produc
 8-B cp.asyncs fill; at 2 CTAs/SM `setmaxnreg` 32 / 104) = WS1 modes 8 (3 stages, 2 CTAs/SM), 9 (4, 1), 10 (6, 1), 11 (7, 1); measured
 best mode 9: fc1 -10.6 % at 4096 rows in the harness (913 vs 1 021 us), bit-identical; in situ (pipelined r26 step, WS1=9 WS2=3)
 the 4096-row fc1 launches are -10.5 % (887 -> 794 us) but the 163K / 19K walls move <= 0.3 % (K/REPORT.md 7.4).
+
+MK-2 (megakernel stage 1, milestone 1): `VLLM_MOET_B12X_MOE_PREFILL_FAST_WS` >= 20 runs fc1 + SwiGLU/quant + fc2 as ONE persistent launch
+(`moe_persistent_kernel`: v10's CTA, 1 CTA/SM x 12 warps, one work list with the fc2 items gated by per-expert fc1_done counters, every wait
+watchdog-bounded - an expired wait records to pinned host memory and traps; the separate topk_sum_kernel follows). 20-25 = fc2 items of one
+128-column tile with 4 / 6 / 7 / 3 / 5 / 2 ring stages, 30-35 = fc2 items of two tiles (the fc1-shaped stage; the faster form). Knobs:
+_WS_LEAD (the work list's lead in experts, default 64; >= the expert count = every fc1 item before the first fc2 item), _WS_MIN_ROWS (default 0),
+_WS_WATCHDOG_MS (2000), _WS_STATS=1 (per-item %globaltimer statistics, moe_prefill_ws_stats()), _WS_ROUTE_CS (streaming route-row stores, 1).
+Bit-identical to v8/v9/v10 on W's harness (6/6 at 4096 and 128 rows, 3 runs); measured +2.6 % vs WS1=9 + WS2=3 at call1 4096 rows
+(MK/REPORT.md 2) - off by default.
 """
 from __future__ import annotations
 

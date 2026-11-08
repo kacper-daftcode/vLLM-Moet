@@ -53,6 +53,7 @@
 #include <stdint.h>
 #include <type_traits>
 #include <cstdlib>
+#include <cstring>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -67,6 +68,10 @@ constexpr int kF2Stages = 9;        // K64 stages of FC2: the 9 live ones (k32 b
 constexpr int kMaxE = 512;          // experts per rank (384 served)
 constexpr int kFrontThreads = 512;
 constexpr int kFrontWarps = kFrontThreads / 32;
+// MK-2 (section 6): the unified work list's FC2 marker (bit 8 of the tile field; fc1 tiles 0-4, fc2 tiles 0-39) and the persistent kernel's
+// consumer warp count (= kWgConsumers, asserted there): fc1_need[e] = kPsConsumerWarps x the expert's FC1 items
+constexpr int kPsFc2 = 0x100;
+constexpr int kWgConsumersFront = 8;
 
 // stage layouts (bytes)
 constexpr int kF1B = 8192;    // [proj 2][kk 2][n32 chunk 4][lane 32][16 B] (the plane's layout)
@@ -265,6 +270,12 @@ struct FrontArgs {
   int32_t* exp_cnt;         // [kMaxE] pair count of the expert
   uint32_t* out;            // fused top-k sum: the output rows of tokens without a valid pair are zeroed here (nullptr: off)
   int32_t* tok_valid;       // fused top-k sum: [T] bits 0-7 the token's valid pairs (0 <= id < E) = its FC2 arrivals per tile, bits 8-15 the slots with id >= 0
+  // MK-2 (WS >= 20): the unified work list of the persistent launch (FC1 items of expert e, then the FC2 items of expert e - lead; nullptr: the
+  // two lists above), its capacity, the lead in experts, and fc1_need[e] = the FC2 items' wait target (8 x the expert's FC1 items)
+  int4* u_items;
+  int32_t* fc1_need;
+  int u_cap, lead;
+  int u_f2_group;           // 128-column tiles per FC2 item of the unified list (1 = as the two lists, 2 = n256 items: the tile field = the first tile)
   int T, K, n_pairs, E, n2_tiles, row_cap, f1_cap, f2_cap, n_chunks, quant_blocks, topk;
 };
 
@@ -408,12 +419,43 @@ __global__ void __launch_bounds__(kFrontThreads) frontend_kernel(FrontArgs a) {
     a.counts[3] = 0; a.counts[4] = 0;  // the work counters of the persistent kernels (also zeroed by the host's memset)
   }
   __syncthreads();
+  // MK-2: the unified work list of the persistent launch (moe_persistent_kernel): block order fc1(0) .. fc1(L-1), fc1(L) fc2(0), fc1(L+1)
+  // fc2(1), ..., fc1(E-1) fc2(E-1-L), fc2(E-L) .. fc2(E-1) (L = the lead in experts; items tile-major within a block as in the two lists);
+  // s_u1[e] / s_u2[e] = the start of the expert's FC1 / FC2 block; fc1_need[e] = 8 x the expert's FC1 items (the consumer warps' arrivals)
+  __shared__ int s_u1[kMaxE];
+  __shared__ int s_u2[kMaxE];
+  if (a.u_items != nullptr) {
+    const int L = a.lead, n2 = a.n2_tiles / a.u_f2_group;  // FC2 items per chunk of the unified list
+    int ua = 0, ub = 0;
+    if (tid < E) {
+      ua = chunks * kN1Tiles + (tid >= L ? s_chunks[tid - L] * n2 : 0);
+      ub = tid >= E - L ? chunks * n2 : 0;  // the FC2 blocks of the last L experts follow the interleaved region
+    }
+    int tot_a, tot_b;
+    const int oa = block_exclusive_scan(ua, s_scan, tot_a);
+    const int ob = block_exclusive_scan(ub, s_scan, tot_b);
+    if (tid < E) { s_u1[tid] = oa; s_u2[tid] = tot_a + ob; a.fc1_need[tid] = chunks * kN1Tiles * kWgConsumersFront; }
+    if (tid == 0) a.counts[6] = min(tot_a + tot_b, a.u_cap);
+    __syncthreads();
+    if (tid < E && tid + L < E) s_u2[tid] = s_u1[tid + L] + s_chunks[tid + L] * kN1Tiles;
+    __syncthreads();
+  }
   // the work items, tile-major within the expert (consecutive items share the weight tile): a thread per (expert, tile)
   for (int et = tid; et < E * (kN1Tiles + a.n2_tiles); et += kFrontThreads) {
     const bool fc2 = et >= E * kN1Tiles;
     const int e = fc2 ? (et - E * kN1Tiles) / a.n2_tiles : et / kN1Tiles;
     const int t = fc2 ? (et - E * kN1Tiles) - e * a.n2_tiles : et - e * kN1Tiles;
-    const int chunks_e = s_chunks[e], m_tiles = chunks_e == 0 ? 0 : ((s_cnt[e] + 15) >> 4), base = fc2 ? s_f2[e] : s_f1[e];
+    const int chunks_e = s_chunks[e], m_tiles = chunks_e == 0 ? 0 : ((s_cnt[e] + 15) >> 4);
+    if (a.u_items != nullptr) {
+      if (fc2 && (t % a.u_f2_group) != 0) continue;  // n256 items: one item per group of tiles, the tile field = its first tile
+      const int base = fc2 ? s_u2[e] : s_u1[e], ti = fc2 ? t / a.u_f2_group : t;
+      for (int ch = 0; ch < chunks_e; ++ch) {
+        const int i = base + ti * chunks_e + ch;
+        if (i < a.u_cap) a.u_items[i] = make_int4(e, s_off[e] + ch * 64, min(4, m_tiles - ch * 4), fc2 ? (t | kPsFc2) : t);
+      }
+      continue;
+    }
+    const int base = fc2 ? s_f2[e] : s_f1[e];
     for (int ch = 0; ch < chunks_e; ++ch) {
       const int i = base + t * chunks_e + ch;
       const int4 v = make_int4(e, s_off[e] + ch * 64, min(4, m_tiles - ch * 4), t);
@@ -2326,6 +2368,724 @@ __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
   }
 }
 
+// -------------------------------------------- 6. MK-2: the fused persistent MoE launch (fc1 -> SwiGLU / MXFP8 quant -> fc2), WS >= 20
+// One kernel, 1 CTA/SM, 12 warps = v10's CTA (warps 0-7 consumers, 8-11 producers: 8 = the item hand-off + A m-tiles 0-1 + A scale rows
+// 0-31, 9 = A m-tiles 2-3 + scale rows 32-63, 10 / 11 = B), one work list built by the front-end's scan CTA: the FC1 items of expert e
+// (tile-major, as today) followed by the FC2 items of expert e - LEAD, then the FC2 items of the last LEAD experts (LEAD = the lead in
+// experts, VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_LEAD, default 32: an FC1 item takes ~13 FC2 items' time and an expert has 8x more FC2 items
+// than FC1 items, so a one-expert lead would make the FC2 producers wait ~50 us per expert; 32 experts of items ~ 2 600 positions ~ 150 us
+// of claim time at 4 096 rows, more than one FC1 item). An FC2 item's A rows (the MXFP8 intermediate) are written by the FC1 items of its
+// expert on other CTAs: every consumer warp publishes fc1_done[e] += 1 (red.release.gpu) after its FC1 epilogue stores, and the two A
+// producer warps of an FC2 item wait for fc1_done[e] == 8 x the expert's FC1 items (ld.acquire.gpu poll with a %globaltimer watchdog: on
+// expiry an error record goes to pinned host memory and the CTA traps - a hang becomes a loud launch failure, never a spinning kernel)
+// before their first copy; the B producers do not wait, so the expert's W2 tiles stream into the ring during the wait. The stage ring
+// (STAGES x the FC1 stage size; an FC2 stage uses the first 8 960 B of a slot in v9's layout) and the item ring run continuously across
+// items and across the FC1 / FC2 boundary. Deadlock-freedom: every CTA is resident (grid = 1 CTA/SM), items are claimed in list order and
+// an item waits only on FC1 items that precede it in the list (claimed by CTAs that process their items in order) - the earliest blocked
+// item always makes progress. Bits by construction: the FC1 consumer is v10's (compute_stage + epilogue verbatim), the FC2 consumer is
+// v9's arithmetic with the A fragment read from the v10 unit (the same four words as v9's two LDS.64), the epilogues are v10's / v9's byte
+// for byte; only who launches what when and who copies differ. The separate topk_sum_kernel follows (MK/REPORT.md 1.6, milestone 1).
+static_assert(kWgConsumersFront == kWgConsumers, "the front-end's fc1_need uses the persistent kernel's consumer warp count");
+
+__device__ __forceinline__ void st_global_cs_v4(uint4* p, const uint4& v) {
+  asm volatile("st.global.cs.v4.b32 [%0], {%1, %2, %3, %4};\n" ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+}
+
+struct PersistArgs {
+  // FC1 (contiguous rows: a_values [T][K] e4m3, a_scales [T][K/32] ue8m0)
+  const uint32_t* a_values;
+  const uint8_t* a_scales;
+  const uint32_t* w13;
+  const uint32_t* w13_sf;
+  const float* alpha;
+  const float* input_global_scale;
+  uint32_t* inter;
+  uint8_t* inter_sf;
+  // FC2
+  const uint32_t* w2;
+  const uint8_t* w2_sf;
+  const float* token_weights;
+  const float* down_alpha;
+  const float* global_scale;
+  uint32_t* route;
+  // common
+  const int32_t* row_pair;
+  const int4* items;          // the unified list
+  int32_t* counts;            // [6] = its length, [3] = the work counter
+  int32_t* fc1_done;          // [kMaxE], zeroed by the host's memset
+  const int32_t* fc1_need;    // [kMaxE] (the scan CTA)
+  int32_t* err_lock;          // one device word (zeroed per call): the first expired watchdog wins the record
+  uint32_t* err;              // pinned host memory [8]: set, item, expert, need, seen, smid, blockIdx, 0
+  // optional per-item-type statistics (VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_STATS=1; nullptr: off): [0] FC1 item ns (consumer warp 0, from
+  // the `full` of its stage 0 to the end of its epilogue), [1] FC1 items, [2] FC2 item ns, [3] FC2 items, [4] consumer idle ns between items
+  // (the wait for the next item's stage 0), [5] the A producer's wait on fc1_done ns, [6] CTA span ns, [7] CTAs; summed over the CTAs
+  unsigned long long* stats;
+  unsigned long long watchdog_ns;
+  int K, topk, igs_per_expert, gs_per_expert, out_tiles, dynamic_schedule;
+  int route_cs;               // 1: the route rows are written with st.global.cs (evict-first; VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_ROUTE_CS, default 1)
+  float limit;
+};
+
+__device__ __forceinline__ void red_release_gpu_add(int32_t* p, int v) {
+  asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ int ld_acquire_gpu_s32(const int32_t* p) {
+  int v;
+  asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+  return v;
+}
+__device__ __forceinline__ unsigned long long globaltimer_ns() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;\n" : "=l"(t));
+  return t;
+}
+__device__ __forceinline__ unsigned smid() {
+  unsigned s;
+  asm volatile("mov.u32 %0, %%smid;\n" : "=r"(s));
+  return s;
+}
+
+// an expired wait: the record (first writer wins the device lock) goes to the pinned host buffer, then the CTA traps - the launch fails
+// loudly and the GPU is left clean (never a spinning kernel). what: 1 / 2 = the FC2 wait on fc1_done (A producer role 0 / 1), 10 + site = an
+// mbarrier wait (site: 0 consumer full at the item start, 1 consumer full in the K-loop, 2 producer empty, 3 producer bar_meta, 4 terminator)
+__device__ __noinline__ void ps_fail(const PersistArgs& a, int what, int x, int need, int seen) {
+  if (atomicCAS(a.err_lock, 0, 1) == 0 && a.err != nullptr) {
+    a.err[1] = (uint32_t)what; a.err[2] = (uint32_t)x; a.err[3] = (uint32_t)need; a.err[4] = (uint32_t)seen;
+    a.err[5] = smid(); a.err[6] = blockIdx.x; a.err[7] = (uint32_t)(a.watchdog_ns / 1000000ull);
+    __threadfence_system();
+    a.err[0] = 1u;
+    __threadfence_system();
+  }
+  __trap();
+}
+
+// one mbarrier try_wait (with the suspend-time hint the thread sleeps until the phase completes or the hint expires)
+__device__ __forceinline__ bool mbar_try(uint32_t bar, uint32_t parity, bool sleep) {
+  uint32_t ok;
+  if (sleep)
+    asm volatile("{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2, %3;\nselp.u32 %0, 1, 0, p;\n}\n"
+                 : "=r"(ok) : "r"(bar), "r"(parity), "r"(0x989680u) : "memory");
+  else
+    asm volatile("{\n.reg .pred p;\nmbarrier.try_wait.parity.shared::cta.b64 p, [%1], %2;\nselp.u32 %0, 1, 0, p;\n}\n"
+                 : "=r"(ok) : "r"(bar), "r"(parity) : "memory");
+  return ok != 0;
+}
+// the persistent kernel's mbarrier wait: the fast path is one try_wait; a wait that does not complete within the watchdog fails loudly
+__device__ __forceinline__ void ps_mbar_wait(uint32_t bar, uint32_t parity, bool sleep, const PersistArgs& a, int site, int k) {
+  if (mbar_try(bar, parity, sleep)) return;
+  const unsigned long long t0 = globaltimer_ns();
+  while (!mbar_try(bar, parity, sleep)) {
+    if (globaltimer_ns() - t0 > a.watchdog_ns) ps_fail(a, 10 + site, k, (int)parity, 0);
+  }
+}
+
+// the FC2 item's wait for its expert's FC1 items (lane 0 polls with acquire semantics, the warp follows): bounded by the watchdog;
+// returns the ns waited (lane 0; 0 when the counter was already complete)
+__device__ __forceinline__ unsigned long long ps_wait_fc1_done(const PersistArgs& a, int e, int item, int lane, int what) {
+  unsigned long long waited = 0;
+  if (lane == 0) {
+    const int need = __ldg(a.fc1_need + e);
+    int seen = ld_acquire_gpu_s32(a.fc1_done + e);
+    if (seen < need) {
+      const unsigned long long t0 = globaltimer_ns();
+      while ((seen = ld_acquire_gpu_s32(a.fc1_done + e)) < need) {
+        if (globaltimer_ns() - t0 > a.watchdog_ns) ps_fail(a, what, item, need, seen);
+        __nanosleep(32);
+      }
+      waited = globaltimer_ns() - t0;
+    }
+  }
+  __syncwarp();
+  return waited;
+}
+
+// the hand-off warp's staging of the next item (= producer_stage_next + the token weights at d == 5 / 7 and the kind-aware A offsets): the
+// next item's kind is known from d == 4 on (its meta); the ring slot nb is written at d == 6 (meta, pairs, A offsets; bar_meta released
+// for the other producers) and d == 7 (token weights: read by the consumers' FC2 epilogue only)
+__device__ __forceinline__ void ps_stage_next(ItemRing& ring, ProducerNext& nx, float& tw0, float& tw1, int d, int nb, int lane, int cur_item,
+                                              int n_items, const PersistArgs& a, uint64_t* bar_meta_nb) {
+  if (d == 0) {
+    int c = 0;
+    if (lane == 0) c = claim_next_item(a.counts + 3, cur_item, a.dynamic_schedule);
+    nx.item = __shfl_sync(0xffffffffu, c, 0);
+  }
+  if (d == 2) nx.w = (lane < 4 && nx.item < n_items) ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)nx.item * 4 + lane) : 0;
+  if (d == 4) {
+    nx.meta = make_int4(__shfl_sync(0xffffffffu, nx.w, 0), __shfl_sync(0xffffffffu, nx.w, 1), __shfl_sync(0xffffffffu, nx.w, 2),
+                        __shfl_sync(0xffffffffu, nx.w, 3));
+    const int rows = nx.meta.z * 16;
+    nx.pr0 = lane < rows ? __ldg(a.row_pair + nx.meta.y + lane) : -1;
+    nx.pr1 = lane + 32 < rows ? __ldg(a.row_pair + nx.meta.y + lane + 32) : -1;
+  }
+  if (d == 5) {
+    tw0 = nx.pr0 >= 0 ? __ldg(a.token_weights + nx.pr0) : 0.f;
+    tw1 = nx.pr1 >= 0 ? __ldg(a.token_weights + nx.pr1) : 0.f;
+  }
+  if (d == 6) {
+    const bool fc2 = (nx.meta.w & kPsFc2) != 0;
+    const uint32_t row_b = fc2 ? (uint32_t)kInterBytes : (uint32_t)a.K;
+    if (lane == 0) ring.meta[nb] = nx.meta;
+    ring.pairs[nb][lane] = nx.pr0;
+    ring.pairs[nb][lane + 32] = nx.pr1;
+    ring.aoff[nb][lane] = nx.pr0 >= 0 ? (uint32_t)(fc2 ? nx.pr0 : nx.pr0 / a.topk) * row_b : 0xFFFFFFFFu;
+    ring.aoff[nb][lane + 32] = nx.pr1 >= 0 ? (uint32_t)(fc2 ? nx.pr1 : nx.pr1 / a.topk) * row_b : 0xFFFFFFFFu;
+    __syncwarp();  // every lane's ring writes precede lane 0's release arrive
+    if (lane == 0) mbar_arrive(smem_addr(bar_meta_nb));
+  }
+  if (d == 7) {
+    ring.tw[nb][lane] = tw0;
+    ring.tw[nb][lane + 32] = tw1;
+  }
+}
+
+// N2 = 128-column tiles per FC2 item: 1 = v9's item (stage = 4 KB W2 + 4 KB A + scales in v9's layout, the consumer with a cross-stage
+// fragment prefetch), 2 = n256 items (MK-2 round 3): the stage has fc1's shape and layout exactly - B = the two tiles' 4 KB (roles 2 / 3, one
+// tile each, like fc1's two projections), A 4 KB at kF1B, the scale words at fc1's offsets - so a consumer warp issues 32 QMMAs per 8
+// A-fragment LDS.128 like fc1 (v9's item: 16 per 8; the A fragments, read once per warp, were the LDS co-limiter at 2 warps per sub-partition),
+// half the items, and the route rows go out 512 B per row. Bits: per element the same k32 chain and epilogue; only the warp->column map differs.
+template <int STAGES, int N2>
+__global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistArgs a) {
+  // an FC2 item has 9 stages and its hand-off writes the ring slot at stages 7 / 8: the consumers must have left the slot's previous
+  // reader (the epilogue of the item before the current one), which the `empty` wait of stage 7 guarantees only for STAGES <= 7
+  static_assert(STAGES >= 2 && STAGES <= 7, "the FC2 hand-off needs STAGES <= 7");
+  static_assert(N2 == 1 || N2 == 2, "FC2 items of one or two 128-column tiles");
+  constexpr int NCW = kWgConsumers;
+  constexpr uint32_t kF2TileBytes = 128 * (kSlices * 4 - 2) * 16;  // 36 KB of W2 per 128-column tile (18 k32)
+  constexpr uint32_t kF2TileSfBytes = 128 * (kSlices * 4 - 2);     // 2304 B of scales per tile
+  // the FC2 stage layout inside the kF1Stage slot: N2 == 1 -> v9's (B 4 KB, A, SFA, SFB); N2 == 2 -> fc1's (B 2 x 4 KB, A, SFA, SFB 2 x 512 B)
+  constexpr uint32_t F2_A = N2 == 2 ? (uint32_t)kF1B : (uint32_t)kF2B;
+  constexpr uint32_t F2_SFA = F2_A + (uint32_t)kF2A;
+  constexpr uint32_t F2_SFB = F2_SFA + (uint32_t)kF2SFA;
+  extern __shared__ __align__(128) uint8_t smem[];
+  __shared__ ItemRing ring;
+  __shared__ __align__(8) uint64_t bar_full[STAGES], bar_empty[STAGES];
+  __shared__ __align__(8) uint64_t bar_meta[2];
+  __shared__ float s_amax[4][NCW][16];
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int K = a.K, n1_stages = K / 64;
+  const uint32_t sbase0 = smem_addr(smem);
+  const int n_items = a.counts[6];
+  if (tid < STAGES) {
+    mbar_init(smem_addr(&bar_full[tid]), 32 * kWgProducers + 1);
+    mbar_init(smem_addr(&bar_empty[tid]), NCW);
+  }
+  if (tid < 2) mbar_init(smem_addr(&bar_meta[tid]), 1);
+  if (warp == NCW) {  // the first item straight from global memory
+    int4 m = make_int4(0, 0, 0, 0);
+    const int item = blockIdx.x;
+    if (item < n_items) {
+      const int w = lane < 4 ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + lane) : 0;
+      m = make_int4(__shfl_sync(0xffffffffu, w, 0), __shfl_sync(0xffffffffu, w, 1), __shfl_sync(0xffffffffu, w, 2),
+                    __shfl_sync(0xffffffffu, w, 3));
+    }
+    const int rows = m.z * 16;
+    const bool fc2 = (m.w & kPsFc2) != 0;
+    const uint32_t row_b = fc2 ? (uint32_t)kInterBytes : (uint32_t)K;
+    const int p0 = lane < rows ? __ldg(a.row_pair + m.y + lane) : -1;
+    const int p1 = lane + 32 < rows ? __ldg(a.row_pair + m.y + lane + 32) : -1;
+    if (lane == 0) ring.meta[0] = m;
+    ring.pairs[0][lane] = p0;
+    ring.pairs[0][lane + 32] = p1;
+    ring.aoff[0][lane] = p0 >= 0 ? (uint32_t)(fc2 ? p0 : p0 / a.topk) * row_b : 0xFFFFFFFFu;
+    ring.aoff[0][lane + 32] = p1 >= 0 ? (uint32_t)(fc2 ? p1 : p1 / a.topk) * row_b : 0xFFFFFFFFu;
+    ring.tw[0][lane] = p0 >= 0 ? __ldg(a.token_weights + p0) : 0.f;
+    ring.tw[0][lane + 32] = p1 >= 0 ? __ldg(a.token_weights + p1) : 0.f;
+  }
+  __syncthreads();  // barriers initialised, item 0 in the ring; from here on the roles only meet through the barriers
+
+  if (warp >= NCW) {
+    // ================================================================================ the producer warpgroup (warps 8-11)
+    const int role = warp - NCW;  // 0 / 1: A m-tiles (2 role, 2 role + 1) + scale rows 32 role..; 2 / 3: B
+    const uint32_t wproj_b = (uint32_t)kN * (K / 32) * 16;
+    const uint32_t sproj_b = (uint32_t)kN * (K / 32);
+    const uint8_t* a1_base = reinterpret_cast<const uint8_t*>(a.a_values);
+    const uint8_t* a2_base = reinterpret_cast<const uint8_t*>(a.inter);
+    RingPos pos;
+    int round0 = STAGES, k = 0;
+    if (role == 0) {
+      int item = blockIdx.x;
+      ProducerNext nx;
+      float tw0 = 0.f, tw1 = 0.f;
+      unsigned long long wait_ns = 0;
+      while (true) {
+        const int4 it = ring.meta[k & 1];
+        if (it.z == 0) {  // no item: one more phase of `full` so that the consumers read the terminator, then leave
+          if (round0 == 0) ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
+          __syncwarp();
+          if (lane == 0) mbar_arrive(smem_addr(&bar_full[pos.buf]));
+          cp_async_mbar_arrive_noinc(smem_addr(&bar_full[pos.buf]));
+          if (a.stats != nullptr && lane == 0) atomicAdd(a.stats + 5, wait_ns);
+          break;
+        }
+        const bool fc2 = (it.w & kPsFc2) != 0;
+        const int e = it.x, slot = k & 1, nb = slot ^ 1;
+        const int n_stages = fc2 ? kF2Stages : n1_stages;
+        // the next item is claimed 10 stages before the current one ends (FC1: K >= 640 -> >= 10 stages) / at stage 1 of an FC2 item (9 stages:
+        // d = 0..7 at stages 1..8 - v9's fc2 hand-off)
+        const int claim_at = fc2 ? 1 : n1_stages - 10;
+        const uint32_t a_region = fc2 ? F2_A : (uint32_t)kF1B;
+        const uint32_t sf_region = fc2 ? F2_SFA : (uint32_t)(kF1B + kF1A);
+        const uint8_t* a_base = fc2 ? a2_base : a1_base;
+        const uint8_t* sf_base = fc2 ? a.inter_sf : a.a_scales;
+        WgRows rows;
+        rows.load(ring.aoff[slot], 0, lane);
+#pragma unroll 1
+        for (int t = 0; t < n_stages; ++t) {
+          if (round0 > 0) --round0;
+          else ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
+          if (fc2 && t == 0) wait_ns += ps_wait_fc1_done(a, e, item, lane, 1);  // the expert's FC1 items are complete: the A rows exist
+          const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
+          ps_stage_next(ring, nx, tw0, tw1, t - claim_at, nb, lane, item, n_items, a, &bar_meta[nb]);
+          __syncwarp();  // the ring writes of this stage (if any) precede lane 0's release arrive
+          if (lane == 0) mbar_arrive(full);
+          wg_copy_a(sb + a_region, a_base, rows, 0, t, lane);
+          {
+            const uint32_t off = rows.sf;
+            const bool on = off != 0xFFFFFFFFu;
+            cp_async4_zfill(sb + sf_region + lane * 4, sf_base + ((on ? off : 0u) >> 5) + (t >> 1) * 4, on ? 4 : 0);
+          }
+          cp_async_mbar_arrive_noinc(full);
+          pos.advance<STAGES>();
+        }
+        item = nx.item;
+        ++k;
+      }
+    } else {
+      while (true) {
+        // producer 8 has written meta[k & 1] (its arrive at d == 6 of item k - 1): bar_meta[s] serves the items k = s, s + 2, ... with
+        // k >= 1, i.e. its phase for item k is ((k - 1) >> 1) & 1 (a fresh barrier returns at once on the other parity: K-4's v9j hang)
+        if (k > 0) ps_mbar_wait(smem_addr(&bar_meta[k & 1]), (uint32_t)((k - 1) >> 1) & 1u, true, a, 3, k);
+        const int4 it = ring.meta[k & 1];
+        if (it.z == 0) {
+          if (round0 == 0) ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
+          cp_async_mbar_arrive_noinc(smem_addr(&bar_full[pos.buf]));
+          break;
+        }
+        const bool fc2 = (it.w & kPsFc2) != 0;
+        const int e = it.x, tile = it.w & 0xFF;
+        const int n_stages = fc2 ? kF2Stages : n1_stages;
+        const bool wide = tile != kN1Tiles - 1;  // FC1 only
+        const int proj = role - 2;               // FC1: the B projection of roles 2 / 3; FC2: the B half
+        // FC2: N2 == 2 -> role 2 / 3 copies the whole tile `tile + proj` (fc1's two-projection pattern); N2 == 1 -> the two halves of one tile
+        const int f2_tile = tile + (N2 == 2 && proj > 0 ? proj : 0);
+        const uint8_t* iss_b = fc2 ? reinterpret_cast<const uint8_t*>(a.w2) + ((size_t)e * a.out_tiles + f2_tile) * kF2TileBytes
+                                   : reinterpret_cast<const uint8_t*>(a.w13) + (size_t)e * 2 * wproj_b + (size_t)tile * 128 * (K / 32) * 16 +
+                                         (size_t)(proj > 0 ? proj : 0) * wproj_b;
+        const uint8_t* iss_sfb = fc2 ? a.w2_sf + ((size_t)e * a.out_tiles + f2_tile) * kF2TileSfBytes
+                                     : reinterpret_cast<const uint8_t*>(a.w13_sf) + (size_t)e * 2 * sproj_b + (size_t)tile * 128 * (K / 32) +
+                                           (size_t)(proj > 0 ? proj : 0) * sproj_b;
+        const uint32_t a_region = fc2 ? F2_A : (uint32_t)kF1B;
+        const uint32_t sf_region = fc2 ? F2_SFA : (uint32_t)(kF1B + kF1A);
+        const uint32_t sfb_region = fc2 ? F2_SFB : (uint32_t)(kF1B + kF1A + kF1SFA);
+        const uint8_t* a_base = fc2 ? a2_base : a1_base;
+        const uint8_t* sf_base = fc2 ? a.inter_sf : a.a_scales;
+        WgRows rows;
+        if (role == 1) rows.load(ring.aoff[k & 1], 1, lane);
+#pragma unroll 1
+        for (int t = 0; t < n_stages; ++t) {
+          if (round0 > 0) --round0;
+          else ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
+          const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
+          if (role == 1) {
+            if (fc2 && t == 0) ps_wait_fc1_done(a, e, k, lane, 2);
+            wg_copy_a(sb + a_region, a_base, rows, 1, t, lane);
+            const uint32_t off = rows.sf;
+            const bool on = off != 0xFFFFFFFFu;
+            cp_async4_zfill(sb + sf_region + (32 + lane) * 4, sf_base + ((on ? off : 0u) >> 5) + (t >> 1) * 4, on ? 4 : 0);
+          } else if (fc2 && N2 == 2) {  // B: the whole 4 KB of W2 tile `tile + proj` of this K64 stage + its column scales (512 B; the tail slice 256)
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+              const uint32_t o = (lane + 32 * i) * 16;
+              cp_async16(sb + proj * 4096 + o, iss_b + (size_t)t * 4096 + o);
+            }
+            {
+              const int s = t >> 1;
+              if (lane < (s == kSlices - 1 ? 16 : 32)) cp_async16(sb + sfb_region + proj * 512 + lane * 16, iss_sfb + s * 512 + lane * 16);
+            }
+          } else if (fc2) {  // B: the 4 KB of W2 of this K64 stage, halves by role (128 x 16 B each); the tile's column scales of the K128 slice by role 2
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              const uint32_t o = (lane + 32 * (i + 4 * proj)) * 16;
+              cp_async16(sb + o, iss_b + (size_t)t * 4096 + o);
+            }
+            if (proj == 0) {
+              const int s = t >> 1;
+              if (lane < (s == kSlices - 1 ? 16 : 32)) cp_async16(sb + sfb_region + lane * 16, iss_sfb + s * 512 + lane * 16);
+            }
+          } else if (wide) {  // FC1 B projection `proj`: 4 KB contiguous per stage + its 512 B of column scales per K128
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+              const uint32_t o = (lane + 32 * i) * 16;
+              cp_async16(sb + proj * 4096 + o, iss_b + (size_t)t * 4096 + o);
+            }
+            cp_async16(sb + sfb_region + proj * 512 + lane * 16, iss_sfb + (t >> 1) * 512 + lane * 16);
+          } else {  // the 64-column tile: 2 x 1 KB per projection per stage, 256 B of column scales
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+              const uint32_t j = lane + 32 * i, kk = j >> 6, rem = j & 63;
+              cp_async16(sb + proj * 4096 + kk * 2048 + rem * 16, iss_b + (size_t)t * 2048 + kk * 1024 + rem * 16);
+            }
+            if (lane < 16) cp_async16(sb + sfb_region + proj * 512 + lane * 16, iss_sfb + (t >> 1) * 256 + lane * 16);
+          }
+          cp_async_mbar_arrive_noinc(full);
+          pos.advance<STAGES>();
+        }
+        ++k;
+      }
+    }
+    cp_async_wait<0>();
+    return;
+  }
+
+  // ================================================================================ the consumer warps (warps 0-7)
+  const int q = lane >> 2, c = lane & 3;
+  RingPos pos;
+  int k = 0;
+  // statistics (warp 0 lane 0 of the CTA): per-item-type time, idle between items, the CTA's span
+  const bool keep_stats = a.stats != nullptr && tid == 0;
+  unsigned long long st_t0 = 0, st_prev_end = 0, st_fc1 = 0, st_fc2 = 0, st_idle = 0, st_n1 = 0, st_n2 = 0;
+  if (keep_stats) st_prev_end = st_t0 = globaltimer_ns();
+  while (true) {
+    ps_mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par, false, a, 0, k);  // stage 0 of item k (or the terminator): meta[k & 1] is published
+    const int4 it = ring.meta[k & 1];
+    const int e = it.x, m_tiles = it.z;
+    unsigned long long st_start = 0;
+    if (keep_stats) { st_start = globaltimer_ns(); st_idle += st_start - st_prev_end; }
+    if (m_tiles == 0) break;
+    const bool fc2 = (it.w & kPsFc2) != 0;
+    const int tile = it.w & 0xFF;
+    const int pslot = k & 1;
+    if (!fc2) {
+      // ---------------------------------------------------------------- FC1 item = v10's consumer (fc1_kernel_wg) verbatim
+      const bool wide = tile != kN1Tiles - 1;
+      const int ns16 = wide ? warp : (warp & 3);
+      const int mt_lo = wide ? 0 : 2 * (warp >> 2), mt_hi = wide ? 4 : mt_lo + 2;
+      bool act[4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) act[mt] = mt >= mt_lo && mt < mt_hi && mt < m_tiles;  // warp-uniform
+      const float alpha = fmul(__ldg(a.alpha + e), __ldg(a.input_global_scale + (a.igs_per_expert ? e : 0)));
+
+      float acc[4][2][2][4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int p = 0; p < 2; ++p)
+#pragma unroll
+          for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+            for (int r = 0; r < 4; ++r) acc[mt][p][nt][r] = 0.f;
+
+      const uint32_t a_off = kF1B + a10_frag(0, 0, q, c);                      // + mt * 1024 + kk * 512
+      const uint32_t sfa_off = kF1B + kF1A + (q + ((lane & 1) << 3)) * 4;     // + mt * 64
+      const uint32_t b_off = (ns16 >> 1) * 512 + lane * 16 + (ns16 & 1) * 8;  // + p * 4096 + kk * 2048
+      const uint32_t sfb_off = kF1B + kF1A + kF1SFA + (ns16 * 16 + q) * 4;    // + p * 512 + nt * 32
+
+      auto compute_stage = [&](const uint8_t* sp, auto kb_tag) {
+        constexpr int KB0 = decltype(kb_tag)::value;
+        uint32_t sfb[2][2], sfa[4];
+#pragma unroll
+        for (int p = 0; p < 2; ++p)
+#pragma unroll
+          for (int nt = 0; nt < 2; ++nt) sfb[p][nt] = *reinterpret_cast<const uint32_t*>(sp + sfb_off + p * 512 + nt * 32);
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+          uint32_t b[2][2][2];
+#pragma unroll
+          for (int p = 0; p < 2; ++p) {
+            const uint2 w = *reinterpret_cast<const uint2*>(sp + p * 4096 + kk * 2048 + b_off);
+            spread_e2m1x8(w.x, b[p][0][0], b[p][0][1]);
+            spread_e2m1x8(w.y, b[p][1][0], b[p][1][1]);
+          }
+#pragma unroll
+          for (int mt = 0; mt < 4; ++mt) {
+            if (act[mt]) {
+              const uint4 af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
+#pragma unroll
+              for (int p = 0; p < 2; ++p)
+#pragma unroll
+                for (int nt = 0; nt < 2; ++nt)
+                  qmma_kk<KB0>(kk, acc[mt][p][nt], af.x, af.z, af.y, af.w, b[p][nt][0], b[p][nt][1], sfa[mt], sfb[p][nt]);
+            }
+          }
+        }
+      };
+      auto step = [&](auto kb_tag) {
+        ps_mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par, false, a, 1, k);
+        compute_stage(smem + pos.buf * kF1Stage, kb_tag);
+        __syncwarp();  // the warp's LDS of this buffer precede lane 0's release arrive
+        if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+        pos.advance<STAGES>();
+      };
+#pragma unroll 1
+      for (int t = 0; t < n1_stages; t += 2) {
+        step(std::integral_constant<int, 0>{});
+        step(std::integral_constant<int, 2>{});
+      }
+
+      // ---- epilogue = v10's (one named barrier of the consumers per item)
+      float v[4][2][4], am[4][2];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        am[mt][0] = am[mt][1] = 0.f;
+        if (mt >= m_tiles) continue;  // CTA-uniform
+        if (act[mt]) {
+#pragma unroll
+          for (int hf = 0; hf < 2; ++hf) {
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+              const float x0 = activated_value(acc[mt][1][nt][2 * hf], acc[mt][0][nt][2 * hf], alpha, a.limit);
+              const float x1 = activated_value(acc[mt][1][nt][2 * hf + 1], acc[mt][0][nt][2 * hf + 1], alpha, a.limit);
+              const uint32_t pk = pack_bf16x2(x0, x1);
+              v[mt][hf][2 * nt] = __uint_as_float(pk << 16);
+              v[mt][hf][2 * nt + 1] = __uint_as_float(pk & 0xFFFF0000u);
+            }
+            float amax = 0.f;
+#pragma unroll
+            for (int kx = 0; kx < 4; ++kx) amax = fmax_plain(amax, fabs_plain(v[mt][hf][kx]));
+            amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+            amax = fmax_plain(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+            am[mt][hf] = amax;
+            if (c == 0) s_amax[mt][warp][q + hf * 8] = amax;
+          }
+        }
+      }
+      consumers_sync<NCW>();
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        if (mt >= m_tiles) continue;  // CTA-uniform
+        if (act[mt]) {
+#pragma unroll
+          for (int hf = 0; hf < 2; ++hf) {
+            const int row = mt * 16 + q + hf * 8;
+            const int pair = ring.pairs[pslot][row];
+            const float amax = fmax_plain(am[mt][hf], s_amax[mt][warp ^ 1][q + hf * 8]);
+            float inv;
+            const uint32_t byte = mx_scale(amax, inv);
+            uint32_t h[4] = {cvt_e4m3x2(fmul(v[mt][hf][0], inv), fmul(v[mt][hf][1], inv)),
+                             cvt_e4m3x2(fmul(v[mt][hf][2], inv), fmul(v[mt][hf][3], inv)), 0u, 0u};
+            uint32_t o0, o1;
+            quad_transpose16(h, c, o0, o1);
+            if (pair >= 0) {
+              if (c < 2) {
+                uint2* dst = reinterpret_cast<uint2*>(reinterpret_cast<uint8_t*>(a.inter) + (size_t)pair * kInterBytes +
+                                                     tile * 128 + ns16 * 16 + c * 8);
+                *dst = make_uint2(o0, o1);
+              }
+              if ((ns16 & 1) == 0) {
+                uint8_t* sf = a.inter_sf + (size_t)pair * (kSlices * 4) + tile * 4;
+                if (c == 0) sf[ns16 >> 1] = (uint8_t)byte;
+                if (!wide && c == 1) sf[(ns16 >> 1) + 2] = 0;
+              }
+            }
+          }
+        }
+      }
+      // this warp's rows of the expert's intermediate are written: one arrival of the 8 per FC1 item (the FC2 producers wait for them)
+      __syncwarp();
+      if (lane == 0) red_release_gpu_add(a.fc1_done + e, 1);
+    } else {
+      // ---------------------------------------------------------------- FC2 item
+      const int ns16 = warp;  // n16 slice of a 128-column tile; every warp takes all m-tiles
+      const float down_scale = fmul(__ldg(a.down_alpha + e), __ldg(a.global_scale + (a.gs_per_expert ? e : 0)));
+      const uint32_t a_off = F2_A + a10_frag(0, 0, q, c);                        // + mt * 1024 + kk * 512
+      const uint32_t sfa_off = F2_SFA + (q + ((lane & 1) << 3)) * 4;             // + mt * 64
+      const uint32_t b_off = (ns16 >> 1) * 512 + lane * 16 + (ns16 & 1) * 8;    // (+ p * 4096) + kk * 2048
+      const int col_q = ns16 * 16 + q;
+      using I0 = std::integral_constant<int, 0>;
+      using I2 = std::integral_constant<int, 2>;
+      if constexpr (N2 == 2) {
+        // ---- n256 item = fc1's compute_stage shape (B of both tiles, the A fragment of each m-tile once, 32 QMMAs per stage), v9's arithmetic
+        float acc[4][2][2][4];  // [mt][tile p][nt][4]
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+          for (int pp = 0; pp < 2; ++pp)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+              for (int r = 0; r < 4; ++r) acc[mt][pp][nt][r] = 0.f;
+        auto compute_stage = [&](const uint8_t* sp, auto kb_tag, auto tail_tag) {
+          constexpr int KB0 = decltype(kb_tag)::value;
+          constexpr bool TAIL = decltype(tail_tag)::value;
+          uint32_t sfb[2][2], sfa[4];
+#pragma unroll
+          for (int pp = 0; pp < 2; ++pp)
+#pragma unroll
+            for (int nt = 0; nt < 2; ++nt) {
+              if constexpr (TAIL) sfb[pp][nt] = *reinterpret_cast<const uint16_t*>(sp + F2_SFB + pp * 512 + (col_q + nt * 8) * 2);
+              else sfb[pp][nt] = *reinterpret_cast<const uint32_t*>(sp + F2_SFB + pp * 512 + (col_q + nt * 8) * 4);
+            }
+#pragma unroll
+          for (int mt = 0; mt < 4; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+#pragma unroll
+          for (int kk = 0; kk < 2; ++kk) {
+            uint32_t b[2][2][2];
+#pragma unroll
+            for (int pp = 0; pp < 2; ++pp) {
+              const uint2 w = *reinterpret_cast<const uint2*>(sp + pp * 4096 + kk * 2048 + b_off);
+              spread_e2m1x8(w.x, b[pp][0][0], b[pp][0][1]);
+              spread_e2m1x8(w.y, b[pp][1][0], b[pp][1][1]);
+            }
+#pragma unroll
+            for (int mt = 0; mt < 4; ++mt) {
+              if (mt < m_tiles) {
+                const uint4 af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
+#pragma unroll
+                for (int pp = 0; pp < 2; ++pp)
+#pragma unroll
+                  for (int nt = 0; nt < 2; ++nt)
+                    qmma_kk<KB0>(kk, acc[mt][pp][nt], af.x, af.z, af.y, af.w, b[pp][nt][0], b[pp][nt][1], sfa[mt], sfb[pp][nt]);
+              }
+            }
+          }
+        };
+        auto step = [&](auto kb_tag, auto tail_tag) {
+          ps_mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par, false, a, 1, k);
+          compute_stage(smem + pos.buf * kF1Stage, kb_tag, tail_tag);
+          __syncwarp();
+          if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+          pos.advance<STAGES>();
+        };
+#pragma unroll 1
+        for (int t = 0; t < kF2Stages - 1; t += 2) {  // slices 0-3: stages 0..7
+          step(I0{}, std::false_type{});
+          step(I2{}, std::false_type{});
+        }
+        step(I0{}, std::true_type{});  // stage 8: k32 16, 17 (the tail slice's u16 scale words); the zero tail is not run
+
+        // ---- epilogue = v9's per tile: scale, bf16, token-major route rows (512 contiguous bytes per row over the two tiles)
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) {
+          if (mt >= m_tiles) continue;
+#pragma unroll
+          for (int hf = 0; hf < 2; ++hf) {
+            const int row = mt * 16 + q + hf * 8;
+            const int pair = ring.pairs[pslot][row];
+            const float scale = fmul(down_scale, ring.tw[pslot][row]);
+#pragma unroll
+            for (int pp = 0; pp < 2; ++pp) {
+              uint32_t w[4], o[4];
+              w[0] = pack_bf16x2(fmul(scale, acc[mt][pp][0][2 * hf]), fmul(scale, acc[mt][pp][0][2 * hf + 1]));
+              w[1] = pack_bf16x2(fmul(scale, acc[mt][pp][1][2 * hf]), fmul(scale, acc[mt][pp][1][2 * hf + 1]));
+              w[2] = w[3] = 0u;
+              quad_transpose32(w, c, o);
+              if (pair >= 0 && c < 2) {  // streaming store (MK-2 round 5): the route rows are read back by topk_sum only
+                uint4* dst = reinterpret_cast<uint4*>(a.route + (size_t)pair * (a.K / 2) + ((tile + pp) * 128 + ns16 * 16 + c * 8) / 2);
+                if (a.route_cs) st_global_cs_v4(dst, make_uint4(o[0], o[1], o[2], o[3]));
+                else *dst = make_uint4(o[0], o[1], o[2], o[3]);
+              }
+            }
+          }
+        }
+      } else {
+      // ---- v9's item (one tile) as a register pipeline over the stages (K-4's v9f idea; it did not fit fc1's 64 accumulators at 168 registers,
+      // fc2's 32 + 2 x 42 fit): every LDS of stage t + 1 (B words, the four A fragments of both k32 blocks, the scale words - the tail slice's
+      // u16 column scales read as u16) is issued before the QMMAs of stage t, so with 2 consumer warps per sub-partition the LDS latency
+      // hides behind the same warp's QMMAs; a stage's buffer is released after its QMMAs (K-4's rule: the release follows the last read of
+      // the buffer, here the fragment loads of the previous iteration, by program order).
+      float acc[4][2][4];
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt)
+#pragma unroll
+          for (int r = 0; r < 4; ++r) acc[mt][nt][r] = 0.f;
+      struct Frags2 {
+        uint4 af[4][2];
+        uint2 bw[2];
+        uint32_t sfa[4], sfb[2];
+      };
+      auto load_frags2 = [&](const uint8_t* sp, Frags2& f, bool tail) {
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) f.bw[kk] = *reinterpret_cast<const uint2*>(sp + kk * 2048 + b_off);
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt)
+#pragma unroll
+          for (int kk = 0; kk < 2; ++kk) f.af[mt][kk] = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
+#pragma unroll
+        for (int nt = 0; nt < 2; ++nt) {
+          if (tail) f.sfb[nt] = *reinterpret_cast<const uint16_t*>(sp + F2_SFB + (col_q + nt * 8) * 2);
+          else f.sfb[nt] = *reinterpret_cast<const uint32_t*>(sp + F2_SFB + (col_q + nt * 8) * 4);
+        }
+#pragma unroll
+        for (int mt = 0; mt < 4; ++mt) f.sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+      };
+      auto mma_stage2 = [&](const Frags2& f, auto kb_tag) {
+        constexpr int KB0 = decltype(kb_tag)::value;
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+          uint32_t b[2][2];
+          spread_e2m1x8(f.bw[kk].x, b[0][0], b[0][1]);
+          spread_e2m1x8(f.bw[kk].y, b[1][0], b[1][1]);
+#pragma unroll
+          for (int mt = 0; mt < 4; ++mt) {
+            if (mt < m_tiles) {
+#pragma unroll
+              for (int nt = 0; nt < 2; ++nt)
+                qmma_kk<KB0>(kk, acc[mt][nt], f.af[mt][kk].x, f.af[mt][kk].z, f.af[mt][kk].y, f.af[mt][kk].w, b[nt][0], b[nt][1], f.sfa[mt], f.sfb[nt]);
+            }
+          }
+        }
+      };
+      Frags2 F0, F1;
+      // stage 0's `full` was waited for at the top of the item (meta): load its fragments
+      load_frags2(smem + pos.buf * kF1Stage, F0, false);
+      auto pipe_step = [&](Frags2& cur, Frags2& nxt, bool has_next, bool next_tail, auto kb_tag) {
+        const int cur_buf = pos.buf;
+        pos.advance<STAGES>();
+        if (has_next) {
+          ps_mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par, false, a, 1, k);
+          load_frags2(smem + pos.buf * kF1Stage, nxt, next_tail);
+        }
+        mma_stage2(cur, kb_tag);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(smem_addr(&bar_empty[cur_buf]));
+      };
+#pragma unroll 1
+      for (int t = 0; t < kF2Stages - 1; t += 2) {  // slices 0-3: stages 0..7 (stage 7 prefetches stage 8 = the tail slice)
+        pipe_step(F0, F1, true, false, I0{});
+        pipe_step(F1, F0, true, t + 2 == kF2Stages - 1, I2{});
+      }
+      pipe_step(F0, F1, false, false, I0{});  // stage 8: k32 16, 17 (the tail slice's u16 scale words); the zero tail (k32 18, 19) is not run
+
+      // ---- epilogue = v9's: scale, bf16, token-major route rows
+#pragma unroll
+      for (int mt = 0; mt < 4; ++mt) {
+        if (mt >= m_tiles) continue;
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf) {
+          const int row = mt * 16 + q + hf * 8;
+          const int pair = ring.pairs[pslot][row];
+          const float scale = fmul(down_scale, ring.tw[pslot][row]);
+          uint32_t w[4], o[4];
+          w[0] = pack_bf16x2(fmul(scale, acc[mt][0][2 * hf]), fmul(scale, acc[mt][0][2 * hf + 1]));
+          w[1] = pack_bf16x2(fmul(scale, acc[mt][1][2 * hf]), fmul(scale, acc[mt][1][2 * hf + 1]));
+          w[2] = w[3] = 0u;
+          quad_transpose32(w, c, o);
+          if (pair >= 0 && c < 2) {
+            uint4* dst = reinterpret_cast<uint4*>(a.route + (size_t)pair * (a.K / 2) + (tile * 128 + ns16 * 16 + c * 8) / 2);
+            if (a.route_cs) st_global_cs_v4(dst, make_uint4(o[0], o[1], o[2], o[3]));
+            else *dst = make_uint4(o[0], o[1], o[2], o[3]);
+          }
+        }
+      }
+      }
+    }
+    if (keep_stats) {
+      const unsigned long long t1 = globaltimer_ns();
+      if (fc2) { st_fc2 += t1 - st_start; ++st_n2; } else { st_fc1 += t1 - st_start; ++st_n1; }
+      st_prev_end = t1;
+    }
+    ++k;
+  }
+  if (keep_stats) {
+    atomicAdd(a.stats + 0, st_fc1); atomicAdd(a.stats + 1, st_n1); atomicAdd(a.stats + 2, st_fc2); atomicAdd(a.stats + 3, st_n2);
+    atomicAdd(a.stats + 4, st_idle); atomicAdd(a.stats + 6, globaltimer_ns() - st_t0); atomicAdd(a.stats + 7, 1ull);
+  }
+}
+
 }  // namespace b12x_moe_prefill_fast
 
 // ------------------------------------------------------------------------------------------------------ host
@@ -2345,6 +3105,83 @@ static int ws_env(const char* name) {
 }
 static int ws1_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1"); return m; }
 static int ws2_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS2"); return m; }
+// MK-2: VLLM_MOET_B12X_MOE_PREFILL_FAST_WS >= 20 = the fused persistent launch (moe_persistent_kernel: fc1 + SwiGLU/quant + fc2 as one kernel,
+// 1 CTA/SM x 12 warps, the separate topk_sum_kernel after it): 20 = 4 stages, 21 = 6, 22 = 7, 23 = 3, 24 = 5, 25 = 2 (the ring depth);
+// _WS_LEAD = the lead in experts of the work list (default 32), _WS_MIN_ROWS = below this many rows the separate kernels run (default 0),
+// _WS_WATCHDOG_MS = the bound of every FC2 wait on its expert's FC1 items (default 2000; expiry = an error record + a trapped launch).
+// Contiguous rows only (lda == K), not with the fused top-k sum. Every configuration computes the same bits.
+static int ws_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS"); return m; }
+static int ws_lead() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_LEAD"); static const int m = v ? std::atoi(v) : 64; return m; }
+static int ws_min_rows() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_MIN_ROWS"); return m; }
+static int ws_watchdog_ms() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_WATCHDOG_MS"); static const int m = v ? std::atoi(v) : 2000; return m; }
+static bool ws_stats_enabled() { static const bool on = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_STATS") == 1; return on; }
+static int ws_route_cs() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_ROUTE_CS"); static const int m = v ? std::atoi(v) : 1; return m; }
+// the per-item-type statistics of the persistent kernel (device memory, 8 x u64, zeroed before every launch when enabled; moe_prefill_ws_stats()
+// copies them to the host - a synchronisation, bench only)
+static unsigned long long* ps_stats_dev() {
+  static unsigned long long* d = [] {
+    unsigned long long* p = nullptr;
+    if (cudaMalloc(reinterpret_cast<void**>(&p), 64) != cudaSuccess) { cudaGetLastError(); return static_cast<unsigned long long*>(nullptr); }
+    cudaMemset(p, 0, 64);
+    return p;
+  }();
+  return d;
+}
+// the persistent kernel's error record lives in pinned host memory (readable after a trapped launch; moe_prefill_ws_error() returns it)
+static uint32_t* ps_err_host() {
+  static uint32_t* h = [] {
+    uint32_t* p = nullptr;
+    if (cudaHostAlloc(reinterpret_cast<void**>(&p), 256, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { cudaGetLastError(); return static_cast<uint32_t*>(nullptr); }
+    memset(p, 0, 256);
+    return p;
+  }();
+  return h;
+}
+static uint32_t* ps_err_dev() {
+  static uint32_t* d = [] {
+    uint32_t* p = nullptr;
+    uint32_t* h = ps_err_host();
+    if (h == nullptr || cudaHostGetDevicePointer(reinterpret_cast<void**>(&p), h, 0) != cudaSuccess) { cudaGetLastError(); return static_cast<uint32_t*>(nullptr); }
+    return p;
+  }();
+  return d;
+}
+template <int S, int N2>
+struct PsLaunch {  // MK-2: moe_persistent_kernel<S, N2> (12 warps, 1 CTA/SM; the stage slot is the FC1 stage size)
+  static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
+  static constexpr int kN2 = N2;
+  static int grid(int sms) {
+    using namespace b12x_moe_prefill_fast;
+    int occ = 0;
+    static bool done = false;
+    if (!done) { cudaFuncSetAttribute(moe_persistent_kernel<S, N2>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, moe_persistent_kernel<S, N2>, kT, S * kF1Stage);
+    return sms * (occ > 0 ? occ : 1);  // every CTA resident (the deadlock-freedom argument of the work list)
+  }
+  static void run(const b12x_moe_prefill_fast::PersistArgs& p, int grid, cudaStream_t stream) {
+    using namespace b12x_moe_prefill_fast;
+    moe_persistent_kernel<S, N2><<<grid, kT, S * kF1Stage, stream>>>(p);
+  }
+};
+// 20-25: one 128-column tile per FC2 item (4 / 6 / 7 / 3 / 5 / 2 stages); 30-35: n256 FC2 items (round 3), the same stage counts
+static int ws_f2_group(int mode) { return mode >= 30 ? 2 : 1; }
+template <typename Fn>
+static void with_ws(int mode, Fn fn) {
+  switch (mode) {
+    case 21: fn(PsLaunch<6, 1>{}); break;
+    case 22: fn(PsLaunch<7, 1>{}); break;
+    case 23: fn(PsLaunch<3, 1>{}); break;
+    case 24: fn(PsLaunch<5, 1>{}); break;
+    case 25: fn(PsLaunch<2, 1>{}); break;
+    case 30: fn(PsLaunch<4, 2>{}); break;
+    case 31: fn(PsLaunch<6, 2>{}); break;
+    case 32: fn(PsLaunch<7, 2>{}); break;
+    case 33: fn(PsLaunch<3, 2>{}); break;
+    case 34: fn(PsLaunch<5, 2>{}); break;
+    case 35: fn(PsLaunch<2, 2>{}); break;
+    default: fn(PsLaunch<4, 1>{}); break;
+  }
+}
 // below this many rows fc1 stays on v8 (_WS1_MIN_ROWS, default 256): at 128 rows (the replay layers) both kernels are at the DRAM
 // floor and the one-CTA/SM v9 fc1 is 4 % slower there (K-4 §6.2); fc2's v9 is neutral at 128 rows and keeps its mode
 static int ws1_min_rows() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1_MIN_ROWS"); static const int m = v ? std::atoi(v) : 256; return m; }
@@ -2479,15 +3316,17 @@ struct Launch {
 // the front-end launches shared by moe_prefill_fast and moe_prefill_fast_frontend: a memset of the counters, the quant +
 // histogram (+ scan) kernel, the scatter kernel. `routing` = the workspace tensors kept alive by the caller.
 struct Routing {
-  torch::Tensor row_pair, f1_items, f2_items, counts, chunk_cnt, exp_off, exp_cnt, tok_valid;
+  torch::Tensor row_pair, f1_items, f2_items, counts, chunk_cnt, exp_off, exp_cnt, tok_valid, u_items, fc1_need;
 };
+constexpr int kCountsWords = 8 + b12x_moe_prefill_fast::kMaxE;  // counts[0..7] + fc1_done[kMaxE] (MK-2), one memset
 static bool fused_topk_sum_enabled() {  // VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1: the sum fused into fc2's epilogue (off by
   // default: on call1 it is break-even with the separate topk_sum_kernel - fc2 +0.125 ms for the kernel's 0.130 - at more
   // moving parts; W/REPORT.md §4)
   static const bool on = [] { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM"); return v && v[0] == '1'; }();
   return on;
 }
-static Routing launch_frontend(b12x_moe_prefill_fast::FrontArgs& fa, bool quant, int T, int K, int topk, int E, torch::Device dev) {
+static Routing launch_frontend(b12x_moe_prefill_fast::FrontArgs& fa, bool quant, int T, int K, int topk, int E, torch::Device dev,
+                               bool unified = false, int f2_group = 1) {
   using namespace b12x_moe_prefill_fast;
   auto o32 = torch::TensorOptions().dtype(torch::kInt32).device(dev);
   const int pairs = T * topk;
@@ -2501,7 +3340,7 @@ static Routing launch_frontend(b12x_moe_prefill_fast::FrontArgs& fa, bool quant,
   r.row_pair = torch::empty({row_cap}, o32);
   r.f1_items = torch::empty({f1_cap, 4}, o32);
   r.f2_items = torch::empty({f2_cap, 4}, o32);
-  r.counts = torch::empty({8}, o32);
+  r.counts = torch::empty({kCountsWords}, o32);
   r.chunk_cnt = torch::empty({n_chunks, kMaxE}, o32);
   r.exp_off = torch::empty({kMaxE}, o32);
   r.exp_cnt = torch::empty({kMaxE}, o32);
@@ -2518,11 +3357,25 @@ static Routing launch_frontend(b12x_moe_prefill_fast::FrontArgs& fa, bool quant,
   fa.topk = topk;
   fa.out = nullptr;
   fa.tok_valid = nullptr;
+  fa.u_items = nullptr;
+  fa.fc1_need = nullptr;
+  fa.u_cap = 0;
+  fa.lead = 0;
+  fa.u_f2_group = 1;
+  if (unified) {  // MK-2: the persistent launch's work list (both kinds) + the FC2 items' wait targets
+    r.u_items = torch::empty({f1_cap + f2_cap, 4}, o32);
+    r.fc1_need = torch::empty({kMaxE}, o32);
+    fa.u_items = reinterpret_cast<int4*>(r.u_items.data_ptr());
+    fa.fc1_need = r.fc1_need.data_ptr<int32_t>();
+    fa.u_cap = f1_cap + f2_cap;
+    fa.lead = std::max(1, ws_lead());
+    fa.u_f2_group = f2_group;
+  }
   return r;
 }
 static void run_frontend(const b12x_moe_prefill_fast::FrontArgs& fa, cudaStream_t stream) {
   using namespace b12x_moe_prefill_fast;
-  cudaMemsetAsync(fa.counts, 0, 8 * sizeof(int32_t), stream);  // the histogram arrival counter and the work counters
+  cudaMemsetAsync(fa.counts, 0, kCountsWords * sizeof(int32_t), stream);  // the histogram arrival counter, the work counters, fc1_done[]
   frontend_kernel<<<fa.quant_blocks + fa.n_chunks, kFrontThreads, 0, stream>>>(fa);
   TORCH_CHECK(cudaGetLastError() == cudaSuccess);
   scatter_kernel<<<fa.n_chunks, kFrontThreads, 0, stream>>>(fa);
@@ -2618,12 +3471,18 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   auto stream = c10::cuda::getCurrentCUDAStream();
 
   const bool fused_sum = topk_sum && topk <= 8 && fused_topk_sum_enabled();  // the slot mask of tok_valid holds 8 slots
+  // MK-2: the fused persistent launch (WS >= 20): contiguous rows, no fused sum, at or above _WS_MIN_ROWS rows
+  const int lda_b = prequant ? (int)a_values.stride(0) : K, lds_b = prequant ? (int)a_scales.stride(0) : K / 32;
+  const bool persistent = ws_mode() >= 20 && !fused_sum && lda_b == K && lds_b == K / 32 && T >= ws_min_rows();
+  // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
+  const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
+  const int f2_group = ws_f2_group(ps_mode);
   torch::Tensor arrive;
   FrontArgs fa;
   fa.hidden = prequant ? nullptr : reinterpret_cast<const uint32_t*>(hidden.data_ptr());
   fa.a_values = reinterpret_cast<uint32_t*>(a_values.data_ptr());
   fa.a_scales = a_scales.data_ptr<uint8_t>();
-  Routing rt = launch_frontend(fa, !prequant, T, K, topk, E, dev);
+  Routing rt = launch_frontend(fa, !prequant, T, K, topk, E, dev, persistent, f2_group);
   fa.ids = ids.data_ptr<int32_t>();
   if (fused_sum) {
     fa.out = reinterpret_cast<uint32_t*>(out.data_ptr());
@@ -2675,6 +3534,27 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   f2.K = K; f2.out_tiles = fa.n2_tiles; f2.gs_per_expert = global_scale.numel() > 1;
   f2.dynamic_schedule = (int)dynamic_schedule; f2.topk = topk;
 
+  if (persistent) {  // MK-2: one launch for fc1 + SwiGLU/quant + fc2 (section 6), then the separate top-k sum below
+    PersistArgs pa;
+    pa.a_values = f1.a_values; pa.a_scales = f1.a_scales; pa.w13 = f1.w13; pa.w13_sf = f1.w13_sf;
+    pa.alpha = f1.alpha; pa.input_global_scale = f1.input_global_scale; pa.inter = f1.inter; pa.inter_sf = f1.inter_sf;
+    pa.w2 = f2.w2; pa.w2_sf = f2.w2_sf; pa.token_weights = f2.token_weights; pa.down_alpha = f2.down_alpha; pa.global_scale = f2.global_scale;
+    pa.route = f2.route;
+    pa.row_pair = fa.row_pair; pa.items = fa.u_items; pa.counts = fa.counts;
+    pa.fc1_done = fa.counts + 8; pa.fc1_need = fa.fc1_need; pa.err_lock = fa.counts + 7; pa.err = ps_err_dev();
+    pa.stats = ws_stats_enabled() ? ps_stats_dev() : nullptr;
+    if (pa.stats != nullptr) cudaMemsetAsync(pa.stats, 0, 64, stream);
+    pa.watchdog_ns = (unsigned long long)std::max(1, ws_watchdog_ms()) * 1000000ull;
+    pa.K = K; pa.topk = topk; pa.igs_per_expert = f1.igs_per_expert; pa.gs_per_expert = f2.gs_per_expert; pa.out_tiles = fa.n2_tiles;
+    pa.dynamic_schedule = (int)dynamic_schedule; pa.limit = (float)limit; pa.route_cs = ws_route_cs();
+    with_ws(ps_mode, [&](auto W) {
+      int g = decltype(W)::grid(sms);
+      if (grid1_cap > 0) g = std::min<int>(g, (int)grid1_cap);
+      g = std::min(g, fa.u_cap);
+      decltype(W)::run(pa, g, stream);
+    });
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+  } else {
   auto run = [&](auto L) {
     using LL = decltype(L);
     LL::prepare();
@@ -2694,6 +3574,7 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
     case 1: run(Launch<3, 2, 4, 2>{}); break;
     case 2: run(Launch<4, 2, 3, 2>{}); break;
     default: run(Launch<4, 2, 4, 2>{}); break;
+  }
   }
 
   if (topk_sum && !fused_sum) {
@@ -2728,10 +3609,38 @@ bool prequant_rows_supported() { return true; }  // the loader probes this entry
 // the loader probes this entry too: a_values / a_scales may be row-strided views (unit column stride, 4-byte row strides and
 // bases) of one gathered buffer - the one-all-gather layout
 bool strided_rows_supported() { return true; }
+// MK-2: the build has the fused persistent launch (VLLM_MOET_B12X_MOE_PREFILL_FAST_WS >= 20); the mode the process runs with
+int64_t persistent_mode() { return ws_mode(); }
+// the persistent kernel's watchdog record (pinned host memory, readable after a trapped launch): [set, item, expert, need, seen, smid, block,
+// watchdog_ms]; set == 0: no expired wait since the process started. `clear` resets it.
+std::vector<int64_t> moe_prefill_ws_error(bool clear) {
+  std::vector<int64_t> r(8, 0);
+  uint32_t* h = ps_err_host();
+  if (h == nullptr) return r;
+  for (int i = 0; i < 8; ++i) r[i] = (int64_t)h[i];
+  if (clear) memset(h, 0, 32);
+  return r;
+}
+
+// the statistics of the LAST persistent launch (VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_STATS=1; synchronises the device): [fc1_ns, fc1_items,
+// fc2_ns, fc2_items, idle_ns, fc1_done_wait_ns, cta_span_ns, ctas], sums over the CTAs
+std::vector<int64_t> moe_prefill_ws_stats() {
+  std::vector<int64_t> r(8, 0);
+  unsigned long long* d = ps_stats_dev();
+  if (d == nullptr || !ws_stats_enabled()) return r;
+  unsigned long long h[8];
+  cudaDeviceSynchronize();
+  if (cudaMemcpy(h, d, 64, cudaMemcpyDeviceToHost) != cudaSuccess) { cudaGetLastError(); return r; }
+  for (int i = 0; i < 8; ++i) r[i] = (int64_t)h[i];
+  return r;
+}
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("moe_prefill_fast", &moe_prefill_fast);
   m.def("moe_prefill_fast_frontend", &moe_prefill_fast_frontend);
   m.def("prequant_rows_supported", &prequant_rows_supported);
   m.def("strided_rows_supported", &strided_rows_supported);
+  m.def("persistent_mode", &persistent_mode);
+  m.def("moe_prefill_ws_error", &moe_prefill_ws_error);
+  m.def("moe_prefill_ws_stats", &moe_prefill_ws_stats);
 }
