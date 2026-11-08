@@ -29,7 +29,7 @@ args = ap.parse_args()
 keys = args.keys.split(",")
 
 
-def load(d: Path):
+def load(d: Path, kind: str):
     out = {}
     for f in sorted(d.glob("rank*.jsonl")):
         rank = int(f.stem[4:])
@@ -37,13 +37,15 @@ def load(d: Path):
             if not line.strip():
                 continue
             e = json.loads(line)
-            if e.get("kind", "all") != args.kind:
+            if e.get("kind", "all") != kind:
                 continue
             out[(rank, e["pos0"], e["rows"], e["layer"])] = e
     return out
 
 
-A, B = load(args.a), load(args.b)
+# --kind shared (K-10 fix): the shared tail's entries of A are compared with the REGULAR entries of the reference B (the kv0 /
+# r25 dumps carry no "shared" kind) at the same (rank, pos0, rows, layer) keys; the other kinds filter both sides alike.
+A, B = load(args.a, args.kind), load(args.b, "all" if args.kind == "shared" else args.kind)
 print(f"A: {len(A)} layer records, B: {len(B)}")
 if not A or not B:
     sys.exit("no records")
