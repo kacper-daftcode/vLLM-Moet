@@ -39,7 +39,11 @@ affinity_policy - K-7, r26b hardening against host CPU load), VLLM_MOET_PREFILL_
 named launch-order variant of K/k6/DESIGN_launch_order.md, a bundle over COMM2 / COMM_PRIORITY, see order - K-7),
 VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS (0 | 1 | verify: the whole sequence-parallel section of a full pipelined step - both groups,
 shard -> layers 0-19 -> the first replay layer's KV - as one CUDA graph captured at engine start and replayed with one launch per
-step, see phase_graphs - K-8), VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX (262144: the context length the graph is captured for).
+step, see phase_graphs - K-8), VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX (262144: the context length the graph is captured for),
+VLLM_MOET_PREFILL_PIPE_SHARED_TAIL (0 | 1 | verify: the replay layers 20-39 + collapse of a full pipelined step run ONCE on the
+concatenation of both groups' replay rows (256) instead of once per group, the three row-count-dependent ops split per group so the
+bits stay today's, see shared_tail - K-9), VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS (all | shared: which slots get replay graphs
+with the shared tail on).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
@@ -165,6 +169,58 @@ def log_steps() -> int:
         return 0
 
 
+def host_timing() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_HOST_TIMING=1 (K-9 task 2): one log line per pipelined step with the runner thread's host time
+    in the step's segments - `between` (the previous step's model call returned -> this step's group planning started: the
+    sampler, the scheduler round trip, the whole-step input / metadata preparation), `plan` (the groups' metadata builds, the
+    shared replay batch), `head` (planning done -> the model's dispatch reached: the embedding, the Engram hashes and rows),
+    `issue` (the dispatch -> both group threads joined: the SP phase's and the tails' launches), and the time of the whole step's
+    host path; every 20 pipelined steps a summary (mean / max per segment). Measures what CPU a step costs before its GPU work
+    can start - the part a loaded host stretches (K-8: +11 ms per 163K step under 100 spinners)."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_HOST_TIMING", "0") == "1"
+
+
+_HOST = {"last_end": None, "plan_start": None, "plan_end": None, "rows": []}
+
+
+def _host_mark(name: str) -> None:
+    """Runner-thread timestamps of the step's segments (host_timing); a no-op otherwise."""
+    if not host_timing():
+        return
+    _HOST[name] = time.perf_counter()
+
+
+def _host_step_done(num_tokens: int, pipelined: bool, t_dispatch: float, t_end: float) -> None:
+    if not host_timing():
+        return
+    ps, pe, last = _HOST.get("plan_start"), _HOST.get("plan_end"), _HOST.get("last_end")
+    row = {
+        "tokens": num_tokens, "pipelined": pipelined,
+        "between": None if (last is None or ps is None) else (ps - last) * 1e3,
+        "plan": None if (ps is None or pe is None) else (pe - ps) * 1e3,
+        "head": None if pe is None else (t_dispatch - pe) * 1e3,
+        "issue": (t_end - t_dispatch) * 1e3,
+    }
+    _HOST["last_end"] = t_end
+    _HOST["plan_start"] = _HOST["plan_end"] = None
+    rows = _HOST["rows"]
+    rows.append(row)
+    fmt = lambda v: "-" if v is None else f"{v:.1f}"  # noqa: E731
+    logger.info(
+        "prefill pipeline host timing: step of %d tokens (%s): between %s ms, plan %s, head %s, issue %s (rank %d)",
+        num_tokens, "pipelined" if pipelined else "sequential", fmt(row["between"]), fmt(row["plan"]), fmt(row["head"]),
+        fmt(row["issue"]), _tp_rank(),
+    )
+    if len(rows) % 20 == 0:
+        recent = rows[-20:]
+        parts = []
+        for key in ("between", "plan", "head", "issue"):
+            vals = [r[key] for r in recent if r[key] is not None]
+            if vals:
+                parts.append(f"{key} mean {sum(vals) / len(vals):.1f} / max {max(vals):.1f}")
+        logger.info("prefill pipeline host timing: last %d steps (rank %d): %s", len(recent), _tp_rank(), "; ".join(parts))
+
+
 def force_sequential() -> bool:
     """VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL=1: the step's groups run one after the other on the runner thread
     (run_sequential: today's bits per group, no overlap) even when both are sequence parallel - the oracle of the
@@ -191,10 +247,15 @@ def replay_graphs() -> bool:
 
 def graph_slots() -> list[int]:
     """The row-group slots that get replay CUDA graphs of their own (model_state.capture_inner_cudagraphs): 1..n with
-    VLLM_MOET_PREFILL_PIPE=2 and VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1, else none."""
+    VLLM_MOET_PREFILL_PIPE=2 and VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1, else none; K-9: + the shared slot with
+    VLLM_MOET_PREFILL_PIPE_SHARED_TAIL != 0 (the shared slot alone with SHARED_TAIL_GRAPHS=shared)."""
     if mode() != 2 or not replay_graphs():
         return []
-    return list(range(1, PipeRunner.NUM_GROUPS + 1))
+    if shared_tail() == "0":
+        return list(range(1, PipeRunner.NUM_GROUPS + 1))
+    if shared_tail_graphs() == "shared":
+        return [SHARED_SLOT]
+    return list(range(1, PipeRunner.NUM_GROUPS + 1)) + [SHARED_SLOT]
 
 
 def comm2_enabled() -> bool:
@@ -259,6 +320,91 @@ def phase_graph_max_ctx() -> int:
         return int(os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPH_MAX_CTX", "262144"))
     except ValueError:
         return 262144
+
+
+# K-9: the slot of the shared replay batch (both groups' replay rows as one batch); slots 1..NUM_GROUPS are the groups'
+SHARED_SLOT = 3
+
+
+def shared_tail() -> str:
+    """VLLM_MOET_PREFILL_PIPE_SHARED_TAIL (K-9): "0" (default) = every group of a pipelined step runs its own replay tail (the
+    128-row layers 20-39 + the collapse) as r26 / r26b - two tails per step, each streaming every active expert's weights once
+    (K-4 6.1: the 128-row fc1 / fc2 sit at the DRAM floor), 2 x 43 all-reduces, ~24 ms of GPU each. "1" = ONE tail per full
+    pipelined step: after both groups' layer-20 KV write and rows gather, the second group's thread runs layers 20-39 + the
+    collapse once on the concatenation of both groups' replay rows (256 rows = the shared replay batch of SHARED_SLOT, built by
+    the runner as a pseudo-batch of the two groups' request slices; its graph is the 256-row one of the capture list), the
+    first group's thread waits at the rendezvous (shared_replay) and takes its rows of the outputs; the scatter back to full
+    rows, the collapse-norm, the aux states and the mtp copy stay per group. Bits = today's by construction: every kernel of a
+    replay layer computes a row independently of the other rows at any M (the inventory in K/k9/DESIGN_shared_tail.md 2) except
+    three ops whose arithmetic is a function of the row count - the TP all-reduces (NCCL's ring chunking per byte count), the
+    router GEMM and the wo_a bmm (cuBLAS's per-shape kernel / split-K choice) - which the shared tail issues as one call per group
+    row block (row_blocks: the same message / the same M as today), and the mHC pre-norm GEMM's split-k count, pinned to the
+    group's row count (pin_tokens). "verify" = "1" plus, every shared step, today's two tails on the same inputs and a torch.equal
+    of every output tensor per group (one log line per step, counters in stats(); the step continues from today's outputs, the KV
+    cache holds today's writes) - the bits oracle on the real model, as K-8's PHASE_GRAPHS=verify. Steps the shared tail does not
+    serve run today's tails, said once per reason: a group without a replay batch (prompt logprobs), REPLAY=stream, a shared
+    batch without a graph while REPLAY_GRAPHS=1 (decode rows in group 0: 128 + d + 128 > the largest capture size), unequal mHC
+    split counts. Design: K/k9/DESIGN_shared_tail.md; measured: K/REPORT.md 12.
+    Measured (K-9, 8.11, test host, image r26b, connector kv16+FS, REPLAY_GRAPHS=1 [128,256], fc2 WS2=3): LEVEL B - verify eager
+    96/96 steps IDENTICAL (24 x 4 ranks) with the shared tail's own per-layer dumps 320/320 chunk-layers x 5 states identical to the kv0
+    and r25 dumps (layers 20-39, both groups), verify with the graphs 360/360 IDENTICAL (90 x 4 ranks) once the shared slot's capture
+    runs inside shared_capture_scope (the first graph arm captured the unsplit 256-row all-reduces / GEMMs: 360/360 MISMATCH - a graph
+    replays what it recorded); agree x3 / long x2 identical. Time: 163K 5 008 / 5 014 / 4 999 ms quiet vs r26b 5 371-5 391 (-6.9 %),
+    19K 647 / 642 / 639 vs 676-686 (-5.5 %), under 100 nice -n 10 spinners +5.1 % (r26b +4.8 %). Cost: the shared slot's graph manager
+    (profiling pass 2.73 vs 2.33 GiB booked, real 1.13 vs 0.98) -> KV 10.3 -> 9.9 GiB per GPU at 0.94 (5.77 M vs 6.01 M tokens)."""
+    value = os.environ.get("VLLM_MOET_PREFILL_PIPE_SHARED_TAIL", "0")
+    return value if value in ("0", "1", "verify") else "0"
+
+
+def shared_tail_graphs() -> str:
+    """VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS (K-9, with SHARED_TAIL != 0 and REPLAY_GRAPHS=1): "all" (default) = the groups'
+    slots keep their replay graphs (a step the shared tail cannot serve - decode rows in group 0 - still runs its tails as graphs)
+    and the shared slot gets its own (capture sizes >= 2 x the replay window only: [128,256] -> [256]); "shared" = the shared
+    slot alone (one manager less: ~0.23 GiB of graph pool real, ~0.5 GiB booked by the memory profiler = KV; the steps the
+    shared tail cannot serve then run eager tails)."""
+    value = os.environ.get("VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS", "all")
+    return value if value in ("all", "shared") else "all"
+
+
+def shared_tail_light() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_LIGHT=1 (K-9 task 2, with SHARED_TAIL=1): when the runner can tell before the groups'
+    metadata builds that the shared tail will serve the step (two groups whose request slices trim, REPLAY=serial, the summed
+    kept rows within the shared slot's capture sizes, equal mHC split counts), each group's own replay batch is built LIGHT -
+    its rows (the gather kernel) without the kept batch's two attention-metadata builds and forward context, which only
+    today's per-group tail would read. Two metadata builds less per group per step on the runner thread (the per-step host
+    path a loaded host stretches). Off (default): the groups' batches are built as today. If the shared plan then fails for a
+    reason the precheck could not see, the groups' batches are rebuilt in full and today's tails run (loud once)."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_LIGHT", "0") == "1"
+
+
+_LIGHT = {"on": False}
+
+
+def light_replay_batch() -> bool:
+    """Model-state side (_prepare_replay_batch, K-9): True while the runner builds a group slot's metadata for a step the shared
+    tail will serve - the slot's replay batch is then its rows only (see shared_tail_light)."""
+    return _LIGHT["on"]
+
+
+def slot_graph_config(vllm_config: Any, slot: int, window: int) -> Any:
+    """The vllm config a slot's DecoderReplayCudaGraphManager is built with (model_state.capture_inner_cudagraphs): the groups'
+    slots take the config as is; the shared slot takes a copy whose decoder_replay_cudagraph_capture_sizes keep only the sizes
+    >= 2 x window (a shared batch is never smaller: two groups' kept rows), or None when no configured size qualifies (then the
+    shared slot gets no graphs and the shared tail serves only eager steps). An empty (automatic) size list is kept as is."""
+    if slot != SHARED_SLOT:
+        return vllm_config
+    from copy import copy
+
+    compilation = copy(vllm_config.compilation_config)
+    sizes = list(getattr(compilation, "decoder_replay_cudagraph_capture_sizes", None) or [])
+    if sizes:
+        kept = [s for s in sizes if s >= 2 * max(int(window), 1)]
+        if not kept:
+            return None
+        compilation.decoder_replay_cudagraph_capture_sizes = kept
+    cfg = copy(vllm_config)
+    cfg.compilation_config = compilation
+    return cfg
 
 
 # "capturing" is True on every thread while the step graph is being captured (the patched sites that would otherwise behave
@@ -343,6 +489,9 @@ _STATS = {
     "steps": 0, "pipelined": 0, "sequential": 0, "mixed": 0, "today": 0,
     # K-8: pipelined steps that ran the phase graph / fell back to eager, verify-mode steps compared / found different
     "phase_graph_steps": 0, "phase_graph_eager": 0, "phase_graph_verified": 0, "phase_graph_mismatch": 0,
+    # K-9: pipelined steps whose tails ran as one shared tail / as today's two tails although the switch is on, verify-mode
+    # steps compared / found different
+    "shared_tail_steps": 0, "shared_tail_today": 0, "shared_tail_verified": 0, "shared_tail_mismatch": 0,
 }
 
 
@@ -368,6 +517,7 @@ class PipeGroup:
     req_lo: int = 0  # the group's first / last request index in the step's batch (the phase graph's key, K-8)
     req_hi: int = 0
     comm_held: list = field(default_factory=list)  # tensors the open phase reads on the comm stream, released at its join
+    shared_plan: "SharedPlan | None" = None  # K-9: the step's shared replay tail, planned by the runner (the same object on every group)
 
 
 def current_group() -> PipeGroup | None:
@@ -495,6 +645,8 @@ class PipeStep:
         self.finished = [False] * n
         self.outputs: dict[int, Any] = {}
         self.errors: dict[int, BaseException] = {}
+        # K-9: the step's shared replay tail (set by run_groups from the groups' plan when the step is pipelined), else None
+        self.shared: SharedTail | None = None
         for g in groups:
             g.step = self
             g.phases_done = 0
@@ -789,6 +941,20 @@ def run_groups(
     the captured graph (or is being captured, during capture_phase_graphs); fn stays the eager path of every other step."""
     runner = _RUNNER
     assert runner is not None, "prefill pipeline: groups without a runner"
+    if host_timing():
+        t_dispatch = time.perf_counter()
+        try:
+            return _run_groups(runner, groups, fn, pipelined, phase)
+        finally:
+            _host_step_done(sum(g.num_tokens for g in groups), pipelined and not force_sequential(), t_dispatch,
+                            time.perf_counter())
+    return _run_groups(runner, groups, fn, pipelined, phase)
+
+
+def _run_groups(
+    runner: "PipeRunner", groups: list[PipeGroup], fn: Callable[[PipeGroup], Any], pipelined: bool,
+    phase: "PhaseHooks | None",
+) -> list[Any]:
     from vllm.utils.torch_utils import current_stream
 
     if pipelined and force_sequential():
@@ -800,6 +966,8 @@ def run_groups(
         groups, current_stream(), runner.comm_stream, runner.row_switch, runner.device, pipelined,
         replay_stream=getattr(runner, "replay_stream", None),
     )
+    if pipelined:
+        step.shared = SharedTail.for_step(groups)  # K-9: None unless the runner planned a shared replay tail for this step
     if _PHASE["request"] is not None:
         # a capture pass of capture_phase_graphs (the dummy step): warm-up = the whole step eagerly as today, capture = the
         # section under stream capture, the rest eagerly
@@ -843,6 +1011,330 @@ def run_groups(
             [g.num_tokens for g in groups],
         )
     return step.run_sequential(fn)
+
+
+# ------------------------------------------------------------------------------------- the shared replay tail (K-9)
+@dataclass
+class SharedPlan:
+    """The runner's plan of a step's shared replay tail (PipeRunner._plan_shared): the groups' kept row counts (the row blocks
+    of the 256-row batch, in group order), the row count the mHC pre-norm GEMM's split-k is pinned to, the verify flag."""
+
+    counts: list[int]
+    pin: int
+    verify: bool
+    capture_window: int = 0  # > 0 only in shared_capture_scope: split any op of >= 2 x window rows into window-sized blocks
+
+    @property
+    def total(self) -> int:
+        return sum(self.counts)
+
+    @property
+    def blocks(self) -> list[tuple[int, int]]:
+        out, lo = [], 0
+        for c in self.counts:
+            out.append((lo, lo + c))
+            lo += c
+        return out
+
+
+@dataclass
+class SharedTail:
+    """The rendezvous state of one pipelined step's shared replay tail (PipeStep.shared): the inputs each group's thread
+    brought (the 7 replay inputs, full rows), the outputs the running thread produced for every group (full rows, the group's
+    replay rows filled), the row blocks. Thread-local while the tail runs (_tls.shared): row_blocks / pin_tokens / the dump hook
+    read it."""
+
+    plan: SharedPlan
+    groups: list[PipeGroup]
+    inputs: list[tuple | None]
+    outputs: list[tuple | None]
+
+    @staticmethod
+    def for_step(groups: list[PipeGroup]) -> "SharedTail | None":
+        plan = groups[0].shared_plan if groups else None
+        if plan is None or any(g.shared_plan is not plan for g in groups):
+            return None
+        return SharedTail(plan, list(groups), [None] * len(groups), [None] * len(groups))
+
+    @property
+    def total(self) -> int:
+        return self.plan.total
+
+    @property
+    def blocks(self) -> list[tuple[int, int]]:
+        return self.plan.blocks
+
+    @property
+    def pin(self) -> int:
+        return self.plan.pin
+
+
+def current_shared() -> SharedTail | None:
+    return getattr(_tls, "shared", None)
+
+
+class _SharedScope:
+    """The calling thread runs the shared replay tail: _tls.shared set for the splits, the pin and the dump hook."""
+
+    def __init__(self, st: SharedTail) -> None:
+        self.st = st
+        self.prev = None
+
+    def __enter__(self):
+        self.prev = getattr(_tls, "shared", None)
+        self.prev_pin = _mhc_warmup()._MOET_SP_PIN_TOKENS
+        _tls.shared = self.st
+        return self
+
+    def __exit__(self, *exc):
+        _tls.shared = self.prev
+        _mhc_warmup()._MOET_SP_PIN_TOKENS = self.prev_pin  # the layers' own pin calls inside were redirected (pin_tokens)
+        return False
+
+
+class shared_capture_scope:
+    """Model-state side (capture_inner_cudagraphs, K-9): the shared slot's replay graphs are CAPTURED inside a shared scope,
+    so that the per-group split of the three row-count-dependent ops (row_blocks: the all-reduces, the router GEMM, the wo_a
+    bmm) and the mHC pin (pin_tokens) are recorded into the graph - a graph replays what was captured, and the capture runs
+    at engine start, outside any step's rendezvous. Every captured size is split into blocks of `window` rows (the groups'
+    kept rows: 256 = 128 + 128). A no-op for the groups' slots. (The first graph arm of K-9 captured the shared slot
+    without this: 256-row all-reduces / GEMMs in the graph, eager verify IDENTICAL but graph verify MISMATCH on every step.)"""
+
+    def __init__(self, slot: int, window: int) -> None:
+        self.active = slot == SHARED_SLOT and window > 0
+        self.plan = SharedPlan(counts=[int(window), int(window)], pin=int(window), verify=False, capture_window=int(window)) \
+            if self.active else None
+        self.scope = None
+
+    def __enter__(self):
+        if self.active:
+            st = SharedTail(self.plan, [], [None] * len(self.plan.counts), [None] * len(self.plan.counts))
+            self.scope = _SharedScope(st)
+            self.scope.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        if self.scope is not None:
+            self.scope.__exit__(*exc)
+        return False
+
+
+def row_blocks(num_rows: int) -> list[tuple[int, int]]:
+    """The row blocks an op of `num_rows` rows is split into: inside the shared replay tail, for a tensor of the tail's row count,
+    one block per group (the same rows / the same M each group's own tail would have had); [(0, num_rows)] otherwise. For the ops
+    whose arithmetic depends on the row count - the TP all-reduce (NCCL's chunking), the router GEMM and the wo_a bmm (cuBLAS's
+    kernel / split-K choice): the call sites iterate over the blocks."""
+    st = current_shared()
+    if st is None:
+        return [(0, num_rows)]
+    w = st.plan.capture_window
+    if w > 0:
+        # the shared slot's graph capture: every op of >= 2 x window rows (the capture sizes) in window-sized blocks
+        if num_rows < 2 * w:
+            return [(0, num_rows)]
+        return [(i, min(i + w, num_rows)) for i in range(0, num_rows, w)]
+    if num_rows != st.total:
+        return [(0, num_rows)]
+    return st.blocks
+
+
+def pin_tokens(num_tokens: int | None) -> int | None:
+    """The mHC pre-norm GEMM's split-k pin (_moet_sp_pin): inside the shared replay tail a layer that would release the pin
+    (None: the replay layers are not sequence parallel) pins it to the group's row count instead, so the 256-row GEMM sums the
+    k-slices the 128-row one did. Unchanged otherwise."""
+    st = current_shared()
+    if st is not None and num_tokens is None:
+        return st.pin
+    return num_tokens
+
+
+def _split_all_reduce(orig: Callable[[torch.Tensor], torch.Tensor]) -> Callable[[torch.Tensor], torch.Tensor]:
+    def all_reduce(input_: torch.Tensor) -> torch.Tensor:
+        blocks = row_blocks(input_.shape[0]) if input_.dim() >= 1 else [(0, 0)]
+        if len(blocks) <= 1:
+            return orig(input_)
+        x = input_.contiguous()
+        return torch.cat([orig(x[lo:hi]) for lo, hi in blocks], dim=0)
+
+    all_reduce._moet_split = True  # type: ignore[attr-defined]
+    return all_reduce
+
+
+def _install_ar_split() -> bool:
+    """K-9: the TP group's device communicator all-reduces one group row block at a time inside the shared replay tail (the
+    NCCL message of today's 128-row tail - the ring's chunk map and so an element's reduction order follow the byte count);
+    a no-op call everywhere else. Installed on the communicator instance (every path of CudaCommunicator.all_reduce - pynccl,
+    the custom / FlashInfer all-reduces - goes through it), once per process."""
+    try:
+        from vllm.distributed.parallel_state import get_tp_group
+
+        tp = get_tp_group()
+    except Exception as exc:  # noqa: BLE001 - outside a distributed process (the unit test installs its own)
+        logger.warning("vllm-moet sm_120 prefill pipeline: shared tail - no TP group to split the all-reduces on (%r)", exc)
+        return False
+    dc = getattr(tp, "device_communicator", None)
+    if dc is None or tp.world_size < 2:
+        return False
+    if getattr(dc.all_reduce, "_moet_split", False):
+        return True
+    dc.all_reduce = _split_all_reduce(dc.all_reduce)
+    logger.info(
+        "vllm-moet sm_120 prefill pipeline: shared replay tail - the TP all-reduces inside it run per group row block (rank %d of %d)",
+        tp.rank_in_group, tp.world_size,
+    )
+    return True
+
+
+def _run_replay_with_batch(replay: Any, batch: Any, inputs: tuple) -> tuple:
+    """DecoderReplayLayers._run on an explicit replay batch (today's tail of one group): the layers on the batch's rows, as
+    its graph or eagerly, the outputs scattered into full rows (zeros elsewhere)."""
+    from vllm.forward_context import override_forward_context
+
+    rows = batch.rows
+    with override_forward_context(batch.forward_context):
+        if batch.run_graph is not None:
+            row_outputs = batch.run_graph(rows, inputs)
+        else:
+            row_outputs = replay.run_layers(*(None if t is None else t.index_select(0, rows) for t in inputs))
+    num_tokens = inputs[0].shape[0]
+    return tuple(out.new_zeros((num_tokens, *out.shape[1:])).index_copy_(0, rows, out) for out in row_outputs)
+
+
+def _scatter_shared_outputs(st: SharedTail, group_rows: list[torch.Tensor], row_outputs: tuple) -> list[tuple]:
+    outs: list[tuple] = []
+    for (lo, hi), rows, inp in zip(st.blocks, group_rows, st.inputs):
+        assert inp is not None
+        num_tokens = inp[0].shape[0]
+        outs.append(tuple(
+            out.new_zeros((num_tokens, *out.shape[1:])).index_copy_(0, rows, out[lo:hi]) for out in row_outputs
+        ))
+    return outs
+
+
+def _run_shared_layers(replay: Any, st: SharedTail, shared_batch: Any, group_rows: list[torch.Tensor], manager: Any) -> tuple:
+    """The replay layers once on both groups' rows: the 256-row inputs assembled from the groups' full-row tensors by their
+    replay rows (into the shared slot's static graph inputs, or a concatenation for the eager layers), run under the shared
+    batch's forward context inside the shared scope (the splits, the pin, the dump per group)."""
+    from vllm.forward_context import get_forward_context, override_forward_context
+
+    with _SharedScope(st), override_forward_context(shared_batch.forward_context):
+        if shared_batch.run_graph is not None:
+            if manager is None:
+                raise RuntimeError("prefill pipeline: the shared replay batch has a graph but the shared slot has no graph manager")
+            for k, buf in enumerate(manager.input_buffers):
+                for (lo, hi), rows, inp in zip(st.blocks, group_rows, st.inputs):
+                    assert inp is not None
+                    t = inp[k]
+                    if t is None:
+                        raise RuntimeError(f"prefill pipeline: shared tail - replay input {k} is None, the graph needs it")
+                    torch.index_select(t, 0, rows, out=buf[lo:hi])
+            num_tokens = get_forward_context().batch_descriptor.num_tokens
+            outputs = manager.breakable_cg_runner(*(buf[:num_tokens] for buf in manager.input_buffers))
+            return tuple(out[: st.total] for out in outputs)
+        cat_inputs = []
+        for k in range(len(st.inputs[0])):
+            parts = [inp[k] for inp in st.inputs]  # type: ignore[index]
+            if any(p is None for p in parts):
+                cat_inputs.append(None)
+                continue
+            cat_inputs.append(torch.cat([p.index_select(0, rows) for p, rows in zip(parts, group_rows)], dim=0))
+        return replay.run_layers(*cat_inputs)
+
+
+def _compare_outputs(a: tuple, b: tuple) -> list[str]:
+    """The names of the output tensors that differ (torch.equal), each with the size of the difference: the share of
+    differing elements, max |a - b|, max |b| (an ulp-level numerics difference vs a wrong-rows bug read differently)."""
+    names = ["hidden_states", "pre_mix"] + [f"aux[{i}]" for i in range(max(len(a), len(b)))]
+    if len(a) != len(b):
+        return [f"structure {len(a)} vs {len(b)} outputs"]
+    out = []
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x.shape != y.shape or x.dtype != y.dtype:
+            out.append(f"{names[i]} shape/dtype {tuple(x.shape)}/{x.dtype} vs {tuple(y.shape)}/{y.dtype}")
+            continue
+        if torch.equal(x, y):
+            continue
+        xf, yf = x.float(), y.float()
+        ne = int((x != y).sum().item())
+        out.append(f"{names[i]} ({ne}/{x.numel()} el = {ne / max(x.numel(), 1):.2%}, max|d| {(xf - yf).abs().max().item():.3g}, "
+                   f"max|ref| {yf.abs().max().item():.3g}, rows {int((x != y).reshape(x.shape[0], -1).any(dim=1).sum().item())})")
+    return out
+
+
+def shared_replay(replay: Any, *inputs: torch.Tensor | None) -> tuple | None:
+    """Model side (K-9), in _moet_sp_decoder_replay_rest after the rows gather, instead of replay._run: the calling group's
+    rows of one replay tail for both groups, or None (no shared tail planned for this step, not a pipelined step: the caller
+    runs its own tail as today). The first thread to arrive leaves its inputs and parks until its outputs exist (the other
+    thread ran the tail and finished or yielded; a finished partner without outputs = error, never a hang); the second runs
+    the layers once for both groups (_run_shared_layers), scatters the outputs per group and returns its own. SHARED_TAIL=verify:
+    today's two tails on the same inputs afterwards, torch.equal per output tensor, the step continues from today's outputs."""
+    g = current_group()
+    if g is None or g.step is None or not g.step.pipelined or g.step.shared is None:
+        return None
+    step = g.step
+    st = step.shared
+    st.inputs[g.idx] = inputs
+    n = len(step.groups)
+    if any(st.inputs[i] is None for i in range(n)):
+        # not the last to arrive: hand the CPU over and wait for the tail's outputs
+        while st.outputs[g.idx] is None:
+            others_done = all(step.finished[h.idx] for h in step.groups if h.idx != g.idx)
+            if others_done or step.errors:
+                raise RuntimeError(
+                    f"prefill pipeline: shared tail - group {g.idx} waited for its outputs but the other group finished without "
+                    f"producing them (errors: {list(step.errors)})"
+                )
+            step.yield_(g)
+        return st.outputs[g.idx]
+    # the last to arrive runs the tail for every group
+    batches = getattr(replay, "_moet_replay_batches", None)
+    if batches is None:
+        raise RuntimeError("prefill pipeline: shared tail - the replay layers carry no per-slot batches (patcher mismatch)")
+    group_batches = [batches.get(h.slot) for h in step.groups]
+    shared_batch = batches.get(SHARED_SLOT)
+    if shared_batch is None or any(b is None for b in group_batches):
+        raise RuntimeError("prefill pipeline: shared tail planned but a replay batch is missing (slots "
+                           f"{[h.slot for h in step.groups]} + {SHARED_SLOT}: {[b is not None for b in group_batches]}, "
+                           f"{shared_batch is not None})")
+    group_rows = [b.rows for b in group_batches]
+    counts = [int(r.shape[0]) for r in group_rows]
+    if counts != st.plan.counts or int(shared_batch.rows.shape[0]) != st.total:
+        raise RuntimeError(f"prefill pipeline: shared tail - the replay batches changed since the plan: {counts} / "
+                           f"{int(shared_batch.rows.shape[0])} vs {st.plan.counts}")
+    runner = _RUNNER
+    manager = None
+    if runner is not None:
+        manager = getattr(runner.model_state, "_moet_pipe_slot_cudagraphs", {}).get(SHARED_SLOT)
+    row_outputs = _run_shared_layers(replay, st, shared_batch, group_rows, manager)
+    outputs = _scatter_shared_outputs(st, group_rows, row_outputs)
+    _STATS["shared_tail_steps"] += 1
+    if _STATS["shared_tail_steps"] == 1:
+        logger.info(
+            "vllm-moet sm_120 prefill pipeline: the replay layers of a pipelined step run ONCE for both groups (%d + %d rows, %s; "
+            "VLLM_MOET_PREFILL_PIPE_SHARED_TAIL=%s)", counts[0], counts[-1],
+            "the shared slot's graph" if shared_batch.run_graph is not None else "eager", shared_tail(),
+        )
+    if st.plan.verify:
+        today = [_run_replay_with_batch(replay, b, inp) for b, inp in zip(group_batches, st.inputs)]  # type: ignore[arg-type]
+        diffs = {h.idx: _compare_outputs(outputs[h.idx], today[h.idx]) for h in step.groups}
+        _STATS["shared_tail_verified"] += 1
+        bad = {i: d for i, d in diffs.items() if d}
+        if bad:
+            _STATS["shared_tail_mismatch"] += 1
+            logger.error(
+                "vllm-moet sm_120 prefill pipeline: SHARED TAIL VERIFY step %d MISMATCH - shared vs today's tails differ in %s "
+                "(the step continues from today's outputs; mismatches so far %d of %d)",
+                _STATS["shared_tail_verified"], bad, _STATS["shared_tail_mismatch"], _STATS["shared_tail_verified"],
+            )
+        else:
+            logger.info(
+                "vllm-moet sm_120 prefill pipeline: shared tail verify step %d IDENTICAL (%d output tensors per group, torch.equal; "
+                "mismatches so far %d)", _STATS["shared_tail_verified"], len(outputs[0]), _STATS["shared_tail_mismatch"],
+            )
+        outputs = today
+    for h in step.groups:
+        st.outputs[h.idx] = outputs[h.idx]
+    return st.outputs[g.idx]
 
 
 # ------------------------------------------------------------------------------------------- the phase graph (K-8)
@@ -1268,8 +1760,16 @@ def _phase_graph_step(runner: "PipeRunner", groups: list[PipeGroup], phase: Phas
                 _STATS["phase_graph_mismatch"],
             )
         states = eager
+    rest = lambda g: phase.rest(g, fresh[g.idx][1], fresh[g.idx][2], states[g.idx])  # noqa: E731
+    shared = SharedTail.for_step(groups)
+    if shared is not None:
+        # K-9: the shared replay tail needs the two threads (the rendezvous); no phases in the rest, so the threads only
+        # alternate there
+        tail = PipeStep(groups, compute, runner.comm_stream, runner.row_switch, runner.device, True)
+        tail.shared = shared
+        return tail.run(rest)
     tail = PipeStep(groups, compute, runner.comm_stream, runner.row_switch, runner.device, False)
-    return tail.run_sequential(lambda g: phase.rest(g, fresh[g.idx][1], fresh[g.idx][2], states[g.idx]))
+    return tail.run_sequential(rest)
 
 
 def capture_phase_graphs(runner: Any, profile_only: bool = False) -> None:
@@ -1429,6 +1929,14 @@ class PipeRunner:
         # the first pipelined step, on every rank at once (the groups' first step is the same step on every rank); the
         # one-element warm-up all-reduce inside synchronizes the current stream once.
         self.comm2 = _install_comm2(self.device) if comm2_enabled() else None
+        # K-9: the shared replay tail - the pseudo-batch's rebased query offsets / seq lens, the all-reduce split (after comm2:
+        # it wraps whatever communicator dispatch is installed)
+        self.shared_qsl_buf = torch.zeros(2 * self.max_num_reqs + 1, dtype=torch.int32, device=self.device)
+        self.shared_seq_lens_buf = torch.zeros(2 * self.max_num_reqs, dtype=torch.int32, device=self.device)
+        self.shared_ar_split = _install_ar_split() if shared_tail() != "0" else False
+        if shared_tail() != "0" and replay_mode() != "serial":
+            logger.warning("vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE_SHARED_TAIL=%s needs REPLAY=serial (found %s) "
+                           "- every step runs today's two tails", shared_tail(), replay_mode())
         if order() != "today":
             logger.info(
                 "vllm-moet sm_120 prefill pipeline: launch order %s (VLLM_MOET_PREFILL_PIPE_ORDER) = second NCCL communicator "
@@ -1507,7 +2015,9 @@ class PipeRunner:
         if num_tokens > self.num_groups * rows:
             self._warn_once("big", "prefill pipeline: a step of %d tokens > %d x %d rows: the last group takes the rest",
                             num_tokens, self.num_groups, rows)
+        _host_mark("plan_start")
         groups = self._build(input_batch, block_tables, slot_mappings, bounds)
+        _host_mark("plan_end")
         verbosity = log_steps()
         if verbosity >= 2 or (verbosity >= 1 and mixed):
             self._log_step(input_batch, groups, mixed)
@@ -1552,6 +2062,9 @@ class PipeRunner:
         num_reqs = input_batch.num_reqs
         qsl = input_batch.query_start_loc_np[: num_reqs + 1]
         groups: list[PipeGroup] = []
+        ubatches: list[Any] = []
+        ub_slices: list[Any] = []
+        light = self._shared_precheck(input_batch, bounds)  # K-9: the groups' replay batches as rows only (shared_tail_light)
         for i, (lo, hi) in enumerate(bounds):
             req_lo = int(np.searchsorted(qsl, lo, side="right") - 1)
             req_hi = int(np.searchsorted(qsl, hi - 1, side="right") - 1)
@@ -1561,18 +2074,24 @@ class PipeRunner:
             )
             # the group's own longest query (None: prepare_attn derives it from the sliced query lengths)
             ubatch = replace(ubatch, max_query_len=None)
+            ubatches.append(ubatch)
+            ub_slices.append(ub_slice)
             group_block_tables = tuple(bt[ub_slice.request_slice] for bt in block_tables)
             group_slot_mappings = slot_mappings[:, ub_slice.token_slice]
             slot = i + 1
-            with _PrepareSlot(slot):
-                attn_metadata = self.model_state.prepare_attn(
-                    ubatch,
-                    CUDAGraphMode.NONE,
-                    group_block_tables,
-                    group_slot_mappings,
-                    self.attn_groups_slots[slot],
-                    self.kv_cache_config,
-                )
+            _LIGHT["on"] = light
+            try:
+                with _PrepareSlot(slot):
+                    attn_metadata = self.model_state.prepare_attn(
+                        ubatch,
+                        CUDAGraphMode.NONE,
+                        group_block_tables,
+                        group_slot_mappings,
+                        self.attn_groups_slots[slot],
+                        self.kv_cache_config,
+                    )
+            finally:
+                _LIGHT["on"] = False
             forward_ctx = create_forward_context(
                 attn_metadata,
                 self.vllm_config,
@@ -1591,11 +2110,217 @@ class PipeRunner:
                     prefill_rows_from=prefill_from, req_lo=req_lo, req_hi=req_hi,
                 )
             )
+        if shared_tail() != "0":
+            plan = self._plan_shared(input_batch, block_tables, slot_mappings, groups, ubatches, ub_slices)
+            for g in groups:
+                g.shared_plan = plan
+            if light and plan is None:
+                # the precheck said the shared tail would serve the step, the plan disagreed: the groups need their full batches
+                self._warn_once("light-rebuild", "prefill pipeline: the light replay batches were rebuilt in full (the shared "
+                                "plan failed after the precheck passed) - today's tails for this step")
+                self._rebuild_group_batches(groups, ubatches, ub_slices, block_tables, slot_mappings)
         # the whole step's buffers current again for whatever else the step prepares (the groups keep their own)
         select = getattr(self.model_state, "_moet_pipe_select_slot", None)
         if select is not None:
             select(0)
         return groups
+
+    def _group_kept(self, input_batch, bounds) -> list[list[tuple[int, int]]] | None:
+        """Per group, per request slice in it: (query rows, kept rows) as _prepare_replay_batch computes them (keeps_rows =
+        every row, else min(rows, window)); None when the model state has no decoder replay."""
+        ms = self.model_state
+        layers = getattr(ms, "decoder_replay_layers", None)
+        keeps = getattr(ms, "_keeps_rows_np", None)
+        if layers is None or keeps is None:
+            return None
+        window = int(layers.window)
+        num_reqs = input_batch.num_reqs
+        qsl = input_batch.query_start_loc_np[: num_reqs + 1]
+        idx = input_batch.idx_mapping_np[:num_reqs]
+        out = []
+        for lo, hi in bounds:
+            req_lo = int(np.searchsorted(qsl, lo, side="right") - 1)
+            req_hi = int(np.searchsorted(qsl, hi - 1, side="right") - 1)
+            rows = []
+            for r in range(req_lo, req_hi + 1):
+                qlen = int(min(qsl[r + 1], hi) - max(qsl[r], lo))
+                kept = qlen if bool(keeps[idx[r]]) else min(qlen, window)
+                rows.append((qlen, kept))
+            out.append(rows)
+        return out
+
+    def _shared_precheck(self, input_batch, bounds) -> bool:
+        """K-9 (shared_tail_light): will the shared tail serve this step? Decided on the host before the groups' metadata builds,
+        with _plan_shared's conditions: SHARED_TAIL=1 (not verify), REPLAY=serial, two groups whose request slices both trim a
+        prefilling request (= both get a replay batch), the summed kept rows within the shared slot's capture sizes when the
+        replay graphs are on, equal mHC pre-norm split counts."""
+        if shared_tail() != "1" or not shared_tail_light() or replay_mode() != "serial" or len(bounds) != 2:
+            return False
+        kept = self._group_kept(input_batch, bounds)
+        if kept is None:
+            return False
+        num_reqs = input_batch.num_reqs
+        qsl = input_batch.query_start_loc_np[: num_reqs + 1]
+        prefilling = input_batch.is_prefilling_np[:num_reqs]
+        counts = []
+        for (lo, hi), rows in zip(bounds, kept):
+            req_lo = int(np.searchsorted(qsl, lo, side="right") - 1)
+            trims = any(kept_r < qlen and bool(prefilling[req_lo + j]) for j, (qlen, kept_r) in enumerate(rows))
+            if not trims:
+                return False
+            counts.append(sum(k for _, k in rows))
+        if replay_graphs():
+            window = int(self.model_state.decoder_replay_layers.window)
+            cfg = slot_graph_config(self.vllm_config, SHARED_SLOT, window)
+            sizes = None if cfg is None else list(cfg.compilation_config.decoder_replay_cudagraph_capture_sizes or [])
+            if not sizes or sum(counts) > max(sizes):
+                return False
+        try:
+            if len({self._mhc_splits(c) for c in counts}) != 1:
+                return False
+        except Exception:  # noqa: BLE001 - no mHC warm-up module: _plan_shared decides
+            pass
+        return True
+
+    def _rebuild_group_batches(self, groups, ubatches, ub_slices, block_tables, slot_mappings) -> None:
+        """The groups' replay batches in full (after a light build the shared plan could not use)."""
+        from vllm.config import CUDAGraphMode
+
+        ms = self.model_state
+        for g, ubatch, ub_slice in zip(groups, ubatches, ub_slices):
+            n = ubatch.num_reqs
+            with _PrepareSlot(g.slot):
+                ms._moet_pipe_select_slot(g.slot)
+                replay_start_np = np.where(
+                    ubatch.is_prefilling_np[:n], ms._replay_start_np[ubatch.idx_mapping_np[:n]], 0
+                ).astype(np.int32)
+                replay_start = ms._replay_start_staging.copy_to_gpu(replay_start_np, out=ms._replay_start[:n])
+                ms._prepare_replay_batch(
+                    ubatch, CUDAGraphMode.NONE, tuple(bt[ub_slice.request_slice] for bt in block_tables),
+                    slot_mappings[:, ub_slice.token_slice], self.attn_groups_slots[g.slot], self.kv_cache_config, replay_start,
+                )
+
+    def _shared_pseudo_batch(self, input_batch, groups: list[PipeGroup], ubatches: list[Any]):
+        """K-9: the two groups' request slices as one batch of separate requests (what each group's ubatch already is - a
+        request straddling the group boundary appears twice, its query truncated to each group's rows): the per-request arrays
+        concatenated, the query offsets of the second group rebased by the first group's rows, the step's per-token tensors
+        over both groups' rows. Device values are built from the ubatches' device tensors (no host-to-device copy)."""
+        a, b = ubatches[0], ubatches[-1]
+        na, nb = a.num_reqs, b.num_reqs
+        n = na + nb
+        lo, hi = groups[0].token_offset, groups[-1].token_offset + groups[-1].num_tokens
+        tok_a = groups[0].num_tokens
+        qsl = self.shared_qsl_buf[: n + 1]
+        qsl[: na + 1].copy_(a.query_start_loc[: na + 1])
+        torch.add(b.query_start_loc[1 : nb + 1], tok_a, out=qsl[na + 1 : n + 1])
+        qsl_np = np.concatenate(
+            [a.query_start_loc_np[: na + 1], b.query_start_loc_np[1 : nb + 1] + tok_a]
+        ).astype(np.int32)
+        seq_lens = self.shared_seq_lens_buf[:n]
+        seq_lens[:na].copy_(a.seq_lens[:na])
+        seq_lens[na:n].copy_(b.seq_lens[:nb])
+
+        def cat_np(x, y):
+            return None if x is None or y is None else np.concatenate([x[:na], y[:nb]])
+
+        def cat_t(x, y):
+            return None if x is None or y is None else torch.cat([x[:na], y[:nb]], dim=0)
+
+        prefilling = cat_np(a.is_prefilling_np, b.is_prefilling_np)
+        return replace(
+            a,
+            req_ids=list(a.req_ids[:na]) + list(b.req_ids[:nb]),
+            num_reqs=n,
+            num_reqs_after_padding=n,
+            idx_mapping=cat_t(a.idx_mapping, b.idx_mapping),
+            idx_mapping_np=cat_np(a.idx_mapping_np, b.idx_mapping_np),
+            num_scheduled_tokens=np.diff(qsl_np)[:n],
+            num_tokens=hi - lo,
+            num_tokens_after_padding=hi - lo,
+            query_start_loc=qsl,
+            query_start_loc_np=qsl_np,
+            seq_lens=seq_lens,
+            seq_lens_cpu_upper_bound=cat_t(a.seq_lens_cpu_upper_bound, b.seq_lens_cpu_upper_bound),
+            dcp_local_seq_lens=None,
+            num_computed_tokens_np=cat_np(a.num_computed_tokens_np, b.num_computed_tokens_np),
+            prefill_len_np=cat_np(a.prefill_len_np, b.prefill_len_np),
+            num_computed_prefill_tokens_np=cat_np(a.num_computed_prefill_tokens_np, b.num_computed_prefill_tokens_np),
+            is_prefilling_np=prefilling,
+            has_prefill=bool(prefilling.any()),
+            prefill_runs_as_decode_np=cat_np(a.prefill_runs_as_decode_np, b.prefill_runs_as_decode_np),
+            input_ids=input_batch.input_ids[lo:hi],
+            positions=input_batch.positions[lo:hi],
+            is_padding=input_batch.is_padding[lo:hi],
+            prompt_lens=cat_t(a.prompt_lens, b.prompt_lens),
+            max_seq_len_np=None,
+            max_query_len=None,
+            fast_prefill=None,
+        )
+
+    def _plan_shared(self, input_batch, block_tables, slot_mappings, groups, ubatches, ub_slices) -> SharedPlan | None:
+        """K-9: build the shared replay batch (SHARED_SLOT) for a two-group step whose groups both have a replay batch, and
+        decide whether the shared tail serves the step; None (today's tails, one warning per reason) otherwise."""
+        from vllm.config import CUDAGraphMode
+
+        ms = self.model_state
+        layers = getattr(ms, "decoder_replay_layers", None)
+        batches = getattr(layers, "_moet_replay_batches", None)
+        if layers is None or batches is None or len(groups) != 2:
+            return None
+        group_batches = [batches.get(g.slot) for g in groups]
+        why = None
+        if any(b is None for b in group_batches):
+            why = "a group has no replay batch (prompt logprobs, or a batch that does not trim)"
+        elif replay_mode() != "serial":
+            why = "VLLM_MOET_PREFILL_PIPE_REPLAY=stream"
+        elif not hasattr(ms, "_prepare_replay_batch") or not hasattr(ms, "_moet_pipe_select_slot"):
+            why = "the model state has no per-slot replay batches (patcher mismatch)"
+        if why is not None:
+            _STATS["shared_tail_today"] += 1
+            self._warn_once("shared:" + why[:24], "prefill pipeline: the step runs today's two replay tails, not the shared one (%s)", why)
+            return None
+        counts = [int(b.rows.shape[0]) for b in group_batches]
+        pseudo = self._shared_pseudo_batch(input_batch, groups, ubatches)
+        n = pseudo.num_reqs
+        shared_block_tables = tuple(
+            torch.cat([bt[ub_slices[0].request_slice], bt[ub_slices[-1].request_slice]], dim=0) for bt in block_tables
+        )
+        lo, hi = groups[0].token_offset, groups[-1].token_offset + groups[-1].num_tokens
+        with _PrepareSlot(SHARED_SLOT):
+            ms._moet_pipe_select_slot(SHARED_SLOT)
+            replay_start_np = np.where(
+                pseudo.is_prefilling_np[:n], ms._replay_start_np[pseudo.idx_mapping_np[:n]], 0
+            ).astype(np.int32)
+            replay_start = ms._replay_start_staging.copy_to_gpu(replay_start_np, out=ms._replay_start[:n])
+            ms._prepare_replay_batch(
+                pseudo, CUDAGraphMode.NONE, shared_block_tables, slot_mappings[:, lo:hi], self.attn_groups_slots[0],
+                self.kv_cache_config, replay_start,
+            )
+        shared_batch = batches.get(SHARED_SLOT)
+        if shared_batch is None:
+            why = "the shared batch was not built (nothing to trim)"
+        elif int(shared_batch.rows.shape[0]) != sum(counts):
+            why = f"the shared batch has {int(shared_batch.rows.shape[0])} rows, the groups {counts}"
+        elif replay_graphs() and shared_batch.run_graph is None:
+            why = f"no replay graph for a shared batch of {sum(counts)} rows (REPLAY_GRAPHS=1; the capture list is smaller)"
+        else:
+            try:
+                splits = {self._mhc_splits(c) for c in counts}
+            except Exception:  # noqa: BLE001 - no mHC warm-up module (the unit test): the pin alone
+                splits = {0}
+            if len(splits) != 1:
+                why = f"the groups' mHC pre-norm split counts differ at {counts} rows ({sorted(splits)})"
+        if why is not None:
+            _STATS["shared_tail_today"] += 1
+            self._warn_once("shared:" + why[:24], "prefill pipeline: the step runs today's two replay tails, not the shared one (%s)", why)
+            return None
+        return SharedPlan(counts=counts, pin=counts[0], verify=shared_tail() == "verify")
+
+    def _mhc_splits(self, num_tokens: int) -> int:
+        """The mHC pre-norm GEMM's split-k count for num_tokens rows (compute_mhc_pre_num_splits, K = hc_mult x hidden)."""
+        hf = self.vllm_config.model_config.hf_config
+        k = int(getattr(hf, "hc_mult", 4)) * int(hf.hidden_size)
+        return int(_mhc_warmup().compute_mhc_pre_num_splits(k, num_tokens))
 
     def capture_phase_graph(self, runner: Any) -> None:
         """K-8: the dummy step of the phase graph and its two passes (warm-up, capture) through the model's forward - the
@@ -1747,6 +2472,27 @@ def dump_layer(layer: int, positions: torch.Tensor, **tensors: torch.Tensor | No
         rank = 0
     g = current_group()
     n = int(positions.shape[0])
+    st = current_shared()
+    if st is not None and n == st.total:
+        # K-9: inside the shared replay tail the states hold both groups' replay rows - one entry per group over its row block,
+        # the entry today's per-group tail would have written (comparable with the kv0 / r25 dumps of layers 20-39)
+        lines = []
+        for (lo, hi), h in zip(st.blocks, st.groups):
+            e = {
+                "forward": _DUMP_FORWARD["n"], "group": h.idx, "offset": h.token_offset, "layer": layer, "rows": hi - lo,
+                "pos0": int(positions[lo].item()) if hi > lo else -1,
+                "pos_last": int(positions[hi - 1].item()) if hi > lo else -1, "t": time.time(), "shared": True, "kind": "shared",
+            }
+            for name, t in tensors.items():
+                part = t[lo:hi] if isinstance(t, torch.Tensor) and t.shape[0] == n else t
+                e[name] = _sha(part)
+                if isinstance(part, torch.Tensor):
+                    e[name + "_shape"] = list(part.shape)
+            lines.append(e)
+        with open(os.path.join(_DUMP_DIR, f"rank{rank}.jsonl"), "a") as fh:
+            for e in lines:
+                fh.write(json.dumps(e) + "\n")
+        return
     entry = {
         "forward": _DUMP_FORWARD["n"],
         "group": -1 if g is None else g.idx,

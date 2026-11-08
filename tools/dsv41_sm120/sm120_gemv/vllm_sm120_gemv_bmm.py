@@ -40,6 +40,24 @@ logger = init_logger(__name__)
 
 DEFAULT_GEMV_DIR = "/opt/vllm-moet/dsv41_sm120/sm120_gemv"
 _QUANT_GROUP = MXFP8_BLOCK_SIZE  # 32
+_PIPE_ROW_BLOCKS = None  # None = unresolved, False = no pipeline module, else moet_prefill_pipe.row_blocks
+
+
+def _row_blocks(num_rows: int):
+    """K-9 (sp_pipeline shared replay tail): the row blocks a cuBLAS call over `num_rows` tokens is issued in - one per group
+    inside the pipelined prefill's shared tail (the bits of the group's own 128-token call), one block everywhere else or
+    without the pipeline module."""
+    global _PIPE_ROW_BLOCKS
+    if _PIPE_ROW_BLOCKS is None:
+        try:
+            from vllm.v1.worker import moet_prefill_pipe as _pipe  # noqa: PLC0415
+
+            _PIPE_ROW_BLOCKS = _pipe.row_blocks
+        except Exception:  # noqa: BLE001 - an image without the pipeline patch
+            _PIPE_ROW_BLOCKS = False
+    if not _PIPE_ROW_BLOCKS:
+        return [(0, num_rows)]
+    return _PIPE_ROW_BLOCKS(num_rows)
 
 
 def _gemv_module():
@@ -181,7 +199,12 @@ class Sm120GemvMxfp8BmmLinearKernel(Mxfp8LinearKernel):
             z = torch.empty(
                 (tokens, n_groups, o_lora_rank), device=o.device, dtype=torch.bfloat16
             )
-            torch.bmm(
-                x.transpose(0, 1), grouped_weight.transpose(1, 2), out=z.transpose(0, 1)
-            )
+            # K-9 (sp_pipeline shared replay tail): inside the pipelined prefill's shared tail one bmm per group row block -
+            # cuBLAS picks its kernel per (batch, M, N, K), so the bits of a 256-token call are not the 128-token call's
+            for lo, hi in _row_blocks(tokens):
+                torch.bmm(
+                    x.transpose(0, 1)[:, lo:hi],
+                    grouped_weight.transpose(1, 2),
+                    out=z.transpose(0, 1)[:, lo:hi],
+                )
         return wo_b(z.flatten(1))

@@ -35,7 +35,9 @@ Patched files (anchor-based, idempotent, after steps 10/39/41/45; the installed 
 
 The K-8 edits (VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS, marker "... phase graph") form a second stage applied after the first:
 a file the first stage already patched (an r26 / r26b image) takes the second stage alone, so the r26b image's files can be
-re-patched in place for a bind-mount (K/k8pg/repatch_r26b.sh).
+re-patched in place for a bind-mount (K/k8pg/repatch_r26b.sh). The K-9 edits (VLLM_MOET_PREFILL_PIPE_SHARED_TAIL, marker
+"... shared tail": one replay tail for both groups - model.py's replay call and the mHC split-k pin, model_state.py's shared
+slot graph manager) are a third stage, applied after the second the same way.
 
 Usage:
     python3 patch_vllm_prefill_pipe_sm120.py [--dist DIR] [--helper FILE] [--check]
@@ -56,6 +58,7 @@ DEFAULT_HELPER = Path(__file__).resolve().parent / "sp_pipeline" / "moet_prefill
 HELPER_DST = "v1/worker/moet_prefill_pipe.py"
 MARKER = "[vllm-moet] sm_120 prefill pipeline"
 MARKER2 = "[vllm-moet] sm_120 prefill pipeline phase graph"  # the K-8 stage (VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS)
+MARKER3 = "[vllm-moet] sm_120 prefill pipeline shared tail"  # the K-9 stage (VLLM_MOET_PREFILL_PIPE_SHARED_TAIL)
 IMPORT = f"from vllm.v1.worker import moet_prefill_pipe as _moet_pipe  # {MARKER}\n"
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -430,6 +433,28 @@ MODEL_EDITS_K8 = [
     ),
 ]
 
+# K-9 (third stage): one replay tail for both groups - the replay call goes through the rendezvous (None = this group's own
+# tail as today), and a layer that releases the mHC split-k pin inside the shared tail pins it to the group's row count.
+MODEL_EDITS_K9 = [
+    (
+        "shared replay",
+        "    out = replay._run(hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        "    _moet_pipe.replay_end(out)\n"
+        "    return out\n",
+        f"    # {MARKER3} (VLLM_MOET_PREFILL_PIPE_SHARED_TAIL): one replay tail for both groups, or None = this group's own as today\n"
+        "    out = _moet_pipe.shared_replay(replay, hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        "    if out is None:\n"
+        "        out = replay._run(hidden_states, positions, input_ids, pre_mix, post_mix, res_mix, residual)\n"
+        "    _moet_pipe.replay_end(out)\n"
+        "    return out\n",
+    ),
+    (
+        "mhc pin",
+        "    _moet_mhc_warmup._MOET_SP_PIN_TOKENS = num_tokens\n",
+        f"    _moet_mhc_warmup._MOET_SP_PIN_TOKENS = _moet_pipe.pin_tokens(num_tokens)  # {MARKER3}: the group's row count inside the shared tail\n",
+    ),
+]
+
 # ---------------------------------------------------------------------------------------------------------------
 # vllm/models/deepseek_v41/attention.py
 # ---------------------------------------------------------------------------------------------------------------
@@ -564,6 +589,53 @@ MODEL_STATE_EDITS = [
     ),
 ]
 
+# K-9 (third stage): the shared slot's graph manager captures the sizes >= 2 x the replay window only (slot_graph_config: a
+# config copy; None = the slot gets no graphs); the groups' slots are built as before. A group slot built while the runner
+# knows the shared tail will serve the step gets a LIGHT replay batch - its rows only, without the kept batch's two metadata
+# builds (shared_tail_light).
+MODEL_STATE_EDITS_K9 = [
+    (
+        "light replay batch",
+        "        kept_batch, kept_slot_mappings = self._kept_input_batch(\n"
+        "            input_batch, slot_mappings, replay_start, kept_lens, num_padded\n"
+        "        )\n"
+        "        if self._replay_attn_groups is None:\n",
+        "        kept_batch, kept_slot_mappings = self._kept_input_batch(\n"
+        "            input_batch, slot_mappings, replay_start, kept_lens, num_padded\n"
+        "        )\n"
+        f"        if _moet_pipe.light_replay_batch():  # {MARKER3}: the shared tail runs this slot's rows - no kept-batch metadata\n"
+        "            layers.replay_batch = ReplayBatch(self._kept_rows[:num_tokens], None, None)  # type: ignore[arg-type]\n"
+        "            return\n"
+        "        if self._replay_attn_groups is None:\n",
+    ),
+    (
+        "shared slot graph config",
+        "            for _slot in _moet_pipe.graph_slots():\n"
+        "                self._moet_pipe_select_slot(_slot)\n"
+        "                self._replay_attn_groups = None\n"
+        "                self._moet_pipe_slot_cudagraphs[_slot] = DecoderReplayCudaGraphManager(\n"
+        "                    self.vllm_config, self.device, self.decoder_replay_layers\n"
+        "                )\n",
+        "            for _slot in _moet_pipe.graph_slots():\n"
+        f"                # {MARKER3}: the shared slot's sizes are the capture list's >= 2 x window (None = no graphs for it)\n"
+        "                _slot_cfg = _moet_pipe.slot_graph_config(self.vllm_config, _slot, self.decoder_replay_layers.window)\n"
+        "                if _slot_cfg is None:\n"
+        "                    continue\n"
+        "                self._moet_pipe_select_slot(_slot)\n"
+        "                self._replay_attn_groups = None\n"
+        "                self._moet_pipe_slot_cudagraphs[_slot] = DecoderReplayCudaGraphManager(\n"
+        "                    _slot_cfg, self.device, self.decoder_replay_layers\n"
+        "                )\n",
+    ),
+    (
+        "shared slot capture scope",
+        "                self._moet_pipe_slot_cudagraphs[_slot].capture_replay_graphs(prepare)\n",
+        f"                # {MARKER3}: the shared slot's graphs record the per-group split of the all-reduces / cuBLAS GEMMs\n"
+        "                with _moet_pipe.shared_capture_scope(_slot, self.decoder_replay_layers.window):\n"
+        "                    self._moet_pipe_slot_cudagraphs[_slot].capture_replay_graphs(prepare)\n",
+    ),
+]
+
 # ---------------------------------------------------------------------------------------------------------------
 # vllm/models/deepseek_v41/decoder_replay_layers.py
 # ---------------------------------------------------------------------------------------------------------------
@@ -690,13 +762,13 @@ INDEXER_EDITS_K8 = [
 ]
 
 FILES = [
-    ("v1/worker/gpu/model_runner.py", RUNNER_EDITS, RUNNER_EDITS_K8),
-    ("models/deepseek_v41/nvidia/model.py", MODEL_EDITS, MODEL_EDITS_K8),
-    ("models/deepseek_v41/attention.py", ATTN_EDITS, []),
-    ("models/deepseek_v41/nvidia/model_state.py", MODEL_STATE_EDITS, []),
-    ("models/deepseek_v41/decoder_replay_layers.py", REPLAY_EDITS, []),
-    ("models/deepseek_v41/common/engram.py", ENGRAM_EDITS, ENGRAM_EDITS_K8),
-    ("v1/attention/backends/mla/indexer.py", [], INDEXER_EDITS_K8),
+    ("v1/worker/gpu/model_runner.py", RUNNER_EDITS, RUNNER_EDITS_K8, []),
+    ("models/deepseek_v41/nvidia/model.py", MODEL_EDITS, MODEL_EDITS_K8, MODEL_EDITS_K9),
+    ("models/deepseek_v41/attention.py", ATTN_EDITS, [], []),
+    ("models/deepseek_v41/nvidia/model_state.py", MODEL_STATE_EDITS, [], MODEL_STATE_EDITS_K9),
+    ("models/deepseek_v41/decoder_replay_layers.py", REPLAY_EDITS, [], []),
+    ("models/deepseek_v41/common/engram.py", ENGRAM_EDITS, ENGRAM_EDITS_K8, []),
+    ("v1/attention/backends/mla/indexer.py", [], INDEXER_EDITS_K8, []),
 ]
 
 
@@ -710,23 +782,26 @@ def _apply(src: str, edits) -> tuple[str, str | None]:
     return src, None
 
 
-def patch_text(src: str, edits, check: bool, edits_k8=()) -> tuple[str, str]:
-    """Apply the edits in two stages - the pipeline (MARKER) and the K-8 phase graph (MARKER2) - each skipped when its
-    marker is in the text already; returns (new source, status) with status in {applied, applied:k8, already,
-    missing:<edit>}. A file the first stage patched earlier (an r26 / r26b image) takes the second stage alone. `check`
-    only names the dry run (the caller writes nothing then); the second stage's anchors are checked on the first's output."""
+def patch_text(src: str, edits, check: bool, edits_k8=(), edits_k9=()) -> tuple[str, str]:
+    """Apply the edits in three stages - the pipeline (MARKER), the K-8 phase graph (MARKER2), the K-9 shared tail (MARKER3)
+    - each skipped when its marker is in the text already; returns (new source, status) with status in {applied,
+    applied:k8, applied:k9, already, missing:<edit>}. A file an earlier stage patched (an r26 / r26b image) takes the later
+    stages alone. `check` only names the dry run (the caller writes nothing then); a later stage's anchors are checked on
+    the earlier stages' output."""
     stages = []
     if MARKER not in src:
         stages.append(("", edits))
     if edits_k8 and MARKER2 not in src:
         stages.append(("k8", edits_k8))
+    if edits_k9 and MARKER3 not in src:
+        stages.append(("k9", edits_k9))
     if not stages:
         return src, "already"
     for _tag, stage_edits in stages:
         src, err = _apply(src, stage_edits)
         if err is not None:
             return src, err
-    return src, "applied" if stages[0][0] == "" else "applied:k8"
+    return src, "applied" if stages[0][0] == "" else f"applied:{stages[0][0]}"
 
 
 def main() -> int:
@@ -741,14 +816,14 @@ def main() -> int:
         return 1
     compile(args.helper.read_text(), str(args.helper), "exec")
     outputs = []
-    for rel, edits, edits_k8 in FILES:
+    for rel, edits, edits_k8, edits_k9 in FILES:
         path = args.dist / rel
         if not path.exists():
             print(f"{rel}: not found under {args.dist}")
             rc = 1
             continue
         src = path.read_text()
-        new, status = patch_text(src, edits, args.check, edits_k8)
+        new, status = patch_text(src, edits, args.check, edits_k8, edits_k9)
         if status.startswith("missing"):
             print(f"{rel}: anchor {status} - not patched")
             rc = 1
@@ -756,9 +831,10 @@ def main() -> int:
         if status == "already":
             print(f"{rel}: already patched")
             continue
-        n_edits = len(edits) + len(edits_k8) if status == "applied" else len(edits_k8)
+        n_edits = {"applied": len(edits) + len(edits_k8) + len(edits_k9), "applied:k8": len(edits_k8) + len(edits_k9),
+                   "applied:k9": len(edits_k9)}[status]
         if args.check:
-            print(f"{rel}: all {n_edits} anchors present (dry run{', K-8 stage only' if status == 'applied:k8' else ''})")
+            print(f"{rel}: all {n_edits} anchors present (dry run{', later stages only: ' + status[8:] if status != 'applied' else ''})")
         else:
             compile(new, str(path), "exec")
             outputs.append((path, new, n_edits))

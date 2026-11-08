@@ -715,5 +715,270 @@ os.environ.pop("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS", None)
 pg.release()
 runner.phase_graph = None
 
+
+# ------------------------------------------------------------------------------------------ (10): K-9 - the shared replay tail
+# Two groups, each with a replay batch of 2 rows out of 4, and a shared batch of 4 rows. The fake replay layers contain one op
+# whose result depends on the row count unless it is issued per group row block (the all-reduce / cuBLAS analogue, through
+# pipe.row_blocks) and read the mHC pin the way the layer does (_moet_sp_pin(None) -> pipe.pin_tokens). Checked: the tail runs
+# once, on the second thread to arrive, under the shared batch's forward context; the first thread gets its rows of the outputs;
+# the results equal today's per-group tails bit for bit (eager and through a fake graph manager); verify mode compares and reports
+# a planted difference; the dump hook writes one entry per group; the fallbacks (no plan, a partner that never arrives).
+import tempfile  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from vllm.forward_context import get_forward_context  # noqa: E402
+
+R_ROWS, R_H, R_HC = 4, 16, 2
+W_T = torch.randn(R_H, R_H, device=dev) * 0.1
+tail_seen = {"calls": 0, "thread_groups": [], "ctx": [], "pins": [], "M": []}
+tail_split = {"on": True}  # the fake all-reduce honours row_blocks (the shared tail's split) when on
+
+
+def fake_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    """Row-count dependent on purpose: x * M for a message of M rows (NCCL's ring chunking stands in for this)."""
+    blocks = pipe.row_blocks(x.shape[0]) if tail_split["on"] else [(0, x.shape[0])]
+    return torch.cat([x[lo:hi] * float(hi - lo) for lo, hi in blocks], dim=0)
+
+
+def fake_run_layers(h, pos, ids, pre, post, res, residual):
+    tail_seen["calls"] += 1
+    g = pipe.current_group()
+    tail_seen["thread_groups"].append(None if g is None else g.idx)
+    tail_seen["ctx"].append(fc._forward_context)
+    tail_seen["M"].append(int(h.shape[0]))
+    mhc_warmup._MOET_SP_PIN_TOKENS = pipe.pin_tokens(None)  # the layer's _moet_sp_pin(None) at a replay layer's start
+    tail_seen["pins"].append(mhc_warmup._MOET_SP_PIN_TOKENS)
+    x = fake_all_reduce(h)
+    y = torch.tanh(x @ W_T) + residual[:, 0, :] * pre[:, :1].to(h.dtype) + pos.to(h.dtype)[:, None] * 1e-3
+    mhc_warmup._MOET_SP_PIN_TOKENS = pipe.pin_tokens(None)  # the layer's end
+    return y, pre * 2.0 + post[:, :, 0], y.mean(dim=1)
+
+
+class FakeBatch:
+    def __init__(self, rows, ctx, run_graph=None):
+        self.rows = rows
+        self.forward_context = ctx
+        self.run_graph = run_graph
+
+
+class FakeReplay:
+    def __init__(self):
+        self._moet_replay_batches = {}
+        self.run_layers = fake_run_layers
+
+
+def tail_inputs(g: pipe.PipeGroup, seed: int):
+    gen = torch.Generator(device=dev).manual_seed(seed * 10 + g.idx)
+    n = g.num_tokens
+    return (
+        torch.randn(n, R_H, device=dev, generator=gen),
+        torch.arange(g.token_offset, g.token_offset + n, device=dev, dtype=torch.int64),
+        torch.arange(n, device=dev, dtype=torch.int32),
+        torch.randn(n, R_HC, device=dev, generator=gen),
+        torch.randn(n, R_HC, 1, device=dev, generator=gen),
+        torch.randn(n, R_HC, R_HC, device=dev, generator=gen),
+        torch.randn(n, R_HC, R_H, device=dev, generator=gen),
+    )
+
+
+replay = FakeReplay()
+rows_g = [torch.tensor([1, 3], device=dev), torch.tensor([0, 2], device=dev)]  # each group's replay rows (local)
+shared_ctx = SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=4), tag="shared")
+
+
+def set_batches(shared_run_graph=None):
+    replay._moet_replay_batches = {
+        1: FakeBatch(rows_g[0], SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=2), tag="g0")),
+        2: FakeBatch(rows_g[1], SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=2), tag="g1")),
+        pipe.SHARED_SLOT: FakeBatch(torch.tensor([1, 3, 4, 6], device=dev), shared_ctx, shared_run_graph),
+    }
+
+
+def make_shared_groups(plan):
+    gs = make_groups(rows=R_ROWS)
+    for g in gs:
+        g.shared_plan = plan
+    return gs
+
+
+def fn_shared(g: pipe.PipeGroup):
+    """A group's tail: two phases, then the replay through the rendezvous (the model's _moet_sp_decoder_replay_rest), then
+    a per-group op on the full rows (the collapse-norm analogue)."""
+    inp = tail_inputs(g, cur_seed["s"])
+    x = inp[0]
+    for layer in range(2):
+        pipe.phase_begin()
+        y = torch.tanh(x @ W_T)
+        pipe.phase_end()
+        x = torch.tanh(y @ W_T.t())
+    inp = (x,) + inp[1:]
+    out = pipe.shared_replay(replay, *inp)
+    if out is None:
+        out = pipe._run_replay_with_batch(replay, replay._moet_replay_batches[g.slot], inp)
+    return out[0] * 2.0 + out[1][:, :1].to(out[0].dtype) + out[2][:, None]
+
+
+def reference_today(seed: int):
+    """Today's two tails, one per group (the fake layers at M = 2 each), on the runner thread."""
+    outs = []
+    for g in make_groups(rows=R_ROWS):
+        inp = tail_inputs(g, seed)
+        x = inp[0]
+        for layer in range(2):
+            x = torch.tanh(torch.tanh(x @ W_T) @ W_T.t())
+        inp = (x,) + inp[1:]
+        with fc.override_forward_context(replay._moet_replay_batches[g.slot].forward_context):
+            out = pipe._run_replay_with_batch(replay, replay._moet_replay_batches[g.slot], inp)
+        outs.append(out[0] * 2.0 + out[1][:, :1].to(out[0].dtype) + out[2][:, None])
+    return torch.cat(outs, dim=0)
+
+
+cur_seed = {"s": 1}
+set_batches()
+runner.model_state = SimpleNamespace(_moet_pipe_slot_cudagraphs={})
+fc._forward_context = "main"
+mhc_warmup._MOET_SP_PIN_TOKENS = None
+ref10 = reference_today(1)
+tail_seen = {"calls": 0, "thread_groups": [], "ctx": [], "pins": [], "M": []}
+plan = pipe.SharedPlan(counts=[2, 2], pin=2, verify=False)
+st0 = dict(pipe.stats())
+outs = pipe.run_groups(make_shared_groups(plan), fn_shared, pipelined=True)
+torch.cuda.synchronize()
+check(torch.equal(pipe.merge_outputs(outs), ref10), "(10) the shared tail's per-group outputs equal today's two tails bit for bit (eager; the row-count-dependent op split per group)")
+check(tail_seen["calls"] == 1 and tail_seen["M"] == [4], f"(10) the replay layers ran once, on 4 rows ({tail_seen['calls']} calls, M {tail_seen['M']})")
+check(tail_seen["thread_groups"] == [1], f"(10) the tail ran on the second thread to arrive (group {tail_seen['thread_groups']}); group 0 parked at the rendezvous")
+check(all(getattr(c, "tag", None) == "shared" for c in tail_seen["ctx"]), "(10) the tail ran under the shared batch's forward context")
+check(tail_seen["pins"] == [2], f"(10) inside the shared tail the mHC pin is the group's row count ({tail_seen['pins']})")
+check(mhc_warmup._MOET_SP_PIN_TOKENS is None and fc._forward_context == "main" and pipe.current_shared() is None,
+      "(10) after the step: pin released, the runner's context back, no shared scope")
+check(pipe.stats()["shared_tail_steps"] == st0["shared_tail_steps"] + 1, "(10) the step is counted as a shared-tail step")
+# the split itself: the all-reduce stand-in splits a tensor of the tail's row count per group inside the scope, nothing outside
+st_obj = pipe.SharedTail(plan, make_shared_groups(plan), [None, None], [None, None])
+w_ar = pipe._split_all_reduce(lambda t: t * float(t.shape[0]))
+x4 = torch.randn(4, 3, device=dev)
+with pipe._SharedScope(st_obj):
+    inside = w_ar(x4)
+    blocks_in = pipe.row_blocks(4)
+    other = pipe.row_blocks(3)
+outside = w_ar(x4)
+check(torch.equal(inside, x4 * 2.0) and torch.equal(outside, x4 * 4.0) and blocks_in == [(0, 2), (2, 4)] and other == [(0, 3)],
+      "(10) _split_all_reduce: one call per group row block inside the scope (a 4-row message = 2 x 2 rows), one call outside; other row counts untouched")
+# through a fake graph manager: the inputs land in its static buffers per group, the layers run on the padded buffers
+bufs = [torch.zeros(4, *t.shape[1:], dtype=t.dtype, device=dev) for t in tail_inputs(make_groups(rows=R_ROWS)[0], 1)]
+mgr = SimpleNamespace(input_buffers=bufs, breakable_cg_runner=lambda *b: fake_run_layers(*b))
+runner.model_state = SimpleNamespace(_moet_pipe_slot_cudagraphs={pipe.SHARED_SLOT: mgr})
+set_batches(shared_run_graph=lambda rows, inputs: (_ for _ in ()).throw(AssertionError("the manager's run must not be used")))
+tail_seen = {"calls": 0, "thread_groups": [], "ctx": [], "pins": [], "M": []}
+outs_g = pipe.run_groups(make_shared_groups(plan), fn_shared, pipelined=True)
+torch.cuda.synchronize()
+check(torch.equal(pipe.merge_outputs(outs_g), ref10) and tail_seen["calls"] == 1 and tail_seen["M"] == [4],
+      "(10) through the shared slot's graph manager (static input buffers, breakable_cg_runner): the same outputs, one run")
+set_batches()
+# verify mode: today's tails run afterwards and are compared; a planted row-count dependence is reported, today's outputs win
+cur_seed["s"] = 2
+ref10b = reference_today(2)
+v0 = dict(pipe.stats())
+tail_seen = {"calls": 0, "thread_groups": [], "ctx": [], "pins": [], "M": []}
+outs_v = pipe.run_groups(make_shared_groups(pipe.SharedPlan(counts=[2, 2], pin=2, verify=True)), fn_shared, pipelined=True)
+torch.cuda.synchronize()
+sv = pipe.stats()
+check(torch.equal(pipe.merge_outputs(outs_v), ref10b) and sv["shared_tail_verified"] == v0["shared_tail_verified"] + 1
+      and sv["shared_tail_mismatch"] == v0["shared_tail_mismatch"] and tail_seen["calls"] == 3 and tail_seen["M"] == [4, 2, 2],
+      f"(10) verify mode: shared tail + today's two tails, compared IDENTICAL (verified {sv['shared_tail_verified']}, mismatch {sv['shared_tail_mismatch']}, runs {tail_seen['M']})")
+tail_split["on"] = False  # the planted difference: the row-count-dependent op is not split any more
+outs_m = pipe.run_groups(make_shared_groups(pipe.SharedPlan(counts=[2, 2], pin=2, verify=True)), fn_shared, pipelined=True)
+torch.cuda.synchronize()
+sm = pipe.stats()
+check(torch.equal(pipe.merge_outputs(outs_m), ref10b) and sm["shared_tail_mismatch"] == v0["shared_tail_mismatch"] + 1,
+      f"(10) verify mode reports a planted mismatch (count {sm['shared_tail_mismatch']}) and the step continues from today's outputs")
+tail_split["on"] = True
+# the dump hook inside the shared scope: one entry per group, keyed like today's per-group entries (pos0, rows, layer)
+dump_dir = tempfile.mkdtemp(prefix="k9dump")
+open(os.path.join(dump_dir, "ENABLE"), "w").close()
+saved_dump_dir = pipe._DUMP_DIR
+pipe._DUMP_DIR = dump_dir
+with pipe._SharedScope(st_obj):
+    pipe.dump_layer(21, torch.tensor([101, 103, 204, 206], device=dev), x=torch.randn(4, R_H, device=dev), residual=torch.randn(4, R_HC, R_H, device=dev))
+pipe._DUMP_DIR = saved_dump_dir
+import json as _json  # noqa: E402
+
+dump_lines = [_json.loads(l) for l in open(os.path.join(dump_dir, "rank0.jsonl")).read().splitlines() if l.strip()]
+check(len(dump_lines) == 2 and [(e["group"], e["rows"], e["pos0"], e["pos_last"], e["layer"]) for e in dump_lines] == [(0, 2, 101, 103, 21), (1, 2, 204, 206, 21)]
+      and all(e["x_shape"] == [2, R_H] and e.get("shared") for e in dump_lines),
+      f"(10) the dump hook splits the shared tail's states into one entry per group ({[(e['group'], e['rows'], e['pos0']) for e in dump_lines]})")
+# fallbacks: no plan -> shared_replay returns None and each group runs its own tail; a partner that never arrives -> an error, not a hang
+tail_seen = {"calls": 0, "thread_groups": [], "ctx": [], "pins": [], "M": []}
+outs_n = pipe.run_groups(make_shared_groups(None), fn_shared, pipelined=True)
+torch.cuda.synchronize()
+check(torch.equal(pipe.merge_outputs(outs_n), ref10b) and tail_seen["calls"] == 2 and tail_seen["M"] == [2, 2],
+      "(10) without a shared plan shared_replay returns None and the groups run today's tails")
+
+
+def fn_absent(g: pipe.PipeGroup):
+    if g.idx == 1:
+        return tail_inputs(g, 2)[0]  # group 1 never reaches the rendezvous
+    return fn_shared(g)
+
+
+try:
+    pipe.run_groups(make_shared_groups(plan), fn_absent, pipelined=True)
+    check(False, "(10) a partner that never arrives at the rendezvous must raise")
+except RuntimeError as exc:
+    check("shared tail" in str(exc) or "shared tail" in str(exc.__cause__), f"(10) a partner that never arrives raises on the runner thread instead of hanging ({str(exc.__cause__)[:80]})")
+check(pipe.slot_graph_config(SimpleNamespace(compilation_config=SimpleNamespace(decoder_replay_cudagraph_capture_sizes=[128, 256])), pipe.SHARED_SLOT, 128).compilation_config.decoder_replay_cudagraph_capture_sizes == [256]
+      and pipe.slot_graph_config(SimpleNamespace(compilation_config=SimpleNamespace(decoder_replay_cudagraph_capture_sizes=[128])), pipe.SHARED_SLOT, 128) is None
+      and pipe.slot_graph_config("cfg", 1, 128) == "cfg",
+      "(10) slot_graph_config: the shared slot keeps the sizes >= 2 x window ([128,256] -> [256]; [128] -> none), the groups' slots the config as is")
+os.environ["VLLM_MOET_PREFILL_PIPE_SHARED_TAIL"] = "1"
+os.environ["VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS"] = "1"
+os.environ["VLLM_MOET_PREFILL_PIPE"] = "2"
+slots_all = pipe.graph_slots()
+os.environ["VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS"] = "shared"
+slots_shared = pipe.graph_slots()
+os.environ["VLLM_MOET_PREFILL_PIPE_SHARED_TAIL"] = "0"
+slots_off = pipe.graph_slots()
+for k in ("VLLM_MOET_PREFILL_PIPE_SHARED_TAIL", "VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS", "VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS", "VLLM_MOET_PREFILL_PIPE"):
+    os.environ.pop(k, None)
+check(slots_all == [1, 2, 3] and slots_shared == [3] and slots_off == [1, 2], f"(10) graph_slots: {slots_all} / {slots_shared} / {slots_off} (shared tail all / shared / off)")
+# the shared slot's graph capture runs inside a scope that splits every captured size into window-sized blocks (the per-group
+# split of the all-reduces / GEMMs is recorded into the graph); the groups' slots capture unsplit
+mhc_warmup._MOET_SP_PIN_TOKENS = None
+with pipe.shared_capture_scope(pipe.SHARED_SLOT, 2):
+    cap = (pipe.row_blocks(4), pipe.row_blocks(6), pipe.row_blocks(3), pipe.pin_tokens(None), pipe.pin_tokens(7))
+with pipe.shared_capture_scope(1, 2):
+    cap_g = (pipe.row_blocks(4), pipe.pin_tokens(None))
+check(cap == ([(0, 2), (2, 4)], [(0, 2), (2, 4), (4, 6)], [(0, 3)], 2, 7) and cap_g == ([(0, 4)], None) and pipe.current_shared() is None
+      and mhc_warmup._MOET_SP_PIN_TOKENS is None,
+      f"(10) shared_capture_scope: the shared slot's capture splits 4 -> 2+2, 6 -> 2+2+2, 3 stays, pin = window; a group slot's capture is unsplit ({cap}, {cap_g})")
+# the light precheck (task 2): the runner's host-side decision before the groups' metadata builds, on a fake 8192-row step
+import numpy as np  # noqa: E402
+
+fake_ms = SimpleNamespace(decoder_replay_layers=SimpleNamespace(window=128), _keeps_rows_np=np.zeros(8, dtype=bool))
+pr = SimpleNamespace(model_state=fake_ms, vllm_config=SimpleNamespace(compilation_config=SimpleNamespace(decoder_replay_cudagraph_capture_sizes=[128, 256]),
+                                                                       model_config=SimpleNamespace(hf_config=SimpleNamespace(hc_mult=4, hidden_size=5120))))
+pr._group_kept = lambda ib, b: pipe.PipeRunner._group_kept(pr, ib, b)
+pr._mhc_splits = lambda n: 16
+pr._shared_precheck = lambda ib, b: pipe.PipeRunner._shared_precheck(pr, ib, b)
+one_req = SimpleNamespace(num_reqs=1, query_start_loc_np=np.array([0, 8192], dtype=np.int32), idx_mapping_np=np.array([3]), is_prefilling_np=np.array([True]))
+mixed = SimpleNamespace(num_reqs=3, query_start_loc_np=np.array([0, 8, 16, 8192], dtype=np.int32), idx_mapping_np=np.array([0, 1, 3]), is_prefilling_np=np.array([False, False, True]))
+bounds = [(0, 4096), (4096, 8192)]
+os.environ.update({"VLLM_MOET_PREFILL_PIPE_SHARED_TAIL": "1", "VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_LIGHT": "1", "VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS": "1"})
+kept1 = pr._group_kept(one_req, bounds)
+ok_full = pr._shared_precheck(one_req, bounds)
+ok_mixed = pr._shared_precheck(mixed, bounds)  # 16 decode rows + 128 + 128 = 272 > 256: no graph for the shared batch
+fake_ms._keeps_rows_np[3] = True  # prompt logprobs: the request keeps every row -> no replay batch
+ok_keeps = pr._shared_precheck(one_req, bounds)
+fake_ms._keeps_rows_np[3] = False
+os.environ["VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS"] = "0"
+ok_mixed_eager = pr._shared_precheck(mixed, bounds)
+os.environ["VLLM_MOET_PREFILL_PIPE_SHARED_TAIL"] = "verify"
+ok_verify = pr._shared_precheck(one_req, bounds)
+for k in ("VLLM_MOET_PREFILL_PIPE_SHARED_TAIL", "VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_LIGHT", "VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS"):
+    os.environ.pop(k, None)
+check(kept1 == [[(4096, 128)], [(4096, 128)]] and ok_full and not ok_mixed and not ok_keeps and ok_mixed_eager and not ok_verify,
+      f"(10) the light precheck: a full step yes ({ok_full}), decode rows + 256 > the capture list no ({ok_mixed}; eager yes {ok_mixed_eager}), prompt logprobs no ({ok_keeps}), verify mode no ({ok_verify}); kept {kept1}")
+fc._forward_context = "main"
+mhc_warmup._MOET_SP_PIN_TOKENS = None
+
 print("ALL PASS" if not failures else f"FAILURES: {len(failures)}")
 sys.exit(1 if failures else 0)

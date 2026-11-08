@@ -10,6 +10,9 @@ usage: compare_dumps.py DIR_A DIR_B [--keys x,residual,...] [--kind all|prefill_
   --kind prefill_rows: the mixed-step entries (a group with decode rows ahead of a prefilling request: the hashes
   of the prefill rows alone, keyed by their first position) - the pipelined run vs the same server with
   VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL=1 under the same number of decode streams.
+  --kind shared (K-9): the entries the shared replay tail wrote per group (its 256-row states split back into the two
+  128-row chunks, layers 20-39) - an eager VLLM_MOET_PREFILL_PIPE_SHARED_TAIL run vs the kv0 / r25 dumps; the default
+  kind excludes them (in verify mode today's tails write the regular entries of the same chunk-layers).
 """
 import argparse
 import json
@@ -21,7 +24,7 @@ ap = argparse.ArgumentParser()
 ap.add_argument("a", type=Path)
 ap.add_argument("b", type=Path)
 ap.add_argument("--keys", default="x,residual,post_mix,res_mix,pre_mix")
-ap.add_argument("--kind", default="all", choices=["all", "prefill_rows"])
+ap.add_argument("--kind", default="all", choices=["all", "prefill_rows", "shared"])
 args = ap.parse_args()
 keys = args.keys.split(",")
 

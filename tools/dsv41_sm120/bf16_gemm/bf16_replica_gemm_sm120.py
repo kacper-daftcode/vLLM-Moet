@@ -116,8 +116,32 @@ def enabled_sites() -> frozenset[str]:
     return frozenset(s.strip() for s in os.environ.get("VLLM_MOET_BF16_GEMM_SITES", DEFAULT_SITES).split(",") if s.strip())
 
 
+_PIPE_ROW_BLOCKS = None  # None = unresolved, False = no pipeline module, else moet_prefill_pipe.row_blocks
+
+
+def _row_blocks(num_rows: int):
+    """K-9 (sp_pipeline shared replay tail): inside the pipelined prefill's shared tail a cuBLAS GEMM over both groups' rows runs
+    as one call per group row block - cuBLAS picks its kernel and split-K count per (M, N, K), so the bits of a 256-row call are
+    not the 128-row call's; outside it one block. Without the pipeline module installed: one block."""
+    global _PIPE_ROW_BLOCKS
+    if _PIPE_ROW_BLOCKS is None:
+        try:
+            from vllm.v1.worker import moet_prefill_pipe as _pipe
+
+            _PIPE_ROW_BLOCKS = _pipe.row_blocks
+        except Exception:  # noqa: BLE001 - an image without the pipeline patch
+            _PIPE_ROW_BLOCKS = False
+    if not _PIPE_ROW_BLOCKS:
+        return [(0, num_rows)]
+    return _PIPE_ROW_BLOCKS(num_rows)
+
+
 def cublas_mm(x: torch.Tensor, w: torch.Tensor, out_f32: bool) -> torch.Tensor:
-    """The op the call sites ran before: GateLinear tier 4 / the compressor (fp32) or ReplicatedLinear (bf16)."""
+    """The op the call sites ran before: GateLinear tier 4 / the compressor (fp32) or ReplicatedLinear (bf16). Inside the
+    pipelined prefill's shared replay tail: one call per group row block (_row_blocks), the same M as the group's own tail."""
+    blocks = _row_blocks(x.shape[0]) if x.dim() == 2 else [(0, x.shape[0])]
+    if len(blocks) > 1:
+        return torch.cat([cublas_mm(x[lo:hi], w, out_f32) for lo, hi in blocks], dim=0)
     return torch.mm(x, w.T, out_dtype=torch.float32) if out_f32 else F.linear(x, w)
 
 
