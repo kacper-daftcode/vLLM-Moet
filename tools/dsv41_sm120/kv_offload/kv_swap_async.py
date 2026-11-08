@@ -2,9 +2,9 @@
 """KV offload connector (vLLM `v1/kv_offload/cpu/gpu_worker.py`): the copy path off the runner's main thread.
 
 Installed next to gpu_worker.py as `vllm.v1.kv_offload.cpu.kv_swap_async` by
-tools/dsv41_sm120/kv_offload/patch_vllm_kv_swap_async_sm120.py (session K-10, K/REPORT.md 13.2).
+tools/dsv41_sm120/kv_offload/patch_vllm_kv_swap_async_sm120.py.
 
-What is wrong today (measured, K-9 / K-10 on the test host, TP4, connector kv16+FS):
+What is wrong today (measured on a second 4x RTX PRO 6000 host, TP4, connector kv16+FS):
   * The connector's CPU side is one /dev/shm mmap region shared by the four TP workers (SharedOffloadRegion). Every
     worker `cudaHostRegister`s the whole region at start-up, all four at the same moment; in 14 of 14 server starts
     exactly one (twice: two) of them succeeded and the others failed with cudaErrorInvalidValue (a race on the long-term

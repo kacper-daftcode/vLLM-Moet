@@ -1280,11 +1280,11 @@ __global__ void __launch_bounds__(256) topk_sum_kernel(const uint4* __restrict__
 // byte count; empty[s]: one arrive per consumer warp). No __syncthreads and no address work in the consumers' K-loop: a
 // consumer warp waits for data that is normally already there, issues every LDS of the stage, then its QMMAs (v8: every
 // stage, all 8 warps stop at a barrier and issue the next stage's copies - ~33 % of fc1's time with the tensor pipe idle,
-// W/REPORT.md §3). Measured (K/REPORT.md §6.2, test host, call1 4096 rows): fc2 673 -> 567 us (-16 %, 4 stages x 2 CTAs/SM),
+// W/REPORT.md §3). Measured (second 4x RTX PRO 6000 host, call1 4096 rows): fc2 673 -> 567 us (-16 %, 4 stages x 2 CTAs/SM),
 // fc1 995 -> 955 (-4 %: 9-warp CTAs fit 2 per SM only at 96 registers = spills, 1 per SM = 2 consumer warps per sub-partition);
 // the QMMA peak is ~900 TFLOPS on this card and both kernels reach ~50 % of it. Bits: the QMMA chain and the epilogue are v8's
 // byte for byte, the A fragment words are the same four words read from the v9 layout; only who copies and how the hand-off is
-// synchronised changes. Design note and the measured steps: /workspace/tmp/par31/K/k4/DESIGN_v9_producer_warp.md.
+// synchronised changes.
 constexpr int kWsThreads = kThreads + 32;  // fc2_kernel_ws: 8 consumer warps + the producer warp
 constexpr int kWsProducer = 8;             // fc2_kernel_ws: the producer warp
 
@@ -1329,7 +1329,7 @@ __device__ __forceinline__ void consumers_sync() {  // the NCW consumer warps on
 }
 // cp.async.bulk (TMA) for the B tiles and column scales: 4 instructions per stage instead of 18 cp.async16 per lane - but on this
 // driver / card the FIRST cp.async.bulk launch of a process takes 4.03 GiB of device memory (K/k4/mem_probe2.cu: context 0.63 ->
-// 4.66 GiB; in situ the KV cache fell 11.31 -> 7.39 GiB per GPU, K/REPORT.md §6.2.4). Off: the producer issues 16-B cp.asyncs.
+// 4.66 GiB; in situ the KV cache fell 11.31 -> 7.39 GiB per GPU). Off: the producer issues 16-B cp.asyncs.
 constexpr bool kProducerTma = false;
 constexpr uint32_t kFullCount = 33;  // 32 x cp.async.mbarrier.arrive.noinc + the producer lane 0's release arrive
 constexpr uint32_t kEmptyCount = 8;  // one arrive per consumer warp (fc2_kernel_ws: 8 consumer warps)
@@ -1793,7 +1793,7 @@ __global__ void __launch_bounds__(8 * MH * 32 + 32 * kFc1Producers, MINB) fc1_ke
 }
 
 // ------------------------------------------------------------------- 5b. v10: fc1 as three warpgroups with setmaxnreg (K-5, 7.11)
-// The v9 skeleton's fc1 problem (K/REPORT.md §6.2.3 / §6.2.6, ncu §7.1): the fc1 consumer wants ~110-150 registers, so 9- or
+// The v9 skeleton's fc1 problem (ncu): the fc1 consumer wants ~110-150 registers, so 9- or
 // 10-warp CTAs fit two per SM only at 96 registers (spills) and one CTA per SM leaves 2 consumer warps per SM sub-partition
 // (tensor pipe 58 % vs v8's 64 %). Here the CTA is 12 warps = 3 warpgroups: warps 0-7 consumers (v8's retile, all 4 m-tiles
 // of an n16 slice), warps 8-11 producers. Launched for 2 CTAs/SM (80 registers per thread, 2 x 384 x 80 = 61 440), the
@@ -1807,7 +1807,7 @@ __global__ void __launch_bounds__(8 * MH * 32 + 32 * kFc1Producers, MINB) fc1_ke
 // (a0, a2, a1, a3) - the same four words as v8's LDS.128 / v9's two LDS.64, in a 16-B unit that 8-B copies can fill (v8's word
 // interleave needs 4-B copies: 32 per lane per stage, the v9a limit). The LDGSTS writes are bank-conflict-free: a half-warp
 // covers (q & 1, c, row half) once each. Bits: the QMMA chain, operands and epilogue are v8's; only the copy issue and the
-// stage hand-off differ (harness). Design note: /workspace/tmp/par31/K/k5/DESIGN_v10_setmaxnreg.md.
+// stage hand-off differ (harness).
 constexpr int kWgThreads = 384;        // 8 consumer warps + 4 producer warps
 constexpr int kWgConsumers = 8;
 constexpr int kWgProducers = 4;

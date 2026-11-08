@@ -30,7 +30,7 @@ layers are at the DRAM floor).
 v10 (K-5): fc1 as three warpgroups (`fc1_kernel_wg`: 8 consumer warps + 4 producer warps, one LDS.128 per A fragment from a layout
 8-B cp.asyncs fill; at 2 CTAs/SM `setmaxnreg` 32 / 104) = WS1 modes 8 (3 stages, 2 CTAs/SM), 9 (4, 1), 10 (6, 1), 11 (7, 1); measured
 best mode 9: fc1 -10.6 % at 4096 rows in the harness (913 vs 1 021 us), bit-identical; in situ (pipelined r26 step, WS1=9 WS2=3)
-the 4096-row fc1 launches are -10.5 % (887 -> 794 us) but the 163K / 19K walls move <= 0.3 % (K/REPORT.md 7.4).
+the 4096-row fc1 launches are -10.5 % (887 -> 794 us) but the 163K / 19K walls move <= 0.3 %.
 
 MK-2 (megakernel stage 1, milestone 1): `VLLM_MOET_B12X_MOE_PREFILL_FAST_WS` >= 20 runs fc1 + SwiGLU/quant + fc2 as ONE persistent launch
 (`moe_persistent_kernel`: v10's CTA, 1 CTA/SM x 12 warps, one work list with the fc2 items gated by per-expert fc1_done counters, every wait

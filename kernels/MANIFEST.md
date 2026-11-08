@@ -7,8 +7,8 @@ Assemble: `cubit asm sass/<SASS> -o <cubin> --kernel <kernel> --mercury-stub sas
 `CUBIT_RB_CHAIN=1 CUBIT_SB_SHARE=1 cubit asm sass/<SASS> -o <cubin> --kernel moe_w2_mm --mercury-stub sass/qmma_e4m3.merc.stub`
 — `moe_w2_mm_mc4_k4096_a32.sass`, `moe_w2_mm_mc4_k6144.sass`, `moe_w2_mm_mc4_k6144_a32.sass`, `moe_w2_mm_mc4_k7168.sass`,
 `moe_w2_mm_mc4_k7168_a32.sass`. The two switches restore the `5912400` schedule of these kernels (the read-barrier
-chain on the scale-byte loads + the shared-W0 prologue; cubit KNOWN_ISSUES A19): measured on the test host (RTX PRO
-6000, K's harness, 25 reps, E = 64; bits identical to the shipped cubins in every arm) the `main` default runs them at
+chain on the scale-byte loads + the shared-W0 prologue; cubit KNOWN_ISSUES A19): measured on a second host (RTX PRO
+6000, the kernels' harness, 25 reps, E = 64; bits identical to the shipped cubins in every arm) the `main` default runs them at
 1.37× / 1.38× / 1.65× / 1.21× / 1.67× of the shipped time and the switched build at 1.01× / 0.84× / 1.01× / 0.84× /
 0.98× (`mc4_k4096_a32` 340.7 → 467.6 → 343.5 µs, `mc4_k6144` 475.8 → 658.6 → 400.6, `mc4_k6144_a32` 513.4 → 847.4 →
 519.9, `mc4_k7168` 560.5 → 680.7 → 469.6, `mc4_k7168_a32` 599.8 → 1002.9 → 590.4). The switches cost 3–30 % on 57

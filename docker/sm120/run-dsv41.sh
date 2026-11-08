@@ -73,11 +73,11 @@ case "$SERVED" in
   0|1) ;;
   *) echo "SERVED must be 0 or 1, got $SERVED" >&2; exit 1 ;;
 esac
-# Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is -22.6 % at 163K on an idle host and was +31 % in the production window of
-# 2026-11-07 (rolled back): not the KV offload tier (with it: +0.5 %) but the host's CPUs, loaded by other processes on the server's
-# NUMA node - the pipelined step's eager replay tails are launch-bound. The -r26b image's PREFILL_PIPE_REPLAY_GRAPHS=1 runs those
-# tails as CUDA graphs (+3.3 % under 100 nice'd hogs instead of +26.6 %); served since the 2026-11-08 window (163K 6.6 -> 5.6-5.8 s on
-# the production host, +1.7 % under 100 hogs, KV 12.5 -> 10.5 GiB). SERVED=1 turns it on (PREFILL_PIPE=0 keeps the one-group path).
+# Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is -22.6 % at 163K on an idle host; its eager replay tails are launch-bound, so a
+# host whose CPUs other processes load on the server's NUMA node pays +31 % (not the KV offload tier: with it +0.5 %). The -r26b
+# image's PREFILL_PIPE_REPLAY_GRAPHS=1 runs those tails as CUDA graphs (+3.3 % under 100 nice'd hogs instead of +26.6 % on the second
+# host; on the reference host 163K 6.6 -> 5.6-5.8 s, +1.7 % under 100 hogs, KV 12.5 -> 10.5 GiB). SERVED=1 turns it on (PREFILL_PIPE=0
+# keeps the one-group path).
 PREFILL_PIPE="${PREFILL_PIPE:-$([[ "$SERVED" == "1" ]] && echo 2 || echo 0)}"
 case "$PREFILL_PIPE" in
   0|2) ;;

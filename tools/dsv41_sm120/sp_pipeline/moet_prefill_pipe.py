@@ -111,10 +111,10 @@ def order() -> str:
     8 ms of a 188-ms SP phase). "comm2prio" = "comm2" + the comm stream at priority -1 (the glue + NCCL CTAs take every
     freed SM slot instead of the compute kernels' last wave; K-3 measured the priority alone as a loss without a trace).
     A named bundle: the individual switches COMM2 / COMM_PRIORITY still apply on top (the stricter setting wins).
-    Measured (K-7, test host, kv16+FS, "comm2prio"): bits identical on every gate, 163K 5 389 / 5 321 / 5 344 ms = -0.6 % vs
+    Measured (second 4x RTX PRO 6000 host, kv16+FS, "comm2prio"): bits identical on every gate, 163K 5 389 / 5 321 / 5 344 ms = -0.6 % vs
     5 376-5 391 as built, 19K -1 %; the compute stream's gaps in the SP phase 48 -> 25 ms per step (the indexer all_gatherv waits
     are gone) but the compute kernels slow down under a priority -1 comm stream (attention +5 ms, MXFP8 GEMMs +6 per 19K step),
-    net -4 % of the SP phase; no protection against host CPU load (+35 %, it never touches the tails). Opt-in (K/REPORT.md 9.2)."""
+    net -4 % of the SP phase; no protection against host CPU load (+35 %, it never touches the tails). Opt-in."""
     variant = os.environ.get("VLLM_MOET_PREFILL_PIPE_ORDER", "today")
     return variant if variant in ("today", "comm2", "comm2prio") else "today"
 
@@ -138,12 +138,12 @@ def affinity_policy() -> frozenset[str]:
     (refused -> one warning, pinning only). Why: the pipelined step's two replay tails are CPU-launch-bound (K-3: ~1 500
     kernels + 2 500 runtime calls per group, CPU slack ~0), so a group thread that loses its CPU to a neighbour delays the
     tail's 85 all-reduces on every rank (K-6 §8.0: +20…+32 % at 163K under 100 nice -n 10 spinners, r25's path 0 %).
-    Measured (K-7, test host, kv16+FS): "pin" is WORSE - 163K quiet 5 519 / 5 480 / 5 487 ms (+2 % vs 5 376-5 391 as built),
+    Measured (second 4x RTX PRO 6000 host, kv16+FS): "pin" is WORSE - 163K quiet 5 519 / 5 480 / 5 487 ms (+2 % vs 5 376-5 391 as built),
     under 100 spinners 7 479 / 7 485 / 7 346 (+36 % vs +26.6 % as built), bits identical: a thread fixed to one CPU shares it
     with whatever lands there, an unpinned one is placed on an idle CPU at every wakeup. Profile under load: issuing one tail
     takes the thread 120-130 ms quiet (for ~50 ms of GPU work; hidden by the 65-77 ms CPU lead built in the SP phase) and
     147-166 ms under load while the lead shrinks to 5-31 ms, so the GPU window becomes the issue span and the other ranks wait
-    in the tail's all-reduces for the starved rank (K/REPORT.md 9.2). "fifo" alone (SCHED_FIFO 1, CAP_SYS_NICE, no pin) is worse
+    in the tail's all-reduces for the starved rank. "fifo" alone (SCHED_FIFO 1, CAP_SYS_NICE, no pin) is worse
     still: quiet 5 494 / 5 506 / 5 540, under load 7 880 / 7 724 / 7 411 (+40 %) - the RT group threads preempt the server's own
     CFS threads (the NCCL proxy, the runner, the connector) on their CPUs, not just the spinners. Neither is a default; both stay
     as switches for measurements. The hardening that works is VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1 (see replay_graphs)."""
@@ -235,7 +235,7 @@ def replay_graphs() -> bool:
     DecoderReplayCudaGraphManager, sizes from --compilation-config decoder_replay_cudagraph_capture_sizes) once per
     row-group slot as well, so a pipelined group's replay tail runs as a graph (its replay batch lives in slot-private
     buffers; slot 0's graphs read slot 0's). Off (default): the groups' replay layers run eagerly, whatever slot 0 has.
-    Measured (K-7, test host, kv16+FS, sizes [128, 256]): the r26b hardening against host CPU load - a pipelined step's two
+    Measured (second 4x RTX PRO 6000 host, kv16+FS, sizes [128, 256]): the r26b hardening against host CPU load - a pipelined step's two
     replay tails (~1 400 launches each) take a thread 120-130 ms to issue for ~50 ms of GPU work, so under 100 nice -n 10
     spinners the 163K prefill is +26.6 % as built (the starved rank's tail delays the other ranks' 85 all-reduces) and +3.3 %
     with the graphs (tail GPU window 45 ms, all-reduces 7-9 ms, the CPU 10+ ms ahead on every rank); quiet +0.6 %; bits
@@ -243,7 +243,7 @@ def replay_graphs() -> bool:
     layers 0-19 400/400 identical, layers 20-39 covered by the end-to-end gates only). Cost: KV 11.31 -> 10.3 GiB per GPU
     at 0.94 (the memory profiler books 2.33 GiB of graphs vs 1.34; really 0.98 vs 0.52). Needs the patcher of the same
     commit (the slot managers are rebuilt at every capture: vLLM's memory-profiling pass leaves a manager created during it
-    on a throwaway graph pool). K/REPORT.md 9.2."""
+    on a throwaway graph pool)."""
     return os.environ.get("VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS", "0") == "1"
 
 
@@ -299,7 +299,7 @@ def phase_graphs() -> str:
     inputs and a torch.equal of every output tensor (one loud log line per step, counters in stats(); the tails continue
     from the eager outputs) - the bits oracle, since the per-layer dump hook cannot run inside a graph. Design and the
     graph-breaker inventory: K/k8/DESIGN_phase_graph.md.
-    Measured (K-8, test host, image r26b, connector kv16+FS, REPLAY_GRAPHS=1 [128,256]): the capture works on the real model (0.4 s,
+    Measured (second 4x RTX PRO 6000 host, image r26b, connector kv16+FS, REPLAY_GRAPHS=1 [128,256]): the capture works on the real model (0.4 s,
     2 121 graph nodes, both of vLLM's capture passes); verify 86 steps x 4 ranks = 344 IDENTICAL / 0 MISMATCH, per-layer dumps 400/400
     vs the kv0 and r25 oracles, agree x3 identical. 163K 5 354 / 5 361 / 5 365 ms quiet = -1.0 % vs r26b (5 405-5 413), under 100
     nice -n 10 spinners +4.1 % (r26b +3.3...+4.8 %); with ORDER=comm2 inside the graph 5 345 / 5 338 / 5 327 (-1.3 %) and +1.9 % under
@@ -307,7 +307,7 @@ def phase_graphs() -> str:
     capture runs out of memory (caught: eager, loud). Why only -1 %: the SP phase was GPU-bound already (K-6: its head-of-line
     blocking is CTA dispatch, the persistent MoE kernels' exclusion and NCCL's per-communicator FIFO - GPU-side mechanics the graph
     keeps), so the 2 600 launches per group it removes were hidden behind the GPU; the exposed CPU under load is the runner's
-    per-step work between the steps. Opt-in (K/REPORT.md 11.3); the foundation for graph-level edits (node priorities on the comm
+    per-step work between the steps. Opt-in; the foundation for graph-level edits (node priorities on the comm
     branch, edge rewrites, the tails inside the graph)."""
     value = os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS", "0")
     return value if value in ("0", "1", "verify") else "0"
@@ -346,8 +346,8 @@ def shared_tail() -> str:
     cache holds today's writes) - the bits oracle on the real model, as K-8's PHASE_GRAPHS=verify. Steps the shared tail does not
     serve run today's tails, said once per reason: a group without a replay batch (prompt logprobs), REPLAY=stream, a shared
     batch without a graph while REPLAY_GRAPHS=1 (decode rows in group 0: 128 + d + 128 > the largest capture size), unequal mHC
-    split counts. Design: K/k9/DESIGN_shared_tail.md; measured: K/REPORT.md 12.
-    Measured (K-9, 8.11, test host, image r26b, connector kv16+FS, REPLAY_GRAPHS=1 [128,256], fc2 WS2=3): LEVEL B - verify eager
+    split counts.
+    Measured (second 4x RTX PRO 6000 host, image r26b, connector kv16+FS, REPLAY_GRAPHS=1 [128,256], fc2 WS2=3): LEVEL B - verify eager
     96/96 steps IDENTICAL (24 x 4 ranks) with the shared tail's own per-layer dumps 320/320 chunk-layers x 5 states identical to the kv0
     and r25 dumps (layers 20-39, both groups), verify with the graphs 360/360 IDENTICAL (90 x 4 ranks) once the shared slot's capture
     runs inside shared_capture_scope (the first graph arm captured the unsplit 256-row all-reduces / GEMMs: 360/360 MISMATCH - a graph
