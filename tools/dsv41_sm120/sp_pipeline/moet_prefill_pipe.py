@@ -235,7 +235,17 @@ def phase_graphs() -> str:
     captured one, a missing replay batch. "verify" = "1" plus, every step, the eager two-thread section on the same static
     inputs and a torch.equal of every output tensor (one loud log line per step, counters in stats(); the tails continue
     from the eager outputs) - the bits oracle, since the per-layer dump hook cannot run inside a graph. Design and the
-    graph-breaker inventory: K/k8/DESIGN_phase_graph.md."""
+    graph-breaker inventory: K/k8/DESIGN_phase_graph.md.
+    Measured (K-8, test host, image r26b, connector kv16+FS, REPLAY_GRAPHS=1 [128,256]): the capture works on the real model (0.4 s,
+    2 121 graph nodes, both of vLLM's capture passes); verify 86 steps x 4 ranks = 344 IDENTICAL / 0 MISMATCH, per-layer dumps 400/400
+    vs the kv0 and r25 oracles, agree x3 identical. 163K 5 354 / 5 361 / 5 365 ms quiet = -1.0 % vs r26b (5 405-5 413), under 100
+    nice -n 10 spinners +4.1 % (r26b +3.3...+4.8 %); with ORDER=comm2 inside the graph 5 345 / 5 338 / 5 327 (-1.3 %) and +1.9 % under
+    load. Cost: 2.3 GiB of graph pool (2.64 booked) -> KV 10.3 -> 7.66 GiB at 0.94; with VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 the
+    capture runs out of memory (caught: eager, loud). Why only -1 %: the SP phase was GPU-bound already (K-6: its head-of-line
+    blocking is CTA dispatch, the persistent MoE kernels' exclusion and NCCL's per-communicator FIFO - GPU-side mechanics the graph
+    keeps), so the 2 600 launches per group it removes were hidden behind the GPU; the exposed CPU under load is the runner's
+    per-step work between the steps. Opt-in (K/REPORT.md 11.3); the foundation for graph-level edits (node priorities on the comm
+    branch, edge rewrites, the tails inside the graph)."""
     value = os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS", "0")
     return value if value in ("0", "1", "verify") else "0"
 
