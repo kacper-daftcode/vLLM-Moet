@@ -53,7 +53,7 @@ bases). The changes behind it:
 input's all-gather alone 15 %), the MoE **19 %** (0.94 ms per layer-chunk against a 0.83 ms DRAM floor), the
 sparse-MLA prefill kernel **13 %** (BF16, one CTA per SM, latency-bound), CUTLASS MXFP8 **9 %**, cuBLAS bf16 4 %,
 GPU idle 2 %. The steps that took it from ~15.5 s (the official image) through ~8.5–9 s (newer vLLM bases: the SWA
-bounded replay, the indexer's row sharding) to 7.2 s:
+bounded replay, the indexer's row sharding) to 7.2 s, and on to 5.6–5.8 s:
 
 - **Step 40** — the V4.1-record prefill rows on sm_120 went through FlashInfer's single-group FP8 kernel (Q, QK, P and
   PV in FP8; H100 / B200 compute the same attention in BF16). The full-BF16 SM120 kernel FlashInfer also ships is 24×
@@ -70,6 +70,20 @@ bounded replay, the indexer's row sharding) to 7.2 s:
   CTAs, 8 warps on 8 n16 column slices × every m16 tile of the expert chunk, a cp.async ring, the epilogue in registers:
   1.67 ms per layer, bit-identical with b12x on dumps of a real prefill and end to end (0 of 30,137 prompt positions
   differ, greedy identical), −9.2 % fresh prefill.
+- **Steps 45–47** — from 7.2 s to 5.6–5.8 s on the reference host (5.4 s on the second host): the MoE input all-gathered as
+  e4m3 + UE8M0 scales + the shard's top-6 instead of bf16 (0.52× the bytes; step 45), the prefill attention chunks on the
+  cubit-assembled SASS kernel (0.66–0.72× FlashInfer's time; step 46), and the pipelined step (step 47): at 8 192 batched
+  tokens a step is two 4 096-row groups one layer apart, the reduce-scatters / all-gathers of one group on a comm stream
+  under the other group's compute, the 128-row replay layers 20–39 as CUDA graphs captured per row-group slot (the eager
+  tails are ~1 400 launches each and launch-bound under host CPU load). The profile of one 4 096-row layer-chunk of the
+  pipelined step (rank 0): 49 kernels on two streams, 3.55 ms on the compute stream and 3.36 ms on the comm stream for
+  7.95 ms of GPU span; the two groups interleave to a period of 9.66 ms per layer against ~7.2–7.3 ms of compute per layer
+  pair (compute stream busy 75 %, comm stream 72 %); the host issues 304 runtime calls per layer per group thread = 6.4 ms
+  of CPU for 7.95 ms of GPU. Per layer-chunk: the two reduce-scatters 1 850 µs and the all-gathers 1 036 µs (NCCL, 91 %
+  of the comm stream), attention 938, fc1 935, fc2 488, CUTLASS MXFP8 GEMMs 466 (our kernels are 71 % of the compute
+  stream). The 26 % between the period and the compute is the cost of running the collectives as NCCL kernels next to the
+  compute — CTA dispatch and NCCL's per-communicator FIFO — not bandwidth: a synthetic model of the layer pair with the
+  collectives issued from a persistent kernel of 32–48 CTAs recovers 57–68 % of it and costs the compute kernels ≤ 1.1 %.
 
 ## How changes are validated
 
@@ -90,9 +104,16 @@ sources in `kernels/sass/` are canonical for it.
 
 ## Open items
 
-- The MoE input's all-gather in MXFP8 instead of bf16 (b12x quantizes the rows anyway) ≈ −3.5 % prefill; then the
-  replay rows' `all_gatherv` and the sequence-parallel threshold.
-- The sparse-MLA prefill kernel in SASS (2–4 CTAs per SM, raw records staged, dequant at `ldmatrix`): −5…6 % prefill.
-- The prefill MoE from 0.94 to its 0.83 ms floor ≈ −2 %.
+- The pipelined step's collectives from the device instead of NCCL (`tools/dsv41_sm120/sp_pipeline/moet_device_comm*`,
+  `VLLM_MOET_PREFILL_PIPE_DEVICE_COMM`, off; not yet an image step): one 32-thread kernel instance per collective pushes
+  this rank's rows over PCIe P2P into the peers' buffers, phased per peer, and 128 reducer CTAs sum the landed pieces in
+  NCCL's per-element order from a table probed on the communicator — NCCL's bits by construction (4-rank unit test 20/20
+  `torch.equal`, a 2-group × 40-phase interleave 0 mismatches), reduce-scatter 896–944 µs against NCCL's 909 alone; every
+  device-side wait is `%globaltimer`-bounded with a pinned error record. The in-situ gain against the 9.66-ms period is
+  the open measurement; the expected whole is −11…−13 % at 163K.
+- The reduce-scatter in fewer bytes (fp8 with a per-row scale, 1 850 → ≈ 950 µs per layer-chunk): a change of the
+  prefill's arithmetic, quality-gated.
+- The prefill MoE's distance to its DRAM floor: FC1 and FC2 in one persistent launch
+  (`VLLM_MOET_B12X_MOE_PREFILL_FAST_WS` ≥ 20) is bit-identical and +2.6 % — FC2 is bound by the expert weights and the
+  routed rows it reads (W2 plus ~252 MB of rows per layer-chunk), not by the launches; the lever is bytes.
 - The deterministic top-k on long rows at eight streams (one CTA per row today; −3…−4 % aggregate decode at 65K × 8).
-- Each request on the disk tier pays ~20 ms more before its first token (cause open).
