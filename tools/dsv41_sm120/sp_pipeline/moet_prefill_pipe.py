@@ -960,6 +960,29 @@ def device_all_gather(t: torch.Tensor, fallback: Callable[[torch.Tensor], torch.
     return dc.all_gather(t, fallback)
 
 
+def device_all_gather_many(ts: list[torch.Tensor], fallback: Callable[[torch.Tensor], torch.Tensor]) -> list[torch.Tensor]:
+    """MK-5 (b): several tensors of one phase as ONE device gather instance (sp_moe_gather_sm120's e4m3 rows + packed small rows);
+    element-wise fallback(t) when the device path does not take them (VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_MULTI=0: the per-tensor path)."""
+    if device_comm_mode() == "0":
+        return [fallback(t) for t in ts]
+    dc = _device_comm()
+    if not dc:
+        return [fallback(t) for t in ts]
+    return dc.all_gather_many(ts, fallback)
+
+
+def device_all_gatherv(local: torch.Tensor, sizes: list[int], out: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]) -> bool:
+    """MK-5 (c): the sparse-attention indexer's variable-size top-k gather (PrefillRowShard.exchange_topk) through the device path on the
+    pipeline's comm stream; True = `out` written, False = the caller runs NCCL's all_gatherv (VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_IDX=0,
+    outside a pipelined step, or a shape the device path does not take)."""
+    if device_comm_mode() == "0":
+        return False
+    dc = _device_comm()
+    if not dc:
+        return False
+    return dc.all_gatherv(local, sizes, out, fallback)
+
+
 # ------------------------------------------------------------------------------------------------- model side
 def merge_outputs(outputs: list[Any]) -> Any:
     """The per-group model outputs in row order: tensors concatenate along the token dim, a tuple's list elements

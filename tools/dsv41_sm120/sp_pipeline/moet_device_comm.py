@@ -41,6 +41,12 @@ _REDUCE_GRID (376), _UNROLL (4: 16-B loads in flight per
 pusher lane), _LINK_TOKEN (1: the two groups' instances take turns per push phase - one destination per GPU at a time), _ARENA_MB (48:
 the gather arena per group and parity; a gather that does not fit stays on NCCL), _SLOT_ROWS (1024: the receive slot per source =
 the largest shard), _STREAM (own | comm: a comm-kernel stream per group, or the pipeline's comm stream itself), _STREAM_PRIORITY (0), _WATCHDOG_S (30), _VERIFY_FIRST (3), _RS=0|1 and _AG=0|1 (1: per-kind master switches).
+MK-5 (MK/BRIEF_MK5.md task 1; all off by default = MK-4's form): _PUSH_STAGES (0 = the register path; 2..16 = (a) the cp.async ring of
+that many 512-B slots per pusher warp - 5 x 4 warps = 10 KB of smem, co-resident with fc1 at 120 registers and the attention), _TEAM (1;
+0 = each pusher walks its three peers alone: no go / team barriers, no link token), _MULTI (0; 1 = (b) one pusher instance per phase for
+the MoE gather's two tensors, all_gather_many), _IDX (0; 1 = (c) the indexer's top-k all_gatherv through the device path on the pipeline's
+comm stream, all_gatherv), _IDX_ARENA_MB (16: the indexer arena per group and parity; 4 x 1 300 rows x 512 int32 = 10.6 MB), _STAMPS (0; 1 = %globaltimer stamps per pusher
+phase of the RS launches, read by stamps_summary() - the in-situ breakdown of a push: reuse wait / go / pushes + flags / team).
 """
 from __future__ import annotations
 
@@ -152,6 +158,35 @@ def stream_mode() -> str:
     return v if v in ("own", "comm") else "own"
 
 
+def push_stages() -> int:
+    """MK-5 (a): 0 = the register path (unroll x 16 B per lane in flight), 2..16 = the cp.async ring per pusher warp (512 B per slot)."""
+    v = _int("PUSH_STAGES", 0)
+    return 0 if v < 2 else min(16, v)
+
+
+def team_mode() -> int:
+    """MK-5: 1 = the pushers enter / leave every peer phase together (MK-4's form), 0 = each pusher walks its peers alone."""
+    return 1 if _int("TEAM", 1) else 0
+
+
+def multi_gather() -> bool:
+    """MK-5 (b): one pusher instance for the MoE gather's two tensors (all_gather_many) instead of two."""
+    return bool(_int("MULTI", 0))
+
+
+def idx_gather() -> bool:
+    """MK-5 (c): the indexer's top-k all_gatherv through the device path (all_gatherv)."""
+    return bool(_int("IDX", 0))
+
+
+def idx_arena_mb() -> int:
+    return max(1, _int("IDX_ARENA_MB", 16))
+
+
+def stamps_on() -> bool:
+    return bool(_int("STAMPS", 0))
+
+
 def watchdog_s() -> float:
     return float(max(1, _int("WATCHDOG_S", 30)))
 
@@ -234,6 +269,8 @@ class _State:
         self.ag_index = [0, 0]
         self.arena_bytes = 0
         self.slot_bytes = 0
+        self.idx_bytes = 0
+        self.iseq = [0, 0]  # MK-5 (c): the indexer gathers launched per group (its parity = iseq & 1)
         self.tables: dict[tuple[int, int, int], torch.Tensor | None] = {}  # (M, K, comm index) -> table | None
         self.table_info: dict[str, Any] = {}
         self.verified: dict[tuple[str, int], int] = {}  # (kind, M) -> collectives compared so far (mode 1)
@@ -250,6 +287,7 @@ _STATS: dict[str, Any] = {
     "rs_device": 0, "ag_device": 0, "rs_nccl_fallback": 0, "ag_nccl_fallback": 0, "fallback_reasons": {},
     "verify_rs": 0, "verify_ag": 0, "verify_rs_mismatch": 0, "verify_ag_mismatch": 0, "steps": 0, "probes": {},
     "disabled": None, "watchdog": None,
+    "ag_multi_device": 0, "idx_device": 0, "idx_nccl_fallback": 0, "verify_idx": 0, "verify_idx_mismatch": 0,  # MK-5
 }
 
 
@@ -327,31 +365,37 @@ def _init() -> _State | None:
             h = 5120  # the slot is sized by rows x the widest RS row (bf16 hidden); wider rows fall back
             slot_bytes = slot_rows() * h * 2
             arena_bytes = arena_mb() * 1024 * 1024
-            total, _, _, slot_bytes, arena_bytes = ext.init_region(tp.rank_in_group, slot_bytes, arena_bytes, pieces())
+            idx_bytes = (idx_arena_mb() * 1024 * 1024) if idx_gather() else 0
+            total, _, _, slot_bytes, arena_bytes, idx_bytes = ext.init_region(tp.rank_in_group, slot_bytes, arena_bytes, pieces(), idx_bytes)
             handles: list = [None] * tp.world_size
             dist.all_gather_object(handles, ext.ipc_handle(), group=tp.cpu_group)
             for r in range(tp.world_size):
                 ext.open_peer(r, handles[r])
             st.ext, st.tp, st.rank, st.world, st.device = ext, tp, tp.rank_in_group, tp.world_size, dev
-            st.slot_bytes, st.arena_bytes = slot_bytes, arena_bytes
+            st.slot_bytes, st.arena_bytes, st.idx_bytes = slot_bytes, arena_bytes, idx_bytes
             st.streams = [torch.cuda.Stream(device=dev, priority=stream_priority()) for _ in range(2)]
             if split_mode():
                 ext.set_push_warps(push_warps())
+                ext.set_push_form(push_stages(), team_mode(), 1 if stamps_on() else 0, n_push())  # MK-5 (a) / (b) / the stamps
             st.v_n = torch.zeros((), dtype=torch.int64, device=dev)
-            st.v_bad = torch.zeros(2, dtype=torch.int64, device=dev)
+            st.v_bad = torch.zeros(3, dtype=torch.int64, device=dev)
             regs, smem_static, smem_dyn, local, per_sm, red_regs = ext.func_info()
             _STATS["kernel"] = dict(regs=regs, smem=smem_static + smem_dyn, local=local, ctas_per_sm=per_sm, reduce_regs=red_regs,
                                     split=split_mode(), push_warps=push_warps() if split_mode() else 1, reduce_grid=reduce_grid(),
                                     n_push=n_push(), n_red=0 if split_mode() else n_red(), pieces=pieces(), unroll=unroll(), link_token=link_token(),
-                                    stream=stream_mode(), region_mb=total / 1e6, build_s=round(time.perf_counter() - t0, 1))
+                                    stream=stream_mode(), region_mb=total / 1e6, build_s=round(time.perf_counter() - t0, 1),
+                                    stages=push_stages() if split_mode() else 0, team=team_mode(), multi=multi_gather(), idx=idx_gather(),
+                                    idx_arena_mb=idx_bytes >> 20, stamps=stamps_on())
             _STATE = st
             logger.info(
                 "vllm-moet sm_120 device comm (MK-4 hybrid, %s): rank %d of %d, region %.0f MB (%d receive slots x %.1f MB, 4 gather "
-                "arenas x %d MB), kernel %d regs / %d B smem / %d B local / %d CTAs per SM at 32 threads, %s, %d pieces, "
-                "unroll %d, link token %d, streams %s, watchdog %.0f s, built in %.1f s (VLLM_MOET_PREFILL_PIPE_DEVICE_COMM=0 turns it off)",
-                mode(), st.rank, st.world, total / 1e6, 2 * 2 * NSRC, slot_bytes / 1e6, arena_bytes >> 20, regs, smem_static + smem_dyn, local,
+                "arenas x %d MB, indexer arenas x %d MB), kernel %d regs / %d B smem / %d B local / %d CTAs per SM at 32 threads, %s, %d pieces, "
+                "unroll %d, link token %d, streams %s, MK-5: stages %d, team %d, multi-gather %d, indexer gather %d, stamps %d; watchdog %.0f s, "
+                "built in %.1f s (VLLM_MOET_PREFILL_PIPE_DEVICE_COMM=0 turns it off)",
+                mode(), st.rank, st.world, total / 1e6, 2 * 2 * NSRC, slot_bytes / 1e6, arena_bytes >> 20, idx_bytes >> 20, regs, smem_static + smem_dyn, local,
                 per_sm, (f"split: {n_push()} pushers x {push_warps()} warps resident, 1-CTA waits + a transient {reduce_grid()}-CTA reduce ({red_regs} regs)"
                          if split_mode() else f"{n_push()} pushers + {n_red()} reducers resident"), pieces(), unroll(), link_token(), stream_mode(),
+                push_stages() if split_mode() else 0, team_mode(), int(multi_gather()), int(idx_gather()), int(stamps_on()),
                 watchdog_s(), time.perf_counter() - t0)
             if regs > 32 or local > 0:
                 logger.warning("vllm-moet sm_120 device comm: the kernel takes %d registers / %d B local memory - the 1 024-register "
@@ -400,7 +444,7 @@ def _table(st: _State, m: int, h: int, gidx: int, rs_fn: Callable[[torch.Tensor]
 def _compare(st: _State, kind: str, m: int, dev: torch.Tensor, ref: torch.Tensor) -> None:
     bad = (dev.reshape(-1).view(torch.uint8) != ref.reshape(-1).view(torch.uint8)).any().to(torch.int64)
     st.v_n += 1
-    st.v_bad[0 if kind == "rs" else 1] += bad
+    st.v_bad[0 if kind == "rs" else (1 if kind == "ag" else 2)] += bad
     _STATS[f"verify_{kind}"] += 1
     if mode() == "1":
         st.v_pending.append((kind, m, bad))
@@ -469,13 +513,14 @@ def reduce_scatter(x: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Ten
     split = split_mode()
     npush, nred, npieces = n_push(), (0 if split else n_red()), pieces_for(c * h * 2)
     st.use[use_key] = st.use.get(use_key, 0) + 1
-    st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
+    if team_mode() or not split:  # the team barrier's target = the pushers of the team-1 launches of (g, par, slot) (a team-0 launch never arrives)
+        st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
     st.cum_red[use_key] = st.cum_red.get(use_key, 0) + (reduce_grid() if split else npieces * nred)
     if kst is not comm:
         ev_in = torch.cuda.Event()
         ev_in.record(comm)
         kst.wait_event(ev_in)
-    st.ext.rs_launch(kst.cuda_stream, x, out, table, gidx, pseq, st.use[use_key], st.cum_push[use_key], st.cum_red[use_key], npieces,
+    st.ext.rs_launch(kst.cuda_stream, x, out, table, gidx, pseq, st.use[use_key], max(npush, st.cum_push.get(use_key, 0)), st.cum_red[use_key], npieces,
                      npush, nred, unroll(), link_token(), watchdog_s())
     if split:  # the bounded wait for the peers' pieces + the transient reduce, on the comm stream (concurrent with my pushes on kst)
         st.ext.rs_wait_reduce(comm.cuda_stream, x, out, table, gidx, pseq, st.use[use_key], st.cum_red[use_key], npieces, reduce_grid(), watchdog_s())
@@ -541,7 +586,8 @@ def all_gather(t: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]
     split = split_mode()
     npush, nred, npieces = n_push(), (0 if split else n_red()), ag_pieces()  # a gather's receiver only waits for the whole: one piece = 3 fences per pusher
     st.use[use_key] = st.use.get(use_key, 0) + 1
-    st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
+    if team_mode() or not split:
+        st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
     st.cum_red[use_key] = st.cum_red.get(use_key, 0) + max(1, npieces * nred)
     comm = torch.cuda.current_stream()
     kst = comm if stream_mode() == "comm" else st.streams[gidx]
@@ -552,7 +598,7 @@ def all_gather(t: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]
         ev_in = torch.cuda.Event()
         ev_in.record(comm)
         kst.wait_event(ev_in)
-    st.ext.ag_launch(kst.cuda_stream, t, off, gidx, pseq, slot, st.use[use_key], st.cum_push[use_key], st.cum_red[use_key], npieces,
+    st.ext.ag_launch(kst.cuda_stream, t, off, gidx, pseq, slot, st.use[use_key], max(npush, st.cum_push.get(use_key, 0)), st.cum_red[use_key], npieces,
                      npush, nred, unroll(), link_token(), watchdog_s())
     if split:
         st.ext.ag_wait(comm.cuda_stream, c, row_bytes, gidx, pseq, slot, st.use[use_key], npieces, watchdog_s())
@@ -572,6 +618,185 @@ def all_gather(t: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]
     return view
 
 
+def all_gather_many(ts: list[torch.Tensor], fallback: Callable[[torch.Tensor], torch.Tensor]) -> list[torch.Tensor]:
+    """MK-5 (b): the device all-gather of 1..3 [c_t, K_t] tensors of the same open device phase as ONE pusher instance (one kernel, one
+    flag per peer, no per-phase team barrier when _TEAM=0) and one wait kernel - the MoE input's e4m3 rows + the packed small rows,
+    instead of two instances. Returns the gathered [4c_t, K_t] views (or fallback(t) per tensor when the device path cannot take them)."""
+    if mode() == "0" or not ag_enabled() or not multi_gather() or not split_mode() or len(ts) > 3:
+        return [all_gather(t, fallback) for t in ts]
+    g = _group_in_phase()
+    st = _STATE
+    if g is None or st is None or st.cur_pseq[g.idx & 1] < 0 or _capturing():
+        return [all_gather(t, fallback) for t in ts]
+    gidx = g.idx & 1
+    pseq = st.cur_pseq[gidx]
+    # eligibility of every tensor first (shapes, the arena, the trust state): all or nothing - a mixed phase runs the single-tensor path
+    ok = st.ag_index[gidx] < 4
+    for t in ts:
+        if t.dim() != 2 or not (t.is_cuda or _ALLOW_CPU) or (t.shape[1] * t.element_size()) % 16 or t.shape[0] <= 0 or st.trusted.get(("ag", t.shape[0])) is False:
+            ok = False
+    nbytes = [NSRC * t.shape[0] * t.shape[1] * t.element_size() for t in ts]
+    offs = []
+    cur = st.arena_cursor[gidx]
+    for nb in nbytes:
+        offs.append(cur)
+        cur = (cur + nb + 255) & ~255
+    if cur > st.arena_bytes:
+        ok = False
+    if not ok:
+        return [all_gather(t, fallback) for t in ts]
+    ts = [t.contiguous() for t in ts]
+    slot = 1 + st.ag_index[gidx]
+    st.ag_index[gidx] += 1
+    st.arena_cursor[gidx] = cur
+    use_key = (gidx, pseq & 1, slot)
+    npush = n_push()
+    st.use[use_key] = st.use.get(use_key, 0) + 1
+    if team_mode():
+        st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
+    st.cum_red[use_key] = st.cum_red.get(use_key, 0) + 1
+    comm = torch.cuda.current_stream()
+    kst = comm if stream_mode() == "comm" else st.streams[gidx]
+    views = [st.ext.arena_view(gidx, pseq & 1, off, NSRC * t.shape[0], t.shape[1], t) for off, t in zip(offs, ts)]
+    for v, t in zip(views, ts):
+        v[st.rank * t.shape[0]:(st.rank + 1) * t.shape[0]].copy_(t)  # my own shard into my arena
+    if kst is not comm:
+        ev_in = torch.cuda.Event()
+        ev_in.record(comm)
+        kst.wait_event(ev_in)
+    st.ext.ag_multi_launch(kst.cuda_stream, ts, offs, gidx, pseq, slot, st.use[use_key], max(npush, st.cum_push.get(use_key, 0)), npush, unroll(), watchdog_s())
+    st.ext.ag_wait(comm.cuda_stream, ts[0].shape[0], ts[0].shape[1] * ts[0].element_size(), gidx, pseq, slot, st.use[use_key], 1, watchdog_s())
+    if kst is not comm:
+        ev_out = torch.cuda.Event()
+        ev_out.record(kst)
+        comm.wait_event(ev_out)
+    _STATS["ag_device"] += len(ts)
+    _STATS["ag_multi_device"] += 1
+    outs = []
+    for v, t in zip(views, ts):
+        key = ("ag", t.shape[0])
+        if mode() == "verify" or (mode() == "1" and not st.trusted.get(key)):
+            ref = fallback(t)
+            _compare(st, "ag", t.shape[0], v, ref)
+            if mode() == "1":
+                st.verified[key] = st.verified.get(key, 0) + 1
+                _first_n_check(st, "ag", t.shape[0])
+            outs.append(ref)
+        else:
+            outs.append(v)
+    return outs
+
+
+def all_gatherv(local: torch.Tensor, sizes: list[int], out: torch.Tensor, fallback: Callable[[torch.Tensor], torch.Tensor]) -> bool:
+    """MK-5 (c): the indexer's variable-size all-gather (PrefillRowShard.exchange_topk: this rank's [sizes[rank], width] int32 top-k rows,
+    the result = the ranks' rows in rank order) through the device path, on the pipeline's comm stream in issue order (NCCL's place in
+    the one FIFO): the rows padded to max(sizes), pushed into the indexer arena idx[g][par], the valid rows copied into `out` on the
+    caller's stream. Returns True when `out` was written; False = the caller runs NCCL's all_gatherv. In verify mode / the first-N check
+    the NCCL result is compared and consumed (out gets NCCL's rows)."""
+    if mode() == "0" or not idx_gather() or not split_mode():
+        return False
+    st = _STATE
+    if st is None or st.idx_bytes == 0 or _capturing():
+        _STATS["idx_nccl_fallback"] += 1
+        return False
+    if _FORCE_GROUP is not None:
+        pipe, g = None, _FakeGroup(_FORCE_GROUP)
+    else:
+        pipe = _pipe()
+        g = pipe.current_group()
+        if g is None or g.step is None or not g.step.pipelined or g.phase_open:
+            _fallback("idx", "not inside a pipelined compute segment")
+            return False
+    if local.dim() != 2 or not (local.is_cuda or _ALLOW_CPU) or len(sizes) != NSRC or local.shape[0] != sizes[st.rank] or (local.shape[1] * local.element_size()) % 16:
+        _fallback("idx", f"shape {tuple(local.shape)} sizes {sizes}")
+        return False
+    gidx = g.idx & 1
+    max_rows = max(sizes)
+    width = local.shape[1]
+    row_bytes = width * local.element_size()
+    if max_rows <= 0 or NSRC * max_rows * row_bytes > st.idx_bytes:
+        _fallback("idx", f"{NSRC} x {max_rows} x {row_bytes} B exceeds the indexer arena")
+        return False
+    if st.trusted.get(("idx", width)) is False:
+        _fallback("idx", f"device all_gatherv at width {width} differed from NCCL")
+        return False
+    iseq = st.iseq[gidx]
+    par = iseq & 1
+    # reuse: the previous use of this parity was consumed by this group's attention block two layers ago, which ended before the RS
+    # of phase pseq - 4 began on the peer (consumed[g] = pseq is written when the RS of phase pseq starts); 0 = no check (first uses)
+    reuse_min = max(0, st.pseq[gidx] - 4)
+    use_key = (gidx, par, st.ext.IDX_SLOT)
+    npush = n_push()
+    st.use[use_key] = st.use.get(use_key, 0) + 1
+    if team_mode():
+        st.cum_push[use_key] = st.cum_push.get(use_key, 0) + npush
+    cur = torch.cuda.current_stream()
+    comm = cur
+    if _FORCE_GROUP is None:  # the pipeline's comm stream = NCCL's place in the one FIFO (the step's, else the runner's)
+        comm = getattr(g.step, "comm_stream", None) or getattr(getattr(pipe, "_RUNNER", None), "comm_stream", None) or cur
+    padded = torch.zeros((max_rows, width), dtype=local.dtype, device=local.device)  # zero pad rows: deterministic arena bytes
+    padded[: sizes[st.rank]].copy_(local)
+    view = st.ext.idx_view(gidx, par, NSRC * max_rows, width, local)
+    view[st.rank * max_rows: st.rank * max_rows + sizes[st.rank]].copy_(local)  # my own rows into my arena (the pushers serve the peers)
+    if comm is not cur:
+        ev_in = torch.cuda.Event()
+        ev_in.record(cur)
+        comm.wait_event(ev_in)
+        padded.record_stream(comm)  # read by the pushers on the comm stream
+    st.ext.idx_launch(comm.cuda_stream, padded, gidx, par, reuse_min, st.use[use_key], max(npush, st.cum_push.get(use_key, 0)), npush, unroll(), watchdog_s())
+    st.ext.idx_wait(comm.cuda_stream, gidx, par, st.use[use_key], watchdog_s())
+    if comm is not cur:
+        ev_out = torch.cuda.Event()
+        ev_out.record(comm)
+        cur.wait_event(ev_out)
+    st.iseq[gidx] = iseq + 1
+    _STATS["idx_device"] += 1
+    key = ("idx", width)
+    if mode() == "verify" or (mode() == "1" and not st.trusted.get(key)):
+        ref = fallback(local)
+        dev = torch.cat([view[r * max_rows: r * max_rows + sizes[r]] for r in range(NSRC)], dim=0)
+        _compare(st, "idx", width, dev, ref)
+        if mode() == "1":
+            st.verified[key] = st.verified.get(key, 0) + 1
+            _first_n_check(st, "idx", width)
+        out.copy_(ref)
+        return True
+    o = 0
+    for r in range(NSRC):
+        if sizes[r]:
+            out[o: o + sizes[r]].copy_(view[r * max_rows: r * max_rows + sizes[r]])
+        o += sizes[r]
+    return True
+
+
+def stamps_summary() -> dict | None:
+    """MK-5: the pushers' per-phase breakdown over the last launches (stamps on): medians in us of reuse wait, go / token wait,
+    pushes + flags, team wait, and the whole phase, per phase (peer offset 1..3) and over all; None when the stamps are off."""
+    st = _STATE
+    if st is None or not stamps_on():
+        return None
+    t = st.ext.read_stamps()  # [slots, n_push, 3, 5] int64 ns
+    valid = (t[..., 0] > 0) & (t[..., 4] >= t[..., 0])
+    if int(valid.sum()) == 0:
+        return {"launches": 0}
+    d = (t[..., 1:] - t[..., :-1]).to(torch.float64) / 1e3  # [slots, n_push, 3, 4] us: reuse, go, pushes, team
+    whole = (t[..., 4] - t[..., 0]).to(torch.float64) / 1e3
+    out: dict = {"launches": int((t[:, 0, 0, 0] > 0).sum())}
+    names = ("reuse_wait", "go_wait", "pushes_flags", "team_wait")
+    for ph in range(3):
+        m = valid[:, :, ph]
+        row = {n: round(float(d[:, :, ph, j][m].median()), 1) for j, n in enumerate(names)}
+        row["phase"] = round(float(whole[:, :, ph][m].median()), 1)
+        row["phase_p90"] = round(float(whole[:, :, ph][m].quantile(0.9)), 1)
+        out[f"peer+{ph + 1}"] = row
+    # the instance = max over CTAs of the last phase's end - min over CTAs of the first phase's start
+    inst = (t[:, :, 2, 4].max(dim=1).values - t[:, :, 0, 0].min(dim=1).values).to(torch.float64) / 1e3
+    inst = inst[(t[:, :, 0, 0] > 0).all(dim=1)]
+    if inst.numel():
+        out["instance_us"] = dict(median=round(float(inst.median()), 1), p90=round(float(inst.quantile(0.9)), 1), max=round(float(inst.max()), 1))
+    return out
+
+
 def step_done() -> None:
     """From the pipeline after a pipelined step: the watchdog record (a trapped kernel = a failed step, loudly) and the verify
     counters (one line per step in verify mode)."""
@@ -579,6 +804,11 @@ def step_done() -> None:
     if st is None:
         return
     _STATS["steps"] += 1
+    if stamps_on() and _STATS["steps"] % 50 == 0:  # MK-5: the in-situ breakdown of the RS pushes (a device sync every 50 steps)
+        try:
+            logger.info("vllm-moet sm_120 device comm stamps: step %d - %s", _STATS["steps"], stamps_summary())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("vllm-moet sm_120 device comm stamps unreadable: %r", exc)
     rec = st.ext.err_check()
     if rec[0]:
         _STATS["watchdog"] = dict(what=rec[1], expected=rec[2], seen=rec[3], cta=rec[4], rank=rec[5], g=rec[6], pseq=rec[7], waited_ms=rec[8] / 1e6)
@@ -591,12 +821,12 @@ def step_done() -> None:
         except Exception:  # noqa: BLE001 - unit tests without the pipeline
             pass
         n = int(st.v_n.item())
-        bad_rs, bad_ag = (int(v) for v in st.v_bad.tolist())
-        _STATS["verify_rs_mismatch"], _STATS["verify_ag_mismatch"] = bad_rs, bad_ag
+        bad_rs, bad_ag, bad_idx = (int(v) for v in st.v_bad.tolist())
+        _STATS["verify_rs_mismatch"], _STATS["verify_ag_mismatch"], _STATS["verify_idx_mismatch"] = bad_rs, bad_ag, bad_idx
         if mode() == "verify":
-            logger.info("vllm-moet sm_120 device comm verify: step %d - %d collectives compared so far (RS %d, AG %d), mismatches RS %d AG %d%s",
-                        _STATS["steps"], n, _STATS["verify_rs"], _STATS["verify_ag"], bad_rs, bad_ag,
-                        "" if bad_rs or bad_ag else " (all bit-identical with NCCL)")
+            logger.info("vllm-moet sm_120 device comm verify: step %d - %d collectives compared so far (RS %d, AG %d, indexer AGv %d), mismatches RS %d AG %d AGv %d%s",
+                        _STATS["steps"], n, _STATS["verify_rs"], _STATS["verify_ag"], _STATS["verify_idx"], bad_rs, bad_ag, bad_idx,
+                        "" if bad_rs or bad_ag or bad_idx else " (all bit-identical with NCCL)")
 
 
 def stats() -> dict:

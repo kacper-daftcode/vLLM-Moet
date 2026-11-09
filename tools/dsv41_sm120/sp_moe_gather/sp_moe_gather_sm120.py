@@ -300,8 +300,13 @@ def gather_moe_input(ffn, x_shard: torch.Tensor, num_tokens: int, input_ids: tor
         q_full, small_full = full[:, :k], full[:, k:]
         q_shared = q_full.contiguous()
     else:
-        q_full = all_gather(q, 0)[:num_tokens]
-        small_full = all_gather(small, 0)[:num_tokens]
+        pipe = _pipe_module()
+        if pipe is not None and hasattr(pipe, "device_all_gather_many"):
+            # [vllm-moet] MK-5 (b): both tensors as one device gather instance when the device path takes them (else per tensor)
+            q_full, small_full = (t[:num_tokens] for t in pipe.device_all_gather_many([q, small], lambda u: _nccl_all_gather(u, 0)))
+        else:
+            q_full = all_gather(q, 0)[:num_tokens]
+            small_full = all_gather(small, 0)[:num_tokens]
         q_shared = q_full
     s_full, ids_full, w_full = unpack_small(small_full, k, topk)
     if _one_all_gather():

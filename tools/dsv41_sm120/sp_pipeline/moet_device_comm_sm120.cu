@@ -30,6 +30,16 @@
 // after the compute segment that read the previous gather). A per-GPU link token (optional) serializes the push phases of the two
 // groups' concurrent instances (one destination per GPU at a time).
 //
+// MK-5 (the hybrid's last three levers, MK/BRIEF_MK5.md task 1):
+//   (a) staged pushers: each warp streams 512-B chunks of the source through a ring of `stages` smem slots (cp.async 16 B per lane) and
+//       stores every landed chunk to the peer - the loads no longer serialise on the warp with the stores (the register path waits for
+//       its 4 loads before it can store); `stages` x 512 B x warps of dynamic smem per pusher CTA (5 stages x 4 warps = 10 KB: still
+//       co-resident with fc1 v8 at 120 registers (43 392 B x 2 CTAs) and the SASS attention (87 040 B));
+//   (b) one gather instance per phase: ag_multi_launch pushes up to kMaxSrc source tensors into one arena with one kernel, each pusher
+//       walking its three peers on its own (no per-phase team barrier, no link token) and one flag per peer;
+//   (c) the indexer's all_gatherv on the device path: a separate arena [g][par] (idx) with an explicit reuse threshold (Args.reuse_min)
+//       and parity, pushed by the same kernel (slot kIdxSlot);
+//   per-phase %globaltimer stamps of the pushers (optional, Args.stamps) for the in-situ breakdown of a push.
 // build (torch.utils.cpp_extension.load): -O3 -std=c++20 -gencode arch=compute_120a,code=sm_120a -maxrregcount=32
 #include <torch/extension.h>
 #include <cuda_runtime.h>
@@ -45,7 +55,13 @@ constexpr int kGroups = 2;
 constexpr int kPar = 2;
 constexpr int kPhases = kWorld - 1;
 constexpr int kMaxPieces = 32;
-constexpr int kSlots = 5;                              // per phase: slot 0 = the RS, slots 1..4 = up to four all-gathers
+constexpr int kSlots = 6;                              // per phase: slot 0 = the RS, slots 1..4 = up to four all-gathers, slot 5 = the indexer's gather (MK-5 (c))
+constexpr int kIdxSlot = 5;
+constexpr int kMaxSrc = 3;                             // source tensors of one multi-gather instance (MK-5 (b))
+constexpr int kMaxStages = 16;                         // cp.async ring slots per warp (MK-5 (a)); 512 B each
+constexpr int kMaxPushWarps = 4;
+constexpr int kStampN = 5;                             // per pusher CTA and phase: start, reuse ok, go ok, pushes+flags done, team done
+constexpr int kStampSlots = 64;                        // ring of launches kept on the device
 constexpr int kThreads = 32;
 constexpr int kLineBytes = 128;
 constexpr int kStages = 3;
@@ -67,7 +83,8 @@ struct Layout {
   size_t token;       // 1 line
   size_t slots;       // [g][par][src] x slot_bytes
   size_t arena;       // [g][par] x arena_bytes
-  size_t slot_bytes, arena_bytes, total;
+  size_t idx;         // [g][par] x idx_bytes (MK-5 (c): the indexer's padded top-k rows)
+  size_t slot_bytes, arena_bytes, idx_bytes, total;
   int pieces;
 };
 constexpr int kCntArrive = 0;                                   // [ph][piece]
@@ -81,8 +98,9 @@ __host__ __device__ inline size_t off_ctrl(const Layout& L, int g, int which) { 
 __host__ __device__ inline size_t off_cnt(const Layout& L, int g, int par, int slot, int word) { return L.cnt + ((((size_t)g * kPar + par) * kSlots + slot) * kCntWords + word) * 4; }
 __host__ __device__ inline size_t off_slot(const Layout& L, int g, int par, int src) { return L.slots + (((size_t)g * kPar + par) * kWorld + src) * L.slot_bytes; }
 __host__ __device__ inline size_t off_arena(const Layout& L, int g, int par) { return L.arena + ((size_t)g * kPar + par) * L.arena_bytes; }
+__host__ __device__ inline size_t off_idx(const Layout& L, int g, int par) { return L.idx + ((size_t)g * kPar + par) * L.idx_bytes; }
 
-Layout make_layout(size_t slot_bytes, size_t arena_bytes, int pieces) {
+Layout make_layout(size_t slot_bytes, size_t arena_bytes, size_t idx_bytes, int pieces) {
   Layout L; memset(&L, 0, sizeof(L));
   size_t o = 0;
   L.flag = o; o += (size_t)kGroups * kPar * kSlots * kWorld * kMaxPieces * kLineBytes;
@@ -92,34 +110,44 @@ Layout make_layout(size_t slot_bytes, size_t arena_bytes, int pieces) {
   o = (o + 4095) & ~(size_t)4095;
   L.slots = o; o += (size_t)kGroups * kPar * kWorld * slot_bytes;
   L.arena = o; o += (size_t)kGroups * kPar * arena_bytes;
-  L.slot_bytes = slot_bytes; L.arena_bytes = arena_bytes; L.total = o; L.pieces = pieces;
+  L.idx = o; o += (size_t)kGroups * kPar * idx_bytes;
+  L.slot_bytes = slot_bytes; L.arena_bytes = arena_bytes; L.idx_bytes = idx_bytes; L.total = o; L.pieces = pieces;
   return L;
 }
 
 struct Args {
   int kind, rank, g;
-  uint32_t pseq;         // the group's phase sequence (monotonic): slot / arena parity, the reuse checks
-  int slot;              // 0 = RS, 1..4 = the k-th all-gather of the phase
+  uint32_t pseq;         // the group's phase sequence (monotonic): the flags' bookkeeping, the consumed word written by the RS
+  int par;               // the slot / arena parity of this instance (pseq & 1 for the phase collectives; the indexer gather has its own sequence)
+  uint32_t reuse_min;    // > 0: before pushing into peer q, q's control word (rs_done for an RS, consumed for a gather) must be >= this
+  int slot;              // 0 = RS, 1..4 = the k-th all-gather of the phase, 5 = the indexer's gather
   uint32_t use;          // how many times (g, par, slot) has been launched including this one (>= 1): the flags' value
   uint32_t arrive_target;// the host's cumulative pusher count of (g, par, slot) including this launch: the team barriers' target (the per-piece
                          // arrival words reset themselves: a launch may use fewer pieces than the previous one of this slot)
   uint32_t red_target;   // the host's cumulative pieces x reducers of (g, par, slot) including this launch: the reduce-done target
   int n_push, n_red, pieces, unroll;
   int link_token;
+  int team;              // 1: the pushers enter / leave every peer phase together (go + team barriers, the link token); 0: each walks its peers alone
+  int stages;            // 0: the register path (unroll x 16 B per lane in flight); >= 2: the cp.async ring of `stages` x 512 B per warp
   uint64_t wd_ns;
   // RS
   const uint8_t* x;      // [4c, row_bytes] partial (contiguous)
   uint8_t* out;          // [c, row_bytes]
   const uint8_t* table;  // [c * row_bytes / 8] u8 order codes (per 4 bf16)
-  // AG
-  const uint8_t* src;    // [c, row_bytes]
-  size_t arena_off;      // where the gathered [4c, row_bytes] starts inside arena[g][par]
+  // AG: nsrc source tensors [c_[t], row_bytes_[t]] into the destination arena at dst_base + arena_off[t] (rank-major rows)
+  int nsrc;
+  const uint8_t* src[kMaxSrc];
+  size_t arena_off[kMaxSrc];
+  int c_[kMaxSrc]; size_t row_bytes_[kMaxSrc];
+  size_t dst_base;       // byte offset of the destination arena [g][par] in the region (the gather arena or the indexer arena)
   // common
-  int c; size_t row_bytes;
+  int c; size_t row_bytes;  // RS: the shard; AG: tensor 0
   uint8_t* my;
   uint8_t* peer[kWorld];
   Layout L;
   ErrRec* err;
+  uint64_t* stamps;      // optional (nullptr = off): [kStampSlots][n_push][kPhases][kStampN] %globaltimer stamps of the pushers
+  int stamp_slot;
 };
 
 // ------------------------------------------------------------------------------------------------------- device helpers
@@ -197,6 +225,55 @@ __device__ __forceinline__ void push_range(const uint4* __restrict__ src, uint4*
   }
 }
 
+// MK-5 (a): the staged stripe - the warp's chunks (512 B = 32 lanes x 16 B) of [u0, u1) are c = u0/32 + wid + i * wstride (wid = the warp's
+// index among all pusher warps); chunk i goes through ring slot i % S by cp.async, and once landed (wait_group S-1 after S-1 chunks of
+// look-ahead) each lane stores its 16 B to the peer. The loads of S-1 chunks are in flight while a chunk is stored, so a DRAM / L2 miss
+// no longer stalls the warp's stores (the register path issues 4 loads, waits for all of them, then stores).
+template <int S>
+__device__ __forceinline__ void push_range_staged(const uint4* __restrict__ src, uint4* __restrict__ dst, size_t u0, size_t u1, int k, int n_push, uint4* ring) {
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nwarp = blockDim.x >> 5;
+  const size_t chunk0 = u0 / 32, nchunks = (u1 - u0 + 31) / 32;
+  const size_t wid = (size_t)k * nwarp + warp, wstride = (size_t)n_push * nwarp;
+  const size_t n_mine = (wid < nchunks) ? (nchunks - wid + wstride - 1) / wstride : 0;
+  ring += (size_t)warp * S * 32;
+  auto issue = [&](size_t i) {
+    const size_t unit = (chunk0 + wid + i * wstride) * 32 + lane;
+    if (unit < u1) cp_async16(ring + (i % S) * 32 + lane, src + unit);
+    cp_async_commit();
+  };
+  // the prologue always commits S-1 groups (empty ones beyond n_mine): at iteration i exactly S + i groups are committed, so wait_group<S-1>
+  // guarantees chunk i has landed also when the warp owns fewer than S-1 chunks (MK-6 block unit3: a 213-KB tensor over 64 warps = 6-7 chunks
+  // per warp at stages 8 stored ring slots before their cp.async landed - the only bits failure of the device path so far)
+  for (size_t i = 0; i < (size_t)(S - 1); ++i) issue(i);
+  for (size_t i = 0; i < n_mine; ++i) {
+    if (i + S - 1 < n_mine) issue(i + S - 1);
+    else cp_async_commit();  // an empty group keeps the count uniform: after wait_group<S-1> chunk i has landed
+    cp_async_wait<S - 1>();
+    __syncwarp();
+    const size_t unit = (chunk0 + wid + i * wstride) * 32 + lane;
+    if (unit < u1) {
+      const uint4 v = ring[(i % S) * 32 + lane];
+      asm volatile("st.global.v4.b32 [%0], {%1,%2,%3,%4};" ::"l"(dst + unit), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
+    }
+    __syncwarp();  // the slot is reused by the issue of chunk i + S at the next iteration
+  }
+  cp_async_wait<0>();
+}
+
+__device__ __forceinline__ void push_stripe(const Args& a, const uint4* src, uint4* dst, size_t u0, size_t u1, int k, uint4* ring) {
+  switch (a.stages) {
+    case 0: if (a.unroll >= 4) push_range<4>(src, dst, u0, u1, k, a.n_push); else push_range<2>(src, dst, u0, u1, k, a.n_push); break;
+    case 2: push_range_staged<2>(src, dst, u0, u1, k, a.n_push, ring); break;
+    case 3: push_range_staged<3>(src, dst, u0, u1, k, a.n_push, ring); break;
+    case 4: push_range_staged<4>(src, dst, u0, u1, k, a.n_push, ring); break;
+    case 5: push_range_staged<5>(src, dst, u0, u1, k, a.n_push, ring); break;
+    case 6: push_range_staged<6>(src, dst, u0, u1, k, a.n_push, ring); break;
+    case 8: push_range_staged<8>(src, dst, u0, u1, k, a.n_push, ring); break;
+    case 12: push_range_staged<12>(src, dst, u0, u1, k, a.n_push, ring); break;
+    default: push_range_staged<16>(src, dst, u0, u1, k, a.n_push, ring); break;
+  }
+}
+
 __device__ __forceinline__ void piece_range(size_t total_u, int piece, int pieces, size_t& u0, size_t& u1) {
   // piece boundaries on unit-row (512 B) multiples so that reducers' unit-rows never straddle pieces
   const size_t rows = (total_u + kThreads - 1) / kThreads;
@@ -205,76 +282,106 @@ __device__ __forceinline__ void piece_range(size_t total_u, int piece, int piece
   u1 = min(((size_t)piece + 1) * per * kThreads, total_u);
 }
 
+__device__ __forceinline__ void stamp(const Args& a, int k, int ph, int j) {
+  if (a.stamps != nullptr && threadIdx.x == 0) a.stamps[(((size_t)a.stamp_slot * a.n_push + k) * kPhases + ph) * kStampN + j] = gtimer();
+}
+
 // ------------------------------------------------------------------------------------------------------- pusher role
-__device__ void pusher(const Args& a) {
+// RS: the partial's rows of peer p into p's receive slot, in `pieces` pieces (a flag per piece); AG: the nsrc source tensors into p's
+// arena (one piece, one flag). team = 1: the pushers enter / leave every peer phase together (go word, team barrier, optional link token);
+// team = 0: each CTA walks its three peers on its own (MK-5 (b)) - the per-piece arrival words still count all n_push CTAs per piece.
+__device__ void pusher(const Args& a, uint4* ring) {
   const int k = blockIdx.x, lane = threadIdx.x;
-  const int par = a.pseq & 1;
+  const int par = a.par;
   const uint32_t use = a.use;
   uint8_t* my = a.my;
-  const size_t total_u = (size_t)a.c * a.row_bytes / 16;
   uint32_t* token = word(my, a.L.token);
   for (int ph = 0; ph < kPhases; ++ph) {
     const int p = (a.rank + 1 + ph) % kWorld;
     uint8_t* peer = a.peer[p];
+    stamp(a, k, ph, 0);
     // reuse check on the destination (one lane): the peer consumed the previous use of this parity
-    if (lane == 0 && a.pseq >= 2) {
-      if (a.kind == K_RS) wait_ge_sys(a, word(peer, off_ctrl(a.L, a.g, 0)), a.pseq - 1, E_REUSE_RS);
-      else wait_ge_sys(a, word(peer, off_ctrl(a.L, a.g, 1)), a.pseq - 1, E_REUSE_AG);
+    if (lane == 0 && a.reuse_min > 0) {
+      if (a.kind == K_RS) wait_ge_sys(a, word(peer, off_ctrl(a.L, a.g, 0)), a.reuse_min, E_REUSE_RS);
+      else wait_ge_sys(a, word(peer, off_ctrl(a.L, a.g, 1)), a.reuse_min, E_REUSE_AG);
     }
-    if (a.kind == K_RS && k == 0 && lane == 0 && a.n_red == 0) st_release_sys(word(my, off_ctrl(a.L, a.g, 1)), a.pseq);  // split mode: consumed[g] = pseq
-    // the team enters the phase together (one destination per team at a time); CTA 0 takes the per-GPU link token first
-    uint32_t* go = word(my, off_cnt(a.L, a.g, par, a.slot, kCntGo + ph));
-    if (lane == 0) {
-      if (k == 0) {
-        if (a.link_token) {
-          const uint64_t t0 = gtimer();
-          while (atomicCAS(token, 0u, 1u) != 0u) {
-            nanosleep_(500);
-            const uint64_t dt = gtimer() - t0;
-            if (dt > a.wd_ns) fail(a, E_TOKEN, 0, 1, dt);
+    stamp(a, k, ph, 1);
+    if (a.kind == K_RS && k == 0 && lane == 0 && a.n_red == 0 && ph == 0) st_release_sys(word(my, off_ctrl(a.L, a.g, 1)), a.pseq);  // split mode: consumed[g] = pseq
+    if (a.team) {
+      // the team enters the phase together (one destination per team at a time); CTA 0 takes the per-GPU link token first
+      uint32_t* go = word(my, off_cnt(a.L, a.g, par, a.slot, kCntGo + ph));
+      if (lane == 0) {
+        if (k == 0) {
+          if (a.link_token) {
+            const uint64_t t0 = gtimer();
+            while (atomicCAS(token, 0u, 1u) != 0u) {
+              nanosleep_(500);
+              const uint64_t dt = gtimer() - t0;
+              if (dt > a.wd_ns) fail(a, E_TOKEN, 0, 1, dt);
+            }
           }
+          st_release_gpu(go, use);
+        } else {
+          wait_ge_gpu(a, go, use, E_GO);
         }
-        st_release_gpu(go, use);
-      } else {
-        wait_ge_gpu(a, go, use, E_GO);
       }
     }
     __syncthreads();
-    const uint4* src; uint4* dst;
+    stamp(a, k, ph, 2);
     if (a.kind == K_RS) {
-      src = reinterpret_cast<const uint4*>(a.x + (size_t)p * a.c * a.row_bytes);
-      dst = reinterpret_cast<uint4*>(peer + off_slot(a.L, a.g, par, a.rank));
+      const size_t total_u = (size_t)a.c * a.row_bytes / 16;
+      const uint4* src = reinterpret_cast<const uint4*>(a.x + (size_t)p * a.c * a.row_bytes);
+      uint4* dst = reinterpret_cast<uint4*>(peer + off_slot(a.L, a.g, par, a.rank));
+      for (int piece = 0; piece < a.pieces; ++piece) {
+        size_t u0, u1; piece_range(total_u, piece, a.pieces, u0, u1);
+        push_stripe(a, src, dst, u0, u1, k, ring);
+        __syncthreads();
+        if (lane == 0) {
+          __threadfence_system();  // my stores to the peer are performed at system scope before I count
+          // per-piece arrival: the last of the n_push pushers resets the word for the next use (the next instance of this (g, par, slot)
+          // runs after this one on the same stream, so nobody touches it in between) and publishes the piece to the receiver
+          uint32_t* arrive = word(my, off_cnt(a.L, a.g, par, a.slot, kCntArrive + ph * kMaxPieces + piece));
+          const uint32_t old = atomicAdd(arrive, 1u);
+          if (old + 1 == (uint32_t)a.n_push) {
+            atomicExch(arrive, 0u);
+            uint32_t* flag = word(peer, off_flag(a.L, a.g, par, a.slot, a.rank, piece));
+            __threadfence_system();
+            st_release_sys(flag, use);
+          }
+        }
+      }
     } else {
-      src = reinterpret_cast<const uint4*>(a.src);
-      dst = reinterpret_cast<uint4*>(peer + off_arena(a.L, a.g, par) + a.arena_off + (size_t)a.rank * a.c * a.row_bytes);
-    }
-    for (int piece = 0; piece < a.pieces; ++piece) {
-      size_t u0, u1; piece_range(total_u, piece, a.pieces, u0, u1);
-      if (a.unroll >= 4) push_range<4>(src, dst, u0, u1, k, a.n_push);
-      else push_range<2>(src, dst, u0, u1, k, a.n_push);
+      for (int t = 0; t < a.nsrc; ++t) {
+        const size_t total_u = (size_t)a.c_[t] * a.row_bytes_[t] / 16;
+        const uint4* src = reinterpret_cast<const uint4*>(a.src[t]);
+        uint4* dst = reinterpret_cast<uint4*>(peer + a.dst_base + a.arena_off[t] + (size_t)a.rank * a.c_[t] * a.row_bytes_[t]);
+        push_stripe(a, src, dst, 0, total_u, k, ring);
+      }
       __syncthreads();
       if (lane == 0) {
-        __threadfence_system();  // my stores to the peer are performed at system scope before I count
-        // per-piece arrival: the last of the n_push pushers resets the word for the next use (the next instance of this (g, par, slot)
-        // runs after this one on the same stream, so nobody touches it in between) and publishes the piece to the receiver
-        uint32_t* arrive = word(my, off_cnt(a.L, a.g, par, a.slot, kCntArrive + ph * kMaxPieces + piece));
+        __threadfence_system();
+        uint32_t* arrive = word(my, off_cnt(a.L, a.g, par, a.slot, kCntArrive + ph * kMaxPieces + 0));
         const uint32_t old = atomicAdd(arrive, 1u);
         if (old + 1 == (uint32_t)a.n_push) {
           atomicExch(arrive, 0u);
-          uint32_t* flag = word(peer, off_flag(a.L, a.g, par, a.slot, a.rank, piece));
+          uint32_t* flag = word(peer, off_flag(a.L, a.g, par, a.slot, a.rank, 0));
           __threadfence_system();
           st_release_sys(flag, use);
         }
       }
     }
-    // the team leaves the phase together
-    uint32_t* team = word(my, off_cnt(a.L, a.g, par, a.slot, kCntTeam + ph));
-    if (lane == 0) {
-      atomicAdd(team, 1u);
-      wait_ge_gpu(a, team, a.arrive_target, E_TEAM);
-      if (k == 0 && a.link_token) { __threadfence(); atomicExch(token, 0u); }
+    stamp(a, k, ph, 3);
+    if (a.team) {
+      // the team leaves the phase together
+      uint32_t* team = word(my, off_cnt(a.L, a.g, par, a.slot, kCntTeam + ph));
+      if (lane == 0) {
+        atomicAdd(team, 1u);
+        wait_ge_gpu(a, team, a.arrive_target, E_TEAM);
+        if (k == 0 && a.link_token) { __threadfence(); atomicExch(token, 0u); }
+      }
     }
     __syncthreads();
+    stamp(a, k, ph, 4);
   }
 }
 
@@ -290,7 +397,7 @@ __device__ __forceinline__ uint2 hadd4(uint2 a, uint2 b) {
 
 __device__ void reducer_rs(const Args& a, uint8_t* smem) {
   const int j = blockIdx.x - a.n_push, lane = threadIdx.x;
-  const int par = a.pseq & 1;
+  const int par = a.par;
   const uint32_t use = a.use;
   uint8_t* my = a.my;
   if (blockIdx.x == a.n_push && lane == 0) st_release_sys(word(my, off_ctrl(a.L, a.g, 1)), a.pseq);  // consumed[g] = pseq: the previous phase's gather is consumed (stream order)
@@ -359,12 +466,12 @@ __device__ void reducer_rs(const Args& a, uint8_t* smem) {
 // ------------------------------------------------------------------------------------------------------- reducer role (AG)
 __device__ void reducer_ag(const Args& a) {
   const int j = blockIdx.x - a.n_push, lane = threadIdx.x;
-  const int par = a.pseq & 1;
+  const int par = a.par;
   uint8_t* my = a.my;
   // my own shard into my arena (interleaved over the reducers), 4 x 16 B in flight per lane
   {
-    const uint4* src = reinterpret_cast<const uint4*>(a.src);
-    uint4* dst = reinterpret_cast<uint4*>(my + off_arena(a.L, a.g, par) + a.arena_off + (size_t)a.rank * a.c * a.row_bytes);
+    const uint4* src = reinterpret_cast<const uint4*>(a.src[0]);
+    uint4* dst = reinterpret_cast<uint4*>(my + a.dst_base + a.arena_off[0] + (size_t)a.rank * a.c * a.row_bytes);
     const size_t total_u = (size_t)a.c * a.row_bytes / 16;
     push_range<4>(src, dst, 0, total_u, j, a.n_red);
   }
@@ -379,7 +486,7 @@ __device__ void reducer_ag(const Args& a) {
 
 __global__ void __maxnreg__(32) comm_kernel(Args a) {
   extern __shared__ __align__(16) uint8_t smem[];
-  if ((int)blockIdx.x < a.n_push) pusher(a);
+  if ((int)blockIdx.x < a.n_push) pusher(a, reinterpret_cast<uint4*>(smem));
   else if (a.kind == K_RS) reducer_rs(a, smem);
   else reducer_ag(a);
 }
@@ -389,7 +496,7 @@ __global__ void __maxnreg__(32) comm_kernel(Args a) {
 // 40-80 us), so NCCL's remaining kernels and the CUTLASS GEMMs see <= n_push occupied SMs instead of 144.
 __global__ void __maxnreg__(32) wait_kernel(Args a) {
   if (threadIdx.x == 0) {
-    const int par = a.pseq & 1;
+    const int par = a.par;
     for (int piece = 0; piece < a.pieces; ++piece)
       for (int r = 0; r < kWorld; ++r) if (r != a.rank) wait_ge_sys(a, word(a.my, off_flag(a.L, a.g, par, a.slot, r, piece)), a.use, a.kind == K_RS ? E_FLAG_RS : E_FLAG_AG);
     fence_acq_rel_sys();
@@ -397,7 +504,7 @@ __global__ void __maxnreg__(32) wait_kernel(Args a) {
 }
 constexpr int kRedThreads = 256;
 __global__ void __launch_bounds__(kRedThreads) reduce_kernel(Args a) {
-  const int par = a.pseq & 1;
+  const int par = a.par;
   const uint8_t* op[kWorld];
   for (int r = 0; r < kWorld; ++r) op[r] = (r == a.rank) ? a.x + (size_t)a.rank * a.c * a.row_bytes : a.my + off_slot(a.L, a.g, par, r);
   const size_t total_u = (size_t)a.c * a.row_bytes / 16;
@@ -438,15 +545,18 @@ __global__ void __launch_bounds__(kRedThreads) reduce_kernel(Args a) {
 struct State {
   Layout L; uint8_t* my = nullptr; uint8_t* peer[kWorld] = {nullptr, nullptr, nullptr, nullptr};
   ErrRec* err_host = nullptr; ErrRec* err_dev = nullptr; int rank = -1; bool attr_set = false;
+  uint64_t* stamps = nullptr; int stamp_n_push = 0; int stamp_next = 0;  // MK-5: the pushers' per-phase stamps (RS launches), a ring of kStampSlots
+  int stages = 0; int team = 1;                                            // MK-5 (a), (b): the pusher form of the next launches
 };
 State g_state;
 
 #define CK(x) do { cudaError_t e_ = (x); TORCH_CHECK(e_ == cudaSuccess, "[moet_device_comm] CUDA error ", #x, ": ", cudaGetErrorString(e_)); } while (0)
+constexpr int kMaxPushSmem = kMaxPushWarps * kMaxStages * 512;  // 32 KB: the largest staged ring
 
-std::vector<int64_t> init_region(int64_t rank, int64_t slot_bytes, int64_t arena_bytes, int64_t pieces) {
+std::vector<int64_t> init_region(int64_t rank, int64_t slot_bytes, int64_t arena_bytes, int64_t pieces, int64_t idx_bytes) {
   TORCH_CHECK(pieces >= 1 && pieces <= kMaxPieces, "pieces 1..32");  // the flag layout's maximum; every launch chooses <= this
   TORCH_CHECK(g_state.my == nullptr, "already initialised");
-  g_state.L = make_layout((size_t)slot_bytes, (size_t)arena_bytes, (int)pieces);
+  g_state.L = make_layout((size_t)slot_bytes, (size_t)arena_bytes, (size_t)idx_bytes, (int)pieces);
   g_state.rank = (int)rank;
   CK(cudaMalloc(&g_state.my, g_state.L.total));
   CK(cudaMemset(g_state.my, 0, g_state.L.total));
@@ -455,10 +565,30 @@ std::vector<int64_t> init_region(int64_t rank, int64_t slot_bytes, int64_t arena
   CK(cudaHostGetDevicePointer((void**)&g_state.err_dev, g_state.err_host, 0));
   for (int r = 0; r < kWorld; ++r) g_state.peer[r] = nullptr;
   g_state.peer[rank] = g_state.my;
-  CK(cudaFuncSetAttribute(comm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  CK(cudaFuncSetAttribute(comm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxPushSmem > kSmemBytes ? kMaxPushSmem : kSmemBytes));
   g_state.attr_set = true;
   CK(cudaDeviceSynchronize());
-  return {(int64_t)g_state.L.total, (int64_t)g_state.L.slots, (int64_t)g_state.L.arena, (int64_t)g_state.L.slot_bytes, (int64_t)g_state.L.arena_bytes};
+  return {(int64_t)g_state.L.total, (int64_t)g_state.L.slots, (int64_t)g_state.L.arena, (int64_t)g_state.L.slot_bytes, (int64_t)g_state.L.arena_bytes, (int64_t)g_state.L.idx_bytes};
+}
+// MK-5: the pusher form - stages (0 = the register path, 2..16 = the cp.async ring per warp), team (1 = phase barriers + token, 0 = free walk),
+// and the stamp ring (on = allocate [kStampSlots][n_push][kPhases][kStampN] u64 on the device)
+void set_push_form(int64_t stages, int64_t team, int64_t stamps, int64_t n_push) {
+  TORCH_CHECK(stages == 0 || (stages >= 2 && stages <= kMaxStages), "stages 0 or 2..16");
+  g_state.stages = (int)stages; g_state.team = team ? 1 : 0;
+  if (stamps && g_state.stamps == nullptr) {
+    const size_t n = (size_t)kStampSlots * n_push * kPhases * kStampN;
+    CK(cudaMalloc(&g_state.stamps, n * sizeof(uint64_t)));
+    CK(cudaMemset(g_state.stamps, 0, n * sizeof(uint64_t)));
+    g_state.stamp_n_push = (int)n_push;
+  }
+}
+// the stamps as a CPU tensor [kStampSlots, n_push, kPhases, kStampN] (a device sync; call it between steps)
+torch::Tensor read_stamps() {
+  TORCH_CHECK(g_state.stamps != nullptr, "stamps are off");
+  auto t = torch::empty({kStampSlots, g_state.stamp_n_push, kPhases, kStampN}, torch::dtype(torch::kInt64));
+  CK(cudaDeviceSynchronize());
+  CK(cudaMemcpy(t.data_ptr(), g_state.stamps, t.numel() * sizeof(int64_t), cudaMemcpyDeviceToHost));
+  return t;
 }
 py::bytes ipc_handle() {
   TORCH_CHECK(g_state.my != nullptr, "not initialised");
@@ -484,11 +614,26 @@ torch::Tensor arena_view(int64_t g, int64_t par, int64_t off, int64_t rows, int6
   TORCH_CHECK(off >= 0 && (size_t)off + (size_t)rows * cols * like.element_size() <= g_state.L.arena_bytes, "the view exceeds the arena");
   return torch::from_blob(g_state.my + off_arena(g_state.L, (int)g, (int)par) + off, {rows, cols}, like.options());
 }
+// MK-5 (c): the same for the indexer arena idx[g][par]
+torch::Tensor idx_view(int64_t g, int64_t par, int64_t rows, int64_t cols, torch::Tensor like) {
+  TORCH_CHECK(g_state.my != nullptr, "not initialised");
+  TORCH_CHECK(g >= 0 && g < kGroups && par >= 0 && par < kPar, "g / par");
+  TORCH_CHECK((size_t)rows * cols * like.element_size() <= g_state.L.idx_bytes, "the view exceeds the indexer arena");
+  return torch::from_blob(g_state.my + off_idx(g_state.L, (int)g, (int)par), {rows, cols}, like.options());
+}
 std::vector<int64_t> func_info() {
   cudaFuncAttributes fa; CK(cudaFuncGetAttributes(&fa, comm_kernel));
   int per_sm = 0; CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, comm_kernel, kThreads, kSmemBytes));
   cudaFuncAttributes fr; CK(cudaFuncGetAttributes(&fr, reduce_kernel));
   return {(int64_t)fa.numRegs, (int64_t)fa.sharedSizeBytes, (int64_t)kSmemBytes, (int64_t)fa.localSizeBytes, (int64_t)per_sm, (int64_t)fr.numRegs};
+}
+
+static int g_push_threads = kThreads;
+void set_push_warps(int64_t warps) { TORCH_CHECK(warps >= 1 && warps <= kMaxPushWarps, "1..4 warps per pusher CTA"); g_push_threads = (int)warps * 32; }
+// the dynamic smem of a pusher launch: the staged ring (warps x stages x 512 B) or the resident form's reducer ring
+static inline size_t push_smem(int n_red) {
+  if (n_red > 0) return kSmemBytes;
+  return g_state.stages > 0 ? (size_t)(g_push_threads / 32) * g_state.stages * 512 : 0;
 }
 
 static Args base_args(int kind, int64_t g, int64_t pseq, int64_t slot, int64_t use, int64_t arrive_target, int64_t red_target, int64_t pieces, int64_t n_push, int64_t n_red, int64_t unroll, int64_t link_token, double wd_s, int64_t c, int64_t row_bytes) {
@@ -497,21 +642,21 @@ static Args base_args(int kind, int64_t g, int64_t pseq, int64_t slot, int64_t u
   TORCH_CHECK(n_push >= 1 && n_red >= 0 && n_push + n_red <= 1024, "bad CTA counts");
   TORCH_CHECK(row_bytes % 16 == 0, "row bytes must be a multiple of 16");
   TORCH_CHECK((size_t)c * row_bytes <= g_state.L.slot_bytes || kind == K_AG, "the shard exceeds the slot");
-  TORCH_CHECK(slot >= 0 && slot < kSlots && (kind == K_RS) == (slot == 0), "slot 0 = RS, 1..4 = AG");
+  TORCH_CHECK(slot >= 0 && slot < kSlots && (kind == K_RS) == (slot == 0), "slot 0 = RS, 1..5 = AG");
   TORCH_CHECK(use >= 1 && arrive_target >= n_push && red_target >= 1, "use / targets");
   TORCH_CHECK(pieces >= 1 && pieces <= g_state.L.pieces, "pieces 1..", g_state.L.pieces);
   Args a; memset(&a, 0, sizeof(a));
   a.kind = kind; a.rank = g_state.rank; a.g = (int)g; a.pseq = (uint32_t)pseq; a.slot = (int)slot; a.use = (uint32_t)use;
+  a.par = (int)(pseq & 1); a.reuse_min = pseq >= 2 ? (uint32_t)(pseq - 1) : 0u;
   a.arrive_target = (uint32_t)arrive_target; a.red_target = (uint32_t)red_target; a.n_push = (int)n_push; a.n_red = (int)n_red;
   a.pieces = (int)pieces; a.unroll = (int)unroll; a.link_token = (int)link_token; a.wd_ns = (uint64_t)(wd_s * 1e9);
+  a.team = g_state.team; a.stages = n_red > 0 ? 0 : g_state.stages;  // the resident form keeps the register path (its smem is the reducers')
   a.c = (int)c; a.row_bytes = (size_t)row_bytes; a.my = g_state.my;
+  a.nsrc = 1; a.dst_base = off_arena(g_state.L, (int)g, a.par);
   for (int r = 0; r < kWorld; ++r) a.peer[r] = g_state.peer[r];
   a.L = g_state.L; a.err = g_state.err_dev;
   return a;
 }
-
-static int g_push_threads = kThreads;
-void set_push_warps(int64_t warps) { TORCH_CHECK(warps >= 1 && warps <= 4, "1..4 warps per pusher CTA"); g_push_threads = (int)warps * 32; }
 
 void rs_launch(int64_t stream, torch::Tensor x, torch::Tensor out, torch::Tensor table, int64_t g, int64_t pseq, int64_t use, int64_t arrive_target,
                int64_t red_target, int64_t pieces, int64_t n_push, int64_t n_red, int64_t unroll, int64_t link_token, double wd_s) {
@@ -523,7 +668,8 @@ void rs_launch(int64_t stream, torch::Tensor x, torch::Tensor out, torch::Tensor
   Args a = base_args(K_RS, g, pseq, 0, use, arrive_target, red_target, pieces, n_push, n_red, unroll, link_token, wd_s, c, row_bytes);
   a.x = reinterpret_cast<const uint8_t*>(x.data_ptr()); a.out = reinterpret_cast<uint8_t*>(out.data_ptr()); a.table = reinterpret_cast<const uint8_t*>(table.data_ptr());
   TORCH_CHECK(n_red == 0 || g_push_threads == kThreads, "multi-warp pushers only in split mode (n_red = 0)");
-  comm_kernel<<<(unsigned)(n_push + n_red), (unsigned)(n_red == 0 ? g_push_threads : kThreads), kSmemBytes, (cudaStream_t)stream>>>(a);
+  if (g_state.stamps != nullptr && n_red == 0 && (int)n_push == g_state.stamp_n_push) { a.stamps = g_state.stamps; a.stamp_slot = g_state.stamp_next; g_state.stamp_next = (g_state.stamp_next + 1) % kStampSlots; }
+  comm_kernel<<<(unsigned)(n_push + n_red), (unsigned)(n_red == 0 ? g_push_threads : kThreads), push_smem((int)n_red), (cudaStream_t)stream>>>(a);
   CK(cudaGetLastError());
 }
 // split mode: the bounded wait for the three sources' pieces (1 CTA) and the transient reduce (grid CTAs x 256), both on the comm stream
@@ -542,15 +688,52 @@ void ag_wait(int64_t stream, int64_t c, int64_t row_bytes, int64_t g, int64_t ps
   wait_kernel<<<1, 32, 0, (cudaStream_t)stream>>>(a);
   CK(cudaGetLastError());
 }
+// MK-5 (c): the wait for the indexer gather (slot kIdxSlot, its own parity)
+void idx_wait(int64_t stream, int64_t g, int64_t par, int64_t use, double wd_s) {
+  Args a = base_args(K_AG, g, 0, kIdxSlot, use, 1, 1, 1, 1, 0, 4, 0, wd_s, 16, 16);
+  a.par = (int)par;
+  wait_kernel<<<1, 32, 0, (cudaStream_t)stream>>>(a);
+  CK(cudaGetLastError());
+}
 void ag_launch(int64_t stream, torch::Tensor src, int64_t arena_off, int64_t g, int64_t pseq, int64_t slot, int64_t use, int64_t arrive_target,
                int64_t red_target, int64_t pieces, int64_t n_push, int64_t n_red, int64_t unroll, int64_t link_token, double wd_s) {
   TORCH_CHECK(src.is_cuda() && src.is_contiguous() && src.dim() == 2, "src: contiguous 2-D CUDA");
   const int64_t c = src.size(0), row_bytes = src.size(1) * src.element_size();
   TORCH_CHECK((size_t)arena_off + (size_t)kWorld * c * row_bytes <= g_state.L.arena_bytes, "the gather exceeds the arena");
   Args a = base_args(K_AG, g, pseq, slot, use, arrive_target, red_target, pieces, n_push, n_red, unroll, link_token, wd_s, c, row_bytes);
-  a.src = reinterpret_cast<const uint8_t*>(src.data_ptr()); a.arena_off = (size_t)arena_off;
+  a.src[0] = reinterpret_cast<const uint8_t*>(src.data_ptr()); a.arena_off[0] = (size_t)arena_off; a.c_[0] = (int)c; a.row_bytes_[0] = (size_t)row_bytes;
   TORCH_CHECK(n_red == 0 || g_push_threads == kThreads, "multi-warp pushers only in split mode (n_red = 0)");
-  comm_kernel<<<(unsigned)(n_push + n_red), (unsigned)(n_red == 0 ? g_push_threads : kThreads), kSmemBytes, (cudaStream_t)stream>>>(a);
+  comm_kernel<<<(unsigned)(n_push + n_red), (unsigned)(n_red == 0 ? g_push_threads : kThreads), push_smem((int)n_red), (cudaStream_t)stream>>>(a);
+  CK(cudaGetLastError());
+}
+// MK-5 (b): one instance for up to kMaxSrc source tensors into one arena (split mode only: pushers + a wait kernel); every pusher walks its
+// three peers alone when team = 0 (set_push_form). offs = the byte offsets of the gathered [4c_t, row_bytes_t] blocks in arena[g][par].
+void ag_multi_launch(int64_t stream, std::vector<torch::Tensor> srcs, std::vector<int64_t> offs, int64_t g, int64_t pseq, int64_t slot, int64_t use,
+                     int64_t arrive_target, int64_t n_push, int64_t unroll, double wd_s) {
+  TORCH_CHECK(srcs.size() >= 1 && srcs.size() <= (size_t)kMaxSrc && offs.size() == srcs.size(), "1..3 sources with offsets");
+  const int64_t c0 = srcs[0].size(0), rb0 = srcs[0].size(1) * srcs[0].element_size();
+  Args a = base_args(K_AG, g, pseq, slot, use, arrive_target, 1, 1, n_push, 0, unroll, 0, wd_s, c0, rb0);
+  a.nsrc = (int)srcs.size();
+  for (size_t t = 0; t < srcs.size(); ++t) {
+    const torch::Tensor& s = srcs[t];
+    TORCH_CHECK(s.is_cuda() && s.is_contiguous() && s.dim() == 2, "src: contiguous 2-D CUDA");
+    const int64_t c = s.size(0), rb = s.size(1) * s.element_size();
+    TORCH_CHECK(rb % 16 == 0, "row bytes must be a multiple of 16");
+    TORCH_CHECK(offs[t] >= 0 && (size_t)offs[t] + (size_t)kWorld * c * rb <= g_state.L.arena_bytes, "the gather exceeds the arena");
+    a.src[t] = reinterpret_cast<const uint8_t*>(s.data_ptr()); a.arena_off[t] = (size_t)offs[t]; a.c_[t] = (int)c; a.row_bytes_[t] = (size_t)rb;
+  }
+  comm_kernel<<<(unsigned)n_push, (unsigned)g_push_threads, push_smem(0), (cudaStream_t)stream>>>(a);
+  CK(cudaGetLastError());
+}
+// MK-5 (c): the indexer's padded top-k rows [rows, width] int32 into idx[g][par] (rank-major), reuse gated on the peers' consumed[g] >= reuse_min
+void idx_launch(int64_t stream, torch::Tensor src, int64_t g, int64_t par, int64_t reuse_min, int64_t use, int64_t arrive_target, int64_t n_push, int64_t unroll, double wd_s) {
+  TORCH_CHECK(src.is_cuda() && src.is_contiguous() && src.dim() == 2, "src: contiguous 2-D CUDA");
+  const int64_t c = src.size(0), row_bytes = src.size(1) * src.element_size();
+  TORCH_CHECK((size_t)kWorld * c * row_bytes <= g_state.L.idx_bytes, "the indexer gather exceeds its arena");
+  Args a = base_args(K_AG, g, 0, kIdxSlot, use, arrive_target, 1, 1, n_push, 0, unroll, 0, wd_s, c, row_bytes);
+  a.par = (int)par; a.reuse_min = (uint32_t)reuse_min; a.dst_base = off_idx(g_state.L, (int)g, (int)par);
+  a.src[0] = reinterpret_cast<const uint8_t*>(src.data_ptr()); a.arena_off[0] = 0; a.c_[0] = (int)c; a.row_bytes_[0] = (size_t)row_bytes;
+  comm_kernel<<<(unsigned)n_push, (unsigned)g_push_threads, push_smem(0), (cudaStream_t)stream>>>(a);
   CK(cudaGetLastError());
 }
 std::vector<int64_t> err_check() {
@@ -568,20 +751,29 @@ std::vector<int64_t> ctrl_offsets(int64_t g) { return {(int64_t)off_ctrl(g_state
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("init_region", &init_region, "allocate my IPC region (rank, slot_bytes, arena_bytes, pieces) -> [total, slots_off, arena_off, slot_bytes, arena_bytes]");
+  m.def("init_region", &init_region, "allocate my IPC region (rank, slot_bytes, arena_bytes, pieces, idx_bytes) -> [total, slots_off, arena_off, slot_bytes, arena_bytes, idx_bytes]");
   m.def("ipc_handle", &ipc_handle);
   m.def("open_peer", &open_peer);
   m.def("arena_ptr", &arena_ptr);
   m.def("arena_view", &arena_view, "(g, par, off, rows, cols, like) -> a tensor aliasing the arena");
+  m.def("idx_view", &idx_view, "(g, par, rows, cols, like) -> a tensor aliasing the indexer arena (MK-5 (c))");
   m.def("func_info", &func_info, "[regs, static smem, dynamic smem, local bytes, max CTAs per SM]");
   m.def("rs_launch", &rs_launch);
   m.def("ag_launch", &ag_launch);
+  m.def("ag_multi_launch", &ag_multi_launch, "MK-5 (b): one pusher instance for 1..3 source tensors (split mode)");
+  m.def("idx_launch", &idx_launch, "MK-5 (c): the indexer gather's pushers (split mode)");
+  m.def("idx_wait", &idx_wait, "MK-5 (c): the bounded wait for the indexer gather");
   m.def("rs_wait_reduce", &rs_wait_reduce, "split mode: the bounded wait + the transient reduce on the comm stream");
   m.def("ag_wait", &ag_wait, "split mode: the bounded wait for the gathered pieces on the comm stream");
   m.def("set_push_warps", &set_push_warps, "1..4 warps per pusher CTA (split mode)");
+  m.def("set_push_form", &set_push_form, "MK-5: (stages, team, stamps, n_push) - the pusher form of the next launches");
+  m.def("read_stamps", &read_stamps, "MK-5: the pushers' per-phase %globaltimer stamps [slots, n_push, 3, 5] (device sync)");
   m.def("err_check", &err_check);
   m.def("read_word", &read_word);
   m.def("ctrl_offsets", &ctrl_offsets);
   m.attr("WORLD") = kWorld;
   m.attr("SMEM_BYTES") = kSmemBytes;
+  m.attr("IDX_SLOT") = kIdxSlot;
+  m.attr("MAX_SRC") = kMaxSrc;
+  m.attr("STAMP_SLOTS") = kStampSlots;
 }

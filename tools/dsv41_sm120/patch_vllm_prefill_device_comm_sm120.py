@@ -80,10 +80,57 @@ ATTN_EDITS = [
     ),
 ]
 
+# MK-5 (c): the sparse-attention indexer's variable-size top-k gather (PrefillRowShard.exchange_topk, NCCL on the compute stream)
+# through the device path when VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_IDX=1; this file has no _moet_pipe import, so the hook resolves the
+# pipeline module lazily
+INDEXER_HOOK = (
+    "\n\n# " + MARKER + " (MK-5 (c)): the indexer's variable-size top-k gather through the pipelined step's device path\n"
+    "_MOET_PIPE = None\n"
+    "\n"
+    "\n"
+    "def _moet_device_all_gatherv(local: torch.Tensor, sizes: list[int], out: torch.Tensor) -> bool:\n"
+    "    global _MOET_PIPE\n"
+    "    if _MOET_PIPE is None:\n"
+    "        _MOET_PIPE = False\n"
+    "        try:\n"
+    "            from vllm.v1.worker import moet_prefill_pipe as pipe\n"
+    "\n"
+    "            if getattr(pipe, \"device_comm_mode\", lambda: \"0\")() != \"0\" and hasattr(pipe, \"device_all_gatherv\"):\n"
+    "                _MOET_PIPE = pipe\n"
+    "        except Exception:  # noqa: BLE001\n"
+    "            _MOET_PIPE = False\n"
+    "    if not _MOET_PIPE:\n"
+    "        return False\n"
+    "    return _MOET_PIPE.device_all_gatherv(local, sizes, out, lambda u: get_tp_group().all_gatherv(u, dim=0, sizes=sizes))\n"
+    "\n"
+    "\n"
+    "class PrefillRowShard:"
+)
+INDEXER_EDITS = [
+    ("the hook", "\n\nclass PrefillRowShard:", INDEXER_HOOK),
+    (
+        "exchange_topk",
+        "        local = topk_buffer[self.start : self.stop, :width].contiguous()\n"
+        "        end = self.num_decode_tokens + sum(self.sizes)\n"
+        "        topk_buffer[self.num_decode_tokens : end, :width] = get_tp_group().all_gatherv(\n"
+        "            local, dim=0, sizes=self.sizes\n"
+        "        )\n",
+        "        local = topk_buffer[self.start : self.stop, :width].contiguous()\n"
+        "        end = self.num_decode_tokens + sum(self.sizes)\n"
+        "        out = topk_buffer[self.num_decode_tokens : end, :width]\n"
+        f"        # {MARKER} (MK-5 (c)): the gather through the device path inside a pipelined step\n"
+        "        if _moet_device_all_gatherv(local, self.sizes, out):\n"
+        "            return\n"
+        "        out[...] = get_tp_group().all_gatherv(local, dim=0, sizes=self.sizes)\n",
+    ),
+]
+
 FILES = [
     ("models/deepseek_v41/nvidia/model.py", MODEL_EDITS),
     ("models/deepseek_v41/attention.py", ATTN_EDITS),
+    ("model_executor/layers/sparse_attn_indexer.py", INDEXER_EDITS),
 ]
+NO_PIPE_IMPORT = {"model_executor/layers/sparse_attn_indexer.py"}  # files the pipeline patcher does not touch (the hook imports lazily)
 
 
 def patch_text(src: str, edits) -> tuple[str, str]:
@@ -116,7 +163,7 @@ def main() -> int:
             rc = 1
             continue
         src = path.read_text()
-        if "_moet_pipe" not in src:
+        if "_moet_pipe" not in src and rel not in NO_PIPE_IMPORT:
             print(f"{rel}: the pipeline patcher has not run on this file (no _moet_pipe) - apply patch_vllm_prefill_pipe_sm120.py first")
             rc = 1
             continue

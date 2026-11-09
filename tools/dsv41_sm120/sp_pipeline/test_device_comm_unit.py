@@ -101,6 +101,44 @@ class FakeExt:
         n = rows * cols * like.element_size()
         return self.arena[g][par][off: off + n].view(like.dtype).view(rows, cols)
 
+    # MK-5 (b): one instance for several tensors - the same landing as ag_launch per tensor, one launch record
+    def ag_multi_launch(self, stream, srcs, offs, g, pseq, slot, use, arrive_target, n_push, unroll, wd):
+        assert arrive_target >= n_push and 1 <= len(srcs) <= 3 and len(offs) == len(srcs)
+        self.launches.append(("ag_multi", g, pseq, slot, use, tuple(offs), len(srcs)))
+        for src, off in zip(srcs, offs):
+            c, k = src.shape
+            rb = k * src.element_size()
+            for r in range(4):
+                if r == self.rank:
+                    continue
+                rows = self.peer_shard(src, r)
+                self.arena[g][pseq & 1][off + r * c * rb: off + (r + 1) * c * rb] = rows.contiguous().view(torch.uint8).reshape(-1)
+
+    # MK-5 (c): the indexer arena [g][par] and its gather (the peers' padded rows = this rank's rotated by rank, as the test's world)
+    IDX_SLOT = 5
+
+    def idx_view(self, g, par, rows, cols, like):
+        if not hasattr(self, "idx"):
+            self.idx = [[torch.zeros(self.arena_bytes, dtype=torch.uint8) for _ in range(2)] for _ in range(2)]
+        n = rows * cols * like.element_size()
+        return self.idx[g][par][:n].view(like.dtype).view(rows, cols)
+
+    def idx_launch(self, stream, src, g, par, reuse_min, use, arrive_target, n_push, unroll, wd):
+        assert arrive_target >= n_push
+        self.launches.append(("idx", g, par, reuse_min, use))
+        c, k = src.shape
+        rb = k * src.element_size()
+        for r in range(4):
+            if r == self.rank:
+                continue
+            self.idx[g][par][r * c * rb: (r + 1) * c * rb] = self.peer_shard(src, r).contiguous().view(torch.uint8).reshape(-1)
+
+    def idx_wait(self, stream, g, par, use, wd):
+        self.launches.append(("idx_wait", g, par, use))
+
+    def set_push_form(self, stages, team, stamps, n_push):
+        self.form = (stages, team, stamps, n_push)
+
     def err_check(self):
         return list(self.err)
 
@@ -114,7 +152,8 @@ def fake_state(ext: FakeExt) -> dc._State:
     st.slot_bytes = 1024 * 5120 * 2
     st.arena_bytes = ext.arena_bytes
     st.v_n = torch.zeros((), dtype=torch.int64)
-    st.v_bad = torch.zeros(2, dtype=torch.int64)
+    st.v_bad = torch.zeros(3, dtype=torch.int64)
+    st.idx_bytes = ext.arena_bytes
     return st
 
 
@@ -294,6 +333,73 @@ class DeviceCommUnit(unittest.TestCase):
         # the slot / arena parity alternates with the phase sequence
         self.assertEqual([l[2] & 1 for l in self.ext.launches if l[0] == "rs"], [0, 1, 0])
         self.assertEqual(len([l for l in self.ext.launches if l[0] == "rs_wait_reduce"]), 3)  # split mode: a wait + reduce per RS
+
+    def test_ag_many_one_instance_per_phase(self):
+        # MK-5 (b): two tensors of one phase -> one ag_multi launch with two arena offsets, both gathered rows equal NCCL's; a tensor
+        # the device path cannot take (odd row bytes) sends the whole call down the single-tensor path (fallback per tensor)
+        os.environ["VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_MULTI"] = "1"
+        try:
+            self._install_table()
+            self.st.trusted[("rs", self.m)] = True
+            parts, ref, fb, calls = self._rs(500)
+            dc.reduce_scatter(parts[0], fb)
+            c = self.m // 4
+            nccl = lambda u: torch.cat([FakeExt.peer_shard(u, r) for r in range(4)])  # noqa: E731
+            q = torch.randint(0, 256, (c, 64), dtype=torch.uint8)
+            small = torch.randint(0, 256, (c, 16), dtype=torch.uint8)
+            self.st.trusted[("ag", c)] = True
+            got = dc.all_gather_many([q, small], nccl)
+            self.assertTrue(torch.equal(got[0], nccl(q)))
+            self.assertTrue(torch.equal(got[1], nccl(small)))
+            multi = [l for l in self.ext.launches if l[0] == "ag_multi"]
+            self.assertEqual(len(multi), 1)
+            self.assertEqual(multi[0][3], 1)  # slot 1
+            self.assertEqual(multi[0][5], (0, 4096))  # q's 4 x 16 x 64 B, then small (256-B aligned)
+            self.assertEqual(multi[0][6], 2)
+            self.assertEqual(len([l for l in self.ext.launches if l[0] == "ag_wait"]), 1)  # one wait for both
+            self.assertEqual(self.st.ag_index[0], 1)
+            self.assertEqual(dc._STATS["ag_multi_device"], 1)
+            odd = torch.zeros((c, 3), dtype=torch.uint8)
+            got = dc.all_gather_many([q, odd], nccl)
+            self.assertTrue(torch.equal(got[0], nccl(q)) and torch.equal(got[1], nccl(odd)))
+            self.assertEqual(dc._STATS["fallback_reasons"].get("row bytes 3"), 1)
+            self.assertEqual(len([l for l in self.ext.launches if l[0] == "ag"]), 1)  # q alone went through the single path
+        finally:
+            os.environ.pop("VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_MULTI", None)
+
+    def test_all_gatherv_indexer_rows(self):
+        # MK-5 (c): variable per-rank row counts, padded to the max, the valid rows of every rank land in `out` in rank order; the
+        # parity alternates per call, the reuse threshold follows the group's phase sequence; verify mode compares and consumes NCCL's
+        os.environ["VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_IDX"] = "1"
+        try:
+            self._install_table()
+            self.st.trusted[("rs", self.m)] = True
+            sizes = [5, 3, 6, 2]
+            width = 8  # 32-B rows (int32)
+            dc._FORCE_GROUP = 0
+            for i in range(3):
+                local = torch.randint(0, 1 << 20, (sizes[0], width), dtype=torch.int32)
+                # the test's world: rank r's rows = this rank's rotated by r (peer_shard), sizes differ -> the fake pads like the module
+                def nccl(u):
+                    pads = [FakeExt.peer_shard(torch.cat([u, torch.zeros(max(sizes) - sizes[0], width, dtype=torch.int32)]), r)[: sizes[r]] for r in range(4)]
+                    return torch.cat(pads)
+                out = torch.zeros((sum(sizes), width), dtype=torch.int32)
+                self.assertTrue(dc.all_gatherv(local, sizes, out, nccl))
+                self.assertTrue(torch.equal(out, nccl(local)), i)
+            idx = [l for l in self.ext.launches if l[0] == "idx"]
+            self.assertEqual([l[2] for l in idx], [0, 1, 0])  # the parity alternates
+            self.assertEqual([l[3] for l in idx], [0, 0, 0])  # no phases yet: no reuse threshold
+            self.assertEqual([l[4] for l in idx], [1, 1, 2])  # use counts per parity
+            self.st.pseq[0] = 9
+            local = torch.randint(0, 1 << 20, (sizes[0], width), dtype=torch.int32)
+            out = torch.zeros((sum(sizes), width), dtype=torch.int32)
+            self.assertTrue(dc.all_gatherv(local, sizes, out, nccl))
+            self.assertEqual([l for l in self.ext.launches if l[0] == "idx"][-1][3], 5)  # reuse_min = pseq - 4
+            self.assertEqual(dc._STATS["idx_device"], 4)
+            bad = torch.zeros((sizes[0], 3), dtype=torch.int32)  # 12-B rows
+            self.assertFalse(dc.all_gatherv(bad, sizes, out, nccl))
+        finally:
+            os.environ.pop("VLLM_MOET_PREFILL_PIPE_DEVICE_COMM_IDX", None)
 
     def test_ag_without_device_phase_falls_back(self):
         t = torch.randint(0, 256, (16, 64), dtype=torch.uint8)
