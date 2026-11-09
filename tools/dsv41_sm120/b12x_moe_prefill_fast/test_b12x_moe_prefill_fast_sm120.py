@@ -48,6 +48,11 @@ def main() -> int:
     os.environ.setdefault("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
     import torch
     from b12x_moe_prefill_fast_sm120 import moe_prefill_fast, prequant_rows_supported, strided_rows_supported
+    try:  # K-12: with SUM_ITEMS=1 + SUM_DISCARD=1 the route rows are summed and dropped in-kernel (scratch): compare the output only
+        from b12x_moe_prefill_fast_sm120 import route_rows_consumed
+        route_scratch = bool(route_rows_consumed())
+    except ImportError:
+        route_scratch = False
     from b12x_moe_prefill_spec_sm120 import expert_sorted_rows, moe_prefill_spec
     from test_b12x_moe_prefill_spec_sm120 import _planes, _served
     import b12x.moe.fused_moe._impl as impl
@@ -118,9 +123,10 @@ def main() -> int:
         # route rows and output vs b12x and vs the spec
         for name, route_r, out_r in (("b12x", route_b, out_b), ("spec", route_s, out_s)):
             same_rows = (route_m[valid].view(torch.int16) == route_r[valid].view(torch.int16)).all(dim=1)
-            r_ok = bool(same_rows.all())
+            r_ok = bool(same_rows.all()) or route_scratch
             o_ok = same(out_m, out_r)
-            msg.append(f"vs {name}: route rows {int(same_rows.sum())}/{valid.numel()}, output {'IDENTICAL' if o_ok else 'DIFFER'}")
+            rr = "route rows consumed in-kernel (scratch, not compared)" if route_scratch else f"route rows {int(same_rows.sum())}/{valid.numel()}"
+            msg.append(f"vs {name}: {rr}, output {'IDENTICAL' if o_ok else 'DIFFER'}")
             if not r_ok:
                 for p in valid[~same_rows][:3].tolist():
                     d = (route_m[p].float() - route_r[p].float()).abs()
@@ -142,6 +148,8 @@ def main() -> int:
                                ("counts", r[7][:3], counts_m[:3]), ("inter", r[4][valid, :N], inter_m[valid, :N]),
                                ("inter_sf", r[5].view(-1, 20)[valid, :18], isf_m8), ("route", r[1][valid], route_m[valid]),
                                ("out", r[0], out_m)):
+                if name == "route" and route_scratch:
+                    continue
                 if not same(x, y):
                     xi = x.view(torch.int16) if x.dtype == torch.bfloat16 else x
                     yi = y.view(torch.int16) if y.dtype == torch.bfloat16 else y
@@ -166,7 +174,7 @@ def main() -> int:
         if prequant_rows_supported():
             res_q = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=av_m, a_scales=as_m, **kw)
             torch.cuda.synchronize()
-            pq_ok = same(res_q[0], out_m) and same(res_q[1][valid], route_m[valid]) and same(res_q[4][valid, :N], inter_m[valid, :N])
+            pq_ok = same(res_q[0], out_m) and (route_scratch or same(res_q[1][valid], route_m[valid])) and same(res_q[4][valid, :N], inter_m[valid, :N])
             msg.append(f"pre-quantized rows entry {'identical' if pq_ok else 'DIFFER'}")
             ok &= pq_ok
             # the same rows as row-strided views of ONE buffer (the one-all-gather layout: per row the K e4m3 bytes,
@@ -178,7 +186,7 @@ def main() -> int:
                 buf[:, Kq:Kq + Kq // 32] = as_m
                 res_s = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=buf[:, :Kq], a_scales=buf[:, Kq:Kq + Kq // 32], **kw)
                 torch.cuda.synchronize()
-                st_ok = same(res_s[0], out_m) and same(res_s[1][valid], route_m[valid]) and same(res_s[4][valid, :N], inter_m[valid, :N])
+                st_ok = same(res_s[0], out_m) and (route_scratch or same(res_s[1][valid], route_m[valid])) and same(res_s[4][valid, :N], inter_m[valid, :N])
                 msg.append(f"strided rows (one-buffer layout, row stride {Kq + Kq // 32 + 48}) {'identical' if st_ok else 'DIFFER'}")
                 ok &= st_ok
         msg.append(f"time b12x {tb:.2f} ms, ours {min(t for _, t in runs):.2f} ms (eager, host included)")

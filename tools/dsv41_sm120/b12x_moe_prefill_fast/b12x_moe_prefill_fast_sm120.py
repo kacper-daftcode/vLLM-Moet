@@ -40,6 +40,13 @@ _WS_LEAD (the work list's lead in experts, default 64; >= the expert count = eve
 _WS_WATCHDOG_MS (2000), _WS_STATS=1 (per-item %globaltimer statistics, moe_prefill_ws_stats()), _WS_ROUTE_CS (streaming route-row stores, 1).
 Bit-identical to v8/v9/v10 on W's harness (6/6 at 4096 and 128 rows, 3 runs); measured +2.6 % vs WS1=9 + WS2=3 at call1 4096 rows
 (MK/REPORT.md 2) - off by default.
+
+K-12 (the route rows' DRAM round trip): `VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1` (with WS2 >= 1) puts the FC2 work list in column-tile-major
+order and runs the top-k sum as work items of `fc2_kernel_ws` (the sum items of a tile follow the FC2 items of tile + _SUM_LAG (2) and wait for
+the tile's FC2 items with watchdog-bounded acquire polls; _SUM_TOKENS (256) tokens per item) so that a tile's route rows (6.3 MB at 4096 rows)
+are summed while still in L2; `_SUM_DISCARD=1` drops the summed route lines from L2 without a write-back (the route buffer is scratch then:
+`route_rows_consumed()`); `_W2_EVICT_FIRST=1` streams W2 with an L2 evict_first hint. The sum is topk_sum_kernel's chain in slot order (level
+B); the separate topk_sum_kernel is skipped. Design and numbers: K/k12/DESIGN_route_rows.md, K/REPORT.md 15.
 """
 from __future__ import annotations
 
@@ -85,6 +92,19 @@ def strided_rows_supported() -> bool:
     multiple of 4 bytes) - e.g. buf[:, :K] and buf[:, K:K + K // 32] of one gathered [T, K + K // 32 + ...] buffer (session
     U's one-all-gather follow-up); older builds get contiguous copies."""
     return hasattr(_ext(), "strided_rows_supported")
+
+
+def sum_items_mode() -> int:
+    """K-12: the fc2 sum-items mode this process runs with (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS with WS2 >= 1; 0 = off / older build)."""
+    e = _ext()
+    return int(e.sum_items_mode()) if hasattr(e, "sum_items_mode") else 0
+
+
+def route_rows_consumed() -> bool:
+    """K-12: whether the route rows are summed and dropped from L2 inside fc2 (SUM_ITEMS=1 + SUM_DISCARD=1): the returned `route` tensor is
+    scratch then (unspecified content); the top-k sum `out` is the interface."""
+    e = _ext()
+    return bool(e.route_rows_consumed()) if hasattr(e, "route_rows_consumed") else False
 
 
 def _rows_arg(x: torch.Tensor) -> torch.Tensor:
