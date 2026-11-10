@@ -116,8 +116,11 @@ sources in `kernels/sass/` are canonical for it.
   queueing for the same SMs. On a model of the layer pair (two streams + NCCL) 10.1 → 8.5–8.7 ms per pair at N = 32 and
   10.0 → 8.5 under a 300 W cap, bits identical; the served kernels pay the SM share on 156 SMs — attention +19 %, `wo_a`
   +24 %, the MXFP8 GEMMs +7…+10 %, fc1 +10 %, fc2 +9 % with their grids capped to the partition (a grid sized for the
-  whole device runs into FC2's watchdog there). Whether the overlap wins that back in the served forward, which is denser
-  than the model, is the open measurement.
+  whole device runs into FC2's watchdog there). In the served forward, which is denser than the model, the overlap does
+  not win that back: with the split switched per forward inside one server life (N = 32, 16 + 16 alternating units per
+  power cap) a 163K-token prefill is 0.7 % slower at a 400 W and at a 300 W cap alike — 0.3 % in the units that repeat
+  their state, the rest being the cost of the first request after a change of the key — and the energy per
+  8 192-token step is not lower (+1.6 % and +0.5 %), bits identical. The switch stays off.
 - The reduce-scatter in fewer bytes (fp8 with a per-row scale, 1 850 → ≈ 950 µs per layer-chunk): a change of the
   prefill's arithmetic, quality-gated.
 - The prefill MoE's distance to its DRAM floor: FC1 and FC2 in one persistent launch
