@@ -7,7 +7,7 @@ CPU part (no GPU needed; fake streams):
   (2) the control-file reader (VLLM_MOET_RUNTIME_AB=1, key PREFILL_PIPE_GREEN): every row of the contract - no file, the key at 0
       / at the start-up value / absent, the file removed after a state was applied, malformed, not an object, out of range, not an
       integer, an unknown key of the namespace, other namespaces, the 100-ms gate, an unchanged (mtime, size), the change lines and
-      the on-demand line;
+      the on-demand line, and the three line formats a generic read-back of the control-file contract matches;
   (3) the fast prefill MoE's grid caps: the CTAs-per-SM rule per mode, the wrapper on a green stream / on any other stream, a
       smaller cap of the caller or the environment, grids given by position, one wrapper however often it is installed;
   (4) the configurations the split refuses.
@@ -229,6 +229,21 @@ def cpu_part() -> None:
         second = buf.getvalue()[len(first):]
     check("activation counters (on demand" in first and "switches now PREFILL_PIPE_GREEN=32" in first and second == "",
           "(2) one touch of the stats file = one on-demand line with `switches now PREFILL_PIPE_GREEN=32`")
+    # the three line formats of the control-file contract, as a generic read-back (one pattern for every module) matches them
+    on_demand = re.search(r"\[([^\[\]]+), device (\d+)\] activation counters \(on demand, call (\d+); [^)]*\): (.*?); switches now "
+                          r"((?:\w+=-?\d+ ?)+)", first.replace("device ?", "device 0"))
+    counters = dict((m.group(1).strip(), int(m.group(2))) for m in re.finditer(r"([A-Za-z][^,;/]*?) (\d+) / (\d+)", on_demand.group(4))) \
+        if on_demand else {}
+    with stderr_lines() as buf:
+        pipe.green_apply_runtime({"PREFILL_PIPE_GREEN": 0})
+        pipe.green_apply_runtime({"PREFILL_PIPE_FORMAT_CHECK": 1})  # an unknown key of the namespace: one WARNING; ours absent = start-up value
+    lines = buf.getvalue().replace("device ?", "device 0")
+    change = re.findall(r"\[[^\[\]]+, device \d+\] runtime A/B: (\w+) (-?\d+) -> (-?\d+)", lines)
+    warning = re.findall(r"\[[^\[\]]+, device \d+\] WARNING: runtime A/B: ", lines)
+    check(on_demand is not None and on_demand.group(5).split() == ["PREFILL_PIPE_GREEN=32"] and set(counters) == {"split", "unsplit"}
+          and change == [("PREFILL_PIPE_GREEN", "32", "0"), ("PREFILL_PIPE_GREEN", "0", "32")] and len(warning) == 1,
+          "(2) the on-demand line (`call <N>; calls / rows`, the counters, `switches now`), the change lines and the WARNING line "
+          "have the control-file contract's formats")
     # the master switch off: the file is never looked at
     reset_green()
     pipe._GREEN["split"] = fake

@@ -1409,9 +1409,12 @@ def _green_install_moe_caps() -> bool:
 
 
 def _green_stats_line(reason: str) -> None:
+    """The counters line in the control-file contract's format, which a generic read-back matches for every module:
+    `[<tag>, device <n>] activation counters (<reason>, call <N>; calls / rows): <path> <calls> / <rows>, ...; switches now
+    <KEY>=<v>`. This module's unit of work - its `call` - is one pipelined forward."""
     st = _GREEN
     _green_log(
-        f"activation counters ({reason}, forward {st['forwards'] + st['forwards_off']}; forwards / rows): split {st['forwards']} / "
+        f"activation counters ({reason}, call {st['forwards'] + st['forwards_off']}; calls / rows): split {st['forwards']} / "
         f"{st['rows']}, unsplit {st['forwards_off']} / {st['rows_off']}; MoE calls with capped grids {st['moe_capped']}; "
         f"switches now PREFILL_PIPE_GREEN={green_sms() if st['on'] else 0}"
     )
