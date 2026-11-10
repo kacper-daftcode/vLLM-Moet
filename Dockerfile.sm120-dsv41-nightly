@@ -435,6 +435,27 @@ RUN if [ "$VLLM_MOET_KV_SWAP_ASYNC_PATCH" = "1" ]; then \
     && grep -q "kv_swap_async" /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_offload/cpu/gpu_worker.py \
     && python3 -c "from vllm.v1.kv_offload.cpu import kv_swap_async; print('kv swap async helper importable')"; fi
 
+# 49. The interpreter's heap frozen again whenever a serving process has worked and gone idle (runtime switch
+#     VLLM_MOET_GC_IDLE_FREEZE=1, default off), and a log line for every garbage collection of 50 ms or more (always on;
+#     VLLM_MOET_GC_WARN_MS). Why: vLLM freezes each serving process's heap once, when its start-up is done (1.25 M objects in a
+#     TP worker); what becomes long-lived afterwards is not frozen - about 1 000 objects per fresh 19K + 163K prefill pair in
+#     every worker - and every full collection walks all of it on the thread that happened to allocate, with the interpreter
+#     lock held: 435 ns per object by the collector's own callbacks in a serving worker (550 ms for a worker's whole heap when
+#     un-frozen). On a 4x RTX PRO 6000 SE server that had served 160 M prompt tokens in nine hours one launch thread of one
+#     rank stopped for 0.3-0.4 s every 5-8 minutes of load per rank (per-thread scheduler statistics sampled from outside):
+#     8 of 23 fresh 163K prefills contained one (+160..+360 ms, +82 ms on the mean), and the pause had grown by 40 % in 2.7
+#     hours of traffic. What: one more gc.collect() right after the start-up freeze (it resets the old-generation size
+#     CPython's full-collection rule remembers) and gc.collect() + gc.freeze() whenever the process has worked and then been
+#     idle for 1 s, so that a full collection walks only what the last burst of requests left. No tensor code is touched.
+#     CPU test 28/28 (gc_idle_freeze/test_gc_idle_freeze.py; 29/29 inside the image). Patcher on utils/gc_utils.py
+#     (freeze_gc_heap), module moet_gc_idle_freeze.py installed next to it.
+ARG VLLM_MOET_GC_IDLE_FREEZE_PATCH=1
+RUN if [ "$VLLM_MOET_GC_IDLE_FREEZE_PATCH" = "1" ]; then \
+       python3 /opt/vllm-moet/dsv41_sm120/gc_idle_freeze/patch_vllm_gc_idle_freeze_sm120.py \
+    && python3 /opt/vllm-moet/dsv41_sm120/gc_idle_freeze/patch_vllm_gc_idle_freeze_sm120.py --check \
+    && grep -q "moet_gc_idle_freeze" /usr/local/lib/python3.12/dist-packages/vllm/utils/gc_utils.py \
+    && python3 -c "from vllm.utils import moet_gc_idle_freeze as m; assert callable(m.after_startup_freeze) and not m.enabled(); print('gc idle freeze module importable, switch off by default')"; fi
+
 # Labels: the launcher reads kv-mode and v41-kv-records; the tests and docs read the step flags.
 LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM main)" \
       org.opencontainers.image.description="DeepSeek-V4.1-Flash on sm_120: vllm/vllm-openai nightly df3bd094 with the sm_120 gaps closed and the decode / prefill kernels of vLLM-Moet (docs/dsv41-sm120.md)" \
@@ -477,6 +498,7 @@ LABEL org.opencontainers.image.title="vLLM-Moet DeepSeek-V4.1-Flash SM120 (vLLM 
       com.vllm-moet.sparse-mla-prefill-sass="${VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH}" \
       com.vllm-moet.prefill-pipe="${VLLM_MOET_PREFILL_PIPE_PATCH}" \
       com.vllm-moet.kv-swap-async="${VLLM_MOET_KV_SWAP_ASYNC_PATCH}" \
+      com.vllm-moet.gc-idle-freeze="${VLLM_MOET_GC_IDLE_FREEZE_PATCH}" \
       com.vllm-moet.v41-kv-records="${VLLM_MOET_V41_KV_RECORDS}" \
       com.vllm-moet.cpu-tier="${VLLM_MOET_CPU_TIER_PATCH}" \
       com.vllm-moet.engram-v2="${VLLM_MOET_ENGRAM_V2_PATCH}"
