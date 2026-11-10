@@ -3,6 +3,7 @@
 #
 #   build_sparse_mla_sass.sh [out.cubin]            (default: kernels/cubins-sm120/sparse_mla_prefill_v41.cubin)
 #   SCHEDULE=s1 build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin)
+#   KERNEL=v42 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v42.cubin)
 #
 # Requirements (see kernels/MANIFEST.md, "Sparse-MLA prefill"):
 #   CUBIT  — cubit `main` at or after ed4d316: the required fixes are BUG-478 (path-following
@@ -26,22 +27,35 @@
 # `main` at or after 49f8340; reproduces sha256 5924622b6289fca4... from 49f8340 and 38e4cc8. The schedule is a
 # separate cubin, selected at run time with VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN=<path>; the default cubin, its
 # digest and the Dockerfile's check of it are untouched. See kernels/MANIFEST.md for its gate.
+# KERNEL=v42 — the next source: v41's text with the dequant of the staged records done by sm_120's scaled BF16 unpack
+# (kernels/gen/gen_sparse_mla_prefill_v42.py -> kernels/sass/sparse_mla_prefill_v42.sass, 1 454 instructions), always
+# with the s1 schedule switches. The entry symbol stays sparse_mla_prefill_v41 (the cubin loads wherever a v41 cubin
+# does). Needs cubit `main` at or after 89564ac (the instruction's table row); reproduces sha256 dfdc0279ea5a3388...
+# from db4cfd1. A separate cubin as well; see kernels/MANIFEST.md for its gate.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
 CUBIT=${CUBIT:-/workspace/cubit/target/release/cubit}
 TABLE=${TABLE:-/workspace/cubit/tables/sm120.json.gz}
 SCHEDULE=${SCHEDULE:-}
+KERNEL=${KERNEL:-v41}
+case "$KERNEL" in
+  v41) ;;
+  v42) SCHEDULE=${SCHEDULE:-s1}
+       [[ "$SCHEDULE" == s1 ]] || { echo "KERNEL=v42 is built with SCHEDULE=s1 only" >&2; exit 2; } ;;
+  *) echo "unknown KERNEL '$KERNEL' (known: v41, v42)" >&2; exit 2 ;;
+esac
 case "$SCHEDULE" in
   "") SCHED_ENV=(); DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin ;;
   s1) SCHED_ENV=(CUBIT_SCHED2=1 CUBIT_SCHED2_LAT=sm120 CUBIT_MMA_PTXAS=1)
       DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin ;;
   *) echo "unknown SCHEDULE '$SCHEDULE' (known: s1)" >&2; exit 2 ;;
 esac
+[[ "$KERNEL" == v42 ]] && DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v42.cubin
 OUT=${1:-$DEFAULT_OUT}
-SASS=$REPO/kernels/sass/sparse_mla_prefill_v41.sass
+SASS=$REPO/kernels/sass/sparse_mla_prefill_$KERNEL.sass
 
-python3 "$REPO/kernels/gen/gen_sparse_mla_prefill_v41.py" >/dev/null
+python3 "$REPO/kernels/gen/gen_sparse_mla_prefill_$KERNEL.py" >/dev/null
 echo "generated $SASS ($(grep -c ';' "$SASS") statements)"
 env CUBIT_SB_SHARE=${CUBIT_SB_SHARE:-1} CUBIT_RB_EARLY=${CUBIT_RB_EARLY:-32} CUBIT_MMA_WAIT=1 CUBIT_MMA_WB_DRAIN=13 \
   ${SCHED_ENV[@]+"${SCHED_ENV[@]}"} \
