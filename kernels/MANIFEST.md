@@ -78,6 +78,121 @@ sessions and drop out at the next regen. Retired for good (not regenerated
 in `_a32`): the `mc2` prefill variant and the `MB=2` experiment — both
 superseded by MC=4/AFRAG, never launched by the serving path.
 
+## Dependency‑aware schedule set of the live MoE GEMM kernels — `cubins-sm120/s1/` (not loaded by default)
+
+`cubins-sm120/s1/` is the complete live `_a32` MoE GEMM set — the 43 file names of the sections below — with cubit's
+dependency‑aware stall schedule wherever that schedule is faster: **37 files are re‑scheduled, 6 are byte copies of
+the pinned cubin** (`s1/SHA256SUMS` lists all 43). **Nothing loads the directory.** The loader opens exact file names in
+`VLLM_MOE_W2_CUBIT_DIR` (default `/cubit-share`, the image's copy of `cubins-sm120/`), so the pinned set stays what a
+server runs; the set is selected by pointing that variable at the subdirectory (`<checkout>/kernels/cubins-sm120/s1`;
+`/cubit-share/s1` in an image built from `Dockerfile.sm120-v024`, whose `COPY` of the directory is recursive). The
+subdirectory holds the MoE GEMM set only: anything else a configuration looks up in the same directory (the opt‑in
+cubit sparse‑MLA kernels, all default off) is not in it.
+
+**What a re‑scheduled file is.** The source of the pinned cubin of the same name (`sass/<name>.sass`) assembled by cubit
+`main` (`ef8ff88`; byte‑identical at `ef7d335`) with `CUBIT_SCHED2=1 CUBIT_SCHED2_LAT=sm120 CUBIT_MMA_PTXAS=1` — the
+switches of `sparse_mla_prefill_v41s1.cubin`: a stall is charged where a consumer needs it instead of behind every
+producer (cubit's pair‑latency table for sm_120, enforced on every path), and the QMMA chain runs at ptxas's issue
+distances instead of between writeback drains. The instructions are the source's — word for word those of today's
+default assembly; against the pinned cubins (the `5912400` build) 328 words of the 37 kernels are another encoding of
+the same instruction (230 `IADD3`, 98 `ISETP`: operand order, `RZ` for `#0`) and the control words are new. In a pinned
+schedule every QMMA sits in 72 stall cycles (one drain in front, four behind); in the set a QMMA pair is
+`QMMA S01 / NOP S15 / QMMA S12` (issue distance 16) and the fold reads a result exactly 28 cycles behind its QMMA.
+Over the 37 kernels: stall cycles per warp 260 651 → 125 070 (−52.0 %), instructions 42 598 → 38 710
+(the 4 320 drains are gone). cubit's read‑only verifiers on each of the 37: `CUBIT_VERIFY` 0 unprotected RAW / 0 broken WAR,
+`CUBIT_DEP_VERIFY` 0 / 0 / 0 / 0. None of them carries a per‑source allocator switch (the three live sources that do
+are among the six that keep the pinned bytes).
+
+**The rule of the set** (fixed before the second sample was taken): a kernel takes the new schedule when its output is
+identical to the pinned cubin's in every warm launch of both samples and in every fresh process, **and** the new schedule
+is faster than the pinned one in both samples, **and** by at least 2 % in their mean (E = 64); every other kernel keeps
+its pinned bytes, so that the directory is a complete loader directory.
+
+**Gate (kernel level; `gen/moe_sched_ab.py`, the families' own harness inputs — packers, seeds, desc ABI and launch
+geometry of the `gen/*_check.py` scripts; 4 096 rows).** Bits, all 43 kernels, output against the pinned cubin's byte
+for byte: 30 warm launches per schedule taking turns in one process on each of three runs (RTX PRO 6000 Blackwell
+Server Edition at a core clock of at most 2 362 MHz; Workstation Edition, twice, at up to 2 812 MHz — the second time
+the committed files themselves), and fresh processes — 10 on the Server Edition card, 30 on the Workstation card, two
+launches per schedule in each, one digest per kernel over schedules, launches and processes: **0 differences**. Time,
+the 37 re‑scheduled kernels against their pinned cubins in the same rounds (CUDA events, 3 rounds × 25 launches,
+schedules interleaved, E = 64 (expert, token‑group) pairs of random planes), median [range] per family:
+
+| family | kernels | Server Edition card | Workstation card | Workstation card, the committed files |
+|---|---|---|---|---|
+| 2‑bit decode | 9 | −7.5 % [−10.1 … −3.9] | −6.8 % [−10.8 … −3.4] | −7.4 % [−11.0 … −3.9] |
+| 2‑bit prefill, MC = 4 | 5 | −5.9 % [−9.8 … −5.3] | −6.2 % [−6.9 … −5.3] | −6.3 % [−9.6 … −4.9] |
+| 2‑bit prefill, MC = 4, AFRAG | 8 | −9.7 % [−13.0 … −3.1] | −9.1 % [−13.4 … −2.1] | −9.2 % [−13.2 … −1.8] |
+| FP4 delta | 9 | −6.0 % [−13.1 … −3.2] | −9.0 % [−14.6 … −4.3] | −6.0 % [−14.7 … −3.3] |
+| split FP4 (quintal) | 6 | −11.4 % [−14.9 … −5.2] | −13.1 % [−14.5 … −4.0] | −12.6 % [−14.4 … −3.8] |
+| **all 37** | 37 | **−8.0 %** [−14.9 … −3.1] | **−8.7 %** [−14.6 … −2.1] | **−7.9 %** [−14.7 … −1.8], faster on 37 / 37 |
+
+Decode shape (E = 8; the 24 re‑scheduled MC = 1 kernels): −9.7 % [−21.6 … −0.4] on the Server Edition card, −10.5 % [−21.5 … +2.6] with the committed files; for 7 of the K ≤ 1 024 kernels
+(11–18 µs per launch at this shape) the difference is inside the run‑to‑run spread (−15.1 … +2.6 % over the three runs, the sign not stable).
+These are kernel times on the harness; the kernels wait on memory, so the gain is a fraction of the stall cycles removed
+(Nsight Compute, `mc4afrag_k4096_a32`, one launch: the fixed‑stall wait falls from 5.71 to 2.27 warp‑cycles per issued
+instruction, the long‑scoreboard wait rises from 9.58 to 11.88; 257 → 236 µs). No end‑to‑end number exists for the set.
+
+| cubin (`cubins-sm120/s1/`) | family | schedule | sha256 | stall cycles per warp, pinned → s1 | µs per launch pinned → s1, Server Edition card | Workstation card, the committed files |
+|---|---|---|---|---|---|---|
+| `moe_w2_mm_k1024_a32.cubin` | 2‑bit decode | **s1** | `52f968497f2c08bc…` | 2 419 → 1 171 | 68.8 → 63.6 (−7.6 %) | 56.9 → 52.7 (−7.4 %) |
+| `moe_w2_mm_k512_a32.cubin` | 2‑bit decode | **s1** | `9c5cfc32ec12d748…` | 2 556 → 1 244 | 40.0 → 36.0 (−10.1 %) | 34.5 → 30.8 (−10.8 %) |
+| `moe_w2_mm_k384_a32.cubin` | 2‑bit decode | **s1** | `14336b23243813fc…` | 2 727 → 1 336 | 32.5 → 29.9 (−8.2 %) | 28.5 → 26.2 (−7.9 %) |
+| `moe_w2_mm_k2048_a32.cubin` | 2‑bit decode | **s1** | `043910133a1bd9cc…` | 4 027 → 1 871 | 133.7 → 126.5 (−5.4 %) | 104.2 → 97.9 (−6.0 %) |
+| `moe_w2_mm_k768_a32.cubin` | 2‑bit decode | **s1** | `a9cea1f489eb6de6…` | 4 335 → 2 036 | 44.9 → 40.8 (−9.1 %) | 38.8 → 34.6 (−11.0 %) |
+| `moe_w2_mm_k4096_a32.cubin` | 2‑bit decode | **s1** | `8c07cd53086e829e…` | 7 243 → 3 271 | 241.3 → 229.0 (−5.1 %) | 188.0 → 179.6 (−4.5 %) |
+| `moe_w2_mm_k3584_a32.cubin` | 2‑bit decode | **s1** | `fd65aef095a16d49…` | 7 489 → 3 413 | 230.9 → 213.7 (−7.5 %) | 183.6 → 167.6 (−8.8 %) |
+| `moe_w2_mm_k6144_a32.cubin` | 2‑bit decode | **s1** | `1762fd5ceee995c5…` | 10 459 → 4 671 | 366.0 → 349.8 (−4.4 %) | 288.4 → 276.1 (−4.2 %) |
+| `moe_w2_mm_k7168_a32.cubin` | 2‑bit decode | **s1** | `ebc0b65c5638fb87…` | 12 067 → 5 371 | 416.4 → 400.0 (−3.9 %) | 325.6 → 312.9 (−3.9 %) |
+| `moe_w2_mm_mc4_k1024_a32.cubin` | 2‑bit prefill, MC = 4 | **s1** | `3629b12effec7814…` | 2 684 → 1 268 | 107.6 → 101.3 (−5.8 %) | 88.0 → 83.7 (−4.9 %) |
+| `moe_w2_mm_mc4_k512_a32.cubin` | 2‑bit prefill, MC = 4 | = pinned | `1ba35b0fb6216e50…` | 2 821 (the new schedule: 1 341) | the new schedule: 56.4 → 56.4 (+0.0 %) | the new schedule: 46.2 → 44.7 (−3.2 %) — not taken |
+| `moe_w2_mm_mc4_k384_a32.cubin` | 2‑bit prefill, MC = 4 | **s1** | `65432bb581d27f3b…` | 2 992 → 1 433 | 45.0 → 40.5 (−9.8 %) | 38.5 → 34.8 (−9.6 %) |
+| `moe_w2_mm_mc4_k2048_a32.cubin` | 2‑bit prefill, MC = 4 | **s1** | `8fe6b77ff7a4eba1…` | 4 516 → 2 048 | 208.4 → 191.7 (−8.0 %) | 165.5 → 155.1 (−6.3 %) |
+| `moe_w2_mm_mc4_k768_a32.cubin` | 2‑bit prefill, MC = 4 | **s1** | `2d408d26f50f01bd…` | 4 824 → 2 213 | 69.5 → 65.4 (−5.9 %) | 56.9 → 53.0 (−6.8 %) |
+| `moe_w2_mm_mc4_k4096_a32.cubin` | 2‑bit prefill, MC = 4 | = pinned | `7cfa8b42fec44a4e…` | 8 180 (the new schedule: 3 608) | the new schedule: 345.7 → 337.6 (−2.4 %) | the new schedule: 279.4 → 275.6 (−1.4 %) — not taken |
+| `moe_w2_mm_mc4_k3584_a32.cubin` | 2‑bit prefill, MC = 4 | **s1** | `45b009aa1bb88539…` | 8 426 → 3 750 | 373.4 → 353.7 (−5.3 %) | 294.6 → 277.3 (−5.9 %) |
+| `moe_w2_mm_mc4_k6144_a32.cubin` | 2‑bit prefill, MC = 4 | = pinned | `aa3992fe75978597…` | 11 844 (the new schedule: 5 168) | the new schedule: 519.7 → 527.9 (+1.6 %) | the new schedule: 493.2 → 496.7 (+0.7 %) — not taken |
+| `moe_w2_mm_mc4_k7168_a32.cubin` | 2‑bit prefill, MC = 4 | = pinned | `1278270682e6cdc9…` | 13 676 (the new schedule: 5 948) | the new schedule: 597.6 → 601.2 (+0.6 %) | the new schedule: 685.3 → 691.5 (+0.9 %) — not taken |
+| `moe_w2_mm_mc4afrag_k1024_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `9b655b93301f5bae…` | 2 618 → 1 204 | 83.2 → 76.8 (−7.7 %) | 68.7 → 63.3 (−7.9 %) |
+| `moe_w2_mm_mc4afrag_k512_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `fdbdc57c99b49c0e…` | 2 755 → 1 277 | 44.2 → 40.1 (−9.3 %) | 37.9 → 34.5 (−8.9 %) |
+| `moe_w2_mm_mc4afrag_k384_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `6b37f64091b5db2c…` | 2 926 → 1 369 | 36.7 → 31.9 (−13.0 %) | 30.7 → 27.7 (−9.8 %) |
+| `moe_w2_mm_mc4afrag_k2048_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `6c4bc3ab497f4ebb…` | 4 402 → 1 936 | 162.5 → 146.1 (−10.1 %) | 128.5 → 116.2 (−9.6 %) |
+| `moe_w2_mm_mc4afrag_k768_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `957cf8fe8cdfa565…` | 4 710 → 2 101 | 54.4 → 48.8 (−10.3 %) | 44.9 → 40.5 (−9.8 %) |
+| `moe_w2_mm_mc4afrag_k4096_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `59066b0fff420bd5…` | 7 970 → 3 400 | 282.2 → 257.6 (−8.7 %) | 218.8 → 200.8 (−8.2 %) |
+| `moe_w2_mm_mc4afrag_k3584_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `651a3f005f241f8b…` | 8 216 → 3 542 | 260.8 → 226.8 (−13.0 %) | 204.3 → 177.4 (−13.2 %) |
+| `moe_w2_mm_mc4afrag_k6144_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | **s1** | `61a20d1b9f2c5cf9…` | 11 538 → 4 864 | 423.2 → 410.1 (−3.1 %) | 329.2 → 323.1 (−1.8 %) |
+| `moe_w2_mm_mc4afrag_k7168_a32.cubin` | 2‑bit prefill, MC = 4, AFRAG | = pinned | `65920010ec01268f…` | 13 322 (the new schedule: 5 596) | the new schedule: 494.9 → 511.6 (+3.4 %) | the new schedule: 463.9 → 462.2 (−0.4 %) — not taken |
+| `moe_w4_mm_k1024_a32.cubin` | FP4 delta | **s1** | `8b9c0a1c818b890a…` | 2 686 → 1 269 | 139.9 → 121.6 (−13.1 %) | 108.0 → 92.1 (−14.7 %) |
+| `moe_w4_mm_k512_a32.cubin` | FP4 delta | **s1** | `b9d93382851dcae4…` | 2 823 → 1 342 | 51.1 → 48.4 (−5.4 %) | 44.0 → 42.4 (−3.5 %) |
+| `moe_w4_mm_k384_a32.cubin` | FP4 delta | **s1** | `a6932eef23dcd71e…` | 2 994 → 1 434 | 44.8 → 42.1 (−6.0 %) | 38.8 → 36.4 (−6.0 %) |
+| `moe_w4_mm_k2048_a32.cubin` | FP4 delta | **s1** | `20d77e07d725d994…` | 4 630 → 2 109 | 228.1 → 212.5 (−6.8 %) | 181.8 → 167.5 (−7.9 %) |
+| `moe_w4_mm_k768_a32.cubin` | FP4 delta | **s1** | `e28263629b530477…` | 4 938 → 2 274 | 62.6 → 56.4 (−9.8 %) | 53.0 → 47.0 (−11.3 %) |
+| `moe_w4_mm_k4096_a32.cubin` | FP4 delta | **s1** | `143af46538ecd63b…` | 8 518 → 3 789 | 411.2 → 394.8 (−4.0 %) | 325.0 → 310.9 (−4.3 %) |
+| `moe_w4_mm_k3584_a32.cubin` | FP4 delta | **s1** | `fa160ea73554ce99…` | 8 764 → 3 931 | 390.6 → 354.9 (−9.1 %) | 312.7 → 278.9 (−10.8 %) |
+| `moe_w4_mm_k6144_a32.cubin` | FP4 delta | **s1** | `317b1362c21d97db…` | 12 406 → 5 469 | 627.5 → 607.3 (−3.2 %) | 493.0 → 476.6 (−3.3 %) |
+| `moe_w4_mm_k7168_a32.cubin` | FP4 delta | **s1** | `2887b7fe28a18ab6…` | 14 350 → 6 309 | 724.5 → 698.1 (−3.6 %) | 568.7 → 548.4 (−3.6 %) |
+| `moe_w4_mm_k8192_a32.cubin` | FP4 delta | = pinned | `56f0cd312e8ef1da…` | 16 294 (the new schedule: 7 149) | the new schedule: 789.1 → 790.1 (+0.1 %) | the new schedule: 724.2 → 687.5 (−5.1 %) — not taken |
+| `moe_w4q_mm_k1024_a32.cubin` | split FP4 (quintal) | **s1** | `eab90d298bf9a675…` | 4 216 → 2 347 | 164.6 → 140.0 (−14.9 %) | 134.7 → 116.1 (−13.8 %) |
+| `moe_w4q_mm_k512_a32.cubin` | split FP4 (quintal) | **s1** | `88fdf2e25d1fe5eb…` | 4 353 → 2 420 | 64.6 → 61.3 (−5.2 %) | 53.2 → 51.2 (−3.8 %) |
+| `moe_w4q_mm_k2048_a32.cubin` | split FP4 (quintal) | **s1** | `3f578247a7de3bf6…` | 7 630 → 4 227 | 282.3 → 243.3 (−13.8 %) | 226.8 → 194.1 (−14.4 %) |
+| `moe_w4q_mm_k4096_a32.cubin` | split FP4 (quintal) | **s1** | `fa9c1a02f93b0db3…` | 14 458 → 7 987 | 516.9 → 454.4 (−12.1 %) | 415.0 → 359.7 (−13.3 %) |
+| `moe_w4q_mm_k6144_a32.cubin` | split FP4 (quintal) | **s1** | `168efc9edad3984d…` | 21 286 → 11 747 | 758.4 → 678.7 (−10.5 %) | 605.7 → 534.2 (−11.8 %) |
+| `moe_w4q_mm_k7168_a32.cubin` | split FP4 (quintal) | **s1** | `956addc2e004a00b…` | 24 700 → 13 627 | 876.4 → 781.9 (−10.8 %) | 699.1 → 615.9 (−11.9 %) |
+
+**What the gate does not cover, and what to repeat before a deployment selects the set.** (1) The files are
+regenerations in this manifest's sense: the in‑situ validation pass (`tools/test_moe_w2_planes.py` + the GSM8K /
+agreement battery) has not been run with them. (2) The table's latencies are counts of issue cycles; the pair floors
+measured for these kernels (cubit `tools/stallfloor/`, harness v5e) are the same at core clocks of 2 362 and 2 752 MHz, and
+the set was gated at up to 2 812 MHz:
+before it runs on cards with a higher core clock, repeat `python3 kernels/gen/moe_sched_ab.py` and
+`python3 kernels/gen/moe_sched_ab.py --cold 30` there (exit status 0 = every output identical). (3) Fewer stall cycles
+are not always less time: `moe_w2_mm_mc4_k3584_a32` runs 373 / 304 / 354 µs (Server Edition card) and
+296 / 251 / 280 µs (Workstation card) as pinned cubin / today's default assembly / this set's file — all three
+bit‑identical. The set carries the new schedule for it (it qualifies by the rule); a default re‑assembly of that one
+source is the faster file and a regeneration of its own.
+
+Rebuild and check: `CUBIT=<cubit>/target/release/cubit TABLE=<cubit>/tables/sm120.json.gz kernels/gen/build_moe_s1.sh`
+(every re‑scheduled file from its source, compared with the committed one; `s1 set: 37 re-scheduled + 6 pinned files; 0 problem(s)`).
+
 ## Split FP4 MoE GEMM — moe_w4q_mm (serving: opt‑in `VLLM_MOE_W2_DELTA_SPLIT=1`, default off)
 **Bit‑exact** FP4 GEMM reading the resident 2‑bit base plane + a **radix‑5
 "quintal" refinement plane at 2.5 bits/elem**: the base code narrows the e2m1
