@@ -108,7 +108,7 @@ def route_rows_consumed() -> bool:
 
 
 # ----------------------------------------------------------------------------------------------------------------------------------
-# K-13 (R0's r29 tasks A + B, K/BRIEF_K13.md addendum of 10.11 01:58Z):
+# The runtime A/B switch and the activation counters of this module (both off by default):
 #   VLLM_MOET_RUNTIME_AB=1          the runtime A/B switch for this module's level-B paths: a flat JSON object switch -> value in the
 #                                   control file VLLM_MOET_RUNTIME_AB_FILE (default /dev/shm/vllm_moet_ab.json; the serving container's
 #                                   /dev/shm is shared by its API server, engine and workers, so `docker exec <c> sh -c 'echo ... > ...'`
