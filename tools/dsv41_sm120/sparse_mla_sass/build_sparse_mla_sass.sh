@@ -7,6 +7,7 @@
 #   KERNEL=v42 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v42.cubin)
 #   KERNEL=v43 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v43.cubin)
 #   KERNEL=v43b build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin)
+#   KERNEL=v43c build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v43c.cubin)
 #
 # Requirements (see kernels/MANIFEST.md, "Sparse-MLA prefill"):
 #   CUBIT  — cubit `main` at or after ed4d316: the required fixes are BUG-478 (path-following
@@ -55,6 +56,20 @@
 # CUBIT_SCHED2_LAT; everything else is SCHEDULE=s1's environment. One control word differs from v41s1 (BAR.SYNC behind
 # PV: S06 -> S13). Reproduces sha256 cba10b0adafd20c3... from cubit `main` at ef7d335 and at 7dda1b6. A separate cubin;
 # see kernels/MANIFEST.md for its gate.
+# KERNEL=v43c — v43b's instruction words and stalls with one wait added: the conditional branch behind the loop-top
+# BAR.SYNC waits on scoreboards 3, 4 and 5 - the read barriers of the dequant's stores that the loop top itself does
+# not wait on. cubit protects the registers a store reads by a wait at their next overwriter; for a store in front of
+# the loop's back edge it looked for that overwriter in the text of the next iteration - here the fragment loads of the
+# block that issues the next chunk's gathers - and the iteration of a token's LAST chunk branches around that block:
+# there the QK fragment loads rewrite the stores' data registers 58 and 67 issue cycles behind them with no wait on
+# the path (v42: 4 such pairs, v43 and v43b: 3; the default cubin, v41s1 and v41s1b: none). This build does not
+# schedule anything: it takes the committed v43b cubin (checked by digest), disassembles it, puts the three scoreboards
+# into that one branch's wait mask and assembles the listing as it stands - behind that branch every store issued in
+# front of the loop top has been served, on every path. One control word differs from v43b. Any cubit that round-trips
+# v43b reproduces sha256 7e812fa2d9c47770...
+# Every build ends with store_war_paths.py (beside this script) on the frozen listing of what was built: the stores
+# whose registers are rewritten on some path without a wait on the store's read barrier. KERNEL=v43c must have none:
+# it is assembled into a scratch file that becomes the output only when the check has passed.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -65,6 +80,8 @@ KERNEL=${KERNEL:-v41}
 KEEP_ENV=()
 MMA_BRA=
 SRC_KERNEL=
+FROM_CUBIN=
+WAIT_WORD=
 case "$KERNEL" in
   v41) ;;
   v42) SCHEDULE=${SCHEDULE:-s1}
@@ -77,7 +94,14 @@ case "$KERNEL" in
        [[ "$SCHEDULE" == s1 ]] || { echo "KERNEL=v43b is built with SCHEDULE=s1 only" >&2; exit 2; }
        grep -q -a CUBIT_SB_LONG_KEEP "$CUBIT" || { echo "KERNEL=v43b needs a cubit with CUBIT_SB_LONG_KEEP (commit df4c557 or later): $CUBIT has none" >&2; exit 2; }
        KEEP_ENV=(CUBIT_SB_LONG_KEEP=1); MMA_BRA=14; SRC_KERNEL=v43 ;;
-  *) echo "unknown KERNEL '$KERNEL' (known: v41, v42, v43, v43b)" >&2; exit 2 ;;
+  v43c) SCHEDULE=${SCHEDULE:-s1}
+       [[ "$SCHEDULE" == s1 ]] || { echo "KERNEL=v43c is v43b's schedule with one wait added (SCHEDULE=s1 only)" >&2; exit 2; }
+       SRC_KERNEL=v43
+       FROM_CUBIN=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin
+       FROM_SHA256=a163aea6d869c55ed21a6433dcf31d96733ba36030202bcc025377b535005e8c
+       # the one control word, as cubit prints it: the wait mask of the branch behind the loop-top BAR.SYNC -> scoreboards 3, 4, 5
+       WAIT_WORD='@!P5 BRA L_2da0 ;'; WAIT_FROM='[B------:R-:W-:Y:S05]'; WAIT_TO='[B---345:R-:W-:Y:S05]' ;;
+  *) echo "unknown KERNEL '$KERNEL' (known: v41, v42, v43, v43b, v43c)" >&2; exit 2 ;;
 esac
 case "$SCHEDULE" in
   "") SCHED_ENV=(); DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin ;;
@@ -88,15 +112,17 @@ case "$SCHEDULE" in
       DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41s1b.cubin ;;
   *) echo "unknown SCHEDULE '$SCHEDULE' (known: s1, s1b)" >&2; exit 2 ;;
 esac
-[[ "$KERNEL" == v42 || "$KERNEL" == v43 || "$KERNEL" == v43b ]] && DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_$KERNEL.cubin
+[[ "$KERNEL" == v42 || "$KERNEL" == v43 || "$KERNEL" == v43b || "$KERNEL" == v43c ]] && DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_$KERNEL.cubin
 OUT=${1:-$DEFAULT_OUT}
 SRC_KERNEL=${SRC_KERNEL:-$KERNEL}
 SASS=$REPO/kernels/sass/sparse_mla_prefill_$SRC_KERNEL.sass
+VARIANT=; BUILT=; FROZEN=$(mktemp --suffix=.sass)
+trap 'rm -f ${VARIANT:+"$VARIANT"} "$FROZEN"; [[ -n "$BUILT" && "$BUILT" != "$OUT" ]] && rm -f "$BUILT"' EXIT
 if [[ -n "$MMA_BRA" ]]; then
   # cubit's dependency table + one resource row: a member of `mma` holds every BRA MMA_BRA issue cycles off
   DEP_TABLE=${DEP_TABLE:-$(dirname "$TABLE")/dep_latency_sm120.json}
   [[ -f "$DEP_TABLE" ]] || { echo "KERNEL=$KERNEL needs cubit's dependency table: $DEP_TABLE not found (set DEP_TABLE)" >&2; exit 2; }
-  VARIANT=$(mktemp --suffix=.json); trap 'rm -f "$VARIANT"' EXIT
+  VARIANT=$(mktemp --suffix=.json)
   python3 - "$DEP_TABLE" "$VARIANT" "$MMA_BRA" <<'PY'
 import json
 import sys
@@ -111,10 +137,38 @@ PY
   SCHED_ENV=(CUBIT_SCHED2=1 "CUBIT_SCHED2_LAT=$VARIANT" CUBIT_MMA_PTXAS=1)
 fi
 
-python3 "$REPO/kernels/gen/gen_sparse_mla_prefill_$SRC_KERNEL.py" >/dev/null
-echo "generated $SASS ($(grep -c ';' "$SASS") statements)"
-env CUBIT_SB_SHARE=${CUBIT_SB_SHARE:-1} CUBIT_RB_EARLY=${CUBIT_RB_EARLY:-32} CUBIT_MMA_WAIT=1 CUBIT_MMA_WB_DRAIN=13 \
-  ${SCHED_ENV[@]+"${SCHED_ENV[@]}"} ${KEEP_ENV[@]+"${KEEP_ENV[@]}"} \
-  "$CUBIT" asm "$SASS" -t "$TABLE" -o "$OUT" --kernel sparse_mla_prefill_v41 \
-  --mercury-stub "$REPO/kernels/sass/qmma_e4m3.merc.stub"
+if [[ -n "$FROM_CUBIN" ]]; then
+  # a committed cubin with one control word changed: nothing is generated or scheduled
+  [[ "$(sha256sum "$FROM_CUBIN" | cut -c1-64)" == "$FROM_SHA256" ]] || { echo "KERNEL=$KERNEL starts from $FROM_CUBIN with sha256 $FROM_SHA256: the file differs" >&2; exit 1; }
+  "$CUBIT" disassemble "$FROM_CUBIN" -t "$TABLE" --frozen > "$FROZEN"
+  n=$(grep -c -F -- "$WAIT_FROM $WAIT_WORD" "$FROZEN" || true)
+  [[ "$n" == 1 ]] || { echo "KERNEL=$KERNEL: expected ONE '$WAIT_FROM $WAIT_WORD' in the listing of $FROM_CUBIN, found $n" >&2; exit 1; }
+  python3 - "$FROZEN" "$WAIT_FROM $WAIT_WORD" "$WAIT_TO $WAIT_WORD" <<'PY'
+import sys
+
+path, old, new = sys.argv[1:4]
+text = open(path).read()
+assert text.count(old) == 1
+open(path, "w").write(text.replace(old, new))
+PY
+  # the listing carries its own control codes: assembled as it stands (no scheduling switch) - into a scratch file,
+  # which becomes OUT only when the path check below has passed
+  BUILT=$(mktemp --suffix=.cubin)
+  "$CUBIT" asm "$FROZEN" -t "$TABLE" -o "$BUILT" --kernel sparse_mla_prefill_v41 \
+    --mercury-stub "$REPO/kernels/sass/qmma_e4m3.merc.stub"
+else
+  python3 "$REPO/kernels/gen/gen_sparse_mla_prefill_$SRC_KERNEL.py" >/dev/null
+  echo "generated $SASS ($(grep -c ';' "$SASS") statements)"
+  env CUBIT_SB_SHARE=${CUBIT_SB_SHARE:-1} CUBIT_RB_EARLY=${CUBIT_RB_EARLY:-32} CUBIT_MMA_WAIT=1 CUBIT_MMA_WB_DRAIN=13 \
+    ${SCHED_ENV[@]+"${SCHED_ENV[@]}"} ${KEEP_ENV[@]+"${KEEP_ENV[@]}"} \
+    "$CUBIT" asm "$SASS" -t "$TABLE" -o "$OUT" --kernel sparse_mla_prefill_v41 \
+    --mercury-stub "$REPO/kernels/sass/qmma_e4m3.merc.stub"
+  BUILT=$OUT
+fi
+"$CUBIT" disassemble "$BUILT" -t "$TABLE" --frozen > "$FROZEN"
+REQUIRE=(); [[ "$KERNEL" == v43c ]] && REQUIRE=(--require-none)
+python3 "$HERE/store_war_paths.py" "$FROZEN" --loads ${REQUIRE[@]+"${REQUIRE[@]}"} | sed "s|^$FROZEN|store_war_paths|"
+if [[ "$BUILT" != "$OUT" ]]; then
+  cp "$BUILT" "$OUT"
+fi
 echo "wrote $OUT"
