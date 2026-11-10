@@ -147,6 +147,30 @@ def _rt_warn_once(key: str, msg: str) -> None:
         _rt_log("WARNING: " + msg)
 
 
+def occupancy_facts() -> list:
+    """What every WS launch family got at its first launch in this process: (kernel, stages, min blocks, registers per thread, CTAs per SM
+    from the occupancy query, CTAs per SM its mode was measured with or 0 when that is not on record, SMs). Empty with an older build."""
+    e = _ext()
+    return [tuple(f) for f in e.occupancy_facts()] if hasattr(e, "occupancy_facts") else []
+
+
+_OCC_SEEN = [0]
+
+
+def _occ_guard() -> None:
+    """One WARNING per kernel that launches with fewer CTAs per SM than its mode was measured with: the grid is sms x the occupancy the
+    build's register count leaves, so a kernel that gained a register (a source change, another ptxas after an image rebuild) can lose
+    half its grid without any error - FC2's v9 kernel sits exactly on that count (96 registers per thread for two CTAs per SM)."""
+    facts = occupancy_facts()
+    for kernel, s, mb, regs, occ, expect, sms in facts[_OCC_SEEN[0]:]:
+        if expect > 0 and occ < expect:
+            _rt_log(f"WARNING: {kernel}<{s}, {mb}> launches with {occ} CTA(s) per SM (grid {sms * max(occ, 1)}) where its mode was measured with "
+                    f"{expect} (grid {sms * expect}): {regs} registers per thread in this build leave no room for more - the kernel is slower than "
+                    "measured (FC2: 10-15 %). Check the build (a source change or another ptxas); "
+                    "VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT=1 refuses such a launch")
+    _OCC_SEEN[0] = len(facts)
+
+
 def runtime_switches() -> dict:
     """The effective switch values of this process (env or runtime override): ws1, sum_items, sum_discard, sum_route_hint."""
     e = _ext()
@@ -259,6 +283,8 @@ def _runtime_hooks() -> None:
         _runtime_ab_poll()
     st["calls"] += 1
     n = st["calls"]
+    if n <= 4 or n % 64 == 0:  # a kernel's first launch is one of the first calls, or follows a switch: seen 64 calls later at the latest
+        _occ_guard()
     if st["stats_every"] > 0 and n % st["stats_every"] == 0:
         _stats_line(f"every {st['stats_every']} calls, call {n}")
     if n % 64 == 0:
