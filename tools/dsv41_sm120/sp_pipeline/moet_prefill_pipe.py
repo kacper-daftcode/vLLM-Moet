@@ -45,7 +45,11 @@ concatenation of both groups' replay rows (256) instead of once per group, the t
 bits stay today's, see shared_tail - K-9), VLLM_MOET_PREFILL_PIPE_SHARED_TAIL_GRAPHS (all | shared: which slots get replay graphs
 with the shared tail on), VLLM_MOET_PREFILL_PIPE_DEVICE_COMM (0 | 1 | verify: the sequence-parallel reduce-scatters and all-gathers
 of a pipelined step as device-initiated PCIe pushes from a small kernel per collective instead of NCCL - moet_device_comm.py, MK-4;
-verify = every device collective compared with NCCL's on the same inputs, NCCL's result consumed, counters in stats()).
+verify = every device collective compared with NCCL's on the same inputs, NCCL's result consumed, counters in stats()),
+VLLM_MOET_PREFILL_PIPE_GREEN (0 | N: a static split of the GPU's SMs for the pipelined step - its comm stream on a CUDA green
+context of N SMs, its compute stream on the remaining SMs, see green_sms; sub-switches _GREEN_TAIL / _GREEN_GRAPHS /
+_GREEN_AUX / _GREEN_WARMUP / _GREEN_WARMUP_CTX / _GREEN_MOE_CTAS; with VLLM_MOET_RUNTIME_AB=1 the control-file key
+PREFILL_PIPE_GREEN turns it off and on per forward).
 
 Measured (4x RTX PRO 6000 SE, TP4, image r25 + this patch): fresh prefill 163K 6947 -> 5360 ms
 (-22.9 %), 19K 819 -> 671 ms; long_agree / agree ALL IDENTICAL to r25, per-layer dumps 800/800 identical (PIPE=2 at 8192 vs
@@ -649,6 +653,9 @@ class PipeStep:
         self.errors: dict[int, BaseException] = {}
         # K-9: the step's shared replay tail (set by run_groups from the groups' plan when the step is pipelined), else None
         self.shared: SharedTail | None = None
+        # the static SM split with GREEN_TAIL=caller (_run_groups): the groups' replay sections run as replay phases on the caller's
+        # stream (= replay_stream), whatever VLLM_MOET_PREFILL_PIPE_REPLAY says
+        self.tail_on_caller = False
         for g in groups:
             g.step = self
             g.phases_done = 0
@@ -808,11 +815,15 @@ def phase_end() -> None:
     torch.cuda.set_stream(step.compute_stream)
     if g.phase_kind == "comm":
         g.last_phase_event = ev
+    # the static SM split's tail phase (GREEN_TAIL=caller) is not one of the sequence-parallel phases the groups are ordered by:
+    # a group may have a replay section when an earlier group has none
+    counted = not (g.phase_kind == "replay" and step.tail_on_caller)
     g.phase_open = False
     g.phase_stream = None
     g.phase_kind = ""
-    g.phases_done += 1
-    step.check_order(g)
+    if counted:
+        g.phases_done += 1
+        step.check_order(g)
     step.yield_(g)
     step.compute_stream.wait_event(ev)
     # the join is enqueued: the tensors the chain read on the comm stream may go back to the compute stream's pool (every
@@ -851,7 +862,9 @@ def replay_begin(*inputs: torch.Tensor | None) -> None:
     (the tail gate of VLLM_MOET_PREFILL_PIPE_TAIL applies in every replay mode)."""
     _tail_gate()
     if replay_mode() != "stream":
-        return
+        g = current_group()
+        if g is None or g.step is None or not g.step.tail_on_caller:  # (the static SM split's tail on the caller's stream)
+            return
     _phase_begin("replay")
     g = current_group()
     if g is None or not g.phase_open:
@@ -983,6 +996,585 @@ def device_all_gatherv(local: torch.Tensor, sizes: list[int], out: torch.Tensor,
     return dc.all_gatherv(local, sizes, out, fallback)
 
 
+# ----------------------------------------------------------------------------------- the static SM split (green contexts)
+def green_sms() -> int:
+    """VLLM_MOET_PREFILL_PIPE_GREEN=N (default 0 = off; N = the SMs asked for the comm side, 32 or 48 of a 188-SM GPU): the
+    pipelined step's two streams on two CUDA green contexts - a static split of the device's SMs, created ONCE per process
+    (cuDevSmResourceSplitByCount: one group of >= N SMs, rounded up by the driver to its co-scheduling alignment of 8, and the
+    remainder; a destroyed green context does not give its ~4 MiB back, so the split is never rebuilt). The comm stream of a
+    pipelined step (the boundary chains: NCCL's reduce-scatter / all-gather, the mHC kernels, the shard GEMMs, the quant)
+    becomes a stream of the N-SM context, its compute stream (attention, MoE, the GEMMs, the replay tails) a stream of the
+    other one, both wrapped as torch.cuda.ExternalStream: every kernel a thread launches while such a stream is current runs
+    on that partition's SMs only, on the tensors of the process's primary context - ATen, cuBLAS, CUTLASS, the JIT kernels,
+    driver-API launches and NCCL alike; nothing is moved or copied. The step joins the caller's stream at both ends
+    (GreenSplit.run).
+    Why: on one device the chain's kernels and the compute kernels queue for the same SMs (a 4-CTA NCCL kernel waits for a
+    compute kernel's wave, the compute stream loses SMs to the glue); a static split removes the queue at the price of the SM
+    share - the compute side's kernels run on 188 - N SMs for good.
+    What changes: which SMs run a kernel. The same kernels, in the same order, on the same rows - bits by construction. With
+    the switch off nothing below is created, loaded or polled.
+    The rules a split imposes, all kept here:
+      * every launch of the step goes through its side's green stream - the group threads' current stream (PipeStep) and
+        the attention modules' aux streams, swapped for streams of the compute partition during the step
+        (VLLM_MOET_PREFILL_PIPE_GREEN_AUX, default 1); a stream of the primary context is NOT confined: it takes whatever
+        SMs are free;
+      * the fast prefill MoE's grids are sized by the partition, not the device (green_moe_ctas): with the FC2 sum items a
+        grid built for the device's SMs waits for CTAs that never become resident on the partition and runs into its own
+        2-s watchdog - a trapped launch, the end of the process;
+      * the replay tails: by default each group's replay section (the rows gather, the 128-row layers 20-39) is a replay
+        phase on the caller's stream (VLLM_MOET_PREFILL_PIPE_GREEN_TAIL=caller, green_tail_on_caller) - the tails and their
+        CUDA graphs are today's and nothing of them depends on the split; with GREEN_TAIL=compute the tails stay on the
+        compute partition's stream and the row-group slots' replay graphs are captured on it
+        (VLLM_MOET_PREFILL_PIPE_GREEN_GRAPHS, default 1; shared_capture_scope) - a captured kernel keeps the context it was
+        recorded in, whatever stream launches the graph;
+      * every kernel of a step is launched once on its partition before the first request
+        (VLLM_MOET_PREFILL_PIPE_GREEN_WARMUP, default 1: one dummy pipelined step at engine start, _green_warmup_step) -
+        a kernel's first launch loads its code and waits for the device.
+    Not combined (the split stays off, said once): PHASE_GRAPHS != 0, DEVICE_COMM != 0, REPLAY=stream, the fast prefill MoE
+    off (the grids of any other MoE path are not capped).
+    One thing to know when measuring: after a CUDA graph is launched on a stream of a green context, torch.cuda.synchronize()
+    (the device) returns before the graph's kernels have finished - whichever stream the graph was captured on; stream order
+    on the launching stream, events recorded behind the launch and that stream's own synchronize() hold. The module joins
+    streams by events only, so nothing here depends on it; a timing loop that brackets such launches with device
+    synchronisation would read short.
+    Runtime A/B (VLLM_MOET_RUNTIME_AB=1 and its control file, as the fast prefill MoE's switches): key PREFILL_PIPE_GREEN =
+    0 (the step on the caller's stream and the pipeline's own comm stream, as without the switch) | N (the start-up value:
+    on the split); the file is looked at at most once per 100 ms, at the dispatch of a pipelined forward, and the state holds
+    for that forward as a whole - a flip never lands inside a step. Only a process started with GREEN=N has the key: both
+    states' streams exist from start-up and nothing is created at a flip. What was captured stays as captured: with the
+    default tail mode no captured launch depends on the key; with GREEN_TAIL=compute the slots' replay graphs keep the
+    compute partition in both states (GREEN_GRAPHS=0 leaves them on the caller's stream in both).
+    Measured so far on a model of the layer pair only (4x RTX PRO 6000 SE; two streams + NCCL as here, 20-layer / 200-layer
+    runs): 10.1 / 9.96 ms per layer pair -> 8.5-8.7 / 8.28 with N = 32 at 400 W, 10.0 -> 8.5 under a 300 W cap, 10.4 -> 10.1 J
+    per pair; the served layer's kernels on 156 SMs: attention +19 %, wo_a +24 %, the CUTLASS MXFP8 GEMMs +7...+10 %, fc1
+    +10 %, fc2 +9 % (grids capped), each bit-identical. The served forward is denser than that model: the number that counts
+    is the in-situ one."""
+    try:
+        n = int(os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN", "0"))
+    except ValueError:
+        return 0
+    return n if n > 0 else 0
+
+
+def green_graphs() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_GREEN_GRAPHS (default 1; with GREEN_TAIL=compute): the slots' replay graphs are captured on the compute
+    partition's stream."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN_GRAPHS", "1") != "0"
+
+
+def green_tail_on_caller() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_GREEN_TAIL (caller | compute, default caller): where the replay tails of a split step run.
+    "caller" = each group's replay section (the rows gather, the 128-row layers 20-39) as a replay phase on the caller's stream
+    - the stream layout of VLLM_MOET_PREFILL_PIPE_REPLAY=stream with the caller's stream as R, without its per-layer handoffs -
+    so the tails and their graphs are exactly today's (a stream of the primary context, captured as without the switch;
+    nothing of them depends on the runtime key) and only the sequence-parallel section is split. "compute" = the tails on the
+    compute partition's stream like the rest of the group's program, their graphs captured on that stream (GREEN_GRAPHS).
+    With the shared tail (its rendezvous does not run inside a replay phase) always "compute"."""
+    value = os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN_TAIL", "caller")
+    return value != "compute" and shared_tail() == "0"
+
+
+def green_aux() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_GREEN_AUX (default 1): the attention modules' aux streams are streams of the compute partition
+    during a split step (0: they stay streams of the primary context - not confined)."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN_AUX", "1") != "0"
+
+
+def green_warmup() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_GREEN_WARMUP (default 1): one dummy pipelined step on the split at engine start."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN_WARMUP", "1") != "0"
+
+
+def green_warmup_ctx() -> int:
+    """VLLM_MOET_PREFILL_PIPE_GREEN_WARMUP_CTX (default 32768): the sequence length of the warm-up step's dummy request (the
+    step's rows are its last 2 x group_rows(); the kernels are the same at any context, a short one touches fewer KV blocks)."""
+    try:
+        return max(int(os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN_WARMUP_CTX", "32768")), 0)
+    except ValueError:
+        return 32768
+
+
+# "split": the process's GreenSplit; "failed": why there is none (said once); "on": the effective state of the runtime A/B key
+# (True = the start-up state); the counters of the pipelined forwards that ran on / off the split while the switch is set, of
+# the MoE calls whose grids were capped and of the slot captures made on the compute partition; the control-file reader's state
+_GREEN: dict[str, Any] = {
+    "split": None, "failed": None, "on": True,
+    "forwards": 0, "rows": 0, "forwards_off": 0, "rows_off": 0, "moe_capped": 0, "graph_scopes": 0, "warmup": None,
+    "ab": None, "next_poll": 0.0, "sig": None, "warned": set(), "stats_mtime": None,
+}
+
+_GREEN_MOE_MODULE = "b12x_moe_prefill_fast_sm120"
+_GREEN_MOE_ENV = "VLLM_MOET_B12X_MOE_PREFILL_FAST"
+
+
+def _green_log(msg: str) -> None:
+    """The control-file contract's line format: `[<module tag>, device <n>] <text>` on stderr, one line per rank."""
+    import sys
+
+    try:
+        dev: Any = torch.cuda.current_device()
+    except Exception:  # noqa: BLE001
+        dev = "?"
+    print(f"[vllm-moet prefill pipeline, device {dev}] {msg}", file=sys.stderr, flush=True)
+
+
+def _green_warn_once(key: str, msg: str) -> None:
+    if key not in _GREEN["warned"]:
+        _GREEN["warned"].add(key)
+        _green_log("WARNING: " + msg)
+
+
+def _green_api():
+    """The CUDA driver's green-context entry points through ctypes (libcuda.so.1; driver API 12.4 or newer). Loaded at the first
+    split only. CUdevResource is 144 bytes in the 13.0 headers: type, 92 bytes the driver owns, the union whose `sm` member
+    (smCount, minSmPartitionSize, smCoscheduledAlignment) is all that is read here."""
+    import ctypes as C
+
+    cu = C.CDLL("libcuda.so.1")
+
+    class SmRes(C.Structure):
+        _fields_ = [("smCount", C.c_uint), ("minSmPartitionSize", C.c_uint), ("smCoscheduledAlignment", C.c_uint)]
+
+    class ResU(C.Union):
+        _fields_ = [("sm", SmRes), ("_oversize", C.c_ubyte * 48)]
+
+    class DevRes(C.Structure):
+        _fields_ = [("type", C.c_int), ("_pad", C.c_ubyte * 92), ("u", ResU)]
+
+    if C.sizeof(DevRes) != 144:
+        raise RuntimeError(f"CUdevResource layout: {C.sizeof(DevRes)} bytes, expected 144")
+    vp = C.c_void_p
+    sigs = {
+        "cuDeviceGet": [C.POINTER(C.c_int), C.c_int],
+        "cuDeviceGetDevResource": [C.c_int, C.POINTER(DevRes), C.c_int],
+        "cuDevSmResourceSplitByCount": [C.POINTER(DevRes), C.POINTER(C.c_uint), C.POINTER(DevRes), C.POINTER(DevRes), C.c_uint,
+                                        C.c_uint],
+        "cuDevResourceGenerateDesc": [C.POINTER(vp), C.POINTER(DevRes), C.c_uint],
+        "cuGreenCtxCreate": [C.POINTER(vp), vp, C.c_int, C.c_uint],
+        "cuGreenCtxStreamCreate": [C.POINTER(vp), vp, C.c_uint, C.c_int],
+        "cuStreamGetGreenCtx": [vp, C.POINTER(vp)],
+        "cuGetErrorName": [C.c_int, C.POINTER(C.c_char_p)],
+    }
+    for name, args in sigs.items():
+        f = getattr(cu, name)  # AttributeError = a driver without green contexts: the split stays off, said once
+        f.argtypes, f.restype = args, C.c_int
+    return C, cu, DevRes, vp
+
+
+class GreenSplit:
+    """The process's static SM split: partition A (the comm side, >= n SMs) and partition B (the compute side, the remaining
+    SMs), one green context each; the streams `comm` (A) and `compute`, `aux[0..2]` (B) as torch.cuda.ExternalStream. `sms` maps
+    a raw stream handle to its partition's SM count (what a launch on that stream has to size a persistent grid by). Created
+    once (green_split) and never destroyed: the process's end frees it."""
+
+    AUX = 3  # the attention modules' aux streams (one list of three, shared by every layer)
+
+    def __init__(self, n: int, device: torch.device, comm_priority: int = 0) -> None:
+        C, cu, DevRes, vp = _green_api()
+
+        def ck(rc: int, what: str) -> None:
+            if rc:
+                name = C.c_char_p()
+                cu.cuGetErrorName(rc, C.byref(name))
+                raise RuntimeError(f"CUDA driver error {rc} ({name.value!r}) in {what}")
+
+        index = device.index if device.index is not None else torch.cuda.current_device()
+        with torch.cuda.device(index):
+            torch.cuda.current_stream()  # the primary context exists and is current on this thread
+            dev = C.c_int()
+            ck(cu.cuDeviceGet(C.byref(dev), int(index)), "cuDeviceGet")
+            res = DevRes()
+            ck(cu.cuDeviceGetDevResource(dev.value, C.byref(res), 1), "cuDeviceGetDevResource")  # 1 = the SM resource
+            self.device_sms = int(res.u.sm.smCount)
+            out, rem, groups = (DevRes * 1)(), DevRes(), C.c_uint(1)
+            ck(cu.cuDevSmResourceSplitByCount(out, C.byref(groups), C.byref(res), C.byref(rem), 0, int(n)),
+               "cuDevSmResourceSplitByCount")
+            self.na = int(out[0].u.sm.smCount)
+            self.nb = int(rem.u.sm.smCount) if rem.type == 1 else 0
+            if groups.value != 1 or self.na <= 0 or self.nb <= 0:
+                raise RuntimeError(f"a split of {n} of {self.device_sms} SMs leaves no second partition ({self.na} + {self.nb})")
+            self._handles: list[Any] = []  # the green contexts and raw streams, kept alive with the object
+
+            def context(key: str, resource: Any) -> Any:
+                desc, ctx = vp(), vp()
+                ck(cu.cuDevResourceGenerateDesc(C.byref(desc), C.byref(resource), 1), f"cuDevResourceGenerateDesc {key}")
+                ck(cu.cuGreenCtxCreate(C.byref(ctx), desc, dev.value, 1), f"cuGreenCtxCreate {key}")  # 1 = with a default stream
+                self._handles.append(ctx)
+                return ctx
+
+            def stream(ctx: Any, priority: int, what: str) -> torch.cuda.Stream:
+                raw = vp()
+                ck(cu.cuGreenCtxStreamCreate(C.byref(raw), ctx, 1, int(priority)), f"cuGreenCtxStreamCreate {what}")  # 1 = non-blocking
+                owner = vp()
+                ck(cu.cuStreamGetGreenCtx(raw, C.byref(owner)), f"cuStreamGetGreenCtx {what}")
+                if owner.value != ctx.value:
+                    raise RuntimeError(f"the {what} stream is not a stream of its green context")
+                self._handles.append(raw)
+                return torch.cuda.ExternalStream(raw.value, device=index)
+
+            ctx_a, ctx_b = context("A", out[0]), context("B", rem)
+            self.comm = stream(ctx_a, comm_priority, "comm")
+            self.compute = stream(ctx_b, 0, "compute")
+            self.aux = [stream(ctx_b, 0, f"aux{i}") for i in range(self.AUX)]
+        self.sms: dict[int, int] = {int(self.comm.cuda_stream): self.na, int(self.compute.cuda_stream): self.nb}
+        self.sms.update({int(s.cuda_stream): self.nb for s in self.aux})
+
+    def run(self, runner: Any, step: "PipeStep", fn: Callable[[PipeGroup], Any]) -> list[Any]:
+        """One pipelined step on the split (the step was built with `compute` / `comm` as its streams): the compute partition
+        starts behind everything the caller's stream holds (the head), the attention's aux streams are the compute partition's
+        for the step, and the caller's stream continues behind the step's last compute kernel - the two joins that the one
+        compute stream of today's path gets from stream order."""
+        from vllm.utils.torch_utils import current_stream
+
+        caller = current_stream()
+        head = torch.cuda.Event()
+        head.record(caller)
+        self.compute.wait_event(head)
+        swapped = []
+        if green_aux():
+            for lst in getattr(runner, "aux_stream_lists", ()):
+                swapped.append((lst, list(lst)))
+                for i in range(min(len(lst), len(self.aux))):
+                    lst[i] = self.aux[i]
+        try:
+            return step.run(fn)
+        finally:
+            for lst, orig in swapped:
+                lst[:] = orig
+            done = torch.cuda.Event()
+            done.record(self.compute)
+            caller.wait_event(done)
+
+
+def _green_unsupported() -> str | None:
+    """Why the split cannot be combined with this process's configuration (None = it can)."""
+    if mode() != 2:
+        return "VLLM_MOET_PREFILL_PIPE != 2"
+    if phase_graphs() != "0":
+        return "VLLM_MOET_PREFILL_PIPE_PHASE_GRAPHS != 0 (the phase graph is captured across primary-context streams)"
+    if device_comm_mode() != "0":
+        return "VLLM_MOET_PREFILL_PIPE_DEVICE_COMM != 0 (the device collectives were not run on a partition in situ)"
+    if replay_mode() != "serial":
+        return "VLLM_MOET_PREFILL_PIPE_REPLAY=stream"
+    if os.environ.get(_GREEN_MOE_ENV, "0") != "1":
+        return f"{_GREEN_MOE_ENV} != 1 (only the fast prefill MoE's grids are capped to a partition)"
+    return None
+
+
+def green_split(device: torch.device | None = None) -> GreenSplit | None:
+    """The process's split, created at the first call with the switch on (the slots' graph capture at engine start, else the
+    first pipelined forward); None when the switch is off, the configuration does not combine, or the creation failed - said
+    once, every pipelined step then runs as without the switch."""
+    n = green_sms()
+    if n == 0:
+        return None
+    if _GREEN["split"] is not None or _GREEN["failed"] is not None:
+        return _GREEN["split"]
+    why = _green_unsupported()
+    sp = None
+    if why is None:
+        try:
+            if device is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            sp = GreenSplit(n, device, _comm_priority())
+            if not _green_install_moe_caps():
+                sp, why = None, "the fast prefill MoE module is not importable or takes no grid caps: its grids cannot be sized by a partition"
+        except Exception as exc:  # noqa: BLE001 - a driver without green contexts, a refused split: today's path, loudly
+            sp, why = None, f"{type(exc).__name__}: {str(exc)[:300]}"
+    if sp is None:
+        _GREEN["failed"] = why
+        logger.warning(
+            "vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE_GREEN=%d requested but the SM split is OFF (%s) - every "
+            "pipelined step runs today's path (the caller's stream and the pipeline's comm stream, as without the switch)", n, why,
+        )
+        return None
+    _GREEN["split"] = sp
+    logger.info(
+        "vllm-moet sm_120 prefill pipeline: static SM split created once for this process (rank %d): comm partition %d SMs "
+        "(asked %d), compute partition %d SMs, device %d SMs; comm stream priority %d, %d aux streams on the compute partition; "
+        "replay tails %s, aux streams swapped: %s, warm-up step: %s, runtime A/B key PREFILL_PIPE_GREEN: %s "
+        "(VLLM_MOET_PREFILL_PIPE_GREEN)",
+        _tp_rank(), sp.na, n, sp.nb, sp.device_sms, _comm_priority(), len(sp.aux),
+        "on the caller's stream (today's graphs)" if green_tail_on_caller() else
+        f"on the compute partition (their graphs captured there: {green_graphs()})", green_aux(), green_warmup(),
+        "on" if os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1" else "off (VLLM_MOET_RUNTIME_AB != 1)",
+    )
+    return sp
+
+
+def _green_current_sms() -> int | None:
+    """The SM count of the partition the calling thread's current stream belongs to; None on a stream of the primary context.
+    Asks torch itself, not vllm's per-thread bookkeeping: the launch that follows goes to torch's current stream, and a stream
+    made current through another door (a `with stream:` of the accelerator API) is not in that bookkeeping."""
+    sp = _GREEN["split"]
+    if sp is None:
+        return None
+    return sp.sms.get(int(torch.cuda.current_stream().cuda_stream))
+
+
+def green_moe_ctas(rows: int, module: Any = None) -> tuple[int, int]:
+    """The CTAs per SM the fast prefill MoE's FC1 / FC2 grids are capped to on a partition. The kernels size a grid as
+    (occupancy of the kernel) x (SMs of the device) so that every CTA is resident; on a partition of S SMs that holds only for
+    occupancy x S. VLLM_MOET_PREFILL_PIPE_GREEN_MOE_CTAS="a,b" gives both numbers; the default follows the as-built modes on
+    this GPU: FC1 1 for a one-CTA-per-SM mode at or above its row threshold (the warpgroup modes 9-11, the producer-warp modes
+    2-7, the persistent launch), else 2; FC2 2 for the producer-warp mode 3 and for the kernel without producer warps, else 1.
+    A number too small only costs CTAs and is always safe; one too large leaves the grid above the partition's capacity, which
+    kernels without cross-CTA waits do not mind and FC2 with the sum items answers with its watchdog - hence 1 for every FC2
+    mode that was not run on a partition."""
+    raw = os.environ.get("VLLM_MOET_PREFILL_PIPE_GREEN_MOE_CTAS", "")
+    if raw:
+        try:
+            a, b = (int(v) for v in raw.split(","))
+            if a >= 1 and b >= 1:
+                return a, b
+        except ValueError:
+            pass
+        _green_warn_once("moe_ctas", f"VLLM_MOET_PREFILL_PIPE_GREEN_MOE_CTAS={raw!r} is not two integers >= 1 - the default rule applies")
+
+    def env(name: str, default: int) -> int:
+        try:
+            return int(os.environ.get(f"{_GREEN_MOE_ENV}_{name}", default))
+        except ValueError:
+            return default
+
+    ws1 = env("WS1", 0)
+    if module is not None and hasattr(module, "runtime_switches"):
+        try:
+            ws1 = int(module.runtime_switches().get("WS1", ws1))  # the fast MoE's own runtime A/B key may have changed it
+        except Exception:  # noqa: BLE001 - an extension without the entry: the environment value
+            pass
+    ws, ws2 = env("WS", 0), env("WS2", 0)
+    if ws >= 20 and rows >= env("WS_MIN_ROWS", 0):
+        fc1 = 1
+    elif (2 <= ws1 <= 7 or 9 <= ws1 <= 11) and rows >= env("WS1_MIN_ROWS", 256):
+        fc1 = 1
+    else:
+        fc1 = 2
+    return fc1, 2 if ws2 in (0, 3) else 1
+
+
+def _green_install_moe_caps() -> bool:
+    """Wrap the fast prefill MoE's entry point once - `moe_prefill_fast` of its Python module, which the b12x launcher looks up
+    on the module at every call - so that a call issued while a green stream is current passes grid caps of the partition's
+    SM count x green_moe_ctas (the module's own grid1 / grid2 arguments; a smaller cap of the caller or of the module's
+    environment wins). On any other stream the wrapper passes the call through untouched. False = the module is not there or
+    its entry point has no grid1 / grid2 parameters."""
+    import sys
+
+    path = os.environ.get(f"{_GREEN_MOE_ENV}_DIR", "/opt/vllm-moet/dsv41_sm120/b12x_moe_prefill_fast")
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    try:
+        module = __import__(_GREEN_MOE_MODULE)
+    except ImportError:
+        return False
+    orig = module.moe_prefill_fast
+    if getattr(orig, "_moet_green_caps", False):
+        return True
+    import inspect
+
+    try:  # where grid1 / grid2 sit when a caller gives them by position (behind hidden, ids): read from the entry point itself
+        names = list(inspect.signature(orig).parameters)
+        positions = tuple((names.index(name) - 2, name) for name in ("grid1", "grid2"))
+    except (TypeError, ValueError):
+        return False  # an entry point without grid caps cannot be made safe on a partition
+
+    def env_cap(name: str) -> int:
+        try:
+            return int(os.environ.get(f"{_GREEN_MOE_ENV}_{name}", 0))
+        except ValueError:
+            return 0
+
+    def moe_prefill_fast(hidden, ids, *args, **kwargs):
+        sms = _green_current_sms()
+        if sms is not None:
+            fc1, fc2 = green_moe_ctas(int(ids.shape[0]), module)
+            args = list(args)
+            for (pos, name), cap in zip(positions, (sms * fc1, sms * fc2)):
+                cur = args[pos] if pos < len(args) else kwargs.get(name)
+                cur = env_cap(name.upper()) if cur is None else int(cur)
+                new = cap if cur <= 0 else min(cur, cap)
+                if pos < len(args):
+                    args[pos] = new
+                else:
+                    kwargs[name] = new
+            _GREEN["moe_capped"] += 1
+        return orig(hidden, ids, *args, **kwargs)
+
+    moe_prefill_fast._moet_green_caps = True  # type: ignore[attr-defined]
+    moe_prefill_fast.__wrapped__ = orig  # type: ignore[attr-defined]
+    moe_prefill_fast.__doc__ = orig.__doc__
+    module.moe_prefill_fast = moe_prefill_fast
+    return True
+
+
+def _green_stats_line(reason: str) -> None:
+    """The counters line in the control-file contract's format, which a generic read-back matches for every module:
+    `[<tag>, device <n>] activation counters (<reason>, call <N>; calls / rows): <path> <calls> / <rows>, ...; switches now
+    <KEY>=<v>`. This module's unit of work - its `call` - is one pipelined forward."""
+    st = _GREEN
+    _green_log(
+        f"activation counters ({reason}, call {st['forwards'] + st['forwards_off']}; calls / rows): split {st['forwards']} / "
+        f"{st['rows']}, unsplit {st['forwards_off']} / {st['rows_off']}; MoE calls with capped grids {st['moe_capped']}; "
+        f"switches now PREFILL_PIPE_GREEN={green_sms() if st['on'] else 0}"
+    )
+
+
+def green_apply_runtime(values: dict) -> list[str]:
+    """Apply the control file's object: PREFILL_PIPE_GREEN = 0 | the start-up value; absent = the start-up value; out of range
+    = the current state kept (one WARNING); an unknown key of this module's namespace = ignored (one WARNING per key); other
+    modules' keys ignored silently. Returns the change descriptions (also logged, one line per change)."""
+    st = _GREEN
+    n = green_sms()
+    sp = st["split"]
+    want = True
+    for key, val in values.items():
+        if not isinstance(key, str) or not key.startswith("PREFILL_PIPE_"):
+            continue
+        if key != "PREFILL_PIPE_GREEN":
+            _green_warn_once("key:" + key, f"runtime A/B: unknown key {key} of this module - ignored")
+            continue
+        v = val if isinstance(val, int) and not isinstance(val, bool) else None
+        if v == 0:
+            want = False
+        elif v is not None and (v == n or (sp is not None and v == sp.na)):
+            want = True
+        else:
+            want = st["on"]
+            _green_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0, or the start-up value {n}: the split "
+                             f"is created once) - kept {n if st['on'] else 0}")
+    changes = []
+    if want != st["on"]:
+        changes.append(f"PREFILL_PIPE_GREEN {n if st['on'] else 0} -> {n if want else 0}")
+        st["on"] = want
+    for c in changes:
+        _green_log("runtime A/B: " + c)
+    return changes
+
+
+def _green_ab_poll() -> None:
+    """The control-file reader of this module (the contract of the fast prefill MoE's runtime switch, its own copy): at most one
+    os.stat per 100 ms, the JSON re-read only when (mtime, size) changed; a missing or malformed file keeps the state."""
+    st = _GREEN
+    now = time.monotonic()
+    if now < st["next_poll"]:
+        return
+    st["next_poll"] = now + 0.1
+    path = os.environ.get("VLLM_MOET_RUNTIME_AB_FILE", "/dev/shm/vllm_moet_ab.json")
+    try:
+        s = os.stat(path)
+    except OSError:
+        _green_warn_once("missing", f"runtime A/B: control file {path} missing or unreadable - the current state is kept until it appears")
+        return
+    sig = (s.st_mtime_ns, s.st_size)
+    if sig == st["sig"]:
+        return
+    st["sig"] = sig
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+        if not isinstance(values, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        _green_warn_once("malformed", f"runtime A/B: control file {path} malformed ({exc}) - the current state is kept")
+        return
+    st["warned"].discard("missing")
+    st["warned"].discard("malformed")
+    green_apply_runtime(values)
+
+
+def green_active() -> GreenSplit | None:
+    """The split the pipelined forward being dispatched runs on, or None (the switch off, no split, or the runtime A/B key at
+    0). Called once per pipelined forward on the runner thread, before the step's streams are chosen: the control-file poll
+    (VLLM_MOET_RUNTIME_AB=1) and the on-demand counters line (`touch` the stats file: one os.stat per forward) sit here."""
+    if green_sms() == 0:
+        return None
+    sp = green_split()
+    if sp is None:
+        return None
+    st = _GREEN
+    if st["ab"] is None:
+        st["ab"] = os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
+    if st["ab"]:
+        _green_ab_poll()
+    try:
+        mtime = os.stat(os.environ.get("VLLM_MOET_RUNTIME_STATS_FILE", "/dev/shm/vllm_moet_stats")).st_mtime_ns
+    except OSError:
+        mtime = None
+    if mtime is not None and mtime != st["stats_mtime"]:
+        st["stats_mtime"] = mtime
+        _green_stats_line("on demand")
+    return sp if st["on"] else None
+
+
+def _green_capture_enter() -> Any:
+    """shared_capture_scope, for every slot: the calling thread captures the slot's replay graphs on the compute partition's
+    stream (GREEN_GRAPHS) - behind everything its own stream holds; the MoE launches recorded there carry the partition's grid
+    caps. Returns the stream to go back to (None = nothing was changed)."""
+    if green_sms() == 0 or not green_graphs() or green_tail_on_caller():
+        return None
+    sp = green_split()
+    if sp is None:
+        return None
+    from vllm.utils.torch_utils import current_stream
+
+    prev = current_stream()
+    ev = torch.cuda.Event()
+    ev.record(prev)
+    sp.compute.wait_event(ev)
+    torch.cuda.set_stream(sp.compute)
+    _GREEN["graph_scopes"] += 1
+    return prev
+
+
+def _green_capture_exit(prev: Any) -> None:
+    if prev is None:
+        return
+    sp = _GREEN["split"]
+    ev = torch.cuda.Event()
+    ev.record(sp.compute)
+    prev.wait_event(ev)
+    torch.cuda.set_stream(prev)
+
+
+def _green_warmup_step(runner: Any, profile_only: bool) -> None:
+    """GREEN_WARMUP, from the runner's capture_model (capture_phase_graphs' call, after the slots' replay graphs; the real pass
+    only): one dummy pipelined step of 2 x group_rows() rows runs eagerly on the split - the phase graph's dummy step
+    (PipeRunner.capture_phase_graph), its warm-up pass alone, at a short context - so that every kernel of a step has been
+    launched once on its partition's stream before the first request. A failure is logged with its traceback and changes
+    nothing else: the first request then loads the kernels as it goes."""
+    global _RUNNER
+    if profile_only or force_sequential():
+        return
+    if kv_connector_policy() == "refuse" and _kv_connector_configured(runner):
+        return
+    if green_split(runner.device) is None:
+        return
+    t0 = time.time()
+    try:
+        _RUNNER = PipeRunner(runner)
+        _RUNNER.capture_phase_graph(runner, passes=("warmup",), max_ctx=green_warmup_ctx())
+        torch.cuda.synchronize()
+        # the step's activation blocks go back to the device: the runner books the free-memory difference around its capture
+        # pass as CUDA graph memory, and a dummy step's cached blocks are not graphs
+        torch.cuda.empty_cache()
+        _GREEN["warmup"] = "done"
+        logger.info(
+            "vllm-moet sm_120 prefill pipeline: SM split warm-up - one dummy pipelined step of %d rows ran on the split in %.1f s "
+            "(every kernel launched once on its partition; MoE calls with capped grids so far %d)",
+            group_rows() * PipeRunner.NUM_GROUPS, time.time() - t0, _GREEN["moe_capped"],
+        )
+    except Exception as exc:  # noqa: BLE001 - never break the engine start: the first request warms the kernels instead
+        _GREEN["warmup"] = f"failed: {type(exc).__name__}: {str(exc)[:200]}"
+        logger.exception(
+            "vllm-moet sm_120 prefill pipeline: SM SPLIT WARM-UP FAILED (%s) - the split stays on, the first pipelined request "
+            "launches each kernel for the first time on its partition", _GREEN["warmup"],
+        )
+    finally:
+        _PHASE["request"] = None
+        _PHASE["capturing"] = False
+
+
 # ------------------------------------------------------------------------------------------------- model side
 def merge_outputs(outputs: list[Any]) -> Any:
     """The per-group model outputs in row order: tensors concatenate along the token dim, a tuple's list elements
@@ -1014,7 +1606,7 @@ def run_groups(
     the captured graph (or is being captured, during capture_phase_graphs); fn stays the eager path of every other step."""
     runner = _RUNNER
     assert runner is not None, "prefill pipeline: groups without a runner"
-    if host_timing():
+    if host_timing() and _PHASE["request"] is None:  # a dummy step at engine start is not a step of the served traffic
         t_dispatch = time.perf_counter()
         try:
             return _run_groups(runner, groups, fn, pipelined, phase)
@@ -1035,10 +1627,20 @@ def _run_groups(
         if _STATS["steps"] == 0:
             logger.info("vllm-moet sm_120 prefill pipeline: VLLM_MOET_PREFILL_PIPE_FORCE_SEQUENTIAL=1 - the groups run one "
                         "after the other (the bits oracle of the pipelined path)")
-    step = PipeStep(
-        groups, current_stream(), runner.comm_stream, runner.row_switch, runner.device, pipelined,
-        replay_stream=getattr(runner, "replay_stream", None),
-    )
+    # the static SM split (VLLM_MOET_PREFILL_PIPE_GREEN): the step's two streams are the partitions' for this forward as a whole
+    green = green_active() if pipelined and green_sms() and _PHASE["request"] in (None, "warmup") else None
+    if green is None:
+        step = PipeStep(
+            groups, current_stream(), runner.comm_stream, runner.row_switch, runner.device, pipelined,
+            replay_stream=getattr(runner, "replay_stream", None),
+        )
+    else:
+        tail_on_caller = green_tail_on_caller()
+        step = PipeStep(
+            groups, green.compute, green.comm, runner.row_switch, runner.device, pipelined,
+            replay_stream=current_stream() if tail_on_caller else getattr(runner, "replay_stream", None),
+        )
+        step.tail_on_caller = tail_on_caller
     if pipelined:
         step.shared = SharedTail.for_step(groups)  # K-9: None unless the runner planned a shared replay tail for this step
     if _PHASE["request"] is not None:
@@ -1049,7 +1651,7 @@ def _run_groups(
                 f"prefill pipeline: the phase graph's dummy step is not pipelined (pipelined={pipelined}, hooks={phase is not None})"
             )
         if _PHASE["request"] == "warmup":
-            return step.run(fn)
+            return step.run(fn) if green is None else green.run(runner, step, fn)
         return _phase_capture_step(runner, groups, phase)
     _STATS["steps"] += 1
     if pipelined and phase is not None and phase_graphs() != "0":
@@ -1075,7 +1677,20 @@ def _run_groups(
                 group_rows(),
                 len(groups),
             )
-        outputs = step.run(fn)
+        if green is not None:
+            _GREEN["forwards"] += 1
+            _GREEN["rows"] += sum(g.num_tokens for g in groups)
+            if _GREEN["forwards"] == 1:
+                logger.info(
+                    "vllm-moet sm_120 prefill pipeline: pipelined steps run on the static SM split - the comm stream on %d SMs, "
+                    "the compute stream on %d (VLLM_MOET_PREFILL_PIPE_GREEN=%d)", green.na, green.nb, green_sms(),
+                )
+            outputs = green.run(runner, step, fn)
+        else:
+            if green_sms():
+                _GREEN["forwards_off"] += 1
+                _GREEN["rows_off"] += sum(g.num_tokens for g in groups)
+            outputs = step.run(fn)
         if device_comm_mode() != "0" and _device_comm():
             _device_comm().step_done()  # the watchdog record (a trapped kernel = a failed step, loudly) + the verify counters
         return outputs
@@ -1181,8 +1796,12 @@ class shared_capture_scope:
         self.plan = SharedPlan(counts=[int(window), int(window)], pin=int(window), verify=False, capture_window=int(window)) \
             if self.active else None
         self.scope = None
+        self.green_prev = None  # the static SM split: the stream to go back to after a capture on the compute partition
 
     def __enter__(self):
+        # every slot (the groups' and the shared one): with VLLM_MOET_PREFILL_PIPE_GREEN the graphs are captured on the compute
+        # partition's stream (_green_capture_enter; None and no effect with the switch off)
+        self.green_prev = _green_capture_enter()
         if self.active:
             st = SharedTail(self.plan, [], [None] * len(self.plan.counts), [None] * len(self.plan.counts))
             self.scope = _SharedScope(st)
@@ -1192,6 +1811,8 @@ class shared_capture_scope:
     def __exit__(self, *exc):
         if self.scope is not None:
             self.scope.__exit__(*exc)
+        _green_capture_exit(self.green_prev)
+        self.green_prev = None
         return False
 
 
@@ -1857,6 +2478,10 @@ def capture_phase_graphs(runner: Any, profile_only: bool = False) -> None:
     eager and says so with the traceback (never a silent fallback). The graph of the memory-profiling pass is dropped
     right away (it lives in that pass's throwaway pool; its size is in the pass's measurement) - K-7's lesson."""
     global _RUNNER
+    if mode() == 2 and phase_graphs() == "0" and green_sms() and green_warmup():
+        # the static SM split (VLLM_MOET_PREFILL_PIPE_GREEN): no graph - this call is the hook of its warm-up step
+        _green_warmup_step(runner, profile_only)
+        return
     if mode() != 2 or phase_graphs() == "0":
         return
     if kv_connector_policy() == "refuse" and _kv_connector_configured(runner):
@@ -1998,6 +2623,16 @@ class PipeRunner:
         self.phase_graph_failed: str | None = None
         self.engram_modules = [m for m in runner.model.modules() if hasattr(m, "_prefetch_done")]
         self.model = runner.model
+        # the static SM split (VLLM_MOET_PREFILL_PIPE_GREEN): the attention modules' aux-stream lists (one list shared by every
+        # layer in the served model), whose streams are the compute partition's during a split step (GreenSplit.run)
+        self.aux_stream_lists: list[list] = []
+        if green_sms():
+            seen: set[int] = set()
+            for module in runner.model.modules():
+                lst = getattr(module, "aux_stream_list", None)
+                if isinstance(lst, list) and lst and id(lst) not in seen and all(isinstance(s, torch.cuda.Stream) for s in lst):
+                    seen.add(id(lst))
+                    self.aux_stream_lists.append(lst)
         # the capture passes run on this stream (a capture cannot begin on the default stream; the warm-up runs on it too, so
         # the per-stream cuBLAS workspaces exist before the capture); the real steps launch the graph on the runner's stream
         self.capture_stream = torch.cuda.Stream(device=self.device)
@@ -2398,11 +3033,13 @@ class PipeRunner:
         k = int(getattr(hf, "hc_mult", 4)) * int(hf.hidden_size)
         return int(_mhc_warmup().compute_mhc_pre_num_splits(k, num_tokens))
 
-    def capture_phase_graph(self, runner: Any) -> None:
+    def capture_phase_graph(self, runner: Any, passes: tuple[str, ...] = ("warmup", "capture"), max_ctx: int | None = None) -> None:
         """K-8: the dummy step of the phase graph and its two passes (warm-up, capture) through the model's forward - the
         runner's eager path on a dummy batch, so the graph reads the buffers a real step fills (the replay-graph capture's
         principle). One request in the middle of its prompt: context = PHASE_GRAPH_MAX_CTX - the step's rows (the host
-        extents of the metadata are then maxima), the step = NUM_GROUPS x group_rows() rows, every row prefilling."""
+        extents of the metadata are then maxima), the step = NUM_GROUPS x group_rows() rows, every row prefilling.
+        `passes` / `max_ctx`: the static SM split's warm-up step is this dummy step's warm-up pass alone, at its own (short)
+        sequence length (_green_warmup_step); the defaults are the phase graph's."""
         from vllm.config import CUDAGraphMode
         from vllm.forward_context import BatchDescriptor, set_forward_context
         from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
@@ -2410,7 +3047,7 @@ class PipeRunner:
 
         rows = group_rows()
         num_tokens = rows * self.num_groups
-        max_ctx = min(phase_graph_max_ctx(), int(runner.max_model_len))
+        max_ctx = min(phase_graph_max_ctx() if max_ctx is None else max(int(max_ctx), num_tokens), int(runner.max_model_len))
         context_len = max(max_ctx - num_tokens, 0)
         input_batch = InputBatch.make_dummy(1, num_tokens, runner.input_buffers, is_padding=False)
         block_tables, slot_mappings = runner.prepare_dummy_attn(input_batch, False)
@@ -2447,13 +3084,19 @@ class PipeRunner:
             "intermediate_tensors": None,
             **self.model_state.prepare_inputs(input_batch, runner.req_states),
         }
-        logger.info(
-            "vllm-moet sm_120 prefill pipeline: capturing the phase graph on a dummy step of %d rows (%d groups x %d, context "
-            "%d tokens = MAX_CTX %d, %d KV blocks): warm-up pass, then the capture pass",
-            num_tokens, self.num_groups, rows, context_len, max_ctx, self.kv_cache_config.num_blocks,
-        )
+        if "capture" in passes:
+            logger.info(
+                "vllm-moet sm_120 prefill pipeline: capturing the phase graph on a dummy step of %d rows (%d groups x %d, context "
+                "%d tokens = MAX_CTX %d, %d KV blocks): warm-up pass, then the capture pass",
+                num_tokens, self.num_groups, rows, context_len, max_ctx, self.kv_cache_config.num_blocks,
+            )
+        else:
+            logger.info(
+                "vllm-moet sm_120 prefill pipeline: SM split warm-up on a dummy step of %d rows (%d groups x %d, context %d tokens, "
+                "%d KV blocks)", num_tokens, self.num_groups, rows, context_len, self.kv_cache_config.num_blocks,
+            )
         self.capture_stream.wait_stream(torch.cuda.current_stream())
-        for request in ("warmup", "capture"):
+        for request in passes:
             _PHASE["request"] = request
             try:
                 with torch.cuda.stream(self.capture_stream), set_forward_context(
@@ -2469,6 +3112,8 @@ class PipeRunner:
             finally:
                 _PHASE["request"] = None
             torch.cuda.synchronize()
+        if "capture" not in passes:
+            return
         if self.phase_graph is None:
             raise RuntimeError("the capture pass ran but no phase graph was recorded (did the dummy step pipeline?)")
         self.phase_graph.captured_ctx = max_ctx
@@ -2510,6 +3155,13 @@ def stats() -> dict:
     d = dict(_STATS)
     if device_comm_mode() != "0" and _DEVICE_COMM:
         d["device_comm"] = _DEVICE_COMM.stats()
+    if green_sms():
+        sp = _GREEN["split"]
+        d["green"] = {
+            "asked": green_sms(), "comm_sms": None if sp is None else sp.na, "compute_sms": None if sp is None else sp.nb,
+            "failed": _GREEN["failed"], "on": bool(_GREEN["on"]) and sp is not None,
+            **{k: _GREEN[k] for k in ("forwards", "rows", "forwards_off", "rows_off", "moe_capped", "graph_scopes", "warmup")},
+        }
     return d
 
 

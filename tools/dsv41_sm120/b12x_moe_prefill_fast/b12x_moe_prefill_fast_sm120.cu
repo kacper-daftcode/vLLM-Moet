@@ -29,15 +29,14 @@
 //              (down_alpha * global_scale) * token weight (staged with the pairs), cvt.rn.satfinite.bf16x2 into the
 //              token-major route rows (a word transpose across the quad: two 16 B stores per row and slice).
 //   topk_sum   out[t, col] = bf16((((0 + r0) + r1) + ...)) over the token's pairs in slot order (ids < 0 skipped), fp32
-//              adds of the bf16 route values - spec B's topk_sum, 8 columns per thread. v8 can also fuse it into fc2's
-//              epilogue (VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1: the CTA that completes the last of a token's rows
-//              for a 128-column tile sums the token's rows for that tile; same chain, same order whoever sums) - on
-//              call1 break-even with this kernel, so off by default. Integrated (patch v2) the kernels write the output
-//              and b12x's TopKSum (0.166 ms) is skipped; with patch v1 the route rows are the interface.
+//              adds of the bf16 route values - spec B's topk_sum, 8 columns per thread; with the v9 FC2 kernel the same
+//              chain runs as work items of FC2's list (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1, below). The v8
+//              variant that summed in FC2's epilogue (..._FUSED_SUM=1) is removed: the sum items replace it, and the
+//              extension refuses to run while that variable is still set. Integrated (patch v2) the kernels write the
+//              output and b12x's TopKSum (0.166 ms) is skipped; with patch v1 the route rows are the interface.
 //
 // Determinism: no atomics in any reduction (the only atomics are the integer pair counts in shared memory, whose sums
-// are order-independent, the work-item counters, which only decide which CTA computes an item, and the fused sum's
-// arrival counters, which only decide which CTA sums - in the fixed slot order). Three runs give identical bits. Plane
+// are order-independent, and the work-item counters, which only decide which CTA computes an item). Three runs give identical bits. Plane
 // layouts and operand conventions are the spec's (see its header).
 //
 // History (call1 layer of the dumps: 4096 rows x top-6, 319 experts, one RTX PRO 6000 at 400 W, bits always identical):
@@ -335,8 +334,6 @@ struct FrontArgs {
   int32_t* chunk_cnt;       // [n_chunks][kMaxE]: the 512-pair chunks' per-expert pair counts, after the scan the exclusive prefix over the chunks
   int32_t* exp_off;         // [kMaxE] padded row offset of the expert (the scan CTA -> the scatter kernel)
   int32_t* exp_cnt;         // [kMaxE] pair count of the expert
-  uint32_t* out;            // fused top-k sum: the output rows of tokens without a valid pair are zeroed here (nullptr: off)
-  int32_t* tok_valid;       // fused top-k sum: [T] bits 0-7 the token's valid pairs (0 <= id < E) = its FC2 arrivals per tile, bits 8-15 the slots with id >= 0
   // MK-2 (WS >= 20): the unified work list of the persistent launch (FC1 items of expert e, then the FC2 items of expert e - lead; nullptr: the
   // two lists above), its capacity, the lead in experts, and fc1_need[e] = the FC2 items' wait target (8 x the expert's FC1 items)
   int4* u_items;
@@ -598,22 +595,6 @@ __global__ void __launch_bounds__(kFrontThreads) scatter_kernel(FrontArgs a) {
   if (valid) {
     const int r = s_off[e] + s_w[warp][e] + rank;
     if (r < a.row_cap) a.row_pair[r] = p;
-  }
-  // fused top-k sum: the thread of a token's slot 0 counts the token's valid pairs (= its arrivals per output tile in
-  // FC2); a token without one gets no arrival - its output row is the sum of nothing = zeros (topk_sum_kernel's acc = +0
-  // -> bf16 0), written here (rare: synthetic -1 rows)
-  if (a.out != nullptr && p < n_pairs && p % a.topk == 0) {
-    int nvalid = 0, mask = 0;  // tok_valid word: bits 0-7 the valid-pair count (arrivals), bits 8-15 the slots with id >= 0 (summed)
-    for (int sl = 0; sl < a.topk; ++sl) {
-      const int id = a.ids[p + sl];
-      nvalid += (id >= 0 && id < E) ? 1 : 0;
-      mask |= (id >= 0 ? 1 : 0) << sl;
-    }
-    a.tok_valid[p / a.topk] = nvalid | (mask << 8);
-    if (nvalid == 0) {
-      uint4* o = reinterpret_cast<uint4*>(a.out + (size_t)(p / a.topk) * (a.K / 2));
-      for (int j = 0; j < a.K / 8; ++j) o[j] = make_uint4(0u, 0u, 0u, 0u);
-    }
   }
 }
 
@@ -992,13 +973,10 @@ struct Fc2Args {
   const float* down_alpha;     // [E]
   const float* global_scale;   // [E] or [1]
   uint32_t* route;             // [pairs][K] bf16
-  // the fused top-k sum (v8; out == nullptr: off, the route rows are the interface): out[t][col] = bf16 of the fp32 sum of
-  // the token's route values in slot order (ids < 0 skipped) = topk_sum_kernel, done by the CTA whose item completes the
-  // last of the token's rows for this 128-column tile (arrival counter per (token, tile), zeroed by the host)
+  // the top-k sum inside FC2 (the sum items of fc2_kernel_ws, below; out == nullptr: off, the route rows are the interface):
+  // out[t][col] = bf16 of the fp32 sum of the token's route values in slot order (ids < 0 skipped) = topk_sum_kernel
   uint32_t* out;               // [T][K] bf16 or nullptr
-  int32_t* arrive;             // [T * out_tiles]
   const int32_t* ids;          // [T * topk]
-  const int32_t* tok_valid;    // [T] valid pairs of the token | slot mask << 8 (the scatter kernel; topk <= 8)
   int K, out_tiles, gs_per_expert, dynamic_schedule, topk;
   // K-12 (SUM_ITEMS, fc2_kernel_ws only; sum_mode 0 = off): the top-k sum as items of the column-tile-major list. tile_done[n] += 1 per
   // consumer warp per FC2 item of tile n (red.release.gpu after the warp's route stores); a sum item's warps wait for tile_done[n] ==
@@ -1094,10 +1072,6 @@ template <int STAGES, int MINB>
 __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
-  __shared__ int s_done[2][64];  // fused top-k sum: the lists - token + 1 of the rows whose (token, tile) slice item j completed, slot j & 1
-  __shared__ int s_mask[2][64];  // ... the token's slot mask (slots with id >= 0: the ones summed)
-  __shared__ int s_ltile[2];     // ... and that item's tile
-  __shared__ int s_tile[4];      // the tile of item j, slot j & 3 (read two items later)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int q = lane >> 2, c = lane & 3;
   // The zero tail (k32 blocks 18-19: zero A, zero B, zero scales - b12x and spec B run them as the 10th K64 stage) is
@@ -1175,10 +1149,6 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
   int item = blockIdx.x;
   if (tid < 4) reinterpret_cast<int*>(&ring.meta[0])[tid] = item < n_items ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + tid) : 0;
   if (tid == 0) ring.items[0] = item;
-  if (tid < 128) (&s_done[0][0])[tid] = 0;  // fused sum: empty lists
-  // fused sum, per row thread (lanes 0-7 of every warp, row = warp * 8 + lane): the token / valid-pair count of the row of the latest item (fs_tok1, fs_nv1),
-  // of the item before it (fs_tok2, fs_nv2) and the arrival-counter result of that item (fs_old); "not done" initially
-  int fs_old = -2, fs_nv1 = 0, fs_tok1 = 0, fs_nv2 = 0, fs_tok2 = 0;
   __syncthreads();
   if (tid < 64) {
     const int4 m = ring.meta[0];
@@ -1196,48 +1166,6 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
     issue_stage(buf_issue);
     buf_issue = buf_issue + 1 == STAGES ? 0 : buf_issue + 1;
   }
-  // fused top-k sum: sum the list in slot `ls` (s_done[ls][row] = token + 1, tile s_ltile[ls]) - a half-warp per row
-  auto fused_sum_list = [&](int ls) {
-    const int hw = tid >> 4, hl = tid & 15;
-    const int ltile = s_ltile[ls];
-#pragma unroll 1
-    for (int row = hw; row < 64; row += 16) {
-      const int tk = s_done[ls][row] - 1;
-      if (tk < 0) continue;  // half-warp-uniform
-      const int mask = s_mask[ls][row];
-      float sum[8];
-#pragma unroll
-      for (int j = 0; j < 8; ++j) sum[j] = 0.f;
-      const int col = ltile * 128 + hl * 8;
-      uint4 v[8];  // the (up to 8) slots' 16 B issued together (one L2 round trip; v8g loaded them one behind the other)
-#pragma unroll
-      for (int sl = 0; sl < 8; ++sl) {
-        v[sl] = make_uint4(0u, 0u, 0u, 0u);
-        if (sl < a.topk && ((mask >> sl) & 1))
-          v[sl] = __ldcg(reinterpret_cast<const uint4*>(a.route + ((size_t)(tk * a.topk + sl) * a.K + col) / 2));
-      }
-#pragma unroll
-      for (int sl = 0; sl < 8; ++sl) {
-        if (sl < a.topk && ((mask >> sl) & 1)) {  // skipped slots as topk_sum_kernel skips them
-          const uint32_t ws[4] = {v[sl].x, v[sl].y, v[sl].z, v[sl].w};
-#pragma unroll
-          for (int j = 0; j < 4; ++j) {
-            sum[2 * j] = fadd(sum[2 * j], bf16_bits_to_f32(ws[j] & 0xFFFFu));
-            sum[2 * j + 1] = fadd(sum[2 * j + 1], bf16_bits_to_f32(ws[j] >> 16));
-          }
-        }
-      }
-      uint32_t o[4];
-#pragma unroll
-      for (int j = 0; j < 4; ++j) {
-        unsigned short lo, hi;
-        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(lo) : "f"(sum[2 * j]));
-        asm("cvt.rn.bf16.f32 %0, %1;" : "=h"(hi) : "f"(sum[2 * j + 1]));
-        o[j] = (uint32_t)lo | ((uint32_t)hi << 16);
-      }
-      *reinterpret_cast<uint4*>(a.out + ((size_t)tk * a.K + col) / 2) = make_uint4(o[0], o[1], o[2], o[3]);
-    }
-  };
 
   int buf = 0;
   while (item < n_items) {
@@ -1309,63 +1237,6 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
 
     // ---- epilogue: scale, bf16, token-major route rows (the slice's 16 columns = 32 B per row: lanes 0 / 1 store 16 B)
     const int pslot = (iss_k + 1) & 1;  // slot k & 1 (iss_k == k + 1 here)
-    // ---- the fused top-k sum (out != nullptr), pipelined over four items so that nothing here waits on memory and no
-    // fence ever sits behind this item's own stores (v8c did fence + arrival right after the stores: +0.21 ms; v8d one
-    // item later but still after the stores: +0.15 - the fence drains the 16 KB of route rows just issued). At item k,
-    // BEFORE its route-row stores:
-    //   (i)   item k - 2: its arrival results (registers, issued one item ago) -> the list s_done[k & 1] (token + 1 per
-    //         row whose (token, tile) slice it completed = the last of the token's valid pairs) with the token's slot
-    //         mask, its tile -> s_ltile; the token's rows for that tile are prefetched into L2;
-    //   (ii)  item k - 1: the arrivals - one thread per row (8 per warp): one fence.acq_rel.gpu per item (release side for item k - 1's
-    //         stores, 9+ barriers old; acquire side for the sums of later epilogues w.r.t. the counters read before it -
-    //         a __threadfence costs ~1 us even when nothing is in flight: two per item were +0.06 ms), then a relaxed
-    //         atomicAdd on the (token, tile) counter, result kept in fs_old: no wait;
-    //   (iii) the route-row stores of item k (below);
-    //   (iv)  item k - 3: its list (prefetched one item ago) is summed - a half-warp per row, 8 columns per lane, fp32
-    //         adds in slot order from +0 (ids < 0 skipped) = topk_sum_kernel's chain, bf16 out;
-    //   (v)   item k: its tile -> s_tile[k & 3], its rows' token and valid-pair count -> fs_tok1 / fs_nv1.
-    // The atomic only decides who sums; the order is the slot order whoever sums: deterministic, identical to the separate
-    // kernel. After the last item the three pending items are flushed (below the loop). No extra barrier: every hand-off
-    // through shared memory or registers is separated by the K-loop's barriers of the items in between.
-    if (a.out != nullptr) {
-      const int k3 = (iss_k - 1) & 3;  // item k & 3
-      const int row8 = warp * 8 + lane;  // the row threads: lanes 0-7 of every warp (8 rows per warp - the work spread over all
-                                         // warps, since whatever one warp does extra here the whole CTA waits for at the next barrier)
-      if (lane < 8) {
-        {  // (i) item k - 2 -> list slot k & 1 (the acquire side is the fence of (ii) below: it follows the atomic that
-           // produced fs_old and precedes the loads of the sum, two epilogues later)
-          const int done = fs_old == (fs_nv2 & 0xFF) - 1;
-          s_done[pslot][row8] = done ? fs_tok2 + 1 : 0;
-          s_mask[pslot][row8] = fs_nv2 >> 8;
-          const int ptile = s_tile[(k3 + 2) & 3];
-          if (tid == 0) s_ltile[pslot] = ptile;
-          if (done) {
-#pragma unroll 1
-            for (int sl = 0; sl < a.topk; ++sl) {
-              const uint8_t* rowp = reinterpret_cast<const uint8_t*>(a.route) + ((size_t)(fs_tok2 * a.topk + sl) * a.K + ptile * 128) * 2;
-              asm volatile("prefetch.global.L2 [%0];" ::"l"(rowp));
-              asm volatile("prefetch.global.L2 [%0];" ::"l"(rowp + 128));
-            }
-          }
-        }
-        {  // (ii) item k - 1: the arrivals
-          fs_old = -2;
-          asm volatile("fence.acq_rel.gpu;" ::: "memory");  // one fence per item: release for item k - 1's stores, acquire for the sums
-          if ((fs_nv1 & 0xFF) > 0) fs_old = atomicAdd(a.arrive + (size_t)fs_tok1 * a.out_tiles + s_tile[(k3 + 3) & 3], 1);
-          fs_tok2 = fs_tok1;
-          fs_nv2 = fs_nv1;
-        }
-      }
-      if (tid == 0) s_tile[k3] = tile;  // (v)
-      if (lane < 8) {
-        const int pair = row8 < m_tiles * 16 ? ring.pairs[pslot][row8] : -1;
-        fs_nv1 = 0;
-        if (pair >= 0) {
-          fs_tok1 = pair / a.topk;
-          fs_nv1 = __ldg(a.tok_valid + fs_tok1);  // count >= 1: this pair is one of them
-        }
-      }
-    }
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
       if (mt >= m_tiles) continue;  // CTA-uniform
@@ -1385,40 +1256,9 @@ __global__ void __launch_bounds__(kThreads, MINB) fc2_kernel(Fc2Args a) {
         }
       }
     }
-    if (a.out != nullptr) fused_sum_list(pslot ^ 1);  // (iv) item k - 3 (slot (k - 3) & 1), after the stores: the accumulators are dead
     item = ring.items[iss_k & 1];  // slot (k + 1) & 1
   }
   cp_async_wait<0>();
-  if (a.out != nullptr) {  // fused sum: flush items L - 2 (list ready), L - 1 (arrivals issued) and L (not yet) - L = the last item
-    const int Ls = (iss_k - 1) & 1, L3 = (iss_k - 1) & 3;  // iss_k == L + 1
-    __syncthreads();     // warps 0-1 may still be writing item L - 2's list (step (i) of the last epilogue); inside the loop
-                         // the next item's K-loop barriers separate the two, here nothing else does
-    fused_sum_list(Ls);  // item L - 2: slot L & 1 (prefetched at the epilogue of item L)
-    __syncthreads();
-    const int row8 = warp * 8 + lane;
-    if (lane < 8) {  // item L - 1 -> slot (L - 1) & 1 (its previous list, item L - 3, was summed at item L's epilogue)
-      __threadfence();
-      s_done[Ls ^ 1][row8] = fs_old == (fs_nv2 & 0xFF) - 1 ? fs_tok2 + 1 : 0;
-      s_mask[Ls ^ 1][row8] = fs_nv2 >> 8;
-      if (tid == 0) s_ltile[Ls ^ 1] = s_tile[(L3 + 3) & 3];
-      fs_old = -2;  // item L: its arrivals now (its stores are this CTA's last; the release fence waits for them once)
-      if ((fs_nv1 & 0xFF) > 0) {
-        __threadfence();
-        fs_old = atomicAdd(a.arrive + (size_t)fs_tok1 * a.out_tiles + s_tile[L3], 1);
-      }
-    }
-    __syncthreads();
-    fused_sum_list(Ls ^ 1);  // item L - 1
-    __syncthreads();
-    if (lane < 8) {  // item L -> slot L & 1 (item L - 2's list is summed)
-      __threadfence();
-      s_done[Ls][row8] = fs_old == (fs_nv1 & 0xFF) - 1 ? fs_tok1 + 1 : 0;
-      s_mask[Ls][row8] = fs_nv1 >> 8;
-      if (tid == 0) s_ltile[Ls] = s_tile[L3];
-    }
-    __syncthreads();
-    fused_sum_list(Ls);  // item L
-  }
 }
 
 // ------------------------------------------------------------------------------------------------ 4. top-k sum
@@ -2335,7 +2175,7 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
   }
 }
 
-// FC2 with the producer-warp skeleton (the fused top-k sum is not carried: the host runs the v8 fc2 when it is on)
+// FC2 with the producer-warp skeleton
 template <int STAGES, int MINB>
 __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
@@ -2576,7 +2416,7 @@ __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
     }
     step(I0{}, Tr{});
 
-    // ---- epilogue = v8's (without the fused sum): scale, bf16, token-major route rows
+    // ---- epilogue = v8's: scale, bf16, token-major route rows
     const int pslot = k & 1;
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
@@ -3305,7 +3145,7 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
 namespace {
 
 // The v9 producer-warp kernels (K-4): VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1=<mode> selects fc1's (contiguous rows only),
-// _WS2=<mode> fc2's (without the fused sum); 0 = the v8 kernel (the defaults until the in-situ measurement). A mode is the ring
+// _WS2=<mode> fc2's; 0 = the v8 kernel (the defaults until the in-situ measurement). A mode is the ring
 // (stages, CTAs per SM) and, for fc1, the consumer layout: 1 = (3, 2) with 8 consumer warps [2 CTAs x 9 warps: ptxas caps the
 // registers at 96 - fc1 spills, fc2 (93 registers) does not], 2 = (6, 1), 3 = (4, 1), 4 = (7, 1) with 8 consumer warps [fc2 at (4, 1)
 // still fits 2 CTAs/SM by shared memory], 5 = (6, 1), 6 = (4, 1), 7 = (7, 1) with 16 consumer warps x 2 m-tiles (fc1 only: 17 warps,
@@ -3329,7 +3169,7 @@ static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // 1 CTA/SM x 12 warps, the separate topk_sum_kernel after it): 20 = 4 stages, 21 = 6, 22 = 7, 23 = 3, 24 = 5, 25 = 2 (the ring depth);
 // _WS_LEAD = the lead in experts of the work list (default 32), _WS_MIN_ROWS = below this many rows the separate kernels run (default 0),
 // _WS_WATCHDOG_MS = the bound of every FC2 wait on its expert's FC1 items (default 2000; expiry = an error record + a trapped launch).
-// Contiguous rows only (lda == K), not with the fused top-k sum. Every configuration computes the same bits.
+// Contiguous rows only (lda == K). Every configuration computes the same bits.
 static int ws_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS"); return m; }
 static int ws_lead() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_LEAD"); static const int m = v ? std::atoi(v) : 64; return m; }
 static int ws_min_rows() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_MIN_ROWS"); return m; }
@@ -3518,7 +3358,7 @@ struct Launch {
     else
       fc1_kernel<S1, MB1, false><<<grid, kThreads, S1 * kF1Stage, stream>>>(f1);
   }
-  static bool fc2_is_ws(const b12x_moe_prefill_fast::Fc2Args& f2) { return ws2_mode() >= 1 && (f2.out == nullptr || f2.sum_mode != 0); }
+  static bool fc2_is_ws(const b12x_moe_prefill_fast::Fc2Args&) { return ws2_mode() >= 1; }
   static int grid2_ws(int sms) {
     int g = 0;
     with_ws2(ws2_mode(), [&](auto W) { g = decltype(W)::grid(sms); });
@@ -3526,7 +3366,7 @@ struct Launch {
   }
   static void fc2(const b12x_moe_prefill_fast::Fc2Args& f2, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    if (fc2_is_ws(f2))  // v9: the producer-warp skeleton (no fused sum)
+    if (fc2_is_ws(f2))  // v9: the producer-warp skeleton
       with_ws2(ws2_mode(), [&](auto W) { decltype(W)::run(f2, grid, stream); });
     else
       fc2_kernel<S2, MB2><<<grid, kThreads, S2 * kF2Stage, stream>>>(f2);
@@ -3536,11 +3376,11 @@ struct Launch {
 // the front-end launches shared by moe_prefill_fast and moe_prefill_fast_frontend: a memset of the counters, the quant +
 // histogram (+ scan) kernel, the scatter kernel. `routing` = the workspace tensors kept alive by the caller.
 struct Routing {
-  torch::Tensor row_pair, f1_items, f2_items, counts, chunk_cnt, exp_off, exp_cnt, tok_valid, u_items, fc1_need;
+  torch::Tensor row_pair, f1_items, f2_items, counts, chunk_cnt, exp_off, exp_cnt, u_items, fc1_need;
 };
 using b12x_moe_prefill_fast::kCountsWords;  // counts[0..7] + fc1_done[kMaxE] (MK-2) + tile_done[kMaxTiles] + the sum need (K-12), one memset
 // K-12: the top-k sum as items of fc2_kernel_ws's column-tile-major list (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1; needs WS2 >= 1, not
-// with the persistent launch or W's FUSED_SUM): _SUM_TOKENS = tokens per sum item (256), _SUM_LAG = tiles between an FC2 tile and its sum
+// with the persistent launch): _SUM_TOKENS = tokens per sum item (256), _SUM_LAG = tiles between an FC2 tile and its sum
 // items (2), _SUM_DISCARD=1 = drop the summed route lines from L2 (the route buffer becomes scratch), _SUM_MIN_ROWS = below this many rows
 // the separate topk_sum_kernel runs (0), _W2_EVICT_FIRST=1 = W2's copies with an L2 evict_first hint, _SUM_WATCHDOG_MS (2000)
 static int sum_items_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS"); return g_rt_sum_items >= 0 ? g_rt_sum_items : m; }
@@ -3551,9 +3391,8 @@ static int sum_min_rows_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_
 static int w2_evict_first_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_W2_EVICT_FIRST"); return m; }
 static int sum_route_hint_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ROUTE_HINT"); return g_rt_sum_route_hint >= 0 ? g_rt_sum_route_hint : m; }  // 1: route stores evict_last
 static int sum_watchdog_ms() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_WATCHDOG_MS"); static const int m = v ? std::atoi(v) : 2000; return m; }
-static bool fused_topk_sum_enabled() {  // VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1: the sum fused into fc2's epilogue (off by
-  // default: on call1 it is break-even with the separate topk_sum_kernel - fc2 +0.125 ms for the kernel's 0.130 - at more
-  // moving parts; W/REPORT.md §4)
+// the v8 epilogue sum (_FUSED_SUM=1) is gone - the sum items replace it; a process that still asks for it must not run on another path unnoticed
+static bool fused_sum_requested() {
   static const bool on = [] { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM"); return v && v[0] == '1'; }();
   return on;
 }
@@ -3589,8 +3428,6 @@ static Routing launch_frontend(b12x_moe_prefill_fast::FrontArgs& fa, bool quant,
   fa.row_cap = row_cap; fa.f1_cap = f1_cap; fa.f2_cap = f2_cap; fa.n_chunks = n_chunks;
   fa.quant_blocks = quant ? (T + kFrontWarps - 1) / kFrontWarps : 0;
   fa.topk = topk;
-  fa.out = nullptr;
-  fa.tok_valid = nullptr;
   fa.u_items = nullptr;
   fa.fc1_need = nullptr;
   fa.u_cap = 0;
@@ -3707,12 +3544,13 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   }
   auto stream = c10::cuda::getCurrentCUDAStream();
 
-  const bool fused_sum = topk_sum && topk <= 8 && fused_topk_sum_enabled() && sum_items_env() == 0;  // the slot mask of tok_valid holds 8 slots
-  // MK-2: the fused persistent launch (WS >= 20): contiguous rows, no fused sum, at or above _WS_MIN_ROWS rows
+  TORCH_CHECK(!fused_sum_requested(), "VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1 is set, but the top-k sum in the v8 FC2 epilogue has been "
+              "removed: unset it and use VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1 (with _WS2 >= 1) - the top-k sum as FC2 work items");
+  // MK-2: the fused persistent launch (WS >= 20): contiguous rows, at or above _WS_MIN_ROWS rows
   const int lda_b = prequant ? (int)a_values.stride(0) : K, lds_b = prequant ? (int)a_scales.stride(0) : K / 32;
-  const bool persistent = ws_mode() >= 20 && !fused_sum && lda_b == K && lds_b == K / 32 && T >= ws_min_rows();
-  // K-12: the sum items of fc2_kernel_ws (the column-tile-major list): with the v9 fc2 kernel, not with W's fused sum or the persistent launch
-  const bool sum_items = topk_sum && !fused_sum && !persistent && sum_items_env() >= 1 && ws2_mode() >= 1 && T >= sum_min_rows_env() &&
+  const bool persistent = ws_mode() >= 20 && lda_b == K && lds_b == K / 32 && T >= ws_min_rows();
+  // K-12: the sum items of fc2_kernel_ws (the column-tile-major list): with the v9 fc2 kernel, not with the persistent launch
+  const bool sum_items = topk_sum && !persistent && sum_items_env() >= 1 && ws2_mode() >= 1 && T >= sum_min_rows_env() &&
                          K / 128 <= kMaxTiles && topk <= kSumMaxTopk;
   {  // K-13 task B: the activation counters (one add per call per counter pair)
     const bool fc1_v10 = !persistent && ws1_mode() >= 8 && T >= ws1_min_rows() && lda_b == K && lds_b == K / 32;
@@ -3722,20 +3560,12 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
   const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
   const int f2_group = ws_f2_group(ps_mode);
-  torch::Tensor arrive;
   FrontArgs fa;
   fa.hidden = prequant ? nullptr : reinterpret_cast<const uint32_t*>(hidden.data_ptr());
   fa.a_values = reinterpret_cast<uint32_t*>(a_values.data_ptr());
   fa.a_scales = a_scales.data_ptr<uint8_t>();
   Routing rt = launch_frontend(fa, !prequant, T, K, topk, E, dev, persistent, f2_group, sum_items);
   fa.ids = ids.data_ptr<int32_t>();
-  if (fused_sum) {
-    fa.out = reinterpret_cast<uint32_t*>(out.data_ptr());
-    rt.tok_valid = torch::empty({T}, torch::TensorOptions().dtype(torch::kInt32).device(dev));
-    fa.tok_valid = rt.tok_valid.data_ptr<int32_t>();
-    arrive = torch::empty({(int64_t)T * fa.n2_tiles}, torch::TensorOptions().dtype(torch::kInt32).device(dev));
-    cudaMemsetAsync(arrive.data_ptr(), 0, (size_t)T * fa.n2_tiles * sizeof(int32_t), stream);
-  }
   run_frontend(fa, stream);
 
   int sms = 0;
@@ -3772,10 +3602,8 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   f2.down_alpha = down_alpha.data_ptr<float>();
   f2.global_scale = global_scale.data_ptr<float>();
   f2.route = reinterpret_cast<uint32_t*>(route.data_ptr());
-  f2.out = (fused_sum || sum_items) ? reinterpret_cast<uint32_t*>(out.data_ptr()) : nullptr;
-  f2.arrive = fused_sum ? arrive.data_ptr<int32_t>() : nullptr;
+  f2.out = sum_items ? reinterpret_cast<uint32_t*>(out.data_ptr()) : nullptr;
   f2.ids = ids.data_ptr<int32_t>();
-  f2.tok_valid = fa.tok_valid;
   f2.K = K; f2.out_tiles = fa.n2_tiles; f2.gs_per_expert = global_scale.numel() > 1;
   f2.dynamic_schedule = (int)dynamic_schedule; f2.topk = topk;
   // K-12: the sum items (fc2_kernel_ws): the per-tile counters live in the counts buffer (zeroed by run_frontend's memset), the wait target is
@@ -3833,7 +3661,7 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   }
   }
 
-  if (topk_sum && !fused_sum && !sum_items) {
+  if (topk_sum && !sum_items) {
     const long long total = (long long)T * (K / 8);
     topk_sum_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const uint4*>(route.data_ptr()), ids.data_ptr<int32_t>(),
