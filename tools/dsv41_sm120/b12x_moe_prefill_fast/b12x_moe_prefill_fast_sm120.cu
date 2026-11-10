@@ -3316,8 +3316,15 @@ static int ws_env(const char* name) {
   const char* v = std::getenv(name);
   return v ? std::atoi(v) : 0;
 }
-static int ws1_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1"); return m; }
+// K-13 (R0's r29 task A): runtime A/B overrides of the level-B switches (set_runtime_switches from Python: -1 = the env value read once
+// at the first call, as before; the switched paths are bit-identical alternatives of the same compiled kernels, so a flip between two
+// calls changes no bits). Plain ints: written by the Python thread between forwards, read by the same thread at the next call.
+static int g_rt_ws1 = -1, g_rt_sum_items = -1, g_rt_sum_discard = -1, g_rt_sum_route_hint = -1;
+static int ws1_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1"); return g_rt_ws1 >= 0 ? g_rt_ws1 : m; }
 static int ws2_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS2"); return m; }
+// K-13 (task B): activation counters of the switched paths, one add per call (moe_prefill_fast_counters() reads them: calls / rows through
+// fc1 v10 (WS1 >= 8) vs fc1 v8/v9 (WS1 < 8), fc2 with the sum items vs fc2 + the separate topk_sum_kernel, the persistent launch)
+static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // MK-2: VLLM_MOET_B12X_MOE_PREFILL_FAST_WS >= 20 = the fused persistent launch (moe_persistent_kernel: fc1 + SwiGLU/quant + fc2 as one kernel,
 // 1 CTA/SM x 12 warps, the separate topk_sum_kernel after it): 20 = 4 stages, 21 = 6, 22 = 7, 23 = 3, 24 = 5, 25 = 2 (the ring depth);
 // _WS_LEAD = the lead in experts of the work list (default 32), _WS_MIN_ROWS = below this many rows the separate kernels run (default 0),
@@ -3536,13 +3543,13 @@ using b12x_moe_prefill_fast::kCountsWords;  // counts[0..7] + fc1_done[kMaxE] (M
 // with the persistent launch or W's FUSED_SUM): _SUM_TOKENS = tokens per sum item (256), _SUM_LAG = tiles between an FC2 tile and its sum
 // items (2), _SUM_DISCARD=1 = drop the summed route lines from L2 (the route buffer becomes scratch), _SUM_MIN_ROWS = below this many rows
 // the separate topk_sum_kernel runs (0), _W2_EVICT_FIRST=1 = W2's copies with an L2 evict_first hint, _SUM_WATCHDOG_MS (2000)
-static int sum_items_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS"); return m; }
-static int sum_discard_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_DISCARD"); return m; }
+static int sum_items_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS"); return g_rt_sum_items >= 0 ? g_rt_sum_items : m; }
+static int sum_discard_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_DISCARD"); return g_rt_sum_discard >= 0 ? g_rt_sum_discard : m; }
 static int sum_tokens_env() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_TOKENS"); static const int m = v ? std::max(16, std::atoi(v)) : 256; return m; }
 static int sum_lag_env() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_LAG"); static const int m = v ? std::max(0, std::atoi(v)) : 2; return m; }
 static int sum_min_rows_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_MIN_ROWS"); return m; }
 static int w2_evict_first_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_W2_EVICT_FIRST"); return m; }
-static int sum_route_hint_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ROUTE_HINT"); return m; }  // 1: route stores evict_last
+static int sum_route_hint_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ROUTE_HINT"); return g_rt_sum_route_hint >= 0 ? g_rt_sum_route_hint : m; }  // 1: route stores evict_last
 static int sum_watchdog_ms() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_WATCHDOG_MS"); static const int m = v ? std::atoi(v) : 2000; return m; }
 static bool fused_topk_sum_enabled() {  // VLLM_MOET_B12X_MOE_PREFILL_FAST_FUSED_SUM=1: the sum fused into fc2's epilogue (off by
   // default: on call1 it is break-even with the separate topk_sum_kernel - fc2 +0.125 ms for the kernel's 0.130 - at more
@@ -3707,6 +3714,11 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   // K-12: the sum items of fc2_kernel_ws (the column-tile-major list): with the v9 fc2 kernel, not with W's fused sum or the persistent launch
   const bool sum_items = topk_sum && !fused_sum && !persistent && sum_items_env() >= 1 && ws2_mode() >= 1 && T >= sum_min_rows_env() &&
                          K / 128 <= kMaxTiles && topk <= kSumMaxTopk;
+  {  // K-13 task B: the activation counters (one add per call per counter pair)
+    const bool fc1_v10 = !persistent && ws1_mode() >= 8 && T >= ws1_min_rows() && lda_b == K && lds_b == K / 32;
+    g_cnt[fc1_v10 ? 0 : 2] += 1; g_cnt[fc1_v10 ? 1 : 3] += (unsigned long long)T;
+    g_cnt[sum_items ? 4 : 6] += 1; g_cnt[sum_items ? 5 : 7] += (unsigned long long)T;
+  }
   // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
   const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
   const int f2_group = ws_f2_group(ps_mode);
@@ -3855,6 +3867,21 @@ bool prequant_rows_supported() { return true; }  // the loader probes this entry
 bool strided_rows_supported() { return true; }
 // MK-2: the build has the fused persistent launch (VLLM_MOET_B12X_MOE_PREFILL_FAST_WS >= 20); the mode the process runs with
 int64_t persistent_mode() { return ws_mode(); }
+// K-13 (R0's r29 task A): the runtime A/B overrides. set_runtime_switches(ws1, sum_items, sum_discard, sum_route_hint): -1 = back to the
+// env value, otherwise the value used from the next call on (no CUDA state is rebuilt: every mode's kernels live in this .so and set their
+// attributes on first use). get_runtime_switches() returns the four effective values; moe_prefill_fast_counters() the eight activation
+// counters [fc1 v10 calls, rows, fc1 v8/v9 calls, rows, fc2 sum-items calls, rows, fc2 + topk_sum calls, rows] (task B; `clear` zeroes them).
+void set_runtime_switches(int64_t ws1, int64_t sum_items, int64_t sum_discard, int64_t sum_route_hint) {
+  TORCH_CHECK(ws1 >= -1 && ws1 <= 11 && sum_items >= -1 && sum_items <= 1 && sum_discard >= -1 && sum_discard <= 1 && sum_route_hint >= -1 && sum_route_hint <= 1,
+              "set_runtime_switches: ws1 in [-1, 11], the sum switches in [-1, 1]");
+  g_rt_ws1 = (int)ws1; g_rt_sum_items = (int)sum_items; g_rt_sum_discard = (int)sum_discard; g_rt_sum_route_hint = (int)sum_route_hint;
+}
+std::vector<int64_t> get_runtime_switches() { return {ws1_mode(), sum_items_env(), sum_discard_env(), sum_route_hint_env()}; }
+std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
+  std::vector<int64_t> r(g_cnt, g_cnt + 8);
+  if (clear) for (auto& c : g_cnt) c = 0;
+  return r;
+}
 // K-12: the sum-items mode of this process (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS; active only with WS2 >= 1 and the separate kernels), and
 // whether the route rows are consumed in-kernel (summed and discarded from L2: their content after the call is unspecified - the harness
 // then compares the output only)
@@ -3892,6 +3919,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("persistent_mode", &persistent_mode);
   m.def("sum_items_mode", &sum_items_mode);
   m.def("route_rows_consumed", &route_rows_consumed);
+  m.def("set_runtime_switches", &set_runtime_switches);
+  m.def("get_runtime_switches", &get_runtime_switches);
+  m.def("moe_prefill_fast_counters", &moe_prefill_fast_counters);
   m.def("moe_prefill_ws_error", &moe_prefill_ws_error);
   m.def("moe_prefill_ws_stats", &moe_prefill_ws_stats);
 }

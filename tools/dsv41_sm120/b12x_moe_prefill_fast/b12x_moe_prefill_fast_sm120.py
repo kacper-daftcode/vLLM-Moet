@@ -107,6 +107,170 @@ def route_rows_consumed() -> bool:
     return bool(e.route_rows_consumed()) if hasattr(e, "route_rows_consumed") else False
 
 
+# ----------------------------------------------------------------------------------------------------------------------------------
+# K-13 (R0's r29 tasks A + B, K/BRIEF_K13.md addendum of 10.11 01:58Z):
+#   VLLM_MOET_RUNTIME_AB=1          the runtime A/B switch for this module's level-B paths: a flat JSON object switch -> value in the
+#                                   control file VLLM_MOET_RUNTIME_AB_FILE (default /dev/shm/vllm_moet_ab.json; the serving container's
+#                                   /dev/shm is shared by its API server, engine and workers, so `docker exec <c> sh -c 'echo ... > ...'`
+#                                   reaches every rank). Keys of this module: B12X_MOE_PREFILL_FAST_SUM_ITEMS (0 / 1 - the sum items with
+#                                   their _DISCARD / _ROUTE_HINT companions as one unit) and B12X_MOE_PREFILL_FAST_WS1 (0..11; 0 = v8,
+#                                   9 = v10). Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
+#                                   at a MoE-call boundary - this module has no view of the prefill forward; the states are bit-identical
+#                                   alternatives, so a flip between two calls of one step changes no bits), re-reads it only when mtime or
+#                                   size changed, applies the values through the extension's set_runtime_switches, logs one line per rank
+#                                   per change ("runtime A/B: SUM_ITEMS 1 -> 0"). A missing / unreadable / malformed file, a key of this
+#                                   module it does not know, or a value out of range = keep the current state (one WARNING, once per
+#                                   cause). Keys outside this module's namespace are other modules' business (ignored silently). Default
+#                                   0 = today's behaviour exactly (no stat call, no import of json).
+#   VLLM_MOET_B12X_MOE_PREFILL_FAST_STATS_EVERY=N   task B: every N calls one line per rank with the activation counters of the switched
+#                                   paths (calls / rows through fc1 v10 vs v8/v9, fc2 with the sum items vs fc2 + topk_sum_kernel) -
+#                                   default 0 = only on demand: `touch /dev/shm/vllm_moet_stats` (VLLM_MOET_RUNTIME_STATS_FILE) -> one
+#                                   line per rank at the next call boundary (checked every 64 calls: one os.stat per 64 calls; the file's
+#                                   mtime is remembered, so one touch = one line per rank). Cost when not requested: one integer add per
+#                                   counter per call in the extension + the 1/64 stat.
+_RT_STATE: dict = {"on": None, "next_poll": 0.0, "sig": None, "warned": set(), "calls": 0, "stats_mtime": None, "stats_every": None}
+
+
+def _rt_log(msg: str) -> None:
+    import sys
+
+    try:
+        dev = torch.cuda.current_device()
+    except Exception:  # noqa: BLE001
+        dev = "?"
+    print(f"[vllm-moet fast prefill MoE, device {dev}] {msg}", file=sys.stderr, flush=True)
+
+
+def _rt_warn_once(key: str, msg: str) -> None:
+    if key not in _RT_STATE["warned"]:
+        _RT_STATE["warned"].add(key)
+        _rt_log("WARNING: " + msg)
+
+
+def runtime_switches() -> dict:
+    """The effective switch values of this process (env or runtime override): ws1, sum_items, sum_discard, sum_route_hint."""
+    e = _ext()
+    if not hasattr(e, "get_runtime_switches"):
+        return {}
+    ws1, si, sd, sh = (int(v) for v in e.get_runtime_switches())
+    return {"WS1": ws1, "SUM_ITEMS": si, "SUM_DISCARD": sd, "SUM_ROUTE_HINT": sh}
+
+
+def apply_runtime_switches(values: dict) -> list[str]:
+    """Apply {"B12X_MOE_PREFILL_FAST_SUM_ITEMS": 0|1, "B12X_MOE_PREFILL_FAST_WS1": 0..11} (keys of other modules ignored); returns the
+    change descriptions. A key the file does not carry goes back to its env value (-1); an out-of-range value keeps the current effective
+    value (one WARNING). The sum-items unit sets SUM_ITEMS, SUM_DISCARD and SUM_ROUTE_HINT together."""
+    e = _ext()
+    if not hasattr(e, "set_runtime_switches"):
+        _rt_warn_once("ext", "this build of the extension has no set_runtime_switches entry: runtime A/B inactive")
+        return []
+    cur = runtime_switches()
+    ws1_arg, si_arg = -1, -1
+    for key, val in values.items():
+        if not isinstance(key, str) or not key.startswith("B12X_MOE_PREFILL_FAST_"):
+            continue
+        try:
+            v = int(val)
+        except (TypeError, ValueError):
+            v = -2
+        if key == "B12X_MOE_PREFILL_FAST_SUM_ITEMS":
+            if v in (0, 1):
+                si_arg = v
+            else:
+                si_arg = cur["SUM_ITEMS"]
+                _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1) - kept {cur['SUM_ITEMS']}")
+        elif key == "B12X_MOE_PREFILL_FAST_WS1":
+            if 0 <= v <= 11:
+                ws1_arg = v
+            else:
+                ws1_arg = cur["WS1"]
+                _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0..11) - kept {cur['WS1']}")
+        else:
+            _rt_warn_once("key:" + key, f"runtime A/B: unknown key {key} of this module - ignored")
+    sd_arg = sh_arg = si_arg  # the unit: discard + evict_last hint follow the sum items (-1 = env for all three)
+    e.set_runtime_switches(int(ws1_arg), int(si_arg), int(sd_arg), int(sh_arg))
+    now = runtime_switches()
+    changes = []
+    if now["WS1"] != cur["WS1"]:
+        changes.append(f"WS1 {cur['WS1']} -> {now['WS1']}")
+    if (now["SUM_ITEMS"], now["SUM_DISCARD"], now["SUM_ROUTE_HINT"]) != (cur["SUM_ITEMS"], cur["SUM_DISCARD"], cur["SUM_ROUTE_HINT"]):
+        changes.append(f"SUM_ITEMS {cur['SUM_ITEMS']} -> {now['SUM_ITEMS']} (DISCARD {cur['SUM_DISCARD']} -> {now['SUM_DISCARD']}, "
+                       f"ROUTE_HINT {cur['SUM_ROUTE_HINT']} -> {now['SUM_ROUTE_HINT']})")
+    for c in changes:
+        _rt_log("runtime A/B: " + c)
+    return changes
+
+
+def _runtime_ab_poll() -> None:
+    import time
+
+    now = time.monotonic()
+    if now < _RT_STATE["next_poll"]:
+        return
+    _RT_STATE["next_poll"] = now + 0.1
+    path = os.environ.get("VLLM_MOET_RUNTIME_AB_FILE", "/dev/shm/vllm_moet_ab.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        _rt_warn_once("missing", f"runtime A/B: control file {path} missing or unreadable - the current state is kept until it appears")
+        return
+    sig = (st.st_mtime_ns, st.st_size)
+    if sig == _RT_STATE["sig"]:
+        return
+    _RT_STATE["sig"] = sig
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            values = json.load(f)
+        if not isinstance(values, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        _rt_warn_once("malformed", f"runtime A/B: control file {path} malformed ({exc}) - the current state is kept")
+        return
+    _RT_STATE["warned"].discard("missing")
+    _RT_STATE["warned"].discard("malformed")
+    apply_runtime_switches(values)
+
+
+def activation_counters(clear: bool = False) -> dict:
+    """Task B: the extension's activation counters of this process (calls / rows per switched path)."""
+    e = _ext()
+    if not hasattr(e, "moe_prefill_fast_counters"):
+        return {}
+    c = [int(v) for v in e.moe_prefill_fast_counters(bool(clear))]
+    return {"fc1_v10": (c[0], c[1]), "fc1_v8_v9": (c[2], c[3]), "fc2_sum_items": (c[4], c[5]), "fc2_topk_sum_kernel": (c[6], c[7])}
+
+
+def _stats_line(reason: str) -> None:
+    c = activation_counters()
+    sw = runtime_switches()
+    _rt_log(f"activation counters ({reason}; calls / rows): fc1 v10 {c['fc1_v10'][0]} / {c['fc1_v10'][1]}, fc1 v8-v9 {c['fc1_v8_v9'][0]} / {c['fc1_v8_v9'][1]}, "
+            f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}; "
+            f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}")
+
+
+def _runtime_hooks() -> None:
+    st = _RT_STATE
+    if st["on"] is None:
+        st["on"] = os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
+        st["stats_every"] = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_STATS_EVERY", 0)
+    if st["on"]:
+        _runtime_ab_poll()
+    st["calls"] += 1
+    n = st["calls"]
+    if st["stats_every"] > 0 and n % st["stats_every"] == 0:
+        _stats_line(f"every {st['stats_every']} calls, call {n}")
+    if n % 64 == 0:
+        try:
+            m = os.stat(os.environ.get("VLLM_MOET_RUNTIME_STATS_FILE", "/dev/shm/vllm_moet_stats")).st_mtime_ns
+        except OSError:
+            m = None
+        if m is not None and m != st["stats_mtime"]:
+            st["stats_mtime"] = m
+            _stats_line(f"on demand, call {n}")
+
+
 def _rows_arg(x: torch.Tensor) -> torch.Tensor:
     if x.is_contiguous():
         return x
@@ -125,6 +289,7 @@ def moe_prefill_fast(hidden: torch.Tensor | None, ids: torch.Tensor, weights: to
     dynamic = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_DYNAMIC", 1) if dynamic is None else dynamic
     grid1 = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID1", 0) if grid1 is None else grid1
     grid2 = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID2", 0) if grid2 is None else grid2
+    _runtime_hooks()  # K-13: the runtime A/B poll (VLLM_MOET_RUNTIME_AB=1) and the activation-counter lines (task B); no-ops by default
     ids = ids.to(torch.int32).contiguous()
     args = (ids, weights.to(torch.float32).contiguous(), planes["w13"],
             planes["w13_sf"], planes["w2"], planes["w2_sf"],
