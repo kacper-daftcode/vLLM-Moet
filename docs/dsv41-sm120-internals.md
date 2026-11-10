@@ -85,6 +85,209 @@ bounded replay, the indexer's row sharding) to 7.2 s, and on to 5.6–5.8 s:
   compute — CTA dispatch and NCCL's per-communicator FIFO — not bandwidth: a synthetic model of the layer pair with the
   collectives issued from a persistent kernel of 32–48 CTAs recovers 57–68 % of it and costs the compute kernels ≤ 1.1 %.
 
+## Steps in detail
+
+The mechanism of the steps whose row in the [switch table](dsv41-sm120.md#switches) is only a summary, in
+step order. What was measured, on what and how:
+[benchmarks/dsv41-sm120-steps-2026-11-10.md](benchmarks/dsv41-sm120-steps-2026-11-10.md).
+
+### Step 3b — the prefill dequant in one kernel
+
+In the prefill branch of step 3's `wo_a` (more than 64 tokens) the bf16 weight that cuBLAS needs is
+rebuilt from MXFP8 on every layer call: vLLM's `dequant_mxfp8_to_bf16`, six elementwise kernels, ≈ 50 µs
+of GPU time and ≈ 160 MB of traffic per call, 60 calls per 8 192-token step.
+With `VLLM_MOET_WOA_DEQUANT_FUSED=1` one Triton kernel does the same arithmetic in the same order
+(e4m3 → fp32, `exp2` of the scale, one multiply, one rounding to bf16): ≈ 6 µs and 25 MB per call.
+`VLLM_MOET_WOA_DEQUANT_CACHE=1` instead keeps the bf16 weight per layer after the first call (no kernel
+at all; +16.8 MB per layer = 0.63 GiB per rank).
+
+The fused kernel differs from the six on one input: scale code 0 next to a non-zero value byte (the
+descale 2^-127 is an fp32 subnormal that it flushes). At a layer's first call its scales are scanned
+once for that input, and such a layer stays on the six kernels (logged and counted), so the switch is
+bit-identical on any weights; the served checkpoint carries scale codes 114-118 only.
+
+The runtime key `WOA_DEQUANT_FUSED` (0 / 1) of step 42b's control file overrides the environment value
+from the next prefill `o_proj` call on: polled by the module itself at most once per 100 ms, a missing /
+malformed file or a value other than 0 / 1 keeps the state (one warning), a key the file drops goes back
+to the environment's value, one line per rank per change (`runtime A/B: WOA_DEQUANT_FUSED 0 -> 1`). Per
+`touch /dev/shm/vllm_moet_stats` or every `VLLM_MOET_WOA_DEQUANT_STATS_EVERY` calls each rank prints one
+line with the calls / weight rows through each path, the layers the guard kept on the six kernels and
+`switches now …`.
+
+In situ the switch does not pay, so the default stays off.
+
+### Step 42 — the prefill MoE kernels
+
+The step's default kernels (v8) are described under [Where the time goes](#where-the-time-goes). The
+sub-switches replace them stage by stage, with the same bits:
+
+- `_WS2=3` runs FC2 on the producer-warp kernel v9: one warp issues TMA / cp.async, eight consume.
+- `_WS1=9` runs FC1 on the warpgroup kernel v10.
+- `_SUM_ITEMS=1` runs the top-k sum as work items of the FC2 kernel on a column-tile-major list: a
+  tile's routed rows are summed while still in L2 and dropped with `discard.global.L2`
+  (`_SUM_DISCARD=1`), so the 252 MB of routed rows per 4 096-row call are no longer written to and read
+  back from DRAM. `_SUM_MIN_ROWS=512` keeps the 128/256-row replay layers on the separate sum kernel.
+
+**The occupancy guard.** The grid of these kernels is the SM count times the CTAs per SM that the
+occupancy query grants, and FC2's v9 kernel runs two CTAs per SM at exactly the register count that
+still allows it (96 per thread): a build in which it needs more — a source change, or another ptxas
+after an image rebuild — gets one, half the grid, and FC2 is 10-15 % slower without any error. Each rank
+therefore logs one `WARNING: fc2_kernel_ws<4, 1> launches with 1 CTA(s) per SM (grid 188) where its mode
+was measured with 2 (grid 376): … registers per thread …` when a kernel of this family starts with
+fewer CTAs per SM than its mode was measured with. `VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT=1`
+refuses such a launch instead (a debug switch); the check changes no launch.
+
+**The m-tile loops.** `_MT_LOOPS=1` (off by default) launches the served FC1 / FC2 kernels with the
+consumers' stage loop specialised on the item's m-tiles. The served loops run the QMMAs of an m-tile
+under a warp-uniform predicate, and a QMMA under a false predicate keeps its stall and its place in the
+tensor pipe's issue throttle (eight warps per SM issue 614 M QMMA slots per second when every slot
+executes and 658 M when none does), so an item pays for four m-tiles whatever it has: at 4 096 rows of a
+real prefill a row chunk has 2.9 of 4 on average, and on FC1's 64-column tile every warp serves two of
+the four. With the switch an item branches once to a loop that holds only its own m-tiles' loads and
+QMMAs: the same QMMAs on the same operands in the same order per accumulator, identical on the harness
+in every mode. FC2's specialised kernel is built for two CTAs per SM (92 registers per thread; the
+warning above covers it as `fc2_kernel_ws_mt<4, 2>`). The loops are measured on the kernel harness and
+not yet in the served forward.
+
+### Step 42b — the runtime keys
+
+The runtime A/B switch of step 42's level-B paths, for paired A/B measurements in one server lifetime.
+With `VLLM_MOET_RUNTIME_AB=1` every rank reads the control file — one flat JSON object switch → value,
+written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/vllm_moet_ab.json'` — at
+most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the
+sum-items unit), `B12X_MOE_PREFILL_FAST_WS1` (0..11) and `B12X_MOE_PREFILL_FAST_MT_LOOPS` (0/1, the
+m-tile loops of step 42) without a restart. A missing / malformed file or an unknown value keeps the
+state (one warning), a key the file drops goes back to the environment's value, each change is logged
+once per rank.
+
+The file is the whole state of every step that has a key, each key read by its own module:
+`WOA_DEQUANT_FUSED` (step 3b) and `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` (step 46b) live in the same file.
+The two states of every key are bit-identical alternatives.
+
+The activation counters (calls / rows through FC1 v10 vs v8/v9, FC2 with the sum items vs with the
+separate sum kernel, and FC1 / FC2 with the m-tile loops) are printed per rank every
+`VLLM_MOET_B12X_MOE_PREFILL_FAST_STATS_EVERY` MoE calls or on `touch /dev/shm/vllm_moet_stats`.
+
+### Step 45 — the MoE input gathered as MXFP8
+
+The sequence-parallel prefill's MoE input is all-gathered as e4m3 + UE8M0 scales + the shard's top-6
+instead of bf16: 0.52× the bytes. The router GEMM runs with M = T on a stand-in buffer, and the
+quantizer equals b12x's.
+
+### Step 46 — the prefill attention in SASS
+
+The step-40 prefill attention chunks (> 64 rows) run on the cubit-assembled SASS kernel
+`kernels/sass/sparse_mla_prefill_v41.sass` (generator `kernels/gen/gen_sparse_mla_prefill_v41.py`, cubin
+`kernels/cubins-sm120/`): FlashInfer's full-BF16 kernel's arithmetic hand-scheduled (occupancy 16.7 % →
+register prefetch of the next 64-candidate chunk), 0.66–0.72× its time on the harness. Chunks of ≤ 64
+rows stay on FlashInfer, and any launch problem disables the route after one warning.
+
+### Step 46b — two cubins of the attention kernel
+
+The runtime A/B of step 46 between two cubins of the attention kernel — two schedules of the same
+instruction words, e.g. `sparse_mla_prefill_v41.cubin` and `sparse_mla_prefill_v41s1.cubin`. With
+`VLLM_MOET_RUNTIME_AB=1` and `VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B` naming the second cubin, it is
+loaded next to the first when a device's launcher is created, and the key
+`SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` of the control file (0 = the cubin of `…_SASS_CUBIN`, the start-up
+state; 1 = the cubin of `…_SASS_CUBIN_B`) selects the cubin per launch — read by the route itself at the
+entry of a launch, at most one `stat` per 100 ms. The key absent = the start-up cubin; a missing /
+malformed file, an unknown key of the `SPARSE_MLA_PREFILL_SASS_` namespace or a value other than the
+integer 0 / 1 keeps the state (one warning).
+
+Each change is one line per rank (`runtime A/B: SPARSE_MLA_PREFILL_SASS_CUBIN_SEL 0 -> 1`) and, per
+`touch /dev/shm/vllm_moet_stats`, one line with the launches / rows per cubin and `switches now …`. At a
+device's first launch outside a CUDA-graph capture both cubins run once on the same chunk and their
+outputs are compared bit for bit (unequal = the second cubin is refused, one warning); a launch recorded
+into a CUDA graph keeps the cubin it was captured with. Without either variable nothing of this runs (no
+`stat`, one cubin per device).
+
+Cubins that `…_SASS_CUBIN_B` may name ship in the image under `/opt/vllm-moet/kernels/cubins-sm120/`
+(the build asserts each sha256, as for the default cubin): the second schedule
+`sparse_mla_prefill_v41s1.cubin`, and `sparse_mla_prefill_v43.cubin` — the kernel with its dequant by
+the scaled BF16 unpack, the candidate index loaded one chunk ahead and the prologue's loads issued back
+to back (bit-identical outputs; `kernels/MANIFEST.md` has its gate).
+
+### Step 47 — the pipelined prefill
+
+`VLLM_MOET_PREFILL_PIPE=2` with `--max-num-batched-tokens 8192` runs a step as two 4 096-row groups one
+layer apart, the SP reduce-scatters / all-gathers of one group on a comm stream under the other's
+compute (NCCL was 38 % of the prefill on one stream). `VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=1` with
+`--compilation-config {"decoder_replay_cudagraph_capture_sizes":[128,256]}` runs the 128-row replay
+layers 20–39 of every step as vLLM's decoder-replay CUDA graphs, captured per row-group slot as well
+(vLLM captures none under `--max-cudagraph-capture-size 64`). The launcher's `PREFILL_PIPE=2` implies
+both.
+
+Without the replay graphs the pipelined step's eager replay tails — ~1 400 launches each — are
+launch-bound, and a host whose cores other processes load pays for it at 163K; the KV offload tier is
+not what costs there.
+
+The step costs a longer engine step for a concurrent decode, and −1.0 GiB KV per GPU for the graphs on
+top of −10 % at 8 192 batched tokens.
+
+The bits are identical: every kernel runs at the row count and on the rows it has without the step.
+Per-layer dumps cover the layers outside the graphs; layers 20–39 run inside the graphs and are covered
+by the end-to-end gates.
+
+### Step 48 — the KV offload copy path
+
+With the host KV tier, each of the four TP workers registers the shared offload region with
+`cudaHostRegister` — the whole range in one `pin_user_pages`, all four at the same moment. On a
+KVM-guest host that fails for three of them at every start (`host_register failed … the offload region
+stays pageable` in the log). A pageable rank's stores are host-synchronous, and when rank 0 — the only
+writer of the TP-replicated MLA KV — is one of them, it blocks 211–219 ms per 8 192-token step under
+load.
+
+`VLLM_MOET_KV_SWAP_ASYNC=1` takes the KV offload connector's copy path off the runner's main thread: the
+four workers' host registration of the shared CPU region runs under a cross-process lock in rank order,
+in 2 GiB chunks with retries, and a still-pageable rank's copies are staged through pinned memory on the
+connector's own threads (a transfer stream). The connector's save-before-evict protocol is unchanged: a
+store completes only after the copy into the region. With the switch on, start-up waits for the
+serialized registration (≈ 3.5 min for the last rank at 17 GB).
+
+The image default is off. The reference host registers the offload region on 4/4 ranks, so the step is
+a safety net there. Code and its CPU unit test: `tools/dsv41_sm120/kv_offload/`
+(`test_kv_swap_async.py`).
+
+### Step 49 — the idle freeze
+
+vLLM freezes each serving process's heap once, when its start-up is done (1.25 M objects in a TP
+worker), so that Python's cyclic collector never walks it again; what becomes long-lived afterwards is
+not frozen. In a serving process that is:
+
+- in each worker, ≈ 800 objects for every step token count it has not seen before — b12x's fused-MoE
+  plans, 20 plan sets of ≈ 40 objects (`TPMoEScratchPlan` with its 25 `_TensorAllocSpec`, `Caps`,
+  `TPMoEPlan`, …); a fresh prompt brings one new count (its last step);
+- in the EngineCore, one KV-offload index entry (`ChunkStatus`) per stored chunk;
+- in the API server, nothing: its old generation does not grow.
+
+Every full collection walks all of it on the thread that happened to allocate, with the interpreter
+lock held. As started, a worker runs no full collection at all at first — CPython's rule still
+remembers the pre-freeze heap as the old generation's size, and ≈ 312 K promotions must pass — and then
+runs them inside requests, in all four ranks within a quarter of a second.
+
+With `VLLM_MOET_GC_IDLE_FREEZE=1` the heap is frozen again whenever a serving process has worked and
+gone idle:
+
+- one more `gc.collect()` right after the start-up freeze: it resets the old-generation size that
+  CPython's full-collection rule remembers, so that the first automatic full collection does not come
+  late and meet everything accumulated until then;
+- `gc.collect()` + `gc.freeze()` whenever the process has worked and then been idle for
+  `VLLM_MOET_GC_IDLE_FREEZE_IDLE_S` seconds (default 1.0; idle = all its threads together below 2 % of
+  one core): a full collection then walks only what the requests since the last idle second left. The
+  workers freeze 2 s after the last request, because their main threads spin for the first second.
+
+Independent of the switch, every collection of `VLLM_MOET_GC_WARN_MS` milliseconds or more (default 50)
+is logged with its generation, duration and thread (at most one line per 5 s; 0 turns it off). With the
+switch on, each serving process logs `gc idle freeze: on` once when its start-up is done and any idle
+freeze of 20 ms or more.
+
+Costs: one thread per serving process that wakes four times a second; an idle freeze holds the
+interpreter lock for the milliseconds of its collection; an object that is alive at an idle moment and
+later dies inside a reference cycle is no longer reclaimed by the collector (as with vLLM's own start-up
+freeze). In a worker and in the EngineCore no request is in flight at such a moment, but the API server
+is idle while the engine works on a long prompt, so its freezes fall inside such requests (≈ 1 ms, off
+the request's path).
+
 ## How changes are validated
 
 Three levels, in this order, because a harness win is not an end-to-end win (the b12x dense GEMM backend: −28 % in the
