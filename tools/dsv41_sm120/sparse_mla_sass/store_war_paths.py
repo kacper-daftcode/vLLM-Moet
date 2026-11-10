@@ -11,8 +11,19 @@ For every store and every register it reads, this walks EVERY path of the contro
 outcomes of each guarded branch, loops included - up to the first overwriter of the register, and reports the
 overwriters that are reached WITHOUT a wait on the store's read barrier at or before them, with the smallest issue
 distance (sum of the stall counts) at which that happens.
+An asynchronous copy (`LDGSTS ... [Rd+off], desc[UR][Rs.64(+off)](, P)`) is walked like a store: it reads the shared
+address register AND both registers of the global source address when it is served, so a later write of any of them -
+the upper half of the pair included - needs a wait on the copy's read barrier in front of it. Its pairs are counted
+apart: those of a copy that holds a barrier, and those behind a copy without one. An atomic (`ATOM* P, Rd, [mem],
+Rs...`) is walked the same way - its data are the registers behind the memory operand, and a wait on its write barrier
+protects them too (the result back means the operands were read) - and counted apart as well: cubit's count is about
+stores.
 With --loads the address registers of scoreboarded loads are checked the same way (protected by a wait on the load's
 read barrier or on its write barrier: data back means the address was read).
+
+NOT walked: uniform registers (an address or a datum held in a UR register, and the words of the uniform datapath that
+rewrite one); the release of an asynchronous copy by its own completion word - an mbarrier or DEPBAR wait is not a
+scoreboard wait here, so a copy WITHOUT a scoreboard barrier whose address registers are rewritten later is reported.
 
 What the walk assumes, and where it is deliberately on the safe side:
   * a predicate is known from the last guarded branch on it until ANY instruction names it as an operand (sources
@@ -121,16 +132,40 @@ def addr_regs(s):
     return out
 
 
+def split_ops(rest):
+    """the operands of an instruction: commas outside brackets separate them."""
+    out, depth, cur = [], 0, ''
+    for ch in rest:
+        depth += (ch == '[') - (ch == ']')
+        if ch == ',' and depth == 0:
+            out.append(cur.strip())
+            cur = ''
+        else:
+            cur += ch
+    return out + ([cur.strip()] if cur.strip() else [])
+
+
 def store_reads(x):
     """(address registers, data registers) of a store / atomic / reduction, None for anything else."""
     op = x['op']
     if not op.startswith(('STS', 'STG', 'STL', 'ATOM', 'RED')):
         return None
+    w = 4 if '.128' in op else 2 if '64' in op else 1
     m = re.match(r'^(?:R\d+\s*,\s*)?(?:desc\[UR\d+\])?\[(.*?)\]\s*(?:,\s*(.*))?$', x['rest'])
     if not m:
-        raise SystemExit(f"store not understood: {x['text']}")
+        # an atomic with its destinations in front: `ATOMG.E.ADD.STRONG.GPU PT, R9, desc[UR8][R32.64+0x8], R9`,
+        # `ATOM.E.CAS.STRONG.GPU PT, R14, [R14], R18, R19` - the registers behind the memory operand are its data
+        ops = split_ops(x['rest'])
+        mem = [k for k, o in enumerate(ops) if '[' in o]
+        if len(mem) != 1:
+            raise SystemExit(f"store not understood: {x['text']}")
+        data = set()
+        for o in ops[mem[0] + 1:]:
+            dm = re.fullmatch(r'R(\d+)', o)
+            if dm:
+                data |= set(range(int(dm.group(1)), int(dm.group(1)) + w))
+        return addr_regs(ops[mem[0]]), data
     data = set()
-    w = 4 if '.128' in op else 2 if '64' in op else 1
     for o in [o.strip() for o in (m.group(2) or '').split(',') if o.strip()]:
         dm = re.fullmatch(r'R(\d+)', o)
         if dm:                          # RZ, a uniform register or an immediate: no general register to rewrite
@@ -139,15 +174,26 @@ def store_reads(x):
     return addr_regs(m.group(1)), data
 
 
+def copy_reads(x):
+    """registers an asynchronous copy reads when it is served: the shared destination's address register and the global
+    source's address pair, upper half included (`LDGSTS.E.BYPASS.128 [R77+0x1000], desc[UR8][R60.64], P1`: R77, R60, R61)."""
+    if not x['op'].startswith('LDGSTS'):
+        return None
+    out = set()
+    for g in re.findall(r'\[([^\[\]]*)\]', x['rest']):
+        out |= addr_regs(g)
+    return out
+
+
 def load_reads(x):
     """address registers of a load that holds a scoreboard barrier (a variable-latency load), None otherwise."""
     op = x['op']
-    if not op.startswith(('LDS', 'LDG', 'LDL', 'LDC', 'LD.')) or op.startswith('LDCU'):
+    if not op.startswith(('LDS', 'LDG', 'LDL', 'LDC', 'LD.')) or op.startswith(('LDCU', 'LDGSTS')):
         return None
     if x['rb'] is None and x['wb'] is None:
         return None
-    m = re.search(r'\[([^\[\]]*)\]\s*$', x['rest'])
-    return addr_regs(m.group(1)) if m else None
+    g = re.findall(r'\[([^\[\]]*)\]', x['rest'])       # the memory operand is the last bracket (an operand may follow it)
+    return addr_regs(g[-1]) if g else None
 
 
 def pred_of(x):
@@ -268,8 +314,12 @@ def analyse(ins, labels, loads):
     rows, mems = [], []
     for x in ins:
         sr = store_reads(x)
-        if sr is not None:
+        if sr is not None and x['op'].startswith(('ATOM', 'RED')):
+            sets, bars, kind = (('addr', sr[0]), ('data', sr[1])), {x['rb'], x['wb']} - {None}, 'atom'
+        elif sr is not None:
             sets, bars, kind = (('addr', sr[0]), ('data', sr[1])), {x['rb']} - {None}, 'store'
+        elif copy_reads(x) is not None:
+            sets, bars, kind = (('addr', copy_reads(x)),), {x['rb'], x['wb']} - {None}, 'copy'
         else:
             la = load_reads(x) if loads else None
             if la is None:
@@ -365,6 +415,11 @@ def main():
         shared_addr = {k for k in pairs if k[0] == 'store' and k[2] == 'addr' and ins[k[1]]['op'].startswith(('STS', 'STL'))}
         st = [k for k in pairs if k[0] == 'store' and k not in shared_addr]
         ld = [k for k in pairs if k[0] == 'load']
+        cp = [k for k in pairs if k[0] == 'copy']
+        cpbare = [k for k in cp if ins[k[1]]['rb'] is None and ins[k[1]]['wb'] is None]
+        ncp = sum(1 for m in mems if m['kind'] == 'copy')
+        at = [k for k in pairs if k[0] == 'atom']
+        nat = sum(1 for m in mems if m['kind'] == 'atom')
         total_bad += len(pairs)
         nst = sum(1 for m in mems if m['kind'] == 'store')
         nbare = sum(1 for m in mems if m['kind'] == 'store' and m['bare'])
@@ -375,6 +430,10 @@ def main():
               + (f", {nld} scoreboarded loads" if loads else '')
               + f": {len(st)} store -> overwriter pair(s) reached with NO wait on the store's read barrier"
               + (f" + {len(shared_addr)} on the address register of a shared-memory store (counted apart)" if shared_addr else '')
+              + (f"; {ncp} asynchronous copies ({sum(1 for m in mems if m['kind'] == 'copy' and m['bare'])} without a scoreboard barrier): "
+                 f"{len(cp) - len(cpbare)} copy -> overwriter pair(s) on an address register with NO wait on the copy's barrier"
+                 f" + {len(cpbare)} behind a copy without a barrier (its release by a completion word is not walked)" if ncp else '')
+              + (f"; {nat} atomics: {len(at)} atomic -> overwriter pair(s) with NO wait on the atomic's barriers" if nat else '')
               + (f", {len(ld)} load-address pair(s) with no wait on the load's barriers" if loads else '')
               + f"; pairs behind a wait on every path: {nprot}"
               + (f"; CONTROL FLOW NOT MODELED: {' '.join(unm)}" if unm else ''))
@@ -382,7 +441,7 @@ def main():
             r = min(rs, key=lambda r: r['unprot_dist'])
             if '--all' not in a and r['unprot_dist'] > 400:
                 continue
-            b = f"R{r['rb'] if r['rb'] is not None else '-'}" + (f"W{r['wb'] if r['wb'] is not None else '-'}" if r['kind'] == 'load' else '')
+            b = f"R{r['rb'] if r['rb'] is not None else '-'}" + (f"W{r['wb'] if r['wb'] is not None else '-'}" if r['kind'] != 'store' else '')
             print(f"  [{r['store']:4}] {r['store_text']:<40} ({b}) {r['role']} {fmt_regs([x['reg'] for x in rs]):<9} "
                   f"-> [{r['over']:4}] {r['over_text']:<44} waits {''.join(map(str, r['over_wait'])) or '-':<4} at {r['unprot_dist']:4} cycles"
                   + (f"  (unarmed wait at {r['unarmed']})" if r['unarmed'] else ''))
