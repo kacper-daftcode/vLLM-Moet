@@ -1888,7 +1888,8 @@ __device__ __forceinline__ void wg_copy_a(uint32_t sb_a, const uint8_t* a_base, 
   }
 }
 
-template <int STAGES, int MINB>
+// MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
+template <int STAGES, int MINB, int MT = 0>
 __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
   constexpr int NCW = kWgConsumers;
   extern __shared__ __align__(128) uint8_t smem[];
@@ -2106,10 +2107,88 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
       if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
       pos.advance<STAGES>();
     };
+    // MT = 1, the m-tile loops. compute_stage above runs the QMMAs of an m-tile under the warp-uniform predicate act[mt], and a QMMA
+    // under a false predicate keeps its stall and its place in the tensor pipe's issue throttle: eight warps per SM issue 614 M QMMA
+    // slots per second when every slot executes and 658 M when none does (one RTX PRO 6000 Workstation card, 2.8 GHz). So an item
+    // pays for the 64 slots of a K128 per warp whatever its m-tile count: a row chunk of one m-tile pays for four, and on the
+    // 64-column tile, where a warp serves two of the four m-tiles, every warp pays for the other two. With MT = 1 the item's
+    // m-tiles select, by one warp-uniform branch per item, a stage loop that contains only the loads and QMMAs of the warp's
+    // active m-tiles [lo, hi): the QMMAs the predicated loop executes, on the same operands, in the same order per accumulator -
+    // the bits are those of MT = 0 (harness). A warp without an active m-tile (the 64-column tile of an item of at most two
+    // m-tiles, warps 4-7) keeps the barrier protocol only. Any other combination runs the predicated loop.
+    auto compute_stage_r = [&](const uint8_t* sp, auto kb_tag, auto lo_tag, auto hi_tag) {
+      constexpr int KB0 = decltype(kb_tag)::value, LO = decltype(lo_tag)::value, HI = decltype(hi_tag)::value;
+      if constexpr (HI > LO) {
+        uint32_t sfb[2][2], sfa[4];
+#pragma unroll
+        for (int p = 0; p < 2; ++p)
+#pragma unroll
+          for (int nt = 0; nt < 2; ++nt) sfb[p][nt] = *reinterpret_cast<const uint32_t*>(sp + sfb_off + p * 512 + nt * 32);
+#pragma unroll
+        for (int mt = LO; mt < HI; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+          uint32_t b[2][2][2];
+#pragma unroll
+          for (int p = 0; p < 2; ++p) {
+            const uint2 w = *reinterpret_cast<const uint2*>(sp + p * 4096 + kk * 2048 + b_off);
+            spread_e2m1x8(w.x, b[p][0][0], b[p][0][1]);
+            spread_e2m1x8(w.y, b[p][1][0], b[p][1][1]);
+          }
+#pragma unroll
+          for (int mt = LO; mt < HI; ++mt) {
+            const uint4 af = *reinterpret_cast<const uint4*>(sp + a_off + mt * 1024 + kk * 512);
+#pragma unroll
+            for (int p = 0; p < 2; ++p)
+#pragma unroll
+              for (int nt = 0; nt < 2; ++nt)
+                qmma_kk<KB0>(kk, acc[mt][p][nt], af.x, af.z, af.y, af.w, b[p][nt][0], b[p][nt][1], sfa[mt], sfb[p][nt]);
+          }
+        }
+      }
+    };
+    auto run_stages_r = [&](auto lo_tag, auto hi_tag) {
 #pragma unroll 1
-    for (int t = 0; t < n_stages; t += 2) {
-      step(std::integral_constant<int, 0>{});
-      step(std::integral_constant<int, 2>{});
+      for (int t = 0; t < n_stages; t += 2) {
+        mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par);
+        compute_stage_r(smem + pos.buf * kF1Stage, std::integral_constant<int, 0>{}, lo_tag, hi_tag);
+        __syncwarp();  // the warp's LDS of this buffer precede lane 0's release arrive
+        if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+        pos.advance<STAGES>();
+        mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par);
+        compute_stage_r(smem + pos.buf * kF1Stage, std::integral_constant<int, 2>{}, lo_tag, hi_tag);
+        __syncwarp();
+        if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+        pos.advance<STAGES>();
+      }
+    };
+    bool specialised = false;
+    if constexpr (MT == 1) {
+      const int hi = m_tiles < mt_hi ? m_tiles : mt_hi;           // the warp's active m-tiles are [mt_lo, hi)
+      const int sel = mt_lo * 4 + (hi > mt_lo ? hi - mt_lo : 0);  // mt_lo is 0 or 2
+      using I0 = std::integral_constant<int, 0>;
+      using I1 = std::integral_constant<int, 1>;
+      using I2 = std::integral_constant<int, 2>;
+      using I3 = std::integral_constant<int, 3>;
+      using I4 = std::integral_constant<int, 4>;
+      specialised = true;
+      switch (sel) {
+        case 1: run_stages_r(I0{}, I1{}); break;
+        case 2: run_stages_r(I0{}, I2{}); break;
+        case 3: run_stages_r(I0{}, I3{}); break;
+        case 4: run_stages_r(I0{}, I4{}); break;
+        case 8: run_stages_r(I2{}, I2{}); break;
+        case 9: run_stages_r(I2{}, I3{}); break;
+        case 10: run_stages_r(I2{}, I4{}); break;
+        default: specialised = false; break;
+      }
+    }
+    if (!specialised) {
+#pragma unroll 1
+      for (int t = 0; t < n_stages; t += 2) {
+        step(std::integral_constant<int, 0>{});
+        step(std::integral_constant<int, 2>{});
+      }
     }
 
     // ---- epilogue = v8's arithmetic (the partner-warp amax exchange through s_amax), with ONE named barrier of the consumers per
@@ -2179,7 +2258,8 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
 }
 
 // FC2 with the producer-warp skeleton
-template <int STAGES, int MINB>
+// MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
+template <int STAGES, int MINB, int MT = 0>
 __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
@@ -2412,12 +2492,76 @@ __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
       if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
       pos.advance<STAGES>();
     };
+    // MT = 1, the m-tile loops (see fc1_kernel_wg): an item of 1-3 m-tiles runs a stage loop that loads and multiplies only its own
+    // m-tiles - the QMMAs the predicated loop executes, on the same operands, in the same order per accumulator. An item of four
+    // m-tiles runs the loop above (nothing in it is nullified then).
+    auto compute_stage_r = [&](const uint8_t* sp, auto kb_tag, auto tail_tag, auto m_tag) {
+      constexpr int KB0 = decltype(kb_tag)::value, M = decltype(m_tag)::value;
+      constexpr bool TAIL = decltype(tail_tag)::value;
+      uint32_t sfb[2], sfa[4];
+      uint2 bw[2], alo[4][2], ahi[4][2];
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) bw[kk] = *reinterpret_cast<const uint2*>(sp + kk * 2048 + b_off);
+#pragma unroll
+      for (int mt = 0; mt < M; ++mt)
+#pragma unroll
+        for (int kk = 0; kk < 2; ++kk) {
+          alo[mt][kk] = *reinterpret_cast<const uint2*>(sp + ((a_lo + mt * 1024) ^ (kk * 32)));
+          ahi[mt][kk] = *reinterpret_cast<const uint2*>(sp + ((a_hi + mt * 1024) ^ (kk * 32)));
+        }
+#pragma unroll
+      for (int nt = 0; nt < 2; ++nt) {
+        if constexpr (TAIL) sfb[nt] = *reinterpret_cast<const uint16_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 2);
+        else sfb[nt] = *reinterpret_cast<const uint32_t*>(sp + kF2B + kF2A + kF2SFA + (col_q + nt * 8) * 4);
+      }
+#pragma unroll
+      for (int mt = 0; mt < M; ++mt) sfa[mt] = *reinterpret_cast<const uint32_t*>(sp + sfa_off + mt * 64);
+#pragma unroll
+      for (int kk = 0; kk < 2; ++kk) {
+        uint32_t b[2][2];
+        spread_e2m1x8(bw[kk].x, b[0][0], b[0][1]);
+        spread_e2m1x8(bw[kk].y, b[1][0], b[1][1]);
+#pragma unroll
+        for (int mt = 0; mt < M; ++mt) {
+#pragma unroll
+          for (int nt = 0; nt < 2; ++nt)
+            qmma_kk<KB0>(kk, acc[mt][nt], alo[mt][kk].x, ahi[mt][kk].x, alo[mt][kk].y, ahi[mt][kk].y, b[nt][0], b[nt][1], sfa[mt], sfb[nt]);
+        }
+      }
+    };
+    auto step_r = [&](auto kb_tag, auto tail_tag, auto m_tag) {
+      mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par);
+      compute_stage_r(smem + pos.buf * kF2Stage, kb_tag, tail_tag, m_tag);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+      pos.advance<STAGES>();
+    };
+    auto run_stages_r = [&](auto m_tag) {
 #pragma unroll 1
-    for (int t = 0; t < n_stages - 1; t += 2) {
-      step(I0{}, F{});
-      step(I2{}, F{});
+      for (int t = 0; t < n_stages - 1; t += 2) {
+        step_r(I0{}, F{}, m_tag);
+        step_r(I2{}, F{}, m_tag);
+      }
+      step_r(I0{}, Tr{}, m_tag);
+    };
+    bool specialised = false;
+    if constexpr (MT == 1) {
+      specialised = true;
+      switch (m_tiles) {
+        case 1: run_stages_r(std::integral_constant<int, 1>{}); break;
+        case 2: run_stages_r(std::integral_constant<int, 2>{}); break;
+        case 3: run_stages_r(std::integral_constant<int, 3>{}); break;
+        default: specialised = false; break;
+      }
     }
-    step(I0{}, Tr{});
+    if (!specialised) {
+#pragma unroll 1
+      for (int t = 0; t < n_stages - 1; t += 2) {
+        step(I0{}, F{});
+        step(I2{}, F{});
+      }
+      step(I0{}, Tr{});
+    }
 
     // ---- epilogue = v8's: scale, bf16, token-major route rows
     const int pslot = k & 1;
@@ -3187,6 +3331,18 @@ static void occ_check(const char* kernel_name, Kernel kernel, bool& noted, int s
 static int g_rt_ws1 = -1, g_rt_sum_items = -1, g_rt_sum_discard = -1, g_rt_sum_route_hint = -1;
 static int ws1_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1"); return g_rt_ws1 >= 0 ? g_rt_ws1 : m; }
 static int ws2_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS2"); return m; }
+// The m-tile loops (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS=1; run-time override set_mt_loops, -1 = the env value): the served FC1 mode
+// (WS1 = 9) launches fc1_kernel_wg<4, 1, 1> and the served FC2 mode (WS2 = 3) fc2_kernel_ws<4, 2, 1> - the same kernels with the
+// consumers' stage loop specialised on the item's m-tiles (no nullified QMMA slots; bit-identical alternatives, so a flip between two
+// calls changes no bits). Other modes are not affected. FC2's specialised kernel is built for two CTAs per SM (launch bounds): with
+// the bounds of one it takes 100 registers per thread, four more than two CTAs of nine warps get.
+static int g_rt_mt_loops = -1;
+static int mt_loops_mode() {
+  static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS") >= 1 ? 1 : 0;
+  return g_rt_mt_loops >= 0 ? g_rt_mt_loops : m;
+}
+// the activation counters of the m-tile loops: [FC1 calls, rows, FC2 calls, rows] launched with the specialised kernels
+static unsigned long long g_cnt_mt[4] = {0, 0, 0, 0};
 // K-13 (task B): activation counters of the switched paths, one add per call (moe_prefill_fast_counters() reads them: calls / rows through
 // fc1 v10 (WS1 >= 8) vs fc1 v8/v9 (WS1 < 8), fc2 with the sum items vs fc2 + the separate topk_sum_kernel, the persistent launch)
 static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -3288,43 +3444,45 @@ struct WsLaunch1 {
     fc1_kernel_ws<S, MB, MH><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB>
-struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2)
+template <int S, int MB, int MT = 0>
+struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2; MT = 1: the m-tile loops)
   static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB>, kT, S * kF1Stage);
+    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT>, kT, S * kF1Stage);
     // on record: <4, 1> one CTA per SM (167 registers, the served mode), <3, 2> two (setmaxnreg)
     static bool noted = false;
-    occ_check("fc1_kernel_wg", fc1_kernel_wg<S, MB>, noted, S, MB, occ,
+    occ_check(MT == 1 ? "fc1_kernel_wg_mt" : "fc1_kernel_wg", fc1_kernel_wg<S, MB, MT>, noted, S, MB, occ,
               occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC1", (S == 4 && MB == 1) ? 1 : (S == 3 && MB == 2) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc1_kernel_wg<S, MB><<<grid, kT, S * kF1Stage, stream>>>(f1);
+    fc1_kernel_wg<S, MB, MT><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB>
+template <int S, int MB, int MT = 0>
 struct WsLaunch2 {
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB>, kWsThreads, S * kF2Stage);
-    // on record: <4, 1> (the served mode) and <3, 2> two CTAs per SM - at 96 registers per thread, the most two CTAs of 9 warps get
+    if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB, MT>, kWsThreads, S * kF2Stage);
+    // on record: <4, 1> (the served mode) and <3, 2> two CTAs per SM - at 96 registers per thread, the most two CTAs of 9 warps get;
+    // the m-tile loops' <4, 2, 1> two as well (92 registers)
     static bool noted = false;
-    occ_check("fc2_kernel_ws", fc2_kernel_ws<S, MB>, noted, S, MB, occ,
-              occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC2", ((S == 4 && MB == 1) || (S == 3 && MB == 2)) ? 2 : 0), sms);
+    occ_check(MT == 1 ? "fc2_kernel_ws_mt" : "fc2_kernel_ws", fc2_kernel_ws<S, MB, MT>, noted, S, MB, occ,
+              occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC2",
+                         ((S == 4 && MB == 1) || (S == 3 && MB == 2) || (S == 4 && MB == 2 && MT == 1)) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc2Args& f2, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc2_kernel_ws<S, MB><<<grid, kWsThreads, S * kF2Stage, stream>>>(f2);
+    fc2_kernel_ws<S, MB, MT><<<grid, kWsThreads, S * kF2Stage, stream>>>(f2);
   }
 };
 template <typename Fn>
@@ -3338,7 +3496,10 @@ static void with_ws1(int mode, Fn fn) {
     case 6: fn(WsLaunch1<4, 1, 2>{}); break;
     case 7: fn(WsLaunch1<7, 1, 2>{}); break;
     case 8: fn(WgLaunch1<3, 2>{}); break;
-    case 9: fn(WgLaunch1<4, 1>{}); break;
+    case 9:
+      if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1>{});
+      else fn(WgLaunch1<4, 1>{});
+      break;
     case 10: fn(WgLaunch1<6, 1>{}); break;
     default: fn(WgLaunch1<7, 1>{}); break;
   }
@@ -3348,7 +3509,10 @@ static void with_ws2(int mode, Fn fn) {
   switch (mode) {
     case 1: fn(WsLaunch2<3, 2>{}); break;
     case 2: fn(WsLaunch2<6, 1>{}); break;
-    case 3: fn(WsLaunch2<4, 1>{}); break;
+    case 3:
+      if (mt_loops_mode() >= 1) fn(WsLaunch2<4, 2, 1>{});
+      else fn(WsLaunch2<4, 1>{});
+      break;
     default: fn(WsLaunch2<7, 1>{}); break;
   }
 }
@@ -3591,6 +3755,10 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
     const bool fc1_v10 = !persistent && ws1_mode() >= 8 && T >= ws1_min_rows() && lda_b == K && lds_b == K / 32;
     g_cnt[fc1_v10 ? 0 : 2] += 1; g_cnt[fc1_v10 ? 1 : 3] += (unsigned long long)T;
     g_cnt[sum_items ? 4 : 6] += 1; g_cnt[sum_items ? 5 : 7] += (unsigned long long)T;
+    if (mt_loops_mode() >= 1) {  // the m-tile loops: the calls whose FC1 / FC2 launch is the specialised kernel
+      if (fc1_v10 && ws1_mode() == 9) { g_cnt_mt[0] += 1; g_cnt_mt[1] += (unsigned long long)T; }
+      if (!persistent && ws2_mode() == 3) { g_cnt_mt[2] += 1; g_cnt_mt[3] += (unsigned long long)T; }
+    }
   }
   // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
   const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
@@ -3740,6 +3908,18 @@ void set_runtime_switches(int64_t ws1, int64_t sum_items, int64_t sum_discard, i
   g_rt_ws1 = (int)ws1; g_rt_sum_items = (int)sum_items; g_rt_sum_discard = (int)sum_discard; g_rt_sum_route_hint = (int)sum_route_hint;
 }
 std::vector<int64_t> get_runtime_switches() { return {ws1_mode(), sum_items_env(), sum_discard_env(), sum_route_hint_env()}; }
+// The m-tile loops' run-time override (-1 = the env value, 0 / 1), the effective value, and their counters [FC1 calls, rows, FC2 calls,
+// rows] - entries of their own, so that the entries above keep their signatures.
+void set_mt_loops(int64_t v) {
+  TORCH_CHECK(v >= -1 && v <= 1, "set_mt_loops: -1 (the env value), 0 or 1");
+  g_rt_mt_loops = (int)v;
+}
+int64_t get_mt_loops() { return mt_loops_mode(); }
+std::vector<int64_t> moe_prefill_fast_mt_counters(bool clear) {
+  std::vector<int64_t> r(g_cnt_mt, g_cnt_mt + 4);
+  if (clear) for (auto& c : g_cnt_mt) c = 0;
+  return r;
+}
 std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
   std::vector<int64_t> r(g_cnt, g_cnt + 8);
   if (clear) for (auto& c : g_cnt) c = 0;
@@ -3793,6 +3973,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("route_rows_consumed", &route_rows_consumed);
   m.def("set_runtime_switches", &set_runtime_switches);
   m.def("get_runtime_switches", &get_runtime_switches);
+  m.def("set_mt_loops", &set_mt_loops);
+  m.def("get_mt_loops", &get_mt_loops);
+  m.def("moe_prefill_fast_mt_counters", &moe_prefill_fast_mt_counters);
   m.def("moe_prefill_fast_counters", &moe_prefill_fast_counters);
   m.def("moe_prefill_ws_error", &moe_prefill_ws_error);
   m.def("moe_prefill_ws_stats", &moe_prefill_ws_stats);

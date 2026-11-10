@@ -47,6 +47,17 @@ the tile's FC2 items with watchdog-bounded acquire polls; _SUM_TOKENS (256) toke
 are summed while still in L2; `_SUM_DISCARD=1` drops the summed route lines from L2 without a write-back (the route buffer is scratch then:
 `route_rows_consumed()`); `_W2_EVICT_FIRST=1` streams W2 with an L2 evict_first hint. The sum is topk_sum_kernel's chain in slot order (level
 B); the separate topk_sum_kernel is skipped.
+
+The m-tile loops: `VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS=1` (default 0) launches the served FC1 / FC2 modes (WS1 = 9, WS2 = 3) with the
+consumers' stage loop specialised on the item's m-tiles. The served consumers run the QMMAs of an m-tile under a warp-uniform predicate,
+and a QMMA under a false predicate keeps its stall and its place in the tensor pipe's issue throttle (eight warps per SM issue 614 M
+QMMA slots per second when every slot executes and 658 M when none does), so an item pays for four m-tiles whatever it has: at 4096 rows
+of a real prefill a row chunk has 2.9 of 4 m-tiles on average, and on FC1's 64-column tile every warp serves two of the four. With the
+switch an item branches once (warp-uniform) to a loop that holds only its own m-tiles' loads and QMMAs - the same QMMAs on the same
+operands in the same order per accumulator, bit-identical on W's harness. One RTX PRO 6000 Workstation card at 2.61 GHz, 4096 rows,
+319 experts with the weights streamed: FC1 736 -> 666 us, FC2 464 -> 449 us, the call's kernels 1 241 -> 1 155 us (-6.9 %); six experts
+with the weights in L2: 817 -> 780 us. FC2's specialised kernel is built for two CTAs per SM and takes 92 registers per thread (the
+occupancy guard watches it as `fc2_kernel_ws_mt<4, 2>`). `mt_loops_supported()` tells whether the built extension has the kernels.
 """
 from __future__ import annotations
 
@@ -113,8 +124,9 @@ def route_rows_consumed() -> bool:
 #                                   control file VLLM_MOET_RUNTIME_AB_FILE (default /dev/shm/vllm_moet_ab.json; the serving container's
 #                                   /dev/shm is shared by its API server, engine and workers, so `docker exec <c> sh -c 'echo ... > ...'`
 #                                   reaches every rank). Keys of this module: B12X_MOE_PREFILL_FAST_SUM_ITEMS (0 / 1 - the sum items with
-#                                   their _DISCARD / _ROUTE_HINT companions as one unit) and B12X_MOE_PREFILL_FAST_WS1 (0..11; 0 = v8,
-#                                   9 = v10). Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
+#                                   their _DISCARD / _ROUTE_HINT companions as one unit), B12X_MOE_PREFILL_FAST_WS1 (0..11; 0 = v8,
+#                                   9 = v10) and B12X_MOE_PREFILL_FAST_MT_LOOPS (0 / 1 - the m-tile loops of the served FC1 / FC2
+#                                   modes). Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
 #                                   at a MoE-call boundary - this module has no view of the prefill forward; the states are bit-identical
 #                                   alternatives, so a flip between two calls of one step changes no bits), re-reads it only when mtime or
 #                                   size changed, applies the values through the extension's set_runtime_switches, logs one line per rank
@@ -123,7 +135,8 @@ def route_rows_consumed() -> bool:
 #                                   cause). Keys outside this module's namespace are other modules' business (ignored silently). Default
 #                                   0 = today's behaviour exactly (no stat call, no import of json).
 #   VLLM_MOET_B12X_MOE_PREFILL_FAST_STATS_EVERY=N   task B: every N calls one line per rank with the activation counters of the switched
-#                                   paths (calls / rows through fc1 v10 vs v8/v9, fc2 with the sum items vs fc2 + topk_sum_kernel) -
+#                                   paths (calls / rows through fc1 v10 vs v8/v9, fc2 with the sum items vs fc2 + topk_sum_kernel,
+#                                   fc1 / fc2 with the m-tile loops) -
 #                                   default 0 = only on demand: `touch /dev/shm/vllm_moet_stats` (VLLM_MOET_RUNTIME_STATS_FILE) -> one
 #                                   line per rank at the next call boundary (checked every 64 calls: one os.stat per 64 calls; the file's
 #                                   mtime is remembered, so one touch = one line per rank). Cost when not requested: one integer add per
@@ -171,25 +184,36 @@ def _occ_guard() -> None:
     _OCC_SEEN[0] = len(facts)
 
 
+def mt_loops_supported() -> bool:
+    """Whether the built extension has the m-tile loops (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS and its runtime key)."""
+    return hasattr(_ext(), "set_mt_loops")
+
+
 def runtime_switches() -> dict:
-    """The effective switch values of this process (env or runtime override): ws1, sum_items, sum_discard, sum_route_hint."""
+    """The effective switch values of this process (env or runtime override): ws1, sum_items, sum_discard, sum_route_hint and, with a
+    build that has them, mt_loops."""
     e = _ext()
     if not hasattr(e, "get_runtime_switches"):
         return {}
     ws1, si, sd, sh = (int(v) for v in e.get_runtime_switches())
-    return {"WS1": ws1, "SUM_ITEMS": si, "SUM_DISCARD": sd, "SUM_ROUTE_HINT": sh}
+    sw = {"WS1": ws1, "SUM_ITEMS": si, "SUM_DISCARD": sd, "SUM_ROUTE_HINT": sh}
+    if hasattr(e, "get_mt_loops"):
+        sw["MT_LOOPS"] = int(e.get_mt_loops())
+    return sw
 
 
 def apply_runtime_switches(values: dict) -> list[str]:
-    """Apply {"B12X_MOE_PREFILL_FAST_SUM_ITEMS": 0|1, "B12X_MOE_PREFILL_FAST_WS1": 0..11} (keys of other modules ignored); returns the
-    change descriptions. A key the file does not carry goes back to its env value (-1); an out-of-range value keeps the current effective
-    value (one WARNING). The sum-items unit sets SUM_ITEMS, SUM_DISCARD and SUM_ROUTE_HINT together."""
+    """Apply {"B12X_MOE_PREFILL_FAST_SUM_ITEMS": 0|1, "B12X_MOE_PREFILL_FAST_WS1": 0..11, "B12X_MOE_PREFILL_FAST_MT_LOOPS": 0|1} (keys of
+    other modules ignored); returns the change descriptions. A key the file does not carry goes back to its env value (-1); an
+    out-of-range value keeps the current effective value (one WARNING). The sum-items unit sets SUM_ITEMS, SUM_DISCARD and
+    SUM_ROUTE_HINT together."""
     e = _ext()
     if not hasattr(e, "set_runtime_switches"):
         _rt_warn_once("ext", "this build of the extension has no set_runtime_switches entry: runtime A/B inactive")
         return []
     cur = runtime_switches()
-    ws1_arg, si_arg = -1, -1
+    ws1_arg, si_arg, mt_arg = -1, -1, -1
+    has_mt = hasattr(e, "set_mt_loops")
     for key, val in values.items():
         if not isinstance(key, str) or not key.startswith("B12X_MOE_PREFILL_FAST_"):
             continue
@@ -209,14 +233,24 @@ def apply_runtime_switches(values: dict) -> list[str]:
             else:
                 ws1_arg = cur["WS1"]
                 _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0..11) - kept {cur['WS1']}")
+        elif key == "B12X_MOE_PREFILL_FAST_MT_LOOPS" and has_mt:
+            if v in (0, 1):
+                mt_arg = v
+            else:
+                mt_arg = cur["MT_LOOPS"]
+                _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1) - kept {cur['MT_LOOPS']}")
         else:
             _rt_warn_once("key:" + key, f"runtime A/B: unknown key {key} of this module - ignored")
     sd_arg = sh_arg = si_arg  # the unit: discard + evict_last hint follow the sum items (-1 = env for all three)
     e.set_runtime_switches(int(ws1_arg), int(si_arg), int(sd_arg), int(sh_arg))
+    if has_mt:
+        e.set_mt_loops(int(mt_arg))
     now = runtime_switches()
     changes = []
     if now["WS1"] != cur["WS1"]:
         changes.append(f"WS1 {cur['WS1']} -> {now['WS1']}")
+    if has_mt and now["MT_LOOPS"] != cur["MT_LOOPS"]:
+        changes.append(f"MT_LOOPS {cur['MT_LOOPS']} -> {now['MT_LOOPS']}")
     if (now["SUM_ITEMS"], now["SUM_DISCARD"], now["SUM_ROUTE_HINT"]) != (cur["SUM_ITEMS"], cur["SUM_DISCARD"], cur["SUM_ROUTE_HINT"]):
         changes.append(f"SUM_ITEMS {cur['SUM_ITEMS']} -> {now['SUM_ITEMS']} (DISCARD {cur['SUM_DISCARD']} -> {now['SUM_DISCARD']}, "
                        f"ROUTE_HINT {cur['SUM_ROUTE_HINT']} -> {now['SUM_ROUTE_HINT']})")
@@ -263,15 +297,24 @@ def activation_counters(clear: bool = False) -> dict:
     if not hasattr(e, "moe_prefill_fast_counters"):
         return {}
     c = [int(v) for v in e.moe_prefill_fast_counters(bool(clear))]
-    return {"fc1_v10": (c[0], c[1]), "fc1_v8_v9": (c[2], c[3]), "fc2_sum_items": (c[4], c[5]), "fc2_topk_sum_kernel": (c[6], c[7])}
+    out = {"fc1_v10": (c[0], c[1]), "fc1_v8_v9": (c[2], c[3]), "fc2_sum_items": (c[4], c[5]), "fc2_topk_sum_kernel": (c[6], c[7])}
+    if hasattr(e, "moe_prefill_fast_mt_counters"):
+        t = [int(v) for v in e.moe_prefill_fast_mt_counters(bool(clear))]
+        out["fc1_mt_loops"] = (t[0], t[1])
+        out["fc2_mt_loops"] = (t[2], t[3])
+    return out
 
 
 def _stats_line(reason: str) -> None:
     c = activation_counters()
     sw = runtime_switches()
+    mt_cnt = mt_tok = ""
+    if "MT_LOOPS" in sw and "fc1_mt_loops" in c:  # a build with the m-tile loops: their counters and their token join the line
+        mt_cnt = f", fc1 m-tile loops {c['fc1_mt_loops'][0]} / {c['fc1_mt_loops'][1]}, fc2 m-tile loops {c['fc2_mt_loops'][0]} / {c['fc2_mt_loops'][1]}"
+        mt_tok = f" MT_LOOPS={sw['MT_LOOPS']}"
     _rt_log(f"activation counters ({reason}; calls / rows): fc1 v10 {c['fc1_v10'][0]} / {c['fc1_v10'][1]}, fc1 v8-v9 {c['fc1_v8_v9'][0]} / {c['fc1_v8_v9'][1]}, "
-            f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}; "
-            f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}")
+            f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}{mt_cnt}; "
+            f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}{mt_tok}")
 
 
 def _runtime_hooks() -> None:
