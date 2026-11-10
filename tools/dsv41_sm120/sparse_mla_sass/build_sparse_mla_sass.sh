@@ -3,6 +3,7 @@
 #
 #   build_sparse_mla_sass.sh [out.cubin]            (default: kernels/cubins-sm120/sparse_mla_prefill_v41.cubin)
 #   SCHEDULE=s1 build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin)
+#   SCHEDULE=s1b build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v41s1b.cubin)
 #   KERNEL=v42 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v42.cubin)
 #   KERNEL=v43 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v43.cubin)
 #   KERNEL=v43b build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin)
@@ -48,6 +49,12 @@
 # script copies cubit's tables/dep_latency_sm120.json (the file next to TABLE), adds "an MMA holds every BRA 14 cycles
 # off" to its resource rows and passes the copy as CUBIT_SCHED2_LAT; everything else is KERNEL=v43's environment.
 # One control word differs from v43 (BAR.SYNC behind PV: S06 -> S13). Reproduces sha256 a163aea6d869c55e...
+# SCHEDULE=s1b — SCHEDULE=s1 with the same row (KERNEL=v41 only): v41's source and v41s1's 2 540 instruction words with
+# the last HMMA of PV 14 and 19 issue cycles in front of the two conditional branches behind it (v41s1: 7 and 12). The
+# script makes the same copy of cubit's dependency table with "an MMA holds every BRA 14 cycles off" and passes it as
+# CUBIT_SCHED2_LAT; everything else is SCHEDULE=s1's environment. One control word differs from v41s1 (BAR.SYNC behind
+# PV: S06 -> S13). Reproduces sha256 cba10b0adafd20c3... from cubit `main` at ef7d335 and at 7dda1b6. A separate cubin;
+# see kernels/MANIFEST.md for its gate.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -76,7 +83,10 @@ case "$SCHEDULE" in
   "") SCHED_ENV=(); DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin ;;
   s1) SCHED_ENV=(CUBIT_SCHED2=1 CUBIT_SCHED2_LAT=sm120 CUBIT_MMA_PTXAS=1)
       DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin ;;
-  *) echo "unknown SCHEDULE '$SCHEDULE' (known: s1)" >&2; exit 2 ;;
+  s1b) [[ "$KERNEL" == v41 ]] || { echo "SCHEDULE=s1b is KERNEL=v41's (the later sources: KERNEL=v43b)" >&2; exit 2; }
+      SCHED_ENV=(CUBIT_SCHED2=1 CUBIT_SCHED2_LAT=sm120 CUBIT_MMA_PTXAS=1); MMA_BRA=14
+      DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41s1b.cubin ;;
+  *) echo "unknown SCHEDULE '$SCHEDULE' (known: s1, s1b)" >&2; exit 2 ;;
 esac
 [[ "$KERNEL" == v42 || "$KERNEL" == v43 || "$KERNEL" == v43b ]] && DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_$KERNEL.cubin
 OUT=${1:-$DEFAULT_OUT}
