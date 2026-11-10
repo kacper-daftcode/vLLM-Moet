@@ -60,6 +60,225 @@ def _row_blocks(num_rows: int):
     return _PIPE_ROW_BLOCKS(num_rows)
 
 
+# The prefill branch of o_proj (tokens > MAX_GROUPED_GEMV_T) dequantizes the MXFP8 wo_a to bf16 for cuBLAS on every call; vLLM's
+# dequant_mxfp8_to_bf16 does that with six PyTorch kernels (fp8 -> fp32 copy, scale copy, - 127, exp2, the fp32 broadcast multiply,
+# fp32 -> bf16 copy: ~50 us of GPU time alone and ~98 us next to the other stream's kernels, ~160 MB of memory traffic per layer call;
+# 60 calls per 8 192-token step = ~6 ms and ~9.6 GB per step). VLLM_MOET_WOA_DEQUANT_FUSED=1 does the same arithmetic in one Triton kernel:
+# the e4m3 value to fp32 (exact), descale = libdevice exp2(scale - 127) (the same __nv_exp2f that torch.exp2 calls), one fp32 multiply (RN),
+# cvt.rn to bf16 - bit for bit dequant_mxfp8_to_bf16 for every scale code except 0: a code-0 block has the descale 2^-127, an fp32
+# subnormal that the six kernels carry into a bf16 subnormal and the Triton kernel flushes to zero (7 808 of the 2^16 (value, scale) codes
+# differ, all at scale byte 0 - test_dequant_fused_sm120.py). The guard: at the first call of a layer, its scales are scanned once for
+# code 0 next to a non-zero value byte (a CPU-side check on the device tensor, cached per layer); such a layer stays on the six kernels,
+# so the fused path is bit-identical by construction on any weights (the served DeepSeek-V4.1 checkpoint carries codes 114-118 only).
+# Reads 8.4 MB + 0.26 MB, writes 16.8 MB. _CACHE=1 keeps the bf16 weight per layer after the first call (no kernel at all; +16.8 MB per
+# layer of device memory = 0.63 GiB per rank for 40 layers - a KV-budget decision).
+# Runtime A/B: with VLLM_MOET_RUNTIME_AB=1 the key WOA_DEQUANT_FUSED (0 / 1) of the control file VLLM_MOET_RUNTIME_AB_FILE (default
+# /dev/shm/vllm_moet_ab.json; one flat JSON object switch -> value, the same file every module reads for its own keys) overrides the
+# env value from the next o_proj call on: polled at most once per 100 ms at the prefill branch's entry (a flip between two calls changes no
+# bits - both paths are bit-identical on guarded weights), re-read only on an mtime / size change; a malformed or missing file or an invalid
+# value keeps the state (one warning per cause), a dropped key goes back to the env value, one line per rank per change. Counters (calls /
+# rows per path) print with the fast-MoE module's lines on `touch /dev/shm/vllm_moet_stats` (VLLM_MOET_RUNTIME_STATS_FILE, checked every 64
+# calls) or every VLLM_MOET_WOA_DEQUANT_STATS_EVERY calls.
+_WOA_DEQUANT_FUSED = os.environ.get("VLLM_MOET_WOA_DEQUANT_FUSED", "0") == "1"
+_WOA_DEQUANT_CACHE = os.environ.get("VLLM_MOET_WOA_DEQUANT_CACHE", "0") == "1"
+_dequant_kernel = None
+_WOA_RT: dict = {"on": None, "fused": None, "next_poll": 0.0, "sig": None, "warned": set(), "calls": 0, "stats_mtime": None,
+                 "stats_every": None, "n_fused": 0, "rows_fused": 0, "n_plain": 0, "rows_plain": 0, "n_guarded": 0}
+
+
+def _woa_log(msg: str) -> None:
+    try:
+        dev = torch.cuda.current_device()
+    except Exception:  # noqa: BLE001
+        dev = "?"
+    print(f"[vllm-moet sm120 wo_a, device {dev}] {msg}", file=sys.stderr, flush=True)
+
+
+def _woa_warn_once(key: str, msg: str) -> None:
+    if key not in _WOA_RT["warned"]:
+        _WOA_RT["warned"].add(key)
+        _woa_log("WARNING: " + msg)
+
+
+def woa_dequant_fused_effective() -> bool:
+    """The fused-dequant switch in effect: the runtime A/B override when set, else the env value."""
+    f = _WOA_RT["fused"]
+    return _WOA_DEQUANT_FUSED if f is None else bool(f)
+
+
+def _woa_runtime_ab_poll() -> None:
+    import time  # noqa: PLC0415
+
+    now = time.monotonic()
+    if now < _WOA_RT["next_poll"]:
+        return
+    _WOA_RT["next_poll"] = now + 0.1
+    path = os.environ.get("VLLM_MOET_RUNTIME_AB_FILE", "/dev/shm/vllm_moet_ab.json")
+    try:
+        st = os.stat(path)
+    except OSError:
+        _woa_warn_once("missing", f"runtime A/B: control file {path} missing or unreadable - the current state is kept until it appears")
+        return
+    sig = (st.st_mtime_ns, st.st_size)
+    if sig == _WOA_RT["sig"]:
+        return
+    _WOA_RT["sig"] = sig
+    import json  # noqa: PLC0415
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            values = json.load(f)
+        if not isinstance(values, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        _woa_warn_once("malformed", f"runtime A/B: control file {path} malformed ({exc}) - the current state is kept")
+        return
+    _WOA_RT["warned"].discard("missing")
+    _WOA_RT["warned"].discard("malformed")
+    old = woa_dequant_fused_effective()
+    if "WOA_DEQUANT_FUSED" in values:
+        try:
+            v = int(values["WOA_DEQUANT_FUSED"])
+        except (TypeError, ValueError):
+            v = -1
+        if v in (0, 1):
+            _WOA_RT["fused"] = v
+        else:
+            _woa_warn_once("val", f"runtime A/B: WOA_DEQUANT_FUSED={values['WOA_DEQUANT_FUSED']!r} out of range (0 / 1) - kept {int(old)}")
+    else:
+        _WOA_RT["fused"] = None  # the key dropped -> the env value
+    new = woa_dequant_fused_effective()
+    if new != old:
+        _woa_log(f"runtime A/B: WOA_DEQUANT_FUSED {int(old)} -> {int(new)}")
+
+
+def woa_dequant_counters() -> dict:
+    """calls / rows (weight rows) through the fused kernel and through the six-kernel path, and the layers the guard kept on the six kernels."""
+    r = _WOA_RT
+    return {"fused": (r["n_fused"], r["rows_fused"]), "six_kernels": (r["n_plain"], r["rows_plain"]), "guarded_layers": r["n_guarded"]}
+
+
+def _woa_stats_line(reason: str) -> None:
+    c = woa_dequant_counters()
+    _woa_log(f"activation counters ({reason}; calls / weight rows): wo_a dequant fused {c['fused'][0]} / {c['fused'][1]}, six kernels "
+             f"{c['six_kernels'][0]} / {c['six_kernels'][1]}, layers kept on the six kernels by the code-0 guard {c['guarded_layers']}; "
+             f"switches now WOA_DEQUANT_FUSED={int(woa_dequant_fused_effective())} CACHE={int(_WOA_DEQUANT_CACHE)}")
+
+
+def _woa_runtime_hooks() -> None:
+    r = _WOA_RT
+    if r["on"] is None:
+        r["on"] = os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
+        try:
+            r["stats_every"] = int(os.environ.get("VLLM_MOET_WOA_DEQUANT_STATS_EVERY", "0"))
+        except ValueError:
+            r["stats_every"] = 0
+    if r["on"]:
+        _woa_runtime_ab_poll()
+    r["calls"] += 1
+    n = r["calls"]
+    if r["stats_every"] > 0 and n % r["stats_every"] == 0:
+        _woa_stats_line(f"every {r['stats_every']} calls, call {n}")
+    if n % 64 == 0:
+        try:
+            m = os.stat(os.environ.get("VLLM_MOET_RUNTIME_STATS_FILE", "/dev/shm/vllm_moet_stats")).st_mtime_ns
+        except OSError:
+            m = None
+        if m is not None and m != r["stats_mtime"]:
+            r["stats_mtime"] = m
+            _woa_stats_line(f"on demand, call {n}")
+
+
+def _fused_dequant_kernel():
+    global _dequant_kernel
+    if _dequant_kernel is None:
+        import triton  # noqa: PLC0415
+        import triton.language as tl  # noqa: PLC0415
+        from triton.language.extra import libdevice  # noqa: PLC0415
+
+        @triton.jit
+        def _k(x_ptr, s_ptr, out_ptr, K, n_blocks, BLOCK_K: tl.constexpr):
+            row = tl.program_id(0).to(tl.int64)
+            offs = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+            mask = offs < K
+            x = tl.load(x_ptr + row * K + offs, mask=mask, other=0).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+            s = tl.load(s_ptr + row * n_blocks + offs // 32, mask=mask, other=127).to(tl.float32)
+            d = libdevice.exp2(s - 127.0)
+            tl.store(out_ptr + row * K + offs, (x * d).to(tl.bfloat16), mask=mask)
+
+        _dequant_kernel = _k
+    return _dequant_kernel
+
+
+def dequant_mxfp8_to_bf16_fused(x: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """dequant_mxfp8_to_bf16 as one kernel (bit for bit for scale codes >= 1; see the note above). x: fp8 e4m3 [..., K] contiguous,
+    scales: uint8 [..., K/32]."""
+    K = x.shape[-1]
+    x2 = x.reshape(-1, K)
+    s2 = scales.reshape(-1, K // MXFP8_BLOCK_SIZE)
+    assert x2.is_contiguous() and s2.is_contiguous() and s2.shape[0] == x2.shape[0]
+    out = torch.empty(x2.shape, dtype=torch.bfloat16, device=x.device)
+    block = 1024 if K % 1024 == 0 else 512 if K % 512 == 0 else 256
+    grid = (x2.shape[0], triton_cdiv(K, block))
+    _fused_dequant_kernel()[grid](x2.view(torch.uint8), s2.view(torch.uint8), out, K, K // MXFP8_BLOCK_SIZE, BLOCK_K=block)
+    return out.view(x.shape)
+
+
+def triton_cdiv(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def fused_dequant_safe(x: torch.Tensor, scales: torch.Tensor) -> bool:
+    """The code-0 guard: True when no 32-block has scale code 0 together with a non-zero value byte (then the fused kernel equals the
+    six kernels bit for bit). One pass over the scales (and, only if a code 0 exists, over its blocks' value bytes)."""
+    s2 = scales.reshape(-1, scales.shape[-1]).view(torch.uint8)
+    zero = s2 == 0
+    if not bool(zero.any()):
+        return True
+    K = x.shape[-1]
+    vb = x.reshape(-1, K // MXFP8_BLOCK_SIZE, MXFP8_BLOCK_SIZE).view(torch.uint8) & 0x7F  # +-0 = byte 0x00 / 0x80
+    nonzero_block = (vb != 0).any(dim=2)
+    return not bool((zero.reshape(nonzero_block.shape) & nonzero_block).any())
+
+
+def dequant_mxfp8_to_bf16_guarded(x: torch.Tensor, scales: torch.Tensor, cache_key=None) -> torch.Tensor:
+    """The fused kernel when the guard allows it, vLLM's six kernels otherwise; the guard's verdict is cached per `cache_key` (a layer)."""
+    if cache_key is not None and hasattr(cache_key, "_moet_woa_fused_safe"):
+        safe = cache_key._moet_woa_fused_safe
+    else:
+        safe = fused_dequant_safe(x, scales)
+        if cache_key is not None:
+            cache_key._moet_woa_fused_safe = safe
+            if not safe:
+                _WOA_RT["n_guarded"] += 1
+                _woa_log("wo_a dequant: a 32-block with scale code 0 and a non-zero value in this layer's weight - the fused kernel is not "
+                         "bit-identical there; this layer stays on the six-kernel path")
+    return dequant_mxfp8_to_bf16_fused(x, scales) if safe else dequant_mxfp8_to_bf16(x, scales)
+
+
+def _woa_dequant(wo_a: nn.Module) -> torch.Tensor:
+    """The bf16 wo_a weight of the prefill branch: cached per layer (_CACHE=1), fused with the code-0 guard (_FUSED=1 or the runtime A/B
+    key), or today's six-kernel chain."""
+    _woa_runtime_hooks()
+    rows = int(wo_a.weight.shape[0]) if wo_a.weight.dim() >= 1 else 0
+    if _WOA_DEQUANT_CACHE:
+        w = getattr(wo_a, "_moet_woa_bf16", None)
+        if w is None:
+            w = (dequant_mxfp8_to_bf16_guarded(wo_a.weight, wo_a.weight_scale, wo_a) if woa_dequant_fused_effective()
+                 else dequant_mxfp8_to_bf16(wo_a.weight, wo_a.weight_scale))
+            wo_a._moet_woa_bf16 = w
+        return w
+    if woa_dequant_fused_effective():
+        w = dequant_mxfp8_to_bf16_guarded(wo_a.weight, wo_a.weight_scale, wo_a)
+        if getattr(wo_a, "_moet_woa_fused_safe", True):
+            _WOA_RT["n_fused"] += 1; _WOA_RT["rows_fused"] += rows
+        else:
+            _WOA_RT["n_plain"] += 1; _WOA_RT["rows_plain"] += rows
+        return w
+    _WOA_RT["n_plain"] += 1; _WOA_RT["rows_plain"] += rows
+    return dequant_mxfp8_to_bf16(wo_a.weight, wo_a.weight_scale)
+
+
 def _gemv_module():
     gemv_dir = os.environ.get("VLLM_MOET_SM120_GEMV_DIR", DEFAULT_GEMV_DIR)
     if gemv_dir not in sys.path:
@@ -194,7 +413,7 @@ class Sm120GemvMxfp8BmmLinearKernel(Mxfp8LinearKernel):
                 tma_aligned_scales=True,
                 quantize=False,
             )
-            w = dequant_mxfp8_to_bf16(wo_a.weight, wo_a.weight_scale)
+            w = _woa_dequant(wo_a)  # VLLM_MOET_WOA_DEQUANT_FUSED (+ the runtime A/B key) / _CACHE; default: dequant_mxfp8_to_bf16 as before
             grouped_weight = w.view(n_groups, o_lora_rank, -1)
             z = torch.empty(
                 (tokens, n_groups, o_lora_rank), device=o.device, dtype=torch.bfloat16
