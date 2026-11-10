@@ -6,14 +6,18 @@ Installed as `vllm.utils.moet_gc_idle_freeze` by `patch_vllm_gc_idle_freeze_sm12
 
 Why. vLLM freezes a serving process's heap once, when its start-up is done (`freeze_gc_heap()`: three collections, then
 `gc.freeze()`), so that the collector never walks the model, the compiled kernels and the captured graphs again - 1.25 M
-objects in a TP worker of the DeepSeek-V4.1 server. Whatever becomes long-lived after that moment is not frozen: about 1 000
-objects per fresh 19K + 163K prefill pair in every worker. A full (generation 2) collection walks all of them, on the thread
-that happened to allocate and with the interpreter lock held - 435 ns per object in a serving worker (550 ms for the whole
-heap of a worker when it is un-frozen) - and CPython runs one whenever the objects promoted since the last full collection
-exceed a quarter of the old generation's size at that collection. In a pipelined prefill step that thread is one of a rank's
-two launch threads: the rank stops, the other ranks wait for it in the collectives. Nine hours and 160 M prompt tokens after
-its start a 4-rank server stops for 0.3-0.4 s in this way every few minutes of load per rank, and the pause grows with every
-request served (+40 % in 2.7 hours of benchmark traffic); a restart resets it.
+objects in a TP worker of the DeepSeek-V4.1 server. Whatever becomes long-lived after that moment is not frozen. Measured in
+a serving 4-rank server (`gc.get_objects` by type between requests): every worker gains about 800 objects for each step
+token count it has not seen before - b12x's fused-MoE plans, 20 plan sets of about 40 objects; a fresh prompt brings one new
+count (its last step), a fresh 19K + 163K prefill pair 1 450-1 600 objects - and the EngineCore one KV-offload index entry
+per stored chunk (about 1 450 per pair); the API server's old generation does not grow. A full (generation 2) collection
+walks all of them, on the thread that happened to allocate and with the interpreter lock held - 0.13-0.36 us per such object
+in a serving worker (10-19 ms 34 pairs after a start; 550-600 ms for the whole heap of a worker when it is un-frozen) - and
+CPython runs one whenever the objects promoted since the last full collection exceed a quarter of the old generation's size
+at that collection. In a pipelined prefill step that thread is one of a rank's two launch threads: the rank stops, the other
+ranks wait for it in the collectives. Nine hours and 160 M prompt tokens after its start a 4-rank server stops for 0.3-0.4 s
+in this way every few minutes of load per rank, and the pause grows with every request served (+40 % in 2.7 hours of
+benchmark traffic); a restart resets it.
 
 What, with the switch on:
 
@@ -23,9 +27,19 @@ What, with the switch on:
      everything accumulated until then);
   2. whenever the process has worked and then been idle for `VLLM_MOET_GC_IDLE_FREEZE_IDLE_S` seconds (default 1.0; idle =
      all its threads together used less than 2 % of one core in that time): `gc.collect()` followed by `gc.freeze()`. The
-     collection is short (it walks what the last burst of requests left), no request is in flight at that moment (so nothing
-     a request holds is frozen, and garbage of the burst is collected before the freeze), and no request waits for it. Every
-     later automatic full collection walks only what has become long-lived since the last idle moment.
+     collection is short (it walks what the requests since the last idle moment left; their garbage is collected before the
+     freeze) and no request waits for it. In a worker and in the EngineCore no request is in flight at that moment, so
+     nothing a request holds is frozen. The API server is different: it is idle while the engine works on a long prompt, so
+     its freezes fall inside such requests (about 1 ms, off the request's path); what the request holds in that process is
+     frozen then and is released by reference count when the request ends, unless it sits in a reference cycle. Every later
+     automatic full collection walks only what has become long-lived since the last idle moment.
+
+In a serving server (the collector's callbacks logged in every process, one server lifetime): with 4 s between fresh 19K +
+163K pairs every worker and the EngineCore freeze once per gap - the workers 2 s after the pair, their main threads spin for
+the first second - 1.5-2.1 ms per freeze, no full collection runs inside a request, and a forced one afterwards takes
+0.01 ms; with the pairs back to back (no idle second) full collections of 1.3-3.0 ms run inside requests, growing until the
+next idle second - as without the switch, but from the last idle moment instead of from the start of the server. Un-freezing
+a worker after 13 idle freezes and collecting its 1.32 M objects found no dead one.
 
 Always, switch on or off: a warning line for every collection that takes `VLLM_MOET_GC_WARN_MS` milliseconds or more
 (default 50; 0 turns it off; at most one line per 5 s, the others are counted) - two clock reads per collection.
