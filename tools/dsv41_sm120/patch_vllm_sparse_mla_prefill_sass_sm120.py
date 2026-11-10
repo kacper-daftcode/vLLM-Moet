@@ -15,6 +15,25 @@ built by tools/dsv41_sm120/sparse_mla_sass/build_sparse_mla_sass.sh). The launch
 PyTorch's context and current stream, captured by CUDA graphs like any kernel) is embedded below — a copy of
 tools/dsv41_sm120/sparse_mla_sass/sass_launcher.py, so the patched file has no import outside the image.
 
+Runtime A/B of two cubins of this kernel (two schedules of the same instruction words — bit-identical alternatives):
+VLLM_MOET_RUNTIME_AB=1 together with VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B=<path> loads the second cubin next to the
+first one (when a device's launcher is created — never at a flip) and selects the cubin per launch with the key
+`SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` of the control file VLLM_MOET_RUNTIME_AB_FILE (default /dev/shm/vllm_moet_ab.json, one
+flat JSON object key -> integer, written from outside the container): 0 = the cubin of ..._SASS_CUBIN (the start-up
+state), 1 = the cubin of ..._SASS_CUBIN_B. Without either variable nothing changes: no stat, no json import, one launcher
+per device. The reader is this module's own (no import from another module): the file is stat'ed at most once per 100 ms
+at the entry of a launch — the unit of the A/B: the key is read before the launch picks its cubin — and re-read only when
+its (mtime, size, inode) changed. The key absent (`{}` or only other modules' keys) = back to the start-up cubin; a missing,
+unreadable or malformed file, an unknown key of this module's namespace (`SPARSE_MLA_PREFILL_SASS_`) or a value that is
+not the integer 0 / 1 = the current state is kept (one WARNING per cause per process); other namespaces are ignored.
+Read-back on the worker's stderr: one line per process per change, `[vllm-moet sparse-MLA prefill SASS, device N]
+runtime A/B: SPARSE_MLA_PREFILL_SASS_CUBIN_SEL 0 -> 1`; and per `touch` of VLLM_MOET_RUNTIME_STATS_FILE (default
+/dev/shm/vllm_moet_stats; checked every 16th launch) one line with the launches / rows per cubin and
+`switches now SPARSE_MLA_PREFILL_SASS_CUBIN_SEL=<v>`. At a device's first launch outside a CUDA-graph capture both cubins
+are launched once on the same chunk and their outputs compared bit for bit (one synchronisation per process): unequal =
+the second cubin is refused for the process (WARNING, the start-up cubin stays). A launch recorded into a CUDA graph keeps
+the cubin it was captured with (the replay tails of the sequence-parallel pipeline); eager launches follow the key.
+
 Usage: python3 patch_vllm_sparse_mla_prefill_sass_sm120.py [--dist DIR] [--check] [--src FILE --out FILE]   (idempotent)
 """
 
@@ -34,6 +53,11 @@ HELPER = f'''
 # {MARKER}: VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1 runs the V4.1-record prefill chunks (> 64 rows) on the cubit-assembled
 # sparse_mla_prefill_v41 kernel (bit-identical with the FlashInfer BF16 prefill kernel of the step-40 route).
 _MOET_SASS_STATE: dict = {{"launchers": {{}}, "disabled": False, "warned": False}}
+# Runtime A/B between two cubins of this kernel (VLLM_MOET_RUNTIME_AB=1 + VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B): the
+# key below in the control file, 0 = the cubin of ..._SASS_CUBIN (start-up), 1 = the cubin of ..._SASS_CUBIN_B.
+_MOET_SASS_AB_KEY = "SPARSE_MLA_PREFILL_SASS_CUBIN_SEL"
+_MOET_SASS_AB: dict = {{"on": None, "sel": 0, "b_ok": True, "launchers_b": {{}}, "warm": set(), "next_poll": 0.0,
+                       "sig": None, "warned": set(), "n": 0, "calls": [0, 0], "rows": [0, 0], "stats_mtime": None}}
 
 
 class _MoetSparseMlaSass:
@@ -127,6 +151,166 @@ def _moet_prefill_sass_enabled() -> bool:
     return os.environ.get("VLLM_MOET_SPARSE_MLA_PREFILL_SASS", "0") == "1" and not _MOET_SASS_STATE["disabled"]
 
 
+def _moet_sass_ab_on() -> bool:
+    """The runtime A/B of this module: the master switch and a second cubin, both read once per process."""
+    st = _MOET_SASS_AB
+    if st["on"] is None:
+        import os
+
+        st["on"] = (os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
+                    and bool(os.environ.get("VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B", "")))
+    return st["on"]
+
+
+def _moet_sass_ab_log(dev, msg: str) -> None:
+    import sys
+
+    print(f"[vllm-moet sparse-MLA prefill SASS, device {{dev}}] {{msg}}", file=sys.stderr, flush=True)
+
+
+def _moet_sass_ab_warn_once(dev, cause: str, msg: str) -> None:
+    if cause not in _MOET_SASS_AB["warned"]:
+        _MOET_SASS_AB["warned"].add(cause)
+        _moet_sass_ab_log(dev, "WARNING: " + msg)
+
+
+def _moet_sass_ab_apply(dev, values: dict) -> None:
+    """The control file's state for this module: the key with 0 / 1 = that cubin, the key absent = the start-up cubin."""
+    st = _MOET_SASS_AB
+    cur = st["sel"]
+    new = 0
+    for key, val in values.items():
+        if not isinstance(key, str) or not key.startswith("SPARSE_MLA_PREFILL_SASS_"):
+            continue  # other modules' keys and the writer's own
+        if key != _MOET_SASS_AB_KEY:
+            _moet_sass_ab_warn_once(dev, "key:" + key, f"runtime A/B: unknown key {{key}} of this module - ignored")
+        elif type(val) is int and val in (0, 1):
+            new = val
+        else:
+            new = cur
+            _moet_sass_ab_warn_once(dev, "val:" + key, f"runtime A/B: {{key}}={{val!r}} is not the integer 0 / 1 - kept {{cur}}")
+    if new == 1 and not st["b_ok"]:
+        new = 0
+        _moet_sass_ab_warn_once(dev, "refused", f"runtime A/B: {{_MOET_SASS_AB_KEY}}=1 refused - the second cubin is not "
+                                "usable in this process (see the earlier WARNING); the start-up cubin stays")
+    if new != cur:
+        st["sel"] = new
+        _moet_sass_ab_log(dev, f"runtime A/B: {{_MOET_SASS_AB_KEY}} {{cur}} -> {{new}}")
+
+
+def _moet_sass_ab_poll(dev) -> None:
+    """At most one os.stat per 100 ms; the file is re-read only when its (mtime, size, inode) changed. A missing,
+    unreadable or malformed file keeps the current state."""
+    import os
+    import time
+
+    st = _MOET_SASS_AB
+    now = time.monotonic()
+    if now < st["next_poll"]:
+        return
+    st["next_poll"] = now + 0.1
+    path = os.environ.get("VLLM_MOET_RUNTIME_AB_FILE", "/dev/shm/vllm_moet_ab.json")
+    try:
+        s = os.stat(path)
+    except OSError:
+        _moet_sass_ab_warn_once(dev, "missing", f"runtime A/B: control file {{path}} missing or unreadable - the current "
+                                "state is kept until it appears")
+        return
+    sig = (s.st_mtime_ns, s.st_size, s.st_ino)  # the inode too: two renamed-in files of one size within one clock tick
+    if sig == st["sig"]:
+        return
+    st["sig"] = sig
+    import json
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            values = json.load(f)
+        if not isinstance(values, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        _moet_sass_ab_warn_once(dev, "malformed", f"runtime A/B: control file {{path}} malformed ({{exc}}) - the current "
+                                "state is kept")
+        return
+    st["warned"].discard("missing")
+    st["warned"].discard("malformed")
+    _moet_sass_ab_apply(dev, values)
+
+
+def _moet_sass_ab_load_b(dev) -> None:
+    """The second cubin, loaded when the device's first launcher is (never at a flip). A failure leaves the start-up
+    cubin serving and the key refused."""
+    import os
+
+    import torch
+
+    st = _MOET_SASS_AB
+    cubin_b = os.environ.get("VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B", "")
+    try:
+        with torch.cuda.device(dev):
+            st["launchers_b"][dev.index] = _MoetSparseMlaSass(cubin_b)
+        from vllm.logger import init_logger
+
+        init_logger(__name__).info("{MARKER}: loaded the second cubin %s on %s (runtime A/B key %s)", cubin_b, dev,
+                                   _MOET_SASS_AB_KEY)
+    except Exception as e:  # noqa: BLE001
+        st["b_ok"] = False
+        _moet_sass_ab_warn_once(dev.index, "load", f"runtime A/B: the second cubin {{cubin_b}} did not load ({{e!r}}) - "
+                                f"{{_MOET_SASS_AB_KEY}}=1 will be refused, the start-up cubin stays")
+
+
+def _moet_sass_ab_count(dev, rows: int, sel: int) -> None:
+    """Launches / rows per cubin; one line per `touch` of the stats file (its mtime is looked at every 16th launch)."""
+    import os
+
+    st = _MOET_SASS_AB
+    st["calls"][sel] += 1
+    st["rows"][sel] += rows
+    st["n"] += 1
+    n = st["n"]
+    if n % 16:
+        return
+    try:
+        m = os.stat(os.environ.get("VLLM_MOET_RUNTIME_STATS_FILE", "/dev/shm/vllm_moet_stats")).st_mtime_ns
+    except OSError:
+        return
+    if m != st["stats_mtime"]:
+        st["stats_mtime"] = m
+        c, r = st["calls"], st["rows"]
+        _moet_sass_ab_log(dev, f"activation counters (on demand, call {{n}}; calls / rows): cubin 0 {{c[0]}} / {{r[0]}}, "
+                               f"cubin 1 {{c[1]}} / {{r[1]}}; switches now {{_MOET_SASS_AB_KEY}}={{st['sel']}}")
+
+
+def _moet_sass_ab_launch(dev, k, rows, q, kv, idx, o, scale, lens, sink, ekv, eidx, elens) -> None:
+    """One launch under the runtime A/B (the key was read at the unit's entry). At the device's first launch outside a
+    CUDA-graph capture both cubins run once on this chunk — nothing is first-launched at a flip — and their outputs are
+    compared bit for bit; that launch is served by the start-up cubin."""
+    import torch
+
+    st = _MOET_SASS_AB
+    kb = st["launchers_b"].get(dev.index)
+    if kb is not None and dev.index not in st["warm"] and not torch.cuda.is_current_stream_capturing():
+        st["warm"].add(dev.index)
+        k.run(q, kv, idx, o, scale, lens, sink, ekv, eidx, elens)
+        alt = torch.empty_like(o)
+        kb.run(q, kv, idx, alt, scale, lens, sink, ekv, eidx, elens)
+        if torch.equal(o.view(torch.int16), alt.view(torch.int16)):
+            _moet_sass_ab_log(dev.index, f"runtime A/B: both cubins launched once on the first chunk ({{rows}} rows), "
+                                         "outputs bit-identical")
+        else:
+            st["b_ok"] = False
+            _moet_sass_ab_warn_once(dev.index, "differs", "runtime A/B: the second cubin's output DIFFERS from the "
+                                    f"start-up cubin's on the first chunk ({{rows}} rows) - {{_MOET_SASS_AB_KEY}}=1 is "
+                                    "refused in this process, the start-up cubin stays")
+            if st["sel"] != 0:
+                _moet_sass_ab_log(dev.index, f"runtime A/B: {{_MOET_SASS_AB_KEY}} {{st['sel']}} -> 0")
+                st["sel"] = 0
+        _moet_sass_ab_count(dev.index, rows, 0)
+        return
+    sel = st["sel"] if kb is not None else 0
+    (kb if sel == 1 else k).run(q, kv, idx, o, scale, lens, sink, ekv, eidx, elens)
+    _moet_sass_ab_count(dev.index, rows, sel)
+
+
 def _moet_prefill_sass_run(self, q_chunk, swa_kv_paged, swa_indices_chunk, swa_lens_chunk, extra_kv_paged,
                            extra_indices_chunk, extra_lens_chunk, out) -> bool:
     """Run the chunk on the SASS kernel; False = not taken (caller falls back to the FlashInfer wrapper)."""
@@ -139,6 +323,9 @@ def _moet_prefill_sass_run(self, q_chunk, swa_kv_paged, swa_indices_chunk, swa_l
         return False
     try:
         dev = q_chunk.device
+        ab = _moet_sass_ab_on()
+        if ab:
+            _moet_sass_ab_poll(dev.index)  # the A/B's unit is this launch: the key is read before its cubin is chosen
         k = _MOET_SASS_STATE["launchers"].get(dev.index)
         if k is None:
             cubin = os.environ.get("VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN",
@@ -149,6 +336,8 @@ def _moet_prefill_sass_run(self, q_chunk, swa_kv_paged, swa_indices_chunk, swa_l
             from vllm.logger import init_logger
 
             init_logger(__name__).info("{MARKER}: loaded %s on %s", cubin, dev)
+            if ab:
+                _moet_sass_ab_load_b(dev)
         q = q_chunk if q_chunk.is_contiguous() else q_chunk.contiguous()
         o = out if out.is_contiguous() else torch.empty_like(q)
         idx = swa_indices_chunk.view(rows, -1)
@@ -157,7 +346,11 @@ def _moet_prefill_sass_run(self, q_chunk, swa_kv_paged, swa_indices_chunk, swa_l
         eidx = extra_indices_chunk.view(rows, -1) if has_extra else None
         elens = extra_lens_chunk.view(-1) if (has_extra and extra_lens_chunk is not None) else None
         sink = None if self.attn_sink is None else self.attn_sink.to(torch.float32).contiguous()
-        k.run(q, swa_kv_paged, idx, o, self.scale, lens, sink, extra_kv_paged if has_extra else None, eidx, elens)
+        if ab:
+            _moet_sass_ab_launch(dev, k, rows, q, swa_kv_paged, idx, o, self.scale, lens, sink,
+                                 extra_kv_paged if has_extra else None, eidx, elens)
+        else:
+            k.run(q, swa_kv_paged, idx, o, self.scale, lens, sink, extra_kv_paged if has_extra else None, eidx, elens)
         if o is not out:
             out.copy_(o)
         return True
