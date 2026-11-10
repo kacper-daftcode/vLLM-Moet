@@ -78,16 +78,18 @@ sessions and drop out at the next regen. Retired for good (not regenerated
 in `_a32`): the `mc2` prefill variant and the `MB=2` experiment — both
 superseded by MC=4/AFRAG, never launched by the serving path.
 
-## Dependency‑aware schedule set of the live MoE GEMM kernels — `cubins-sm120/s1/` (not loaded by default)
+## Dependency‑aware schedule set of the live MoE GEMM kernels — `cubins-sm120-s1/` (not loaded by default, in no image)
 
-`cubins-sm120/s1/` is the complete live `_a32` MoE GEMM set — the 43 file names of the sections below — with cubit's
-dependency‑aware stall schedule wherever that schedule is faster: **37 files are re‑scheduled, 6 are byte copies of
-the pinned cubin** (`s1/SHA256SUMS` lists all 43). **Nothing loads the directory.** The loader opens exact file names in
-`VLLM_MOE_W2_CUBIT_DIR` (default `/cubit-share`, the image's copy of `cubins-sm120/`), so the pinned set stays what a
-server runs; the set is selected by pointing that variable at the subdirectory (`<checkout>/kernels/cubins-sm120/s1`;
-`/cubit-share/s1` in an image built from `Dockerfile.sm120-v024`, whose `COPY` of the directory is recursive). The
-subdirectory holds the MoE GEMM set only: anything else a configuration looks up in the same directory (the opt‑in
-cubit sparse‑MLA kernels, all default off) is not in it.
+`cubins-sm120-s1/` (next to `cubins-sm120/`, not inside it) is the complete live `_a32` MoE GEMM set — the 43 file names
+of the sections below — with cubit's dependency‑aware stall schedule wherever that schedule is faster: **37 files are
+re‑scheduled, 6 are byte copies of the pinned cubin** (`cubins-sm120-s1/SHA256SUMS` lists all 43). **Nothing loads the
+directory and no Dockerfile copies it.** The loader opens exact file names in `VLLM_MOE_W2_CUBIT_DIR` (default
+`/cubit-share`, the image's copy of `cubins-sm120/`), so the pinned set stays what a server runs. `Dockerfile.sm120-v024`
+copies `cubins-sm120/` with its subdirectories, which is why the set is not a subdirectory of it: an image changes only
+through a step of its own. A deployment that wants the set adds that step — a `COPY` of `kernels/cubins-sm120-s1/` to a
+directory of its own, checked there with `sha256sum -c SHA256SUMS` — or mounts `<checkout>/kernels/cubins-sm120-s1`,
+and points `VLLM_MOE_W2_CUBIT_DIR` at that directory. The directory holds the MoE GEMM set only: anything else a
+configuration looks up in the loader's directory (the opt‑in cubit sparse‑MLA kernels, all default off) is not in it.
 
 **What a re‑scheduled file is.** The source of the pinned cubin of the same name (`sass/<name>.sass`) assembled by cubit
 `main` (`ef8ff88`; byte‑identical at `ef7d335`) with `CUBIT_SCHED2=1 CUBIT_SCHED2_LAT=sm120 CUBIT_MMA_PTXAS=1` — the
@@ -132,7 +134,7 @@ These are kernel times on the harness; the kernels wait on memory, so the gain i
 (Nsight Compute, `mc4afrag_k4096_a32`, one launch: the fixed‑stall wait falls from 5.71 to 2.27 warp‑cycles per issued
 instruction, the long‑scoreboard wait rises from 9.58 to 11.88; 257 → 236 µs). No end‑to‑end number exists for the set.
 
-| cubin (`cubins-sm120/s1/`) | family | schedule | sha256 | stall cycles per warp, pinned → s1 | µs per launch pinned → s1, Server Edition card | Workstation card, the committed files |
+| cubin (`cubins-sm120-s1/`) | family | schedule | sha256 | stall cycles per warp, pinned → s1 | µs per launch pinned → s1, Server Edition card | Workstation card, the committed files |
 |---|---|---|---|---|---|---|
 | `moe_w2_mm_k1024_a32.cubin` | 2‑bit decode | **s1** | `52f968497f2c08bc…` | 2 419 → 1 171 | 68.8 → 63.6 (−7.6 %) | 56.9 → 52.7 (−7.4 %) |
 | `moe_w2_mm_k512_a32.cubin` | 2‑bit decode | **s1** | `9c5cfc32ec12d748…` | 2 556 → 1 244 | 40.0 → 36.0 (−10.1 %) | 34.5 → 30.8 (−10.8 %) |
