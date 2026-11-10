@@ -67,8 +67,9 @@
 # into that one branch's wait mask and assembles the listing as it stands - behind that branch every store issued in
 # front of the loop top has been served, on every path. One control word differs from v43b. Any cubit that round-trips
 # v43b reproduces sha256 7e812fa2d9c47770...
-# Every build ends with store_war_paths.py (beside this script) on the frozen listing of what was written: the stores
-# whose registers are rewritten on some path without a wait on the store's read barrier. KERNEL=v43c must have none.
+# Every build ends with store_war_paths.py (beside this script) on the frozen listing of what was built: the stores
+# whose registers are rewritten on some path without a wait on the store's read barrier. KERNEL=v43c must have none:
+# it is assembled into a scratch file that becomes the output only when the check has passed.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -115,7 +116,8 @@ esac
 OUT=${1:-$DEFAULT_OUT}
 SRC_KERNEL=${SRC_KERNEL:-$KERNEL}
 SASS=$REPO/kernels/sass/sparse_mla_prefill_$SRC_KERNEL.sass
-VARIANT=; FROZEN=$(mktemp --suffix=.sass); trap 'rm -f ${VARIANT:+"$VARIANT"} "$FROZEN"' EXIT
+VARIANT=; BUILT=; FROZEN=$(mktemp --suffix=.sass)
+trap 'rm -f ${VARIANT:+"$VARIANT"} "$FROZEN"; [[ -n "$BUILT" && "$BUILT" != "$OUT" ]] && rm -f "$BUILT"' EXIT
 if [[ -n "$MMA_BRA" ]]; then
   # cubit's dependency table + one resource row: a member of `mma` holds every BRA MMA_BRA issue cycles off
   DEP_TABLE=${DEP_TABLE:-$(dirname "$TABLE")/dep_latency_sm120.json}
@@ -149,8 +151,10 @@ text = open(path).read()
 assert text.count(old) == 1
 open(path, "w").write(text.replace(old, new))
 PY
-  # the listing carries its own control codes: assembled as it stands (no scheduling switch)
-  "$CUBIT" asm "$FROZEN" -t "$TABLE" -o "$OUT" --kernel sparse_mla_prefill_v41 \
+  # the listing carries its own control codes: assembled as it stands (no scheduling switch) - into a scratch file,
+  # which becomes OUT only when the path check below has passed
+  BUILT=$(mktemp --suffix=.cubin)
+  "$CUBIT" asm "$FROZEN" -t "$TABLE" -o "$BUILT" --kernel sparse_mla_prefill_v41 \
     --mercury-stub "$REPO/kernels/sass/qmma_e4m3.merc.stub"
 else
   python3 "$REPO/kernels/gen/gen_sparse_mla_prefill_$SRC_KERNEL.py" >/dev/null
@@ -159,8 +163,12 @@ else
     ${SCHED_ENV[@]+"${SCHED_ENV[@]}"} ${KEEP_ENV[@]+"${KEEP_ENV[@]}"} \
     "$CUBIT" asm "$SASS" -t "$TABLE" -o "$OUT" --kernel sparse_mla_prefill_v41 \
     --mercury-stub "$REPO/kernels/sass/qmma_e4m3.merc.stub"
+  BUILT=$OUT
 fi
-"$CUBIT" disassemble "$OUT" -t "$TABLE" --frozen > "$FROZEN"
+"$CUBIT" disassemble "$BUILT" -t "$TABLE" --frozen > "$FROZEN"
 REQUIRE=(); [[ "$KERNEL" == v43c ]] && REQUIRE=(--require-none)
 python3 "$HERE/store_war_paths.py" "$FROZEN" --loads ${REQUIRE[@]+"${REQUIRE[@]}"} | sed "s|^$FROZEN|store_war_paths|"
+if [[ "$BUILT" != "$OUT" ]]; then
+  cp "$BUILT" "$OUT"
+fi
 echo "wrote $OUT"
