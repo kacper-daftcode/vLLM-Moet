@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Public-tree hygiene: no host paths, session jargon or internal references in
 what the repository publishes; every relative Markdown link resolves; Python
-tools compile; launchers parse.
+tools compile; launchers parse; the reference docs keep the form of a
+reference: README.md and docs/*.md have no table cell longer than 400
+characters and no line longer than 1 200, and the switch table of
+docs/dsv41-sm120.md has its rows in step order with a `served` cell that is a
+state (on / off / not built / a value, plus at most one short parenthesis).
 
     python3 tools/docs_lint.py          # exit 1 on any finding
 
 Data records keep their provenance strings: bench/results/, the rendered
 reports under docs/benchmarks/ and the generated patch are not scanned for
-wording, only for links where applicable.
+wording or form, only for links where applicable.
 """
 from __future__ import annotations
 
@@ -44,6 +48,30 @@ WORDING_EXEMPT_PREFIXES = ("patch/", "bench/results/", "docs/benchmarks/", "kern
 TEXT_SUFFIXES = (".md", ".py", ".sh", ".yml", ".yaml", ".cu", ".cuh", ".h", ".txt", "Dockerfile")
 
 LINK_RE = re.compile(r"\]\(([^)\s#]+)(#[^)]*)?\)")
+
+# The form of a reference doc (README.md and docs/*.md; the records under docs/benchmarks/ keep their raw tables and
+# logs): a table cell holds a fact, not a narrative. What does not fit goes where AGENTS.md says - the mechanism to the
+# line's internals doc, the measurement to a record under docs/benchmarks/, the image history to CHANGELOG.md.
+MAX_CELL = 400  # characters of one Markdown table cell
+MAX_LINE = 1200  # characters of one line
+FORM_DOC_RE = re.compile(r"README\.md|docs/[^/]+\.md")
+# Rows that were over MAX_CELL when the check was introduced, in docs of other lines of work that the introducing
+# commit did not rewrite: (file, first cell of the row) -> the cell length the row may keep. The way out is to shorten
+# the row and delete its entry: an entry whose row is gone or fits MAX_CELL is itself a finding.
+CELL_EXEMPT = {
+    # "Repository layout": the row of the Kimi-K3.1-Pro files
+    ("README.md", "`Dockerfile.b300-k31`, `tools/k3_b300/patch_vllm_k31_experts_grid.py`, `tools/k3_b300/k31/`, "
+                  "`tools/k3_b300/apply_file_patches.py`"): 497,
+    # "Measurements": two rows of the MoET hybrid's table
+    ("docs/moet-hybrid.md", "concurrency"): 515,
+    ("docs/moet-hybrid.md", "host RAM while up"): 531,
+}
+# The switch table of the DeepSeek-V4.1 doc (the table whose first header cell is "step"): one row per step in step
+# order (3, 3b, 4, ... 42, 42b, 43); every `served` cell of that doc's tables is a state - on, off, not built or a
+# value, plus at most one parenthesis of at most 40 characters - not the story of how the state came about.
+SWITCH_TABLE_DOC = "docs/dsv41-sm120.md"
+STEP_RE = re.compile(r"(\d+)([a-z]?)")
+SERVED_RE = re.compile(r"(?:on|off|not built|`[^\s`|]+`|[^\s`|()]+)(?: \([^()]{1,40}\))?")
 
 
 def tracked_files() -> list[str]:
@@ -90,6 +118,93 @@ def check_links(files: list[str]) -> list[str]:
     return findings
 
 
+def table_cells(line: str) -> list[str] | None:
+    """The cells of a Markdown table row (a line that starts with '|'); None for any other line."""
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+    s = s[1:-1] if len(s) > 1 and s.endswith("|") and not s.endswith("\\|") else s[1:]
+    return [c.strip() for c in re.split(r"(?<!\\)\|", s)]
+
+
+def md_tables(path: str) -> list[list[tuple[int, list[str]]]]:
+    """The tables of a Markdown file outside code fences: per table its rows as (line number, cells), header first,
+    the delimiter row left out."""
+    tables, cur, fence = [], [], False
+    with open(path, encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            if line.lstrip().startswith("```"):
+                fence = not fence
+            cells = None if fence else table_cells(line)
+            if cells is None:
+                if cur:
+                    tables.append(cur)
+                cur = []
+            elif not all(re.fullmatch(r":?-+:?", c) for c in cells):
+                cur.append((n, cells))
+    if cur:
+        tables.append(cur)
+    return tables
+
+
+def check_form(files: list[str]) -> list[str]:
+    findings, used = [], set()
+    for f in files:
+        if not FORM_DOC_RE.fullmatch(f):
+            continue
+        path = os.path.join(ROOT, f)
+        with open(path, encoding="utf-8") as fh:
+            for n, line in enumerate(fh, 1):
+                length = len(line.rstrip("\n"))
+                if length > MAX_LINE:
+                    findings.append(f"{f}:{n}: line of {length} characters (limit {MAX_LINE}): {line.strip()[:80]}")
+        for table in md_tables(path):
+            for n, cells in table:
+                longest = max(len(c) for c in cells)
+                limit = CELL_EXEMPT.get((f, cells[0]), MAX_CELL)
+                if limit != MAX_CELL:
+                    used.add((f, cells[0]))
+                    if longest <= MAX_CELL:
+                        findings.append(f"{f}:{n}: the row fits {MAX_CELL} characters per cell: delete its CELL_EXEMPT entry: {cells[0][:60]}")
+                if longest > limit:
+                    findings.append(f"{f}:{n}: table cell of {longest} characters (limit {limit}): | {' | '.join(cells)[:80]}")
+    for f, first in sorted(set(CELL_EXEMPT) - used):
+        if f in files:
+            findings.append(f"{f}: CELL_EXEMPT entry matches no table row: {first[:60]}")
+    return findings
+
+
+def check_switch_table(files: list[str]) -> list[str]:
+    f = SWITCH_TABLE_DOC
+    if f not in files:
+        return []
+    findings, found = [], 0
+    for table in md_tables(os.path.join(ROOT, f)):
+        header = table[0][1]
+        served = header.index("served") if "served" in header else None
+        is_switch_table = header[0] == "step" and served is not None
+        found += is_switch_table
+        prev = None  # (sort key, cell text) of the last step row that was in order
+        for n, cells in table[1:]:
+            if is_switch_table:
+                m = STEP_RE.fullmatch(cells[0])
+                key = (int(m.group(1)), m.group(2)) if m else None
+                if key is None:
+                    findings.append(f"{f}:{n}: switch table: the first cell must be a step (3, 3b, 42): {cells[0][:40]}")
+                elif prev is not None and key <= prev[0]:
+                    findings.append(f"{f}:{n}: switch table: step {cells[0]} stands after step {prev[1]} (one row per step, in step order)")
+                else:
+                    prev = (key, cells[0])
+            if served is not None:
+                cell = cells[served] if served < len(cells) else ""
+                if not SERVED_RE.fullmatch(cell):
+                    findings.append(f"{f}:{n}: served cell of {len(cell)} characters: must be on, off, not built or a value, "
+                                    f"plus at most one parenthesis of 40 characters: {cell[:60]}")
+    if found != 1:
+        findings.append(f"{f}: expected one switch table (first header cell 'step', a 'served' column), found {found}")
+    return findings
+
+
 def check_sources(files: list[str]) -> list[str]:
     findings = []
     py = [f for f in files if f.endswith(".py") and (f.startswith("tools/") or f.startswith("docker/") or f.startswith("bench/"))]
@@ -107,7 +222,7 @@ def check_sources(files: list[str]) -> list[str]:
 
 def main() -> int:
     files = tracked_files()
-    findings = check_wording(files) + check_links(files) + check_sources(files)
+    findings = check_wording(files) + check_links(files) + check_form(files) + check_switch_table(files) + check_sources(files)
     for line in findings:
         print(line)
     if findings:

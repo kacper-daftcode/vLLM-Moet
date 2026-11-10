@@ -8,8 +8,10 @@
 #                        --enable-prompt-tokens-details and the runtime switches production runs with (the list is
 #                        SERVED_SWITCHES below; docs/dsv41-sm120.md explains each). EXTRA_DOCKER_ARGS="-e VAR=0" after it
 #                        overrides a single switch. 0 = vLLM's defaults plus the image's build-time changes only.
+#                        Six switches of the list need the -r28 image (the default IMAGE) or a later one: step 42's
+#                        _WS1=9 (FC1 on the warpgroup kernel) and its five _SUM_* (the top-k sum as FC2 work items).
 #
-# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r26b)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r28)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
 #            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results + DeepGEMM JIT; the first start fills it (~22 min)
 #            SERVED_NAME (deepseek-ai/DeepSeek-V4.1-Flash)  the model name the API answers to
@@ -58,7 +60,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r26b}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r28}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -94,14 +96,19 @@ REPLAY_CAPTURE_SIZES="${REPLAY_CAPTURE_SIZES:-128,256}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 # The production configuration (docs/dsv41-sm120.md, "Switches"): the runtime switches of the image's steps that are
 # off by default, in the state production serves them. EXTRA_DOCKER_ARGS comes later on the docker command line, so
-# "-e VAR=0" there overrides one of these.
+# "-e VAR=0" there overrides one of these. Step 42's stages: FC2 on the producer-warp kernel (_WS2=3), FC1 on the
+# warpgroup kernel (_WS1=9), the top-k sum as work items of the FC2 kernel (the five _SUM_*); _WS1=9 and the _SUM_*
+# need the -r28 image or a later one.
 SERVED_SWITCHES=(
   VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1
   VLLM_MOET_P2P_AR=1 VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8
   VLLM_MOET_DFLASH_PREP_GROUPS=1 VLLM_MOET_CANDIDATE_DET_TOPK=1 VLLM_MOET_SWA_DECODE_BUILD=1
   VLLM_MOET_MOE_TOPKSUM_ADD=1 VLLM_MOET_SWA_DRAFT_BUILD=1 B12X_DYNAMIC_DETERMINISTIC_OUTPUT=1
   VLLM_MOET_MHC_MXFP8=1 VLLM_MOET_MHC_SIDE_DEFER=1
-  VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1 VLLM_MOET_B12X_MOE_PREFILL_FAST_WS2=3
+  VLLM_MOET_SPARSE_MLA_PREFILL_BF16=1 VLLM_MOET_PREFILL_SP=1 VLLM_MOET_B12X_MOE_PREFILL_FAST=1
+  VLLM_MOET_B12X_MOE_PREFILL_FAST_WS2=3 VLLM_MOET_B12X_MOE_PREFILL_FAST_WS1=9 VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1
+  VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_DISCARD=1 VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ROUTE_HINT=1
+  VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_TOKENS=128 VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_MIN_ROWS=512
   VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
   VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE} VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=${PREFILL_PIPE_REPLAY_GRAPHS}
 )
