@@ -46,7 +46,7 @@ order and runs the top-k sum as work items of `fc2_kernel_ws` (the sum items of 
 the tile's FC2 items with watchdog-bounded acquire polls; _SUM_TOKENS (256) tokens per item) so that a tile's route rows (6.3 MB at 4096 rows)
 are summed while still in L2; `_SUM_DISCARD=1` drops the summed route lines from L2 without a write-back (the route buffer is scratch then:
 `route_rows_consumed()`); `_W2_EVICT_FIRST=1` streams W2 with an L2 evict_first hint. The sum is topk_sum_kernel's chain in slot order (level
-B); the separate topk_sum_kernel is skipped. Design and numbers: K/k12/DESIGN_route_rows.md, K/REPORT.md 15.
+B); the separate topk_sum_kernel is skipped.
 """
 from __future__ import annotations
 
