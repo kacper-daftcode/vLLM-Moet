@@ -22,7 +22,9 @@ What the walk assumes, and where it is deliberately on the safe side:
     before the guard) - but only from 2 issue cycles behind the store on (closer, the barrier may not be armed yet:
     such a wait is reported as `unarmed` and does not protect);
   * every store is taken as executed (a guarded store whose guard is false needs nothing: over-reported, never under);
-  * a guarded overwriter whose guard is known false on the path is skipped; unknown or true: it overwrites;
+  * a guarded overwriter whose guard is known false on the path is skipped; known true: it overwrites and the path
+    ends; unknown: it is reported as an overwriter AND the walk goes on with the guard false, so that the instruction
+    that rewrites the register when the guard is false is listed too (the verdict does not depend on it, the list does);
   * multi-register results: .128 / LDSM...4 / an MMA = 4 registers, any 64-bit form / IMAD.WIDE / CS2R / LDSM...2 = 2
     (wider than the instruction where unsure: an overwrite too many, never one too few);
   * control flow: BRA (plain, guarded, .U / .DIV forms) and EXIT are followed; BSSY / BSYNC / BREAK fall through;
@@ -34,13 +36,21 @@ through a guarded forward branch can reach a different first overwriter, which t
 verifier follows the same text (v42, v43 and v43b of the sparse-MLA prefill kernel: 4, 3 and 3 such pairs on the path
 of a token's last chunk; v43c closes them). This check walks paths instead.
 
+The same rule is checked inside cubit (`CUBIT_VERIFY=1 cubit asm <frozen.sass> ...`: lines `STORE PATH: ...` and
+`CUBIT_VERIFY_PATHS: N ...` on stderr; no such line = 0). The two share no code. The counts here are cubit's: N = the
+pairs on a data register of any store and on the address registers of a global store; the address register of a
+shared-memory store is counted apart (`+ K`), as cubit does - the vendor's schedules rewrite it without a wait, by
+shared-memory loads and shuffles. `--cubit <file>` reads a saved stderr of that command and compares count and rows.
+
 usage: store_war_paths.py <frozen.sass> [--loads] [--via] [--all] [--stores] [--json out.json] [--require-none]
+                          [--cubit <stderr of CUBIT_VERIFY=1 cubit asm>]
   --loads          also the address registers of scoreboarded loads
   --via            print the branches, barrier syncs and waits on each reported path
   --all            print the pairs beyond 400 issue cycles too (they are always counted)
   --stores         the full listing: every store, every register it reads, every first overwriter on any path with the
                    wait that protects it (the evidence behind a "0 pairs")
-  --require-none   exit status 1 when a pair is reported
+  --require-none   exit status 1 when a pair is reported (of either count)
+  --cubit FILE     exit status 2 when cubit's count or its (store, overwriter, distance) rows differ from this walk
 """
 import heapq
 import json
@@ -220,7 +230,12 @@ def walk(ins, labels, s, reg, barriers):
                 o['unarmed'] |= set(unarmed)
             else:
                 o['guards'].add(guard)
-            continue
+            pr = pred_of(x)
+            if pr is None or pr[0] in dict(f) or x['pred'] in ('@PT', '@UPT'):
+                continue               # it certainly rewrites the register: this path ends here
+            known = dict(f)
+            known[pr[0]] = not pr[1]                                       # the guard was false: the register survives
+            f = tuple(sorted(known.items()))
         keep = is_bra(x) or x['op'].startswith('BAR.') or bool(x['wait'])
         for j, g in succ(ins, labels, i, frozenset(f)):
             g = tuple(sorted(g))
@@ -309,11 +324,29 @@ def listing(ins, mems, out):
                 print(f"         {role} {fmt_regs(rs)}: first rewritten by [{o}] {ins[o]['text']} at >= {dist} cycles - {how}", file=out)
 
 
+def compare_cubit(errfile, n, k, mine, path):
+    """cubit's verdict on the same listing (a saved stderr of `CUBIT_VERIFY=1 cubit asm`) against this walk."""
+    text = open(errfile, errors='replace').read()
+    m = re.search(r'CUBIT_VERIFY_PATHS: (\d+) store', text)
+    m2 = re.search(r'CUBIT_VERIFY_PATHS: \+ (\d+)', text)
+    if 'CUBIT_VERIFY:' not in text:
+        print(f"{path}: cubit comparison VOID - {errfile} holds no CUBIT_VERIFY line (was CUBIT_VERIFY=1 set?)")
+        return False
+    cn, ck = int(m.group(1)) if m else 0, int(m2.group(1)) if m2 else 0
+    theirs = {(int(s), int(o), int(d)) for s, o, d in
+              re.findall(r'STORE PATH: insn\[(\d+)\].*?rewritten by insn\[(\d+)\] \S+ (\d+) issue cycles', text)}
+    same = (cn, ck) == (n, k) and (not theirs or theirs <= mine)
+    print(f"{path}: cubit's check (CUBIT_VERIFY_PATHS) {cn} + {ck}, this walk {n} + {k}: "
+          + (f"AGREE ({len(theirs)} rows of cubit found here with the same distance)" if same else
+             f"DIFFER (rows only in cubit: {sorted(theirs - mine)[:6]})"))
+    return same
+
+
 def main():
     a = sys.argv[1:]
     path = a[0]
     loads = '--loads' in a
-    allrows, total_bad = [], 0
+    allrows, total_bad, agree = [], 0, True
     for name, lines in kernels(path):
         ins, labels = parse(lines)
         try:
@@ -329,7 +362,8 @@ def main():
         pairs = {}
         for r in bad:                    # one pair = (memory instruction, overwriter); its registers together
             pairs.setdefault((r['kind'], r['store'], r['role'], r['over']), []).append(r)
-        st = [k for k in pairs if k[0] == 'store']
+        shared_addr = {k for k in pairs if k[0] == 'store' and k[2] == 'addr' and ins[k[1]]['op'].startswith(('STS', 'STL'))}
+        st = [k for k in pairs if k[0] == 'store' and k not in shared_addr]
         ld = [k for k in pairs if k[0] == 'load']
         total_bad += len(pairs)
         nst = sum(1 for m in mems if m['kind'] == 'store')
@@ -340,6 +374,7 @@ def main():
         print(f"{path} [{name}]: {len(ins)} instructions, {nst} stores ({nbare} without a read barrier)"
               + (f", {nld} scoreboarded loads" if loads else '')
               + f": {len(st)} store -> overwriter pair(s) reached with NO wait on the store's read barrier"
+              + (f" + {len(shared_addr)} on the address register of a shared-memory store (counted apart)" if shared_addr else '')
               + (f", {len(ld)} load-address pair(s) with no wait on the load's barriers" if loads else '')
               + f"; pairs behind a wait on every path: {nprot}"
               + (f"; CONTROL FLOW NOT MODELED: {' '.join(unm)}" if unm else ''))
@@ -356,10 +391,15 @@ def main():
                     print(f"           via {v}")
         if '--stores' in a:
             listing(ins, mems, sys.stdout)
+        if '--cubit' in a:
+            mine = {(k[1], k[3], min(r['unprot_dist'] for r in rs)) for k, rs in pairs.items() if k[0] == 'store'}
+            agree = compare_cubit(a[a.index('--cubit') + 1], len(st), len(shared_addr), mine, path)
     if '--json' in a:
         json.dump(allrows, open(a[a.index('--json') + 1], 'w'), indent=1)
     if '--require-none' in a and total_bad:
         sys.exit(1)
+    if not agree:
+        sys.exit(2)
 
 
 if __name__ == '__main__':
