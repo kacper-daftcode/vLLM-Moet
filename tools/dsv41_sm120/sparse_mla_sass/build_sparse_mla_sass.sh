@@ -4,6 +4,7 @@
 #   build_sparse_mla_sass.sh [out.cubin]            (default: kernels/cubins-sm120/sparse_mla_prefill_v41.cubin)
 #   SCHEDULE=s1 build_sparse_mla_sass.sh [out.cubin] (default: kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin)
 #   KERNEL=v42 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v42.cubin)
+#   KERNEL=v43 build_sparse_mla_sass.sh [out.cubin]  (default: kernels/cubins-sm120/sparse_mla_prefill_v43.cubin)
 #
 # Requirements (see kernels/MANIFEST.md, "Sparse-MLA prefill"):
 #   CUBIT  — cubit `main` at or after ed4d316: the required fixes are BUG-478 (path-following
@@ -32,6 +33,13 @@
 # with the s1 schedule switches. The entry symbol stays sparse_mla_prefill_v41 (the cubin loads wherever a v41 cubin
 # does). Needs cubit `main` at or after 89564ac (the instruction's table row); reproduces sha256 dfdc0279ea5a3388...
 # from db4cfd1. A separate cubin as well; see kernels/MANIFEST.md for its gate.
+# KERNEL=v43 — v42 with two load waits taken out (kernels/gen/gen_sparse_mla_prefill_v43.py ->
+# kernels/sass/sparse_mla_prefill_v43.sass, 1 489 instructions): the candidate index of chunk c+2 is loaded one chunk
+# ahead, and the prologue's global loads are issued back to back. The s1 schedule switches plus CUBIT_SB_LONG_KEEP=1
+# (cubit's opt-in colouring rule: a prefetch keeps its scoreboard to itself — without it the same text assembles to a
+# legal, bit-identical kernel whose gather prefetch shares a scoreboard with a wait at the start of QK). Needs a cubit
+# that has the rule (commit df4c557; the script refuses a binary without it); reproduces sha256 43f04db5cc9e9874...
+# The entry symbol stays sparse_mla_prefill_v41. A separate cubin as well; see kernels/MANIFEST.md for its gate.
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../../.." && pwd)
@@ -39,11 +47,16 @@ CUBIT=${CUBIT:-/workspace/cubit/target/release/cubit}
 TABLE=${TABLE:-/workspace/cubit/tables/sm120.json.gz}
 SCHEDULE=${SCHEDULE:-}
 KERNEL=${KERNEL:-v41}
+KEEP_ENV=()
 case "$KERNEL" in
   v41) ;;
   v42) SCHEDULE=${SCHEDULE:-s1}
        [[ "$SCHEDULE" == s1 ]] || { echo "KERNEL=v42 is built with SCHEDULE=s1 only" >&2; exit 2; } ;;
-  *) echo "unknown KERNEL '$KERNEL' (known: v41, v42)" >&2; exit 2 ;;
+  v43) SCHEDULE=${SCHEDULE:-s1}
+       [[ "$SCHEDULE" == s1 ]] || { echo "KERNEL=v43 is built with SCHEDULE=s1 only" >&2; exit 2; }
+       grep -q -a CUBIT_SB_LONG_KEEP "$CUBIT" || { echo "KERNEL=v43 needs a cubit with CUBIT_SB_LONG_KEEP (commit df4c557 or later): $CUBIT has none" >&2; exit 2; }
+       KEEP_ENV=(CUBIT_SB_LONG_KEEP=1) ;;
+  *) echo "unknown KERNEL '$KERNEL' (known: v41, v42, v43)" >&2; exit 2 ;;
 esac
 case "$SCHEDULE" in
   "") SCHED_ENV=(); DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin ;;
@@ -51,14 +64,14 @@ case "$SCHEDULE" in
       DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin ;;
   *) echo "unknown SCHEDULE '$SCHEDULE' (known: s1)" >&2; exit 2 ;;
 esac
-[[ "$KERNEL" == v42 ]] && DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_v42.cubin
+[[ "$KERNEL" == v42 || "$KERNEL" == v43 ]] && DEFAULT_OUT=$REPO/kernels/cubins-sm120/sparse_mla_prefill_$KERNEL.cubin
 OUT=${1:-$DEFAULT_OUT}
 SASS=$REPO/kernels/sass/sparse_mla_prefill_$KERNEL.sass
 
 python3 "$REPO/kernels/gen/gen_sparse_mla_prefill_$KERNEL.py" >/dev/null
 echo "generated $SASS ($(grep -c ';' "$SASS") statements)"
 env CUBIT_SB_SHARE=${CUBIT_SB_SHARE:-1} CUBIT_RB_EARLY=${CUBIT_RB_EARLY:-32} CUBIT_MMA_WAIT=1 CUBIT_MMA_WB_DRAIN=13 \
-  ${SCHED_ENV[@]+"${SCHED_ENV[@]}"} \
+  ${SCHED_ENV[@]+"${SCHED_ENV[@]}"} ${KEEP_ENV[@]+"${KEEP_ENV[@]}"} \
   "$CUBIT" asm "$SASS" -t "$TABLE" -o "$OUT" --kernel sparse_mla_prefill_v41 \
   --mercury-stub "$REPO/kernels/sass/qmma_e4m3.merc.stub"
 echo "wrote $OUT"
