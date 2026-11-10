@@ -2,7 +2,7 @@
 """Bits and time of schedule variants of the hand-written MoE GEMM kernels (sm_120).
 
 A schedule variant of a kernel is the same source and the same instructions with other control words (stalls,
-barriers, pads) -- for example `cubins-sm120/s1/<stem>.cubin`, the dependency-aware stall schedule, next to the pinned
+barriers, pads) -- for example `cubins-sm120-s1/<stem>.cubin`, the dependency-aware stall schedule, next to the pinned
 `cubins-sm120/<stem>.cubin` (see the MANIFEST, "Dependency-aware schedule set"). Bit identity on identical inputs is
 therefore the gate, and the time is what the variant is for.
 
@@ -19,11 +19,12 @@ moe_w4q_check.py, moe_w4s_check.py, moe_w2_afrag_check.py: the same packers, see
                -- over variants, launches and processes -- must be one value. A schedule race can hide in one warm
                process and show only across processes.
 
-    python3 kernels/gen/moe_sched_ab.py                                   # pinned vs cubins-sm120/s1/, every kernel of the set
+    python3 kernels/gen/moe_sched_ab.py                                   # pinned vs cubins-sm120-s1/, every kernel of the set
     python3 kernels/gen/moe_sched_ab.py --cold 30 --jobs 6
     python3 kernels/gen/moe_sched_ab.py --variants pinned=,mine=.new --cubins /tmp/build --only mc4afrag
 
-A variant is LABEL=SUFFIX (file <cubins>/<stem><SUFFIX>.cubin) or LABEL=SUBDIR/ (file <cubins>/<SUBDIR>/<stem>.cubin); the
+A variant is LABEL=SUFFIX (file <cubins>/<stem><SUFFIX>.cubin) or LABEL=DIR/ (file <cubins>/<DIR>/<stem>.cubin: DIR is
+taken relative to <cubins>, the default `s1=../cubins-sm120-s1/` is the set's directory next to the pinned one); the
 first variant is the reference. A variant whose file is byte-identical to the reference's is reported as such. Exit status 1
 when any output differs, a kernel fails to load or launch, or nothing was measured. Needs an sm_120 card (the cubins
 are sm_120-only), numpy, and torch on the CPU for the packers of the default mode.
@@ -35,8 +36,8 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument("--cubins", default=os.path.join(os.path.dirname(HERE), "cubins-sm120"))
-ap.add_argument("--variants", default="pinned=,s1=s1/",
-                help="LABEL=SUFFIX or LABEL=SUBDIR/, comma separated (file <stem><SUFFIX>.cubin or <SUBDIR>/<stem>.cubin; first = reference)")
+ap.add_argument("--variants", default="pinned=,s1=../cubins-sm120-s1/",
+                help="LABEL=SUFFIX or LABEL=DIR/, comma separated (file <stem><SUFFIX>.cubin or <DIR>/<stem>.cubin, DIR relative to --cubins; first = reference)")
 ap.add_argument("--out", default="")
 ap.add_argument("--only", default="")
 ap.add_argument("--list", default="", help="file with one stem per line (order kept)")
@@ -280,7 +281,7 @@ def free_all(pairs):
 
 
 def variant_path(stem, v):
-    """<cubins>/<stem><SUFFIX>.cubin, or <cubins>/<SUBDIR>/<stem>.cubin when the variant is written `LABEL=SUBDIR/`."""
+    """<cubins>/<stem><SUFFIX>.cubin, or <cubins>/<DIR>/<stem>.cubin when the variant is written `LABEL=DIR/`."""
     sfx = VARIANTS[v]
     return f"{args.cubins}/{sfx}{stem}.cubin" if sfx.endswith("/") else f"{args.cubins}/{stem}{sfx}.cubin"
 

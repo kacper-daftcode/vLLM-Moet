@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Rebuild the `s1` schedule set of the live MoE GEMM kernels (kernels/cubins-sm120/s1/) from kernels/sass/ and compare
+# Rebuild the `s1` schedule set of the live MoE GEMM kernels (kernels/cubins-sm120-s1/) from kernels/sass/ and compare
 # every file with the committed one.
 #
 #   kernels/gen/build_moe_s1.sh              rebuild into a temporary directory, compare, one line per file and a verdict
@@ -22,7 +22,7 @@ K=$(cd "$HERE/.." && pwd)
 CUBIT=${CUBIT:-/workspace/cubit/target/release/cubit}
 TABLE=${TABLE:-/workspace/cubit/tables/sm120.json.gz}
 PIN=$K/cubins-sm120
-SET=$PIN/s1
+SET=$K/cubins-sm120-s1
 OUT=${1:-$(mktemp -d)}
 mkdir -p "$OUT"
 bad=0; new=0; same=0
