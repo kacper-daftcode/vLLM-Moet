@@ -53,6 +53,9 @@
 #include <type_traits>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <tuple>
+#include <vector>
 #include <torch/extension.h>
 #include <c10/cuda/CUDAStream.h>
 
@@ -3156,6 +3159,28 @@ static int ws_env(const char* name) {
   const char* v = std::getenv(name);
   return v ? std::atoi(v) : 0;
 }
+// The occupancy guard. The grid of a WS launch is sms x cudaOccupancyMaxActiveBlocksPerMultiprocessor(kernel): as many CTAs per SM as
+// the build's register count leaves. fc2_kernel_ws<4, 1> (9 warps) is meant to run two per SM, and the SM grants that up to 96
+// registers per thread (18 warps -> 5 in one sub-partition -> 65 536 / (5 x 32) = 102, in steps of 8); the kernel uses exactly 96.
+// One register more - an edit, or another ptxas after an image rebuild - and the query answers 1: half the grid, FC2 10-15 % slower,
+// no error anywhere. So every WS launch family records what it got at its first launch (occupancy_facts()) next to the CTAs per SM
+// its mode was measured with, where that is on record (0 = not recorded, no check); the Python module prints one WARNING per kernel
+// that starts with fewer, and VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT=1 (debug) refuses the launch instead. The grid is what it was.
+// _OCC_EXPECT_FC1 / _OCC_EXPECT_FC2 replace the expectation (tests).
+struct OccFact { const char* kernel; int s, mb, regs, occ, expect, sms; };
+static std::vector<OccFact>& occ_facts() { static std::vector<OccFact> v; return v; }
+static int occ_expect(const char* env_name, int recorded) { const char* v = std::getenv(env_name); return v ? std::atoi(v) : recorded; }
+template <typename Kernel>
+static void occ_check(const char* kernel_name, Kernel kernel, bool& noted, int s, int mb, int occ, int expect, int sms) {
+  static const bool strict = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT") == 1;
+  if (noted && !strict) return;
+  cudaFuncAttributes at{};
+  int regs = -1;
+  if (cudaFuncGetAttributes(&at, kernel) == cudaSuccess) regs = at.numRegs; else cudaGetLastError();
+  if (!noted) { noted = true; occ_facts().push_back({kernel_name, s, mb, regs, occ, expect, sms}); }
+  TORCH_CHECK(!(strict && expect > 0 && occ < expect), kernel_name, "<", s, ", ", mb, "> would launch with ", occ, " CTA(s) per SM where its mode was "
+              "measured with ", expect, " (", regs, " registers per thread in this build): refused under VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT=1");
+}
 // K-13 (R0's r29 task A): runtime A/B overrides of the level-B switches (set_runtime_switches from Python: -1 = the env value read once
 // at the first call, as before; the switched paths are bit-identical alternatives of the same compiled kernels, so a flip between two
 // calls changes no bits). Plain ints: written by the Python thread between forwards, read by the same thread at the next call.
@@ -3254,6 +3279,8 @@ struct WsLaunch1 {
     static bool done = false;
     if (!done) { cudaFuncSetAttribute(fc1_kernel_ws<S, MB, MH>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_ws<S, MB, MH>, kT, S * kF1Stage);
+    static bool noted = false;
+    occ_check("fc1_kernel_ws", fc1_kernel_ws<S, MB, MH>, noted, S, MB, occ, occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC1", 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
@@ -3270,6 +3297,10 @@ struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2)
     static bool done = false;
     if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB>, kT, S * kF1Stage);
+    // on record: <4, 1> one CTA per SM (167 registers, the served mode), <3, 2> two (setmaxnreg)
+    static bool noted = false;
+    occ_check("fc1_kernel_wg", fc1_kernel_wg<S, MB>, noted, S, MB, occ,
+              occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC1", (S == 4 && MB == 1) ? 1 : (S == 3 && MB == 2) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
@@ -3285,6 +3316,10 @@ struct WsLaunch2 {
     static bool done = false;
     if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB>, kWsThreads, S * kF2Stage);
+    // on record: <4, 1> (the served mode) and <3, 2> two CTAs per SM - at 96 registers per thread, the most two CTAs of 9 warps get
+    static bool noted = false;
+    occ_check("fc2_kernel_ws", fc2_kernel_ws<S, MB>, noted, S, MB, occ,
+              occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC2", ((S == 4 && MB == 1) || (S == 3 && MB == 2)) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc2Args& f2, int grid, cudaStream_t stream) {
@@ -3739,7 +3774,16 @@ std::vector<int64_t> moe_prefill_ws_stats() {
   return r;
 }
 
+// what every WS launch family got at its first launch in this process: (kernel, stages, min blocks, registers per thread, CTAs per SM
+// from the occupancy query, CTAs per SM its mode was measured with or 0, SMs) - the occupancy guard's record
+std::vector<std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>> occupancy_facts() {
+  std::vector<std::tuple<std::string, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>> r;
+  for (const OccFact& f : occ_facts()) r.emplace_back(std::string(f.kernel), f.s, f.mb, f.regs, f.occ, f.expect, f.sms);
+  return r;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("occupancy_facts", &occupancy_facts);
   m.def("moe_prefill_fast", &moe_prefill_fast);
   m.def("moe_prefill_fast_frontend", &moe_prefill_fast_frontend);
   m.def("prequant_rows_supported", &prequant_rows_supported);
