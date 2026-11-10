@@ -1,4 +1,5 @@
-# vLLM-Moet: Kimi-K3.1-Pro + DSpark on 8x B300 (HGX, sm_103) -- the day-0 vLLM image plus the fix it needs there.
+# vLLM-Moet: Kimi-K3.1-Pro + DSpark on 8x B300 (HGX, sm_103) -- the day-0 vLLM image plus the fix it needs there and two
+# patch sets for its decode step.
 #
 # Base: vllm/vllm-openai:kimi-k31 (vLLM 0.1.dev24216+g266e88c05, the K3.1 line before its first release: K3.1 missed
 # v0.33.0, the recipe's minimum is 0.34.0), served on hgx-02 as TP8 + DCP8, FP8 KV, prefix caching, SimpleCPUOffloadConnector
@@ -11,9 +12,47 @@
 #      the persistent routed-experts kernel's grid table was sized on GB300 (152 SMs) and the image refuses to start the
 #      path with "152 CTAs cannot be co-resident (1 per SM x 148 SMs)"; the kernel splits its work by its grid, so the
 #      patch caps the table at the device's SM count.
+#   2. (-r2) The DSpark drafter and the MoE tail of the specialized path, ten files (tools/k3_b300/k31/r2.patch):
+#      a. drafter/attention.py: the DCP drafter attention serves a causal draft block (`causal_block`, `causal_decode`).
+#         The DSpark checkpoint drafts a causal block (`dflash_config.causal`); the stock `DraftDcp.forward` serves only
+#         non-causal blocks and hands every draft step of this checkpoint back to the stock attention path. No switch.
+#      b. The drafter's MLP as one launch per layer: the gate_up GEMM with a SwiGLU epilogue (cutedsl/gemm/warp_splitk.py,
+#         `swiglu=False` by default, so the target's kernel is the stock one; drafter/linears.py `install_swiglu`).
+#         VLLM_MOET_DRAFT_SWIGLU=0 keeps the stock GEMM + SiluAndMul.
+#      c. The drafter's context KV in one launch instead of six: grouped norm, RoPE, FP8 quantization and the paged
+#         insert (drafter/context_kv.py, a new file; hooked in drafter/model.py), and one kernel-slot mapping per KV
+#         group instead of one per layer (v1/worker/gpu/spec_decode/dflash/speculator.py). VLLM_MOET_DRAFT_CONTEXT_KV=0
+#         keeps the stock chain.
+#      d. drafter/markov.py: the Markov sampling step rescheduled for the checkpoint's rank-512 head (the stock kernel
+#         is laid out for rank 256): a kernel persistent over the vocabulary, two programs per SM that each stream
+#         their own range of `markov_w2`, one reduction after the loop instead of one per tile, a per-row variant at one
+#         request, the Gumbel noise hashed in the kernel. The arithmetic and the module's interface are the stock ones.
+#      e. TP8 batches of 3-4 rows (DSpark k = 2..3 at one request) on the published-latent tail that batches 5-8 use:
+#         cutedsl/moe/tail_runtime.py (`published`), experts_runtime.py (their persistent grid 148 -> 128 CTAs, as for
+#         5-6 rows, so the one-wave tail finds SMs while the experts drain), front.py (`EARLY_ROUTE` 3-8).
+#   3. (-r3) The Markov head across the TP ranks and the sampler chain, eight files (tools/k3_b300/k31/r3.patch, cut
+#      against step 2's files):
+#      a. A vocab-sharded Markov step: each rank scores its own shard of the vocabulary and the ranks exchange their
+#         best tokens (drafter/markov.py `ShardedMarkov`, comm.py `exchange_rows`, linears.py `draft_logits_shard`,
+#         model.py). It takes over only where its conditions hold (a drafter mailbox, BF16 draft logits, FP32 Gumbel
+#         keys, the lm_head layout it expects) and logs why not otherwise; VLLM_MOET_MARKOV_SHARD=0 keeps step 2's
+#         replicated kernel.
+#      b. The rejection sampler reads its per-request parameters (temperature, seeds, prefill length) from device memory:
+#         the chain's first kernel copies them once per step from the UVA-backed host arrays that every CTA of the
+#         vocabulary scans read before, and the resample kernel's last block does the insert and the sampled / rejected
+#         counts itself, one launch instead of three (v1/worker/gpu/spec_decode/rejection_sampler.py,
+#         rejection_sampler_utils.py). The vocabulary scans are unchanged. No switch.
+#      c. Positions, sequence lengths, the sampled / draft input ids and the logits indices of a step in one launch
+#         (v1/worker/gpu/input_batch.py `prepare_pos_seq_lens_and_combine`, model_runner.py). VLLM_MOET_FUSED_PREP=0
+#         keeps the two stock launches.
 #
-# Build:  DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r1 .   (~2 min)
-# Serve:  IMAGE=vllm-moet-b300:k31-266e88c0-r1 DECODE_BACKEND=latency_specialized ... docker/b300/run-k3.sh
+# Steps 2 and 3 are file patch sets: unified diffs anchored on the sha256 of every file before and after
+# (tools/k3_b300/apply_file_patches.py; cut with make_file_patches.py). A base image whose files differ stops the build.
+#
+# Build:  DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r3 .   (~5 min)
+#         --build-arg VLLM_MOET_K31_R3_PATCH=0 builds -r2; with --build-arg VLLM_MOET_K31_R2_PATCH=0 as well, -r1
+#         (step 3 is cut against step 2's files, so it does not apply without step 2).
+# Serve:  IMAGE=vllm-moet-b300:k31-266e88c0-r3 DECODE_BACKEND=latency_specialized ... docker/b300/run-k3.sh
 ARG BASE_IMAGE=vllm/vllm-openai:kimi-k31
 FROM ${BASE_IMAGE}
 
@@ -23,6 +62,32 @@ RUN python3 /opt/vllm-moet/k3_b300/patch_vllm_k31_experts_grid.py --check \
  && python3 -m py_compile /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py \
  && find /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3 -name '__pycache__' -type d -prune -exec rm -rf {} +
 
+COPY tools/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/
+COPY tools/k3_b300/k31/ /opt/vllm-moet/k3_b300/k31/
+
+ARG VLLM_MOET_K31_R2_PATCH=1
+RUN if [ "$VLLM_MOET_K31_R2_PATCH" = "1" ]; then python3 /opt/vllm-moet/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/k31/r2.patch --check \
+ && python3 /opt/vllm-moet/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/k31/r2.patch \
+ && cd /usr/local/lib/python3.12/dist-packages/vllm && python3 -m py_compile \
+      models/kimi_k3/nvidia/specialized_decode/drafter/attention.py models/kimi_k3/nvidia/specialized_decode/drafter/model.py \
+      models/kimi_k3/nvidia/specialized_decode/drafter/linears.py models/kimi_k3/nvidia/specialized_decode/drafter/context_kv.py \
+      models/kimi_k3/nvidia/specialized_decode/drafter/markov.py models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/warp_splitk.py \
+      models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py \
+      models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py v1/worker/gpu/spec_decode/dflash/speculator.py \
+ && find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -prune -exec rm -rf {} +; fi
+
+ARG VLLM_MOET_K31_R3_PATCH=1
+RUN if [ "$VLLM_MOET_K31_R3_PATCH" = "1" ]; then python3 /opt/vllm-moet/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/k31/r3.patch --check \
+ && python3 /opt/vllm-moet/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/k31/r3.patch \
+ && cd /usr/local/lib/python3.12/dist-packages/vllm && python3 -m py_compile \
+      models/kimi_k3/nvidia/specialized_decode/drafter/markov.py models/kimi_k3/nvidia/specialized_decode/drafter/comm.py \
+      models/kimi_k3/nvidia/specialized_decode/drafter/linears.py models/kimi_k3/nvidia/specialized_decode/drafter/model.py \
+      v1/worker/gpu/spec_decode/rejection_sampler.py v1/worker/gpu/spec_decode/rejection_sampler_utils.py \
+      v1/worker/gpu/input_batch.py v1/worker/gpu/model_runner.py \
+ && find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -prune -exec rm -rf {} +; fi
+
 LABEL org.opencontainers.image.title="vLLM-Moet B300 Kimi-K3.1" \
-      org.opencontainers.image.description="vllm/vllm-openai:kimi-k31 + the specialized decode's experts grid capped at the device's SM count (B300: 148)" \
-      org.opencontainers.image.source="https://github.com/kacper-daftcode/vLLM-Moet"
+      org.opencontainers.image.description="vllm/vllm-openai:kimi-k31 + the specialized decode's experts grid capped at the device's SM count (B300: 148) + the decode-step patch sets named by the com.vllm-moet.k31.r2 / .r3 labels (1 = applied): the DSpark drafter and MoE tail, the sharded Markov head and sampler chain" \
+      org.opencontainers.image.source="https://github.com/kacper-daftcode/vLLM-Moet" \
+      com.vllm-moet.k31.r2="${VLLM_MOET_K31_R2_PATCH}" \
+      com.vllm-moet.k31.r3="${VLLM_MOET_K31_R3_PATCH}"

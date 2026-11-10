@@ -1,0 +1,1978 @@
+# vllm-moet file patch set: k31-r3
+# cut against the files of step 2 (k31-r2) of Dockerfile.b300-k31
+# sha256 a0b1710174c916f520c8f1862be4e7932056390866e295a4e8fce18b202df2df d490bdd72000a80f644dd645e73ea9c7dbf53d633014eafa099cf6bf7b549f14 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/comm.py
+# sha256 dac6641deb45a54f0c39daa0e93023b2bdaa39cb72b4d943f243df91406fc326 b0f2bed74fca27d29e850c4c65bc943fdf95b7018b75698023e177127de13259 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/linears.py
+# sha256 bfa768f2283906816f8deea38bf482284e084b47e467c73e412a012e602d3158 a4afbe930bc29efa985e7e16176f4329846bf035c1f8bc02fae1d9799243a58c vllm/models/kimi_k3/nvidia/specialized_decode/drafter/markov.py
+# sha256 50b2889ece3888c1e28e4a79b8aaad41d87b7bf505a8c451fb95b192b15b6245 abbbc185d5bb2940a6729ffd2df7186e48562a4146a1f3288dcd93352d2e7bc4 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/model.py
+# sha256 ada7b6827bcd5a1df8d7ba855d9d423a073745f3fbde4673417ad203016a4d54 93c19a6d8379110f487e92cf1444ce20b761a49acbf2ee962af13d84d4de2ebe vllm/v1/worker/gpu/input_batch.py
+# sha256 d7057581efb2c62873792307bf3bbd6acfd833063eb8bdce982a178c48af3b69 51125f4524e89a866473e00a0440a41de39e35b510282177b8ed6a5d7fbf5c9a vllm/v1/worker/gpu/model_runner.py
+# sha256 ed8ff919c5bde44101dd22f2190e5a8d838c198dc3159f75ebe767b6fe1c77a1 cd6b0581a4a7e8712c53aa05bd26bc2d0639b09daec709f8aa8a78e629645fe1 vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+# sha256 9e6e99879942fc7994c12bb76b5a85b3a35debe927d02812067df3882fd31ffa 3b97a881aa73e7c68a21fbebaa4134d9d957b1c5395720b202b1b98a99c103da vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/comm.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/comm.py
+@@ -82,6 +82,11 @@
+ # collectives (their time is not latency).
+ ROWS_CAP = 64
+ CONTEXT_ROWS_CAP = 80
++# [vllm-moet r3] Draft steps the Markov exchange mailbox has slots for: one
++# [ROWS_CAP, 4 TP] slot per step, so consecutive steps never reuse a slot a slower
++# rank may not have read yet (the next decode step's reuse is separated by this
++# rank's logits gather, which needs every rank's push made after its last read).
++EXCHANGE_STEPS = 8
+ 
+ 
+ @cute.jit
+@@ -323,6 +328,11 @@
+             words = vocab_shard * tp // 2
+             self.logits = LamportRows(group, device, (ROWS_CAP, words), PAIR_SENT)
+         self.vocab_shard = vocab_shard
++        # [vllm-moet r3] the Markov steps' (max, token) exchange: 4 words per row
++        # and rank, one slot per draft step (64 KB at TP8)
++        self.exchange = LamportRows(
++            group, device, (EXCHANGE_STEPS, ROWS_CAP, 4 * tp), PAIR_SENT
++        )
+         torch.accelerator.synchronize(device)
+         torch.distributed.barrier(group=group)
+ 
+@@ -388,6 +398,31 @@
+             self.context, shard, CONTEXT_ROWS_CAP, (shard.shape[0], HIDDEN)
+         )
+ 
++    def exchange_rows(self, words, out, step):
++        """[vllm-moet r3] Every rank's [M, 4] int32 words of draft step ``step`` ->
++        ``out`` [M, 4 TP] (rank r's at columns 4 r ..), the same ``Gather`` kernel
++        as the logits (one 16 B fragment per row and rank, polled, copied, re-armed);
++        None for a shape it does not serve. The words must not contain the
++        sentinel pair 0x80000000 except as an FP32 -0.0 key, which arrives as +0.0
++        (``clean``; equal under every comparison the select makes)."""
++        rows = words.shape[0]
++        if (
++            words.dim() != 2
++            or words.shape[1] != 4
++            or words.dtype != torch.int32
++            or out.shape != (rows, 4 * self.tp)
++            or out.dtype != torch.int32
++            or not 1 <= rows <= ROWS_CAP
++            or not 0 <= step < EXCHANGE_STEPS
++            or not words.is_contiguous()
++            or not out.is_contiguous()
++        ):
++            return None
++        kernel = compile_gather(self.tp, 4, ROWS_CAP, PAIR_SENT, True, True, self.device)
++        box, mc = self.exchange.view(step)
++        kernel(words, out, box, mc, self.rank, gather_ctas(rows, self.tp))
++        return out
++
+     def gather_logits(self, shard):
+         """The vocab-parallel lm_head's [M, V / TP] -> [M, V] (BF16)."""
+         if (
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/linears.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/linears.py
+@@ -251,12 +251,9 @@
+     return count
+ 
+ 
+-def draft_logits(model, hidden_states):
+-    """``model.compute_draft_logits``: the lm_head shard (the target's lm_head weight,
+-    shared; on ``DraftGemm`` for a plain BF16 head, else its own method), then the
+-    vocab gather on the drafter's mailbox (``comm.DrafterComm.gather_logits``; vLLM's
+-    all-gather for a shape it does not serve). BF16 logits only (an FP32 head keeps
+-    ``compute_logits``)."""
++def _lm_head_gemm(model):
++    """[vllm-moet r3] ``(head.weight, DraftGemm or None)`` of the draft lm_head,
++    built once per weight (factored out of ``draft_logits``)."""
+     lp, head = model.logits_processor, model.lm_head
+     cached = getattr(model, "_draft_lm_head_gemm", None)
+     if cached is None or cached[0] is not head.weight:
+@@ -271,6 +268,44 @@
+             gemm = DraftGemm(head.weight)
+         cached = (head.weight, gemm)
+         model._draft_lm_head_gemm = cached
++    return cached
++
++
++def draft_logits_shard(model, hidden_states):
++    """[vllm-moet r3] This rank's lm_head logits shard [rows, V_padded / TP] (the
++    operand ``draft_logits`` gathers), for the vocab-sharded Markov steps; None
++    when ``draft_logits`` would not compute it here either (an FP32 head, logits
++    as input, a non-2-D input): the caller then takes the gathered path."""
++    lp, head = model.logits_processor, model.lm_head
++    if hidden_states.dim() != 2 or lp.logits_as_input or head.tp_size <= 1:
++        return None
++    cached = _lm_head_gemm(model)
++    gemm, comm = cached[1], getattr(model, "_drafter_comm", None)
++    if gemm is None and (
++        comm is None
++        or head.weight.dtype != torch.bfloat16
++        or lp.head_dtype not in (None, torch.bfloat16)
++    ):
++        return None
++    if lp.soft_cap is not None or lp.scale != 1.0:
++        return None
++    x = hidden_states.contiguous()
++    if gemm is not None:
++        logits = torch.empty(x.shape[0], gemm.n, dtype=x.dtype, device=x.device)
++        gemm.run(x, logits)
++    else:
++        logits = lp._apply_head(head, x, None)
++    return logits
++
++
++def draft_logits(model, hidden_states):
++    """``model.compute_draft_logits``: the lm_head shard (the target's lm_head weight,
++    shared; on ``DraftGemm`` for a plain BF16 head, else its own method), then the
++    vocab gather on the drafter's mailbox (``comm.DrafterComm.gather_logits``; vLLM's
++    all-gather for a shape it does not serve). BF16 logits only (an FP32 head keeps
++    ``compute_logits``)."""
++    lp, head = model.logits_processor, model.lm_head
++    cached = _lm_head_gemm(model)  # [vllm-moet r3] factored out
+     gemm, comm = cached[1], getattr(model, "_drafter_comm", None)
+     if hidden_states.dim() != 2 or lp.logits_as_input:
+         return model.compute_logits(hidden_states)
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/markov.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/markov.py
+@@ -61,6 +61,8 @@
+ # the rank accumulated in the same order), only the tile's N and the vocabulary
+ # range a program owns changed, which touch no arithmetic.
+ """
++
++import os  # [vllm-moet r3]
+ 
+ import torch
+ 
+@@ -185,6 +187,8 @@
+     VT: tl.constexpr,
+     USE_FP64: tl.constexpr,
+     NOISE: tl.constexpr,
++    SHARD: tl.constexpr = False,  # [vllm-moet r3]
++    voff=0,
+ ):
+     # The bias: one FP32 dot product per (row, token) on the tensor cores.
+     acc = tl.dot(emb, tl.trans(w))
+@@ -192,7 +196,7 @@
+         acc, vs, vocab, rows64, rmask, base_ptr, base_stride,
+         cache_ptr, cache_stride0, cache_stride1, crow, cmask, temp, seed, pos,
+         noise_ptr, noise_stride0, noise_stride1, best_val, best_idx,
+-        STEP, VT, USE_FP64, NOISE,
++        STEP, VT, USE_FP64, NOISE, SHARD, voff,
+     )  # fmt: skip
+ 
+ 
+@@ -224,9 +228,18 @@
+     VT: tl.constexpr,
+     USE_FP64: tl.constexpr,
+     NOISE: tl.constexpr,
++    SHARD: tl.constexpr = False,  # [vllm-moet r3] v is local to a vocabulary shard
++    voff=0,  # [vllm-moet r3] the shard's first token id
+ ):
+     v = vs + tl.arange(0, VT)
+     vmask = v < vocab
++    # [vllm-moet r3] the token id: the shard offset plus the local column (the
++    # base logits and the shard cache are indexed locally, the noise, the Gumbel
++    # hash and the argmax globally)
++    if SHARD:
++        vg = v + voff
++    else:
++        vg = v
+     # The bias rounds to the logits dtype like the GEMV output; the add rounds
+     # once like a tensor add.
+     bmask = rmask[:, None] & vmask[None, :]
+@@ -248,7 +261,7 @@
+         # back: the same operations, in the same kernel, from the outer log on.
+         noisy = temp[:, None] != 0.0
+         arg = tl.load(
+-            noise_ptr + rows64[:, None] * noise_stride0 + STEP * noise_stride1 + v[None, :],
++            noise_ptr + rows64[:, None] * noise_stride0 + STEP * noise_stride1 + vg[None, :],
+             mask=bmask & noisy,
+             other=1.0,
+         )
+@@ -261,7 +274,7 @@
+             temp[:, None],
+             seed[:, None],
+             pos[:, None],
+-            v[None, :],
++            vg[None, :],
+             USE_FP64,
+         )
+     x = tl.where(vmask[None, :], x, float("-inf"))
+@@ -270,7 +283,7 @@
+     # a slot; ``_markov_reduce`` finds the lowest token among the maximal slots.
+     take = x > best_val
+     best_val = tl.where(take, x, best_val)
+-    best_idx = tl.where(take, v[None, :], best_idx)
++    best_idx = tl.where(take, vg[None, :], best_idx)
+     return best_val, best_idx
+ 
+ 
+@@ -312,9 +325,15 @@
+     VT: tl.constexpr,
+     USE_FP64: tl.constexpr,
+     NOISE: tl.constexpr,
++    SHARD: tl.constexpr = False,  # [vllm-moet r3]
++    voff=0,
+ ):
+     v = vs + tl.arange(0, VT)
+     vmask = v < vocab
++    if SHARD:
++        vg = v + voff
++    else:
++        vg = v
+     base = tl.load(
+         base_ptr + row64 * base_stride + v,
+         mask=vmask,
+@@ -331,7 +350,7 @@
+     if NOISE:
+         noisy = temp != 0.0
+         arg = tl.load(
+-            noise_ptr + row64 * noise_stride0 + STEP * noise_stride1 + v,
++            noise_ptr + row64 * noise_stride0 + STEP * noise_stride1 + vg,
+             mask=vmask & noisy,
+             other=1.0,
+         )
+@@ -339,11 +358,11 @@
+         lf = tl.where(noisy, lf / temp, lf)
+         x = tl.where(noisy, lf + -tl.log(arg), lf)
+     else:
+-        x = _gumbel_key(logits.to(tl.float32), temp, seed, pos, v, USE_FP64)
++        x = _gumbel_key(logits.to(tl.float32), temp, seed, pos, vg, USE_FP64)
+     x = tl.where(vmask, x, float("-inf"))
+     take = x > best_val
+     best_val = tl.where(take, x, best_val)
+-    best_idx = tl.where(take, v, best_idx)
++    best_idx = tl.where(take, vg, best_idx)
+     return best_val, best_idx
+ 
+ 
+@@ -357,13 +376,16 @@
+ @triton.jit
+ def _markov_row_state(
+     row64, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride,
+-    STEP: tl.constexpr, SALT: tl.constexpr,
++    STEP: tl.constexpr, SALT: tl.constexpr, SHARD: tl.constexpr = False,
+ ):
+     """The sampling state of one row: (cache row, cache row valid, temperature,
+     seed, position), as the vector loads of the step kernel compute them."""
+     req = tl.load(idx_map_ptr + row64 * idx_stride + STEP).to(tl.int64)
+     valid = req >= 0
+-    crow = draft_logits_row(req, row_map_ptr)
++    if SHARD:
++        crow = row64  # [vllm-moet r3] the shard cache is indexed by batch row
++    else:
++        crow = draft_logits_row(req, row_map_ptr)
+     temp = tl.load(temp_ptr + req, mask=valid, other=0.0).to(tl.float32)
+     seed = spec_step_seed(tl.load(seeds_ptr + req, mask=valid, other=0), STEP)
+     pos = tl.load(pos_ptr + row64 * pos_stride + STEP) - 1
+@@ -382,33 +404,112 @@
+     r2, c2, m2, t2, s2, p2, bx2, bi2,
+     r3, c3, m3, t3, s3, p3, bx3, bi3,
+     STEP: tl.constexpr, VT: tl.constexpr, USE_FP64: tl.constexpr, NOISE: tl.constexpr,
+-    NR: tl.constexpr,
++    NR: tl.constexpr, SHARD: tl.constexpr = False, voff=0,
+ ):
+     acc = tl.dot(emb, tl.trans(w))
+     a = tl.sum(tl.where((rr == 0)[:, None], acc, 0.0), axis=0)
+     bx0, bi0 = _markov_row_epilogue(
+         a, vs, vocab, r0, c0, m0, t0, s0, p0, base_ptr, base_stride, cache_ptr,
+         cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx0, bi0,
+-        STEP, VT, USE_FP64, NOISE)  # fmt: skip
++        STEP, VT, USE_FP64, NOISE, SHARD, voff)  # fmt: skip
+     if NR > 1:
+         a = tl.sum(tl.where((rr == 1)[:, None], acc, 0.0), axis=0)
+         bx1, bi1 = _markov_row_epilogue(
+             a, vs, vocab, r1, c1, m1, t1, s1, p1, base_ptr, base_stride, cache_ptr,
+             cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx1, bi1,
+-            STEP, VT, USE_FP64, NOISE)  # fmt: skip
++            STEP, VT, USE_FP64, NOISE, SHARD, voff)  # fmt: skip
+     if NR > 2:
+         a = tl.sum(tl.where((rr == 2)[:, None], acc, 0.0), axis=0)
+         bx2, bi2 = _markov_row_epilogue(
+             a, vs, vocab, r2, c2, m2, t2, s2, p2, base_ptr, base_stride, cache_ptr,
+             cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx2, bi2,
+-            STEP, VT, USE_FP64, NOISE)  # fmt: skip
++            STEP, VT, USE_FP64, NOISE, SHARD, voff)  # fmt: skip
+     if NR > 3:
+         a = tl.sum(tl.where((rr == 3)[:, None], acc, 0.0), axis=0)
+         bx3, bi3 = _markov_row_epilogue(
+             a, vs, vocab, r3, c3, m3, t3, s3, p3, base_ptr, base_stride, cache_ptr,
+             cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx3, bi3,
+-            STEP, VT, USE_FP64, NOISE)  # fmt: skip
++            STEP, VT, USE_FP64, NOISE, SHARD, voff)  # fmt: skip
+     return bx0, bi0, bx1, bi1, bx2, bi2, bx3, bi3
++
++
++# [vllm-moet r3] The vocab-sharded step's cross-rank select. Rank d owns the
++# vocabulary range [d * S, (d + 1) * S): after a step every rank publishes
++# (max key, its token) of each row as 4 words (FP32 key bits, token low, token
++# high, rank) and the drafter's Lamport gather (``comm.DrafterComm.exchange_rows``)
++# lays the TP ranks' words side by side: ``exch[row, 4 * d .. 4 * d + 3]``. The
++# first rank (lowest vocabulary range) holding the largest key is the row's token,
++# the same "first of the largest" as the replicated kernel's two-level argmax, and
++# every rank performs the identical comparisons on the identical words.
++@triton.jit
++def _exchange_select(exch_ptr, rows64, rmask, exch_stride, TP: tl.constexpr, TP_POW2: tl.constexpr):
++    d = tl.arange(0, TP_POW2)
++    dm = rmask[:, None] & (d < TP)[None, :]
++    base = exch_ptr + rows64[:, None] * exch_stride + d[None, :] * 4
++    m = tl.load(base + 0, mask=dm, other=0).to(tl.float32, bitcast=True)
++    m = tl.where(dm, m, float("-inf"))
++    lo = tl.load(base + 1, mask=dm, other=0)
++    hi = tl.load(base + 2, mask=dm, other=0)
++    tok = (lo.to(tl.int64) & 0xFFFFFFFF) | (hi.to(tl.int64) << 32)
++    mx = tl.max(m, axis=1)
++    first = tl.min(tl.where(m == mx[:, None], d[None, :], TP_POW2), axis=1)
++    return tl.sum(tl.where(d[None, :] == first[:, None], tok, 0), axis=1)
++
++
++@triton.jit
++def _pack_words(pack_ptr, rows64, rmask, best_val, tok, rank):
++    """[vllm-moet r3] A row's (max key, token) as the 4 exchanged words."""
++    tl.store(pack_ptr + rows64 * 4 + 0, best_val.to(tl.int32, bitcast=True), mask=rmask)
++    tl.store(pack_ptr + rows64 * 4 + 1, tok.to(tl.int32), mask=rmask)
++    tl.store(pack_ptr + rows64 * 4 + 2, (tok >> 32).to(tl.int32), mask=rmask)
++    tl.store(pack_ptr + rows64 * 4 + 3, tl.zeros_like(rows64).to(tl.int32) + rank, mask=rmask)
++
++
++@triton.jit
++def _markov_exchange_tokens_kernel(
++    exch_ptr,  # [k, rows_cap, 4 * TP] int32: the k steps' gathered words
++    exch_stride0,
++    exch_stride1,
++    tokens_ptr,
++    tokens_stride,
++    K: tl.constexpr,
++    TP: tl.constexpr,
++    TP_POW2: tl.constexpr,
++):
++    # [vllm-moet r3] Row r's k draft tokens from the k exchanges (one program per row).
++    r = tl.program_id(0).to(tl.int64)
++    rr = r + tl.zeros([1], tl.int64)
++    rm = rr >= 0
++    for s in tl.static_range(K):
++        tok = _exchange_select(exch_ptr + s * exch_stride0, rr, rm, exch_stride1, TP, TP_POW2)
++        tl.store(tokens_ptr + rr * tokens_stride + s, tok, mask=rm)
++
++
++@triton.jit
++def _markov_scatter_cache_kernel(
++    src_ptr,  # [rows * k, V] the gathered biased logits (row r * k + s)
++    src_stride,
++    cache_ptr,  # draft logits [cache rows, k, V]
++    cache_stride0,
++    cache_stride1,
++    row_map_ptr,
++    idx_map_ptr,  # [rows, k]
++    idx_stride,
++    vocab,
++    K: tl.constexpr,
++    BLOCK: tl.constexpr,
++):
++    # [vllm-moet r3] cache[row(req of (r, s)), s, :] = src[r * k + s, :]
++    i = tl.program_id(0).to(tl.int64)
++    r = i // K
++    s = i % K
++    req = tl.load(idx_map_ptr + r * idx_stride + s).to(tl.int64)
++    crow = draft_logits_row(req, row_map_ptr)
++    if (req >= 0) & (crow >= 0):
++        v = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
++        vm = v < vocab
++        x = tl.load(src_ptr + i * src_stride + v, mask=vm)
++        tl.store(cache_ptr + crow * cache_stride0 + s * cache_stride1 + v, x, mask=vm)
+ 
+ 
+ @triton.jit
+@@ -438,8 +539,13 @@
+     tokens_ptr,  # [vllm-moet] draft_tokens [rows_cap, k] (fused select)
+     tokens_stride,
+     counter_ptr,  # [vllm-moet] [row chunks] int32 programs done, 0 between launches
++    exch_ptr,  # [vllm-moet r3] SHARD: the previous step's gathered words [rows, 4 TP]
++    exch_stride,
++    pack_ptr,  # [vllm-moet r3] SHARD: this rank's (max, token) words [rows, 4]
++    voff,  # [vllm-moet r3] SHARD: the shard's first token id
++    rank,  # [vllm-moet r3] SHARD: this rank (the 4th word)
+     num_rows,
+-    vocab,
++    vocab,  # the vocabulary (SHARD: the shard's valid entries)
+     NB,  # programs per row chunk (the grid's second axis)
+     STEP: tl.constexpr,
+     RANK: tl.constexpr,
+@@ -453,7 +559,17 @@
+     SELECT: tl.constexpr,  # [vllm-moet] the last program of a chunk selects the token
+     NB_POW2: tl.constexpr,
+     NR: tl.constexpr,  # [vllm-moet] rows of the launch when <= SMALL_ROWS, else 0
++    SHARD: tl.constexpr = False,  # [vllm-moet r3] this rank's vocabulary shard
++    TP: tl.constexpr = 1,
++    TP_POW2: tl.constexpr = 1,
+ ):
++    # [vllm-moet r3] SHARD: markov_w2 / the base logits / the cache are this rank's
++    # [S, rank] / [rows, k, S] / [rows, k, S] shard, token ids are voff + column, the
++    # previous token is the cross-rank select of the previous step's exchange, and
++    # the step's result is the packed (max, token) of each row (``pack_ptr``), not
++    # the token. FP32 keys only (the exchange carries 32-bit key bits).
++    if SHARD:
++        tl.static_assert(not USE_FP64)
+     # [vllm-moet] Persistent over a contiguous vocabulary range: program (chunk,
+     # pid) owns rows chunk * RB .. and entries pid * TPC * VT .. of the vocabulary.
+     # Row chunks of one vocabulary range run as neighbouring programs, so the
+@@ -481,6 +597,8 @@
+     if STEP == 0:
+         anchor = tl.load(anchor_idx_ptr + rows, mask=rmask, other=0)
+         prev = tl.load(input_ids_ptr + anchor, mask=rmask, other=0).to(tl.int64)
++    elif SHARD:
++        prev = _exchange_select(exch_ptr, rows64, rmask, exch_stride, TP, TP_POW2)
+     else:
+         prev = tl.load(prev_tok_ptr + rows64, mask=rmask, other=0)
+     # [RB, RANK] Markov embeddings of the previous tokens.
+@@ -490,7 +608,10 @@
+     req = tl.load(idx_map_ptr + rows64 * idx_stride + STEP, mask=rmask, other=-1)
+     req = req.to(tl.int64)
+     valid = req >= 0
+-    crow = draft_logits_row(req, row_map_ptr)
++    if SHARD:
++        crow = rows64  # [vllm-moet r3] the shard cache is indexed by batch row
++    else:
++        crow = draft_logits_row(req, row_map_ptr)
+     temp = tl.load(temp_ptr + req, mask=valid, other=0.0).to(tl.float32)
+     seed = spec_step_seed(tl.load(seeds_ptr + req, mask=valid, other=0), STEP)
+     pos = tl.load(pos_ptr + rows64 * pos_stride + STEP, mask=rmask, other=1) - 1
+@@ -509,7 +630,7 @@
+                 w, emb, v0, vocab, rows64, rmask, base_ptr, base_stride,
+                 cache_ptr, cache_stride0, cache_stride1, crow, cmask, temp, seed, pos,
+                 noise_ptr, noise_stride0, noise_stride1, best_val, best_idx,
+-                STEP, VT, USE_FP64, NOISE,
++                STEP, VT, USE_FP64, NOISE, SHARD, voff,
+             )  # fmt: skip
+         # [vllm-moet] The pipelined stream: STAGES - 1 tiles of markov_w2 (and the
+         # matching base logits / noise tiles) in flight ahead of the tensor cores.
+@@ -525,7 +646,7 @@
+                 w, emb, vs, vocab, rows64, rmask, base_ptr, base_stride,
+                 cache_ptr, cache_stride0, cache_stride1, crow, cmask, temp, seed, pos,
+                 noise_ptr, noise_stride0, noise_stride1, best_val, best_idx,
+-                STEP, VT, USE_FP64, NOISE,
++                STEP, VT, USE_FP64, NOISE, SHARD, voff,
+             )  # fmt: skip
+         if PDL:
+             # [vllm-moet] The next step may launch: it prefetches its first tile and
+@@ -545,13 +666,13 @@
+         r2 = (chunk * RB + (2 if NR > 2 else NR - 1)).to(tl.int64)
+         r3 = (chunk * RB + (3 if NR > 3 else NR - 1)).to(tl.int64)
+         c0, m0, t0, s0, p0 = _markov_row_state(
+-            r0, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++            r0, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT, SHARD)
+         c1, m1, t1, s1, p1 = _markov_row_state(
+-            r1, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++            r1, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT, SHARD)
+         c2, m2, t2, s2, p2 = _markov_row_state(
+-            r2, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++            r2, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT, SHARD)
+         c3, m3, t3, s3, p3 = _markov_row_state(
+-            r3, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++            r3, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT, SHARD)
+         bx0 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
+         bx1 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
+         bx2 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
+@@ -566,7 +687,7 @@
+                 cache_stride1, noise_ptr, noise_stride0, noise_stride1,
+                 r0, c0, m0, t0, s0, p0, bx0, bi0, r1, c1, m1, t1, s1, p1, bx1, bi1,
+                 r2, c2, m2, t2, s2, p2, bx2, bi2, r3, c3, m3, t3, s3, p3, bx3, bi3,
+-                STEP, VT, USE_FP64, NOISE, NR,
++                STEP, VT, USE_FP64, NOISE, NR, SHARD, voff,
+             )  # fmt: skip
+         for t in range(T0, TPC):
+             vs = v0 + t * VT
+@@ -581,7 +702,7 @@
+                 cache_stride1, noise_ptr, noise_stride0, noise_stride1,
+                 r0, c0, m0, t0, s0, p0, bx0, bi0, r1, c1, m1, t1, s1, p1, bx1, bi1,
+                 r2, c2, m2, t2, s2, p2, bx2, bi2, r3, c3, m3, t3, s3, p3, bx3, bi3,
+-                STEP, VT, USE_FP64, NOISE, NR,
++                STEP, VT, USE_FP64, NOISE, NR, SHARD, voff,
+             )  # fmt: skip
+         if PDL:
+             tl.extra.cuda.gdc_launch_dependents()
+@@ -619,8 +740,12 @@
+             )
+             best = tl.argmax(m, axis=1, tie_break_left=True)
+             tok = tl.load(out_arg_ptr + rows64 * NB + best, mask=rmask, other=0, volatile=True)
+-            tl.store(prev_tok_ptr + rows64, tok, mask=rmask)
+-            tl.store(tokens_ptr + rows64 * tokens_stride + STEP, tok, mask=rmask)
++            if SHARD:
++                # [vllm-moet r3] the rank's (max, token) for the exchange
++                _pack_words(pack_ptr, rows64, rmask, tl.max(m, axis=1), tok, rank)
++            else:
++                tl.store(prev_tok_ptr + rows64, tok, mask=rmask)
++                tl.store(tokens_ptr + rows64 * tokens_stride + STEP, tok, mask=rmask)
+             tl.store(counter_ptr + chunk, 0)
+ 
+ 
+@@ -635,6 +760,9 @@
+     NB,
+     STEP: tl.constexpr,
+     NB_POW2: tl.constexpr,
++    PACK: tl.constexpr = False,  # [vllm-moet r3] write the exchanged words instead
++    pack_ptr=None,
++    rank=0,
+ ):
+     # Row r's token of step STEP: the first of its largest per-program maxima.
+     r = tl.program_id(0).to(tl.int64)
+@@ -642,8 +770,13 @@
+     m = tl.load(max_ptr + r * NB + j, mask=j < NB, other=float("-inf"))
+     best = tl.argmax(m, axis=0, tie_break_left=True)
+     tok = tl.load(arg_ptr + r * NB + best)
+-    tl.store(prev_tok_ptr + r, tok)
+-    tl.store(tokens_ptr + r * tokens_stride + STEP, tok)
++    if PACK:
++        rr = r + tl.zeros([1], tl.int64)
++        _pack_words(pack_ptr, rr, rr >= 0, tl.max(m, axis=0) + tl.zeros([1], tl.float32),
++                    tok + tl.zeros([1], tl.int64), rank)
++    else:
++        tl.store(prev_tok_ptr + r, tok)
++        tl.store(tokens_ptr + r * tokens_stride + STEP, tok)
+ 
+ 
+ # [vllm-moet] Programs per SM per row chunk (the grid's second axis is CTAS_PER_SM
+@@ -841,6 +974,11 @@
+                 tokens,
+                 tokens.stride(0),
+                 self.counter,
++                self.prev,  # [vllm-moet r3] exch_ptr (unused: SHARD=False)
++                0,
++                self.prev,  # pack_ptr (unused)
++                0,
++                0,
+                 num_reqs,
+                 self.vocab,
+                 nb,
+@@ -872,6 +1010,330 @@
+                     STEP=step,
+                     NB_POW2=nb_pow2,
+                 )
++
++# [vllm-moet r3] The vocab-sharded Markov steps: each TP rank d keeps its own
++# slice markov_w2[d S : (d + 1) S] (S = the lm_head's
++# vocab-parallel shard, 20480 at TP8: 21 MB instead of 168 MB), each step runs the
++# step kernel on the rank's own lm_head logits shard (no pre-step logits gather),
++# publishes (max key, token) per row through the drafter's Lamport mailbox
++# (``comm.DrafterComm.exchange_rows``, per-step slots) and every rank selects the
++# same token (``_exchange_select``). The biased logits shards of the k steps are
++# gathered once after the last step (``comm.gather_logits``, the bytes the pre-step
++# gather moved) and scattered into the draft logits cache rows for the rejection
++# sampler, which reads the full vocabulary. VLLM_MOET_MARKOV_SHARD=0 keeps the
++# replicated path above.
++MARKOV_SHARD = os.environ.get("VLLM_MOET_MARKOV_SHARD", "1") != "0"
++# Programs per SM of the sharded step (the shard is 640 tiles of 32: with 2 per SM
++# 3 tiles per program over 214 programs).
++SHARD_CTAS_PER_SM = 2
++SHARD_STAGES = 3
++# One launch per sharded step (the fused select packs the exchanged words).
++SHARD_FUSED_SELECT = True
++# Draft steps the exchange mailbox has slots for (``comm.EXCHANGE_STEPS``).
++
++
++class ShardedMarkov:
++    """The vocab-sharded Markov steps of one speculator on one TP rank (scratch
++    allocated once: the shard of markov_w2, the shard cache, the exchange words)."""
++
++    def __init__(self, vocab, rank_dim, max_rows, k_max, device, comm, w2, tp, tp_rank,
++                 shard, ctas_per_sm=None, stages=None, fused_select=None, pdl=None,
++                 num_warps=None, small_rows=None):
++        self.vocab, self.rank, self.tp, self.tp_rank = vocab, rank_dim, tp, tp_rank
++        self.comm = comm
++        self.shard = shard  # S: the lm_head's rows per rank (padded vocab / tp)
++        self.voff = tp_rank * shard
++        # the shard's valid entries (the last rank may hold padding)
++        self.vocab_local = max(0, min(vocab - self.voff, shard))
++        sms = torch.cuda.get_device_properties(device).multi_processor_count
++        self.vt = VT
++        self.stages = SHARD_STAGES if stages is None else stages
++        self.num_warps = NUM_WARPS if num_warps is None else num_warps
++        self.small_rows = SMALL_ROWS if small_rows is None else small_rows
++        self.fused_select = SHARD_FUSED_SELECT if fused_select is None else fused_select
++        self.pdl = _pdl_supported(device) if pdl is None else pdl
++        tiles = triton.cdiv(max(self.vocab_local, 1), self.vt)
++        ctas = SHARD_CTAS_PER_SM if ctas_per_sm is None else ctas_per_sm
++        self.tpc = triton.cdiv(tiles, sms * ctas)
++        self.nb = triton.cdiv(tiles, self.tpc)
++        self.nb_pow2 = triton.next_power_of_2(self.nb)
++        self.tp_pow2 = triton.next_power_of_2(tp)
++        self.w2 = w2 if (w2.shape[0] == shard and w2.is_contiguous()) else slice_w2(w2, self.voff, shard)
++        self.bufs = (
++            torch.empty(max_rows, self.nb, dtype=torch.float32, device=device),
++            torch.empty(max_rows, self.nb, dtype=torch.int64, device=device),
++        )
++        self.counter = torch.zeros(
++            triton.cdiv(max_rows, RB), dtype=torch.int32, device=device
++        )
++        self.pack = torch.zeros(max_rows, 4, dtype=torch.int32, device=device)
++        self.exch = torch.zeros(k_max, max_rows, 4 * tp, dtype=torch.int32, device=device)
++        self.shard_cache = None  # [max_rows, k_max, S] at the first run (its dtype)
++        self.max_rows, self.k_max, self.device = max_rows, k_max, device
++        self.dummy = torch.zeros(1, dtype=torch.int64, device=device)
++
++    def run(self, spec, num_reqs, base_shard, w1, cache):
++        """``base_shard``: [num_reqs, k, S] this rank's lm_head logits shard (BF16 /
++        FP32, the cache's dtype); writes ``spec.draft_tokens[:num_reqs]`` and the
++        k rows of every request in ``cache`` (the draft logits cache values)."""
++        n_spec = base_shard.shape[1]
++        assert n_spec <= self.k_max and num_reqs <= self.max_rows
++        if (
++            self.shard_cache is None
++            or self.shard_cache.dtype != base_shard.dtype
++            or self.shard_cache.shape[1] != n_spec
++        ):
++            # [rows, k, S] so that the k rows of a request are contiguous for the
++            # post-step gather (allocated at the eager warmup, before capture)
++            self.shard_cache = torch.zeros(
++                self.max_rows, n_spec, self.shard, dtype=base_shard.dtype,
++                device=self.device,
++            )
++        for step in range(n_spec):
++            self.run_step(spec, num_reqs, base_shard, w1, step)
++        self.finish(spec, num_reqs, n_spec, cache)
++
++    def run_step(self, spec, num_reqs, base_shard, w1, step):
++        """Draft step ``step`` on the shard: the step kernel, then the exchange."""
++        n_spec = base_shard.shape[1]
++        rb = RB
++        grid = (triton.cdiv(num_reqs, rb), self.nb)
++        idx_map = spec.sample_idx_mapping[: num_reqs * n_spec].view(num_reqs, n_spec)
++        sample_pos = spec.sample_pos[: num_reqs * n_spec].view(num_reqs, n_spec)
++        shard_cache = self.shard_cache
++        out_max, out_arg = self.bufs
++        if True:
++            exch_prev = self.exch[step - 1] if step > 0 else self.exch[0]
++            _markov_step_kernel[grid](
++                self.dummy,  # prev_tok_ptr (unused: SHARD)
++                spec.input_buffers.input_ids,
++                spec._anchor_idx,
++                w1,
++                self.w2,
++                base_shard[:, step],
++                base_shard.stride(0),
++                shard_cache,
++                shard_cache.stride(0),
++                shard_cache.stride(1),
++                None,  # row_map_ptr (the shard cache is indexed by batch row)
++                idx_map,
++                idx_map.stride(0),
++                sample_pos,
++                sample_pos.stride(0),
++                spec.temperature,
++                spec.seeds,
++                out_max,
++                out_arg,
++                self.dummy,  # noise (unused: NOISE=False)
++                0,
++                0,
++                self.dummy,  # tokens_ptr (unused: SHARD)
++                0,
++                self.counter,
++                exch_prev,
++                exch_prev.stride(0),
++                self.pack,
++                self.voff,
++                self.tp_rank,
++                num_reqs,
++                self.vocab_local,
++                self.nb,
++                STEP=step,
++                RANK=self.rank,
++                VT=self.vt,
++                TPC=self.tpc,
++                RB=rb,
++                USE_FP64=False,
++                SALT=_DRAFT_NOISE_SALT,
++                NOISE=False,
++                PDL=self.pdl,
++                SELECT=self.fused_select,
++                NB_POW2=self.nb_pow2,
++                NR=num_reqs if num_reqs <= self.small_rows else 0,
++                SHARD=True,
++                TP=self.tp,
++                TP_POW2=self.tp_pow2,
++                num_warps=self.num_warps,
++                num_stages=self.stages,
++                launch_pdl=self.pdl,
++            )
++            if not self.fused_select:
++                _markov_select_kernel[(num_reqs,)](
++                    out_max,
++                    out_arg,
++                    self.dummy,
++                    self.dummy,
++                    0,
++                    num_reqs,
++                    self.nb,
++                    STEP=step,
++                    NB_POW2=self.nb_pow2,
++                    PACK=True,
++                    pack_ptr=self.pack,
++                    rank=self.tp_rank,
++                )
++            # the TP ranks' words of this step, side by side (Lamport gather)
++            out = self.exchange(self.pack[:num_reqs], self.exch[step, :num_reqs], step)
++            assert out is not None, "exchange_rows refused a shape why_not_sharded admitted"
++
++    def finish(self, spec, num_reqs, n_spec, cache):
++        """After the last step: the k tokens of every row from the k exchanges,
++        the biased shards gathered and scattered into the draft logits cache."""
++        idx_map = spec.sample_idx_mapping[: num_reqs * n_spec].view(num_reqs, n_spec)
++        shard_cache = self.shard_cache
++        _markov_exchange_tokens_kernel[(num_reqs,)](
++            self.exch,
++            self.exch.stride(0),
++            self.exch.stride(1),
++            spec.draft_tokens,
++            spec.draft_tokens.stride(0),
++            K=n_spec,
++            TP=self.tp,
++            TP_POW2=self.tp_pow2,
++        )
++        # the k steps' biased shards of every row -> [R k, V] -> the cache rows
++        gathered = self.gather(shard_cache[:num_reqs].view(num_reqs * n_spec, self.shard))
++        assert gathered is not None, "gather_logits refused a shape why_not_sharded admitted"
++        BLOCK = 4096
++        _markov_scatter_cache_kernel[(num_reqs * n_spec, triton.cdiv(self.vocab, BLOCK))](
++            gathered,
++            gathered.stride(0),
++            cache,
++            cache.stride(0),
++            cache.stride(1),
++            spec.draft_logits.row_mapping,
++            idx_map,
++            idx_map.stride(0),
++            self.vocab,
++            K=n_spec,
++            BLOCK=BLOCK,
++            num_warps=4,
++        )
++
++    # the two collectives, overridable by the single-GPU tests (which emulate them)
++    def exchange(self, pack, out, step):
++        return self.comm.exchange_rows(pack, out, step)
++
++    def gather(self, shard_rows):
++        return self.comm.gather_logits(shard_rows)
++
++
++def slice_w2(w2, voff, shard):
++    """[vllm-moet r3] This rank's rows of markov_w2: ``w2[voff : voff + shard]``,
++    zero-padded to ``shard`` rows past the vocabulary (the last rank of a padded
++    vocabulary), contiguous."""
++    end = min(voff + shard, w2.shape[0])
++    rows = w2[voff:end]
++    if rows.shape[0] == shard:
++        return rows.contiguous()
++    out = torch.zeros(shard, w2.shape[1], dtype=w2.dtype, device=w2.device)
++    out[: rows.shape[0]].copy_(rows)
++    return out
++
++
++def shard_layout(model):
++    """[vllm-moet r3] (tp, rank, S, V) of the lm_head's vocab-parallel layout when
++    it is the plain contiguous one the shard needs (rank d owns padded-vocab rows
++    [d S, (d + 1) S), which the logits gather lays out in rank order), else None."""
++    head = model.lm_head
++    lp = model.logits_processor
++    tp = getattr(head, "tp_size", 1)
++    if tp <= 1:
++        return None
++    idx = getattr(head, "shard_indices", None)
++    if idx is None or head.weight.dim() != 2:
++        return None
++    S = head.weight.shape[0]
++    V = lp.org_vocab_size
++    rank = idx.org_vocab_start_index // S if S else -1
++    if (
++        S * tp != head.num_embeddings_padded
++        or idx.org_vocab_start_index != rank * S
++        or idx.org_vocab_end_index != min(rank * S + S, V)
++        or idx.added_vocab_start_index != idx.added_vocab_end_index
++        or idx.num_org_elements_padded != S
++        or not 0 <= rank < tp
++    ):
++        return None
++    return tp, rank, S, V
++
++
++def why_not_sharded(spec, model, num_reqs, comm):
++    """[vllm-moet r3] Why this draft step takes the replicated fused path instead
++    of the vocab-sharded one, or None."""
++    if not MARKOV_SHARD:
++        return "VLLM_MOET_MARKOV_SHARD=0"
++    if comm is None or comm.logits is None:
++        return "no drafter mailbox"
++    if spec.use_fp64_gumbel:
++        return "FP64 Gumbel keys"
++    if spec.draft_logits.values.dtype != torch.bfloat16:
++        return f"{spec.draft_logits.values.dtype} draft logits cache (the mailbox gather is BF16)"
++    layout = shard_layout(model)
++    if layout is None:
++        return "lm_head layout"
++    tp, rank, S, V = layout
++    if tp != comm.tp or rank != comm.rank or S != comm.vocab_shard:
++        return "lm_head shard differs from the mailbox's"
++    w2 = model.model.markov_head.markov_w2.weight
++    if w2.shape[0] != V:
++        return "markov_w2 vocabulary differs from the lm_head's"
++    k = spec.num_speculative_steps
++    from .comm import EXCHANGE_STEPS, ROWS_CAP
++
++    if k > EXCHANGE_STEPS:
++        return f"k {k} > exchange slots {EXCHANGE_STEPS}"
++    if num_reqs > ROWS_CAP or num_reqs * k > ROWS_CAP:
++        return f"{num_reqs} x {k} rows > mailbox cap {ROWS_CAP}"
++    return None
++
++
++_SHARDED: dict = {}
++
++
++def _sharded(spec, model, comm, w2, device):
++    tp, rank, S, V = shard_layout(model)
++    key = (device, V, w2.shape[1], S)
++    inst = _SHARDED.get(key)
++    if inst is None or inst.max_rows < spec.max_num_reqs:
++        from .comm import EXCHANGE_STEPS
++
++        # the load-time shard (``prepare_sharded``), else sliced now (eager warmup)
++        shard_w2 = getattr(model, "_markov_w2_shard", None)
++        if shard_w2 is None or shard_w2.shape != (S, w2.shape[1]) or shard_w2.dtype != w2.dtype:
++            shard_w2 = w2
++        inst = ShardedMarkov(
++            V, w2.shape[1], spec.max_num_reqs, EXCHANGE_STEPS, device, comm, shard_w2,
++            tp, rank, S,
++        )
++        _SHARDED[key] = inst
++        logger.info_once(
++            "DSpark vocab-sharded Markov sampling: rank %d of %d owns tokens %d..%d "
++            "(%d valid), %d programs x %d tiles of %d, fused select %s",
++            rank, tp, inst.voff, inst.voff + S, inst.vocab_local, inst.nb, inst.tpc,
++            inst.vt, inst.fused_select,
++        )
++    return inst
++
++
++def prepare_sharded(model) -> str:
++    """[vllm-moet r3] Build the rank's markov_w2 shard at load (``model.py``
++    ``after_loading``), so its memory precedes the KV-cache profile; returns a
++    log string. The speculator-sized scratch follows at the first draft step."""
++    comm = getattr(model, "_drafter_comm", None)
++    if not MARKOV_SHARD:
++        return "off (VLLM_MOET_MARKOV_SHARD=0)"
++    if comm is None or comm.logits is None:
++        return "off (no mailbox)"
++    layout = shard_layout(model)
++    if layout is None:
++        return "off (lm_head layout)"
++    tp, rank, S, V = layout
++    w2 = model.model.markov_head.markov_w2.weight
++    if w2.dtype != torch.bfloat16 or w2.shape[0] != V:
++        return "off (markov_w2 shape / dtype)"
++    model._markov_w2_shard = slice_w2(w2, rank * S, S)
++    return f"rank {rank}/{tp} tokens {rank * S}..{rank * S + S} ({S * w2.shape[1] * 2 / 2**20:.0f} MiB)"
+ 
+ 
+ def why_not(spec, model, num_reqs):
+@@ -922,11 +1384,36 @@
+     num_sample = num_reqs * n_spec
+     head = model.model.markov_head
+     w1, w2 = head.markov_w1.weight, head.markov_w2.weight
++    sample_hidden = head_hidden[spec.sample_indices[:num_sample]]
++    # [vllm-moet r3] the vocab-sharded steps on this rank's lm_head logits shard
++    comm = getattr(model, "_drafter_comm", None)
++    why = why_not_sharded(spec, model, num_reqs, comm)
++    if why is None:
++        from .linears import draft_logits_shard
++
++        cache = spec.draft_logits.values
++        shard = draft_logits_shard(model, sample_hidden)
++        if shard is not None and (
++            shard.dtype in (torch.bfloat16, torch.float32)
++            and shard.dtype == cache.dtype
++            and shard.stride(-1) == 1
++            and cache.shape[-1] >= w2.shape[0]
++        ):
++            inst = _sharded(spec, model, comm, w2, head_hidden.device)
++            inst.run(spec, num_reqs, shard.view(num_reqs, n_spec, inst.shard), w1, cache)
++            return True
++        why = "lm_head shard unavailable" if shard is None else f"{shard.dtype} shard, {cache.dtype} cache"
++        if shard is not None:
++            # the shard was computed: finish it with the stock gather (one step)
++            base_logits = model.logits_processor._gather_logits(shard)
++            base_logits = base_logits[..., : model.logits_processor.org_vocab_size]
++            logger.info_once("DSpark vocab-sharded Markov sampling off: %s", why)
++            return _fused_rest(spec, model, num_reqs, w1, w2, base_logits, head_hidden.device)
++    logger.info_once("DSpark vocab-sharded Markov sampling off: %s", why)
+     fused = _fused(spec, w1, w2, head_hidden.device)
+     noise = None
+     if fused.noise_rows(num_reqs, n_spec):
+         noise = fused.fork_noise(spec, num_reqs, n_spec)
+-    sample_hidden = head_hidden[spec.sample_indices[:num_sample]]
+     base_logits = model.compute_draft_logits(sample_hidden)
+     if noise is not None:
+         fused.join()
+@@ -946,6 +1433,24 @@
+         )
+         return _loop_rest(spec, model, num_reqs, base_logits)
+     fused.run(spec, num_reqs, base_logits.view(num_reqs, n_spec, vocab), w1, w2, noise)
++    return True
++
++
++def _fused_rest(spec, model, num_reqs, w1, w2, base_logits, device) -> bool:
++    """[vllm-moet r3] The replicated fused steps from gathered base logits."""
++    n_spec = spec.num_speculative_steps
++    cache = spec.draft_logits.values
++    vocab = base_logits.shape[-1]
++    if (
++        base_logits.dtype not in (torch.bfloat16, torch.float32)
++        or base_logits.dtype != cache.dtype
++        or base_logits.stride(-1) != 1
++        or w2.shape[0] != vocab
++        or cache.shape[-1] < vocab
++    ):
++        return _loop_rest(spec, model, num_reqs, base_logits)
++    fused = _fused(spec, w1, w2, device)
++    fused.run(spec, num_reqs, base_logits.view(num_reqs, n_spec, vocab), w1, w2, None)
+     return True
+ 
+ 
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/model.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/model.py
+@@ -244,6 +244,11 @@
+         device = next(model.parameters()).device
+         reserved = reserve_cake_workspace(device, **shape)
+     comm, dcp = install_collectives(model)
++    # [vllm-moet r3] the rank's markov_w2 shard for the vocab-sharded Markov steps
++    from .markov import prepare_sharded
++
++    markov_shard = prepare_sharded(model)
++    init_logger(__name__).info_once("DSpark vocab-sharded Markov head: %s", markov_shard)
+     init_logger(__name__).info_once(
+         "Specialized DSpark drafter: %d linears on DraftGemm, %d MLPs on the fused "
+         "SwiGLU GEMM, context KV insert %s, CAKE workspace %.0f MiB, "
+--- a/vllm/v1/worker/gpu/input_batch.py
++++ b/vllm/v1/worker/gpu/input_batch.py
+@@ -718,6 +718,127 @@
+     )
+ 
+ 
++# [vllm-moet r3] ``prepare_pos_seq_lens`` + ``combine_sampled_and_draft_tokens`` in
++# one launch: both are one program per request, and the second only needs the
++# first's ``seq_len`` of the same request (computed here instead of re-read), so
++# the fused program writes the request's positions, its seq_len, its logits
++# indices and its sampled / draft input ids; the extra program pads seq_lens as
++# before. Same stores, same values, same order within a request.
++@triton.jit
++def _prepare_pos_and_combine_kernel(
++    pos_ptr,
++    seq_lens_ptr,
++    idx_mapping_ptr,
++    query_start_loc_ptr,
++    num_computed_tokens_ptr,
++    max_num_reqs,
++    input_ids_ptr,
++    last_sampled_tokens_ptr,
++    prefill_len_ptr,
++    draft_tokens_ptr,
++    draft_tokens_stride,
++    cu_num_logits_ptr,
++    logits_indices_ptr,
++    POS_BLOCK: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    NUM_NEW_SAMPLED_TOKENS: tl.constexpr = 1,
++):
++    batch_idx = tl.program_id(0)
++    num_reqs = tl.num_programs(0) - 1
++    if batch_idx == num_reqs:
++        # Pad unused seq_lens as 0 for full CUDA graphs.
++        for i in tl.range(num_reqs, max_num_reqs, POS_BLOCK):
++            block = i + tl.arange(0, POS_BLOCK)
++            mask = block < max_num_reqs
++            tl.store(seq_lens_ptr + block, 0, mask=mask)
++        return
++
++    req_state_idx = tl.load(idx_mapping_ptr + batch_idx)
++    num_computed_tokens = tl.load(num_computed_tokens_ptr + req_state_idx)
++    start = tl.load(query_start_loc_ptr + batch_idx)
++    query_end = tl.load(query_start_loc_ptr + batch_idx + 1)
++    query_len = query_end - start
++    seq_len = num_computed_tokens + query_len
++    tl.store(seq_lens_ptr + batch_idx, seq_len)
++    for i in tl.range(0, query_len, POS_BLOCK):
++        block = i + tl.arange(0, POS_BLOCK)
++        mask = block < query_len
++        tl.store(pos_ptr + start + block, num_computed_tokens + block, mask=mask)
++
++    # ``_combine_sampled_and_draft_tokens_kernel`` with seq_len from above.
++    cu_num_logits_start = tl.load(cu_num_logits_ptr + batch_idx)
++    cu_num_logits_end = tl.load(cu_num_logits_ptr + batch_idx + 1)
++    num_logits = cu_num_logits_end - cu_num_logits_start
++    num_draft_tokens = num_logits - NUM_NEW_SAMPLED_TOKENS
++    block = tl.arange(0, BLOCK_SIZE)
++    logits_start = query_end - num_logits
++    tl.store(
++        logits_indices_ptr + cu_num_logits_start + block,
++        logits_start + block,
++        mask=block < num_logits,
++    )
++    prefill_len = tl.load(prefill_len_ptr + req_state_idx)
++    if seq_len <= prefill_len:
++        return
++    first_logit_seq_pos = seq_len - num_logits
++    if NUM_NEW_SAMPLED_TOKENS > 0 and first_logit_seq_pos >= prefill_len:
++        last_token_id = tl.load(last_sampled_tokens_ptr + req_state_idx)
++        tl.store(input_ids_ptr + logits_start, last_token_id)
++    if num_draft_tokens > 0:
++        mask = block < num_draft_tokens
++        draft_tokens = tl.load(
++            draft_tokens_ptr + req_state_idx * draft_tokens_stride + block,
++            mask=mask,
++        )
++        tl.store(
++            input_ids_ptr + query_end - num_draft_tokens + block,
++            draft_tokens,
++            mask=mask,
++        )
++
++
++def prepare_pos_seq_lens_and_combine(
++    idx_mapping: torch.Tensor,
++    query_start_loc: torch.Tensor,
++    num_computed_tokens: torch.Tensor,
++    pos: torch.Tensor,
++    seq_lens: torch.Tensor,
++    input_ids: torch.Tensor,
++    last_sampled_tokens: torch.Tensor,
++    prefill_len: torch.Tensor,
++    draft_tokens: torch.Tensor,
++    cu_num_logits: torch.Tensor,
++    num_logits: int,
++    num_new_sampled_tokens: int = 1,
++) -> torch.Tensor:
++    """[vllm-moet r3] ``prepare_pos_seq_lens(...)`` then
++    ``combine_sampled_and_draft_tokens(...)`` (``seq_lens[:num_reqs_padded]`` is
++    what the latter reads) as one launch; returns ``logits_indices``."""
++    assert num_new_sampled_tokens in (0, 1), num_new_sampled_tokens
++    num_reqs = idx_mapping.shape[0]
++    num_speculative_steps = draft_tokens.shape[-1]
++    logits_indices = torch.empty(num_logits, dtype=torch.int64, device=input_ids.device)
++    _prepare_pos_and_combine_kernel[(num_reqs + 1,)](
++        pos,
++        seq_lens,
++        idx_mapping,
++        query_start_loc,
++        num_computed_tokens,
++        seq_lens.shape[0],
++        input_ids,
++        last_sampled_tokens,
++        prefill_len,
++        draft_tokens,
++        draft_tokens.stride(0),
++        cu_num_logits,
++        logits_indices,
++        POS_BLOCK=1024,
++        BLOCK_SIZE=triton.next_power_of_2(num_speculative_steps + num_new_sampled_tokens),
++        NUM_NEW_SAMPLED_TOKENS=num_new_sampled_tokens,
++    )
++    return logits_indices
++
++
+ @triton.jit
+ def _expand_idx_mapping_kernel(
+     idx_mapping_ptr,
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -17,6 +17,7 @@
+ """
+ 
+ import functools
++import os  # [vllm-moet r3]
+ import gc
+ import time
+ from collections.abc import Iterable
+@@ -127,6 +128,7 @@
+     post_update,
+     post_update_num_computed_tokens,
+     prepare_pos_seq_lens,
++    prepare_pos_seq_lens_and_combine,  # [vllm-moet r3]
+     prepare_prefill_inputs,
+     set_dummy_context,
+ )
+@@ -196,6 +198,10 @@
+ from vllm.v1.worker.workspace import lock_workspace, use_workspace_lane
+ 
+ logger = init_logger(__name__)
++
++# [vllm-moet r3] A/B switch (default on): the fused positions / seq_lens / input
++# ids / logits-indices launch of _prepare_inputs (input_batch.py).
++_FUSED_PREP = os.environ.get("VLLM_MOET_FUSED_PREP", "1") != "0"
+ 
+ 
+ class GPUModelRunner(LoRAModelRunnerMixin):
+@@ -1529,30 +1535,49 @@
+                 self.req_states.num_computed_tokens.gpu,
+             )
+ 
+-        # Prepare positions and seq_lens.
+-        prepare_pos_seq_lens(
+-            idx_mapping,
+-            query_start_loc,
+-            self.req_states.num_computed_tokens.gpu,
+-            self.input_buffers.positions,
+-            self.input_buffers.seq_lens,
+-        )
+-        seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
++        if _FUSED_PREP:
++            # [vllm-moet r3] positions + seq_lens + sampled / draft input ids +
++            # logits indices in one launch (VLLM_MOET_FUSED_PREP=0: the two below)
++            logits_indices = prepare_pos_seq_lens_and_combine(
++                idx_mapping,
++                query_start_loc,
++                self.req_states.num_computed_tokens.gpu,
++                self.input_buffers.positions,
++                self.input_buffers.seq_lens,
++                self.input_buffers.input_ids,
++                self.req_states.last_sampled_tokens,
++                self.req_states.prefill_len.gpu,
++                self.req_states.draft_tokens,
++                cu_num_logits,
++                total_num_logits,
++                self.model_state.num_new_sampled_tokens_per_step,
++            )
++            seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
++        else:
++            # Prepare positions and seq_lens.
++            prepare_pos_seq_lens(
++                idx_mapping,
++                query_start_loc,
++                self.req_states.num_computed_tokens.gpu,
++                self.input_buffers.positions,
++                self.input_buffers.seq_lens,
++            )
++            seq_lens = self.input_buffers.seq_lens[:num_reqs_padded]
+ 
+-        # Some input token ids are directly read from the last sampled tokens
+-        # and draft tokens. Also, get the logits indices to sample tokens from.
+-        logits_indices = combine_sampled_and_draft_tokens(
+-            self.input_buffers.input_ids,
+-            idx_mapping,
+-            self.req_states.last_sampled_tokens,
+-            query_start_loc,
+-            seq_lens,
+-            self.req_states.prefill_len.gpu,
+-            self.req_states.draft_tokens,
+-            cu_num_logits,
+-            total_num_logits,
+-            self.model_state.num_new_sampled_tokens_per_step,
+-        )
++            # Some input token ids are directly read from the last sampled tokens
++            # and draft tokens. Also, get the logits indices to sample tokens from.
++            logits_indices = combine_sampled_and_draft_tokens(
++                self.input_buffers.input_ids,
++                idx_mapping,
++                self.req_states.last_sampled_tokens,
++                query_start_loc,
++                seq_lens,
++                self.req_states.prefill_len.gpu,
++                self.req_states.draft_tokens,
++                cu_num_logits,
++                total_num_logits,
++                self.model_state.num_new_sampled_tokens_per_step,
++            )
+ 
+         fast_prefill = None
+         if self.fast_prefill is not None:
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler.py
+@@ -93,8 +93,20 @@
+     expanded_local_pos_ptr,
+     # [max_num_reqs]
+     prefill_len_ptr,
++    # [vllm-moet] Sampling params staged from UVA (pinned host) memory into device
++    # memory, once per step, by program 0: [max_num_reqs] each. The rejection
++    # kernels then read device memory instead of one PCIe round trip per CTA.
++    temperature_src_ptr,
++    temperature_dst_ptr,
++    seeds_src_ptr,
++    seeds_dst_ptr,
++    prefill_len_dst_ptr,
++    num_temperature,
++    num_seeds,
++    num_prefill_len,
+     num_logits,
+     BLOCK_SIZE: tl.constexpr,
++    STAGE_BLOCK: tl.constexpr,
+ ):
+     block = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+     mask = block < num_logits
+@@ -104,6 +116,36 @@
+     req_state_idx = tl.load(expanded_idx_mapping_ptr + block, mask=mask)
+     local_pos = tl.load(expanded_local_pos_ptr + block, mask=mask)
+     prefill_len = tl.load(prefill_len_ptr + req_state_idx, mask=mask)
++    if temperature_dst_ptr is not None:  # [vllm-moet]
++        if tl.program_id(0) == 0:
++            # All PCIe (UVA) loads are issued before any store so that they
++            # overlap each other and the gather loads above (the compiler does
++            # not reorder loads past stores). Straight-line for the usual
++            # max_num_reqs (<= STAGE_BLOCK), a loop beyond that.
++            max_num_reqs = tl.maximum(tl.maximum(num_temperature, num_seeds), num_prefill_len)
++            if max_num_reqs <= STAGE_BLOCK:
++                offs = tl.arange(0, STAGE_BLOCK)
++                m_t = offs < num_temperature
++                m_s = offs < num_seeds
++                m_p = offs < num_prefill_len
++                t_src = tl.load(temperature_src_ptr + offs, mask=m_t)
++                s_src = tl.load(seeds_src_ptr + offs, mask=m_s)
++                p_src = tl.load(prefill_len_ptr + offs, mask=m_p)
++                tl.store(temperature_dst_ptr + offs, t_src, mask=m_t)
++                tl.store(seeds_dst_ptr + offs, s_src, mask=m_s)
++                tl.store(prefill_len_dst_ptr + offs, p_src, mask=m_p)
++            else:
++                for i in range(0, max_num_reqs, STAGE_BLOCK):
++                    offs = i + tl.arange(0, STAGE_BLOCK)
++                    m_t = offs < num_temperature
++                    m_s = offs < num_seeds
++                    m_p = offs < num_prefill_len
++                    t_src = tl.load(temperature_src_ptr + offs, mask=m_t)
++                    s_src = tl.load(seeds_src_ptr + offs, mask=m_s)
++                    p_src = tl.load(prefill_len_ptr + offs, mask=m_p)
++                    tl.store(temperature_dst_ptr + offs, t_src, mask=m_t)
++                    tl.store(seeds_dst_ptr + offs, s_src, mask=m_s)
++                    tl.store(prefill_len_dst_ptr + offs, p_src, mask=m_p)
+     # Drafts are only proposed after sampling past the prefill, so any draft
+     # slots in a step starting within the prefill are placeholders (e.g. the
+     # padded first step after a P/D remote KV load).
+@@ -120,6 +162,9 @@
+     expanded_idx_mapping: torch.Tensor,
+     expanded_local_pos: torch.Tensor,
+     prefill_len: torch.Tensor,
++    # [vllm-moet] optional (src, dst) staging of the sampling params, see
++    # _gather_draft_sampled_kernel. All [max_num_reqs].
++    staging: tuple[torch.Tensor, ...] | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Gather the input token and position of each logits row.
+ 
+@@ -130,6 +175,11 @@
+     draft_sampled = input_ids.new_empty(num_logits)
+     pos = positions.new_empty(num_logits)
+     BLOCK_SIZE = 1024
++    if staging is None:
++        staging = (None, None, None, None, None)
++        lengths = (0, 0, 0)
++    else:
++        lengths = (staging[1].shape[0], staging[3].shape[0], staging[4].shape[0])
+     _gather_draft_sampled_kernel[(triton.cdiv(num_logits, BLOCK_SIZE),)](
+         draft_sampled,
+         pos,
+@@ -139,8 +189,11 @@
+         expanded_idx_mapping,
+         expanded_local_pos,
+         prefill_len,
++        *staging,
++        *lengths,
+         num_logits,
+         BLOCK_SIZE=BLOCK_SIZE,
++        STAGE_BLOCK=1024,
+     )
+     return draft_sampled, pos
+ 
+@@ -180,6 +233,51 @@
+         elif rejection_sample_method == "fly":
+             assert spec_config.fly_window_size is not None
+             self.fly_window_size = spec_config.fly_window_size
++        # [vllm-moet] Device-resident copies of the UVA sampling params and the
++        # per-request block counter of the fused resample tail. Allocated on the
++        # first call (the UVA tensors fix the sizes).
++        self.device = device
++        self._dev_temperature: torch.Tensor | None = None
++        self._dev_seeds: torch.Tensor | None = None
++        self._dev_prefill_len: torch.Tensor | None = None
++        self._resample_counter: torch.Tensor | None = None
++
++    def _staging_buffers(
++        self, temperature: torch.Tensor, seeds: torch.Tensor, prefill_len: torch.Tensor
++    ) -> tuple[torch.Tensor, ...]:
++        """[vllm-moet] (src, dst) pairs for _gather_draft_sampled_kernel's staging
++        of temperature / seeds / prefill_len from UVA into device memory. Each
++        buffer follows its own source's length (all are [max_num_reqs] today)."""
++        assert temperature.ndim == 1 and seeds.ndim == 1 and prefill_len.ndim == 1
++        if (
++            self._dev_temperature is None
++            or self._dev_temperature.shape[0] != temperature.shape[0]
++            or self._dev_seeds is None
++            or self._dev_seeds.shape[0] != seeds.shape[0]
++            or self._dev_prefill_len is None
++            or self._dev_prefill_len.shape[0] != prefill_len.shape[0]
++        ):
++            self._dev_temperature = torch.empty(
++                temperature.shape[0], dtype=temperature.dtype, device=self.device
++            )
++            self._dev_seeds = torch.empty(
++                seeds.shape[0], dtype=seeds.dtype, device=self.device
++            )
++            self._dev_prefill_len = torch.empty(
++                prefill_len.shape[0], dtype=prefill_len.dtype, device=self.device
++            )
++            self._resample_counter = torch.empty(
++                max(temperature.shape[0], seeds.shape[0], prefill_len.shape[0]),
++                dtype=torch.int32,
++                device=self.device,
++            )
++        return (
++            temperature,
++            self._dev_temperature,
++            seeds,
++            self._dev_seeds,
++            self._dev_prefill_len,
++        )
+ 
+     def _get_logprobs_tensors(
+         self,
+@@ -261,7 +359,16 @@
+         expanded_local_pos: torch.Tensor,
+         seq_lens_upper_bound_np: np.ndarray,
+         verify_draft_sampled: torch.Tensor,
+-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++        # [vllm-moet] [num_reqs] device seq_lens of the chunk: when given, the
++        # num_sampled / num_rejected finalization is fused into the resample
++        # kernel and (num_sampled_final, num_rejected) is returned (else None).
++        seq_lens: torch.Tensor | None = None,
++    ) -> tuple[
++        torch.Tensor,
++        torch.Tensor,
++        torch.Tensor,
++        tuple[torch.Tensor, torch.Tensor] | None,
++    ]:
+         processed_logits = self.sampler.apply_sampling_params(
+             logits,
+             expanded_idx_mapping,
+@@ -272,7 +379,16 @@
+             expanded_local_pos,
+             seq_lens_upper_bound_np,
+         )
+-        sampled, num_sampled = rejection_sample(
++        # [vllm-moet] The device copies staged by gather_draft_sampled replace
++        # sampling_states.temperature.gpu / seeds.gpu (UVA views of pinned host
++        # memory, which every CTA of the vocab-scan kernels would read over PCIe).
++        temperature = self._dev_temperature
++        seeds = self._dev_seeds
++        if temperature is None or seeds is None:
++            temperature = self.sampler.sampling_states.temperature.gpu
++            seeds = self.sampler.sampling_states.seeds.gpu
++        num_reqs = cu_num_logits.shape[0] - 1
++        out = rejection_sample(
+             processed_logits,
+             draft_logits,
+             verify_draft_sampled,
+@@ -281,8 +397,8 @@
+             idx_mapping,
+             expanded_idx_mapping,
+             expanded_local_pos,
+-            self.sampler.sampling_states.temperature.gpu,
+-            self.sampler.sampling_states.seeds.gpu,
++            temperature,
++            seeds,
+             self.num_speculative_steps,
+             self.synthetic_conditional_rates,
+             use_fp64=self.sampler.use_fp64_gumbel,
+@@ -290,15 +406,26 @@
+             fly_window_size=self.fly_window_size,
+             fly_entropy_threshold=self.fly_entropy_threshold,
+             fly_entropy_top_k=self.fly_entropy_top_k,
++            seq_lens=seq_lens,
++            prefill_len=self._dev_prefill_len if seq_lens is not None else None,
++            resample_counter=(
++                self._resample_counter[:num_reqs]
++                if self._resample_counter is not None
++                and self._resample_counter.shape[0] >= num_reqs
++                else None
++            ),
+             **self._watermarking_kwargs(
+                 draft_sampled, expanded_idx_mapping, expanded_local_pos
+             ),
+         )
++        sampled, num_sampled = out[0], out[1]
++        # (num_sampled_final, num_rejected) of _get_num_sampled_and_rejected, or None.
++        finalized = (out[2], out[3]) if len(out) > 2 else None
+         if self.sampler.trace_replay_state is not None:
+             self.sampler.trace_replay_state.apply_trace_to_verified(
+                 sampled, num_sampled, verify_draft_sampled, cu_num_logits, idx_mapping
+             )
+-        return processed_logits, sampled, num_sampled
++        return processed_logits, sampled, num_sampled, finalized
+ 
+     def _verify_in_chunks(
+         self,
+@@ -334,6 +461,8 @@
+ 
+         sampled_chunks: list[torch.Tensor] = []
+         num_sampled_chunks: list[torch.Tensor] = []
++        # [vllm-moet] per chunk (num_sampled_final, num_rejected) from the fused tail
++        finalized_chunks: list[tuple[torch.Tensor, torch.Tensor]] = []
+         logprobs_chunks: list[LogprobsTensors] = []
+         sampling_mask_chunks: list[SamplingMaskTensors] = []
+         max_num_kept = None
+@@ -343,6 +472,12 @@
+                     self.sampler.sampling_states.top_k.np[input_batch.idx_mapping_np]
+                 )
+             )
++        # [vllm-moet] Fuse the num_sampled / num_rejected finalization into the
++        # resample kernel unless a trace replay rewrites num_sampled afterwards.
++        fuse_num_rejected = (
++            self._dev_prefill_len is not None
++            and self.sampler.trace_replay_state is None
++        )
+ 
+         for start, end in request_chunks:
+             lo = int(cu_num_logits_np[start])
+@@ -350,7 +485,7 @@
+             chunk_cu_num_logits_np = cu_num_logits_np[start : end + 1] - lo
+             chunk_cu_num_logits = input_batch.cu_num_logits[start : end + 1] - lo
+             # draft_logits uses persistent request-state indices, not batch rows.
+-            processed_logits, sampled, num_sampled = self._verify(
++            processed_logits, sampled, num_sampled, finalized = self._verify(
+                 logits[lo:hi],
+                 draft_logits,
+                 draft_sampled[lo:hi],
+@@ -362,7 +497,10 @@
+                 input_batch.expanded_local_pos[lo:hi],
+                 input_batch.seq_lens_cpu_upper_bound.numpy()[start:end],
+                 verify_draft_sampled[lo:hi],
++                seq_lens=input_batch.seq_lens[start:end] if fuse_num_rejected else None,
+             )
++            if finalized is not None:
++                finalized_chunks.append(finalized)
+             chunk_logprobs = self._get_logprobs_tensors(
+                 sampled,
+                 num_sampled,
+@@ -387,6 +525,17 @@
+             sampled_chunks.append(sampled)
+             num_sampled_chunks.append(num_sampled)
+ 
++        # [vllm-moet] (num_sampled_final, num_rejected) when every chunk fused them.
++        finalized = None
++        if len(finalized_chunks) == len(sampled_chunks):
++            if len(finalized_chunks) == 1:
++                finalized = finalized_chunks[0]
++            else:
++                finalized = (
++                    torch.cat([f[0] for f in finalized_chunks]),
++                    torch.cat([f[1] for f in finalized_chunks]),
++                )
++
+         if len(sampled_chunks) == 1:
+             logprobs_tensors = logprobs_chunks[0] if logprobs_chunks else None
+             sampling_mask_tensors = (
+@@ -397,6 +546,7 @@
+                 num_sampled_chunks[0],
+                 logprobs_tensors,
+                 sampling_mask_tensors,
++                finalized,
+             )
+ 
+         logprobs_tensors = None
+@@ -416,7 +566,7 @@
+             if sampling_mask_chunks
+             else None
+         )
+-        return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors
++        return sampled, num_sampled, logprobs_tensors, sampling_mask_tensors, finalized
+ 
+     def __call__(
+         self,
+@@ -429,13 +579,22 @@
+         # that num_nans is computed before applying penalties and temperature.
+         num_nans = get_num_nans(logits) if self.sampler.compute_nans else None
+ 
++        # [vllm-moet] Also stage temperature / seeds / prefill_len (UVA, pinned
++        # host memory) into device buffers for the kernels below.
++        prefill_len = self.sampler.req_states.prefill_len.gpu
++        staging = self._staging_buffers(
++            self.sampler.sampling_states.temperature.gpu,
++            self.sampler.sampling_states.seeds.gpu,
++            prefill_len,
++        )
+         draft_sampled, pos = gather_draft_sampled(
+             input_batch.input_ids,
+             input_batch.positions,
+             input_batch.logits_indices,
+             input_batch.expanded_idx_mapping,
+             input_batch.expanded_local_pos,
+-            self.sampler.req_states.prefill_len.gpu,
++            prefill_len,
++            staging=staging,
+         )
+ 
+         # Marking a draft invalid (`is_valid_draft = draft_sampled >= 0`) pins the
+@@ -466,6 +625,7 @@
+             num_sampled,
+             logprobs_tensors,
+             sampling_mask_tensors,
++            finalized,
+         ) = self._verify_in_chunks(
+             logits,
+             input_batch,
+@@ -477,13 +637,20 @@
+             verify_draft_sampled,
+         )
+ 
+-        num_sampled, num_rejected = get_num_sampled_and_rejected(
+-            num_sampled,
+-            input_batch.seq_lens,
+-            input_batch.cu_num_logits,
+-            input_batch.idx_mapping,
+-            self.sampler.req_states.prefill_len.gpu,
+-        )
++        if finalized is not None:
++            # [vllm-moet] Finalized by the fused tail of _resample_kernel.
++            num_sampled, num_rejected = finalized
++        else:
++            num_sampled, num_rejected = get_num_sampled_and_rejected(
++                num_sampled,
++                input_batch.seq_lens,
++                input_batch.cu_num_logits,
++                input_batch.idx_mapping,
++                # [vllm-moet] device copy of prefill_len
++                self._dev_prefill_len
++                if self._dev_prefill_len is not None
++                else self.sampler.req_states.prefill_len.gpu,
++            )
+ 
+         return SamplerOutput(
+             sampled_token_ids=sampled,
+--- a/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py
+@@ -572,6 +572,9 @@
+     # [num_logits]
+     fly_entropy_ptr,
+     fly_entropy_threshold,
++    # [vllm-moet] [num_reqs] int32 arrival counter of _resample_kernel's vocab
++    # blocks (see _resample_kernel). Zeroed here, one kernel ahead of its use.
++    resample_counter_ptr,
+     vocab_num_blocks,
+     PADDED_VOCAB_NUM_BLOCKS: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+@@ -580,6 +583,8 @@
+     FLY_WINDOW_SIZE: tl.constexpr,
+ ):
+     req_idx = tl.program_id(0)
++    if resample_counter_ptr is not None:  # [vllm-moet]
++        tl.store(resample_counter_ptr + req_idx, 0)
+     req_state_idx = tl.load(idx_mapping_ptr + req_idx).to(tl.int64)
+     start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+     end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+@@ -820,50 +825,40 @@
+     )
+ 
+ 
+-@triton.jit(do_not_specialize=["watermark_key_0", "watermark_key_1"])
+-def _resample_kernel(
+-    # [num_reqs, num_blocks]
+-    resampled_local_argmax_ptr,
+-    resampled_local_argmax_stride,
+-    # [num_reqs, num_blocks]
+-    resampled_local_max_ptr,
+-    resampled_local_max_stride,
+-    # [num_logits, V]
++# [vllm-moet] The per-vocab-block body of _resample_kernel, unchanged, factored out
++# so the fused tail (FUSE_INSERT) and the stock path share one copy.
++@triton.jit
++def _resample_block(
+     target_logits_ptr,
+     target_logits_stride,
+-    # [num_reqs]
+     target_rejected_logsumexp_ptr,
+-    # [max_num_reqs, num_speculative_steps, V]
+     draft_logits_ptr,
+     draft_logits_stride_0,
+     draft_logits_stride_1,
+     draft_logits_row_mapping_ptr,
+-    # [num_reqs]
+     draft_rejected_logsumexp_ptr,
+-    # [num_reqs]
+-    rejected_step_ptr,
+-    # [num_reqs + 1]
+-    cu_num_logits_ptr,
+-    # [num_logits]
+     expanded_idx_mapping_ptr,
+-    # [num_logits]
+     draft_sampled_ptr,
+-    # [max_num_reqs]
+     temp_ptr,
+-    # [max_num_reqs]
+     seed_ptr,
+-    # [num_logits]
+     pos_ptr,
+-    # [num_logits]
+     cumulative_log_p_ptr,
+-    # [num_logits, CONTEXT_WIDTH]
+     contexts_ptr,
+     contexts_stride,
+-    # [max_num_reqs], uint8 view of a bool tensor
+     watermarking_ptr,
+     watermarking_skip_mask_ptr,
+     watermark_key_0,
+     watermark_key_1,
++    resampled_local_argmax_ptr,
++    resampled_local_argmax_stride,
++    resampled_local_max_ptr,
++    resampled_local_max_stride,
++    req_idx,
++    resample_idx,
++    resample_token_idx,
++    req_state_idx,
++    temp,
++    is_bonus,
+     vocab_size,
+     BLOCK_SIZE: tl.constexpr,
+     HAS_DRAFT_LOGITS: tl.constexpr,
+@@ -873,20 +868,6 @@
+     WATERMARK: tl.constexpr,
+     DEDUPLICATE_CONTEXTS: tl.constexpr,
+ ):
+-    req_idx = tl.program_id(0)
+-    resample_idx = tl.load(rejected_step_ptr + req_idx)
+-    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
+-    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
+-    resample_token_idx = start_idx + resample_idx
+-    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
+-
+-    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
+-    is_bonus = resample_token_idx == end_idx - 1
+-    if temp == 0.0 and not is_bonus:
+-        # Greedy + non-bonus token. No resampling needed because
+-        # the target argmax is already in the sampled tensor.
+-        return
+-
+     rejected_draft_token = tl.load(
+         draft_sampled_ptr + resample_token_idx + 1,
+         mask=not is_bonus,
+@@ -1039,6 +1020,242 @@
+     )
+ 
+ 
++@triton.jit(do_not_specialize=["watermark_key_0", "watermark_key_1"])
++def _resample_kernel(
++    # [num_reqs, num_blocks]
++    resampled_local_argmax_ptr,
++    resampled_local_argmax_stride,
++    # [num_reqs, num_blocks]
++    resampled_local_max_ptr,
++    resampled_local_max_stride,
++    # [num_logits, V]
++    target_logits_ptr,
++    target_logits_stride,
++    # [num_reqs]
++    target_rejected_logsumexp_ptr,
++    # [max_num_reqs, num_speculative_steps, V]
++    draft_logits_ptr,
++    draft_logits_stride_0,
++    draft_logits_stride_1,
++    draft_logits_row_mapping_ptr,
++    # [num_reqs]
++    draft_rejected_logsumexp_ptr,
++    # [num_reqs]
++    rejected_step_ptr,
++    # [num_reqs + 1]
++    cu_num_logits_ptr,
++    # [num_logits]
++    expanded_idx_mapping_ptr,
++    # [num_logits]
++    draft_sampled_ptr,
++    # [max_num_reqs]
++    temp_ptr,
++    # [max_num_reqs]
++    seed_ptr,
++    # [num_logits]
++    pos_ptr,
++    # [num_logits]
++    cumulative_log_p_ptr,
++    # [num_logits, CONTEXT_WIDTH]
++    contexts_ptr,
++    contexts_stride,
++    # [max_num_reqs], uint8 view of a bool tensor
++    watermarking_ptr,
++    watermarking_skip_mask_ptr,
++    watermark_key_0,
++    watermark_key_1,
++    # [vllm-moet] Fused tail (FUSE_INSERT): the last vocab block of a request to
++    # finish folds _insert_resampled_kernel (and, with FUSE_NUM_REJECTED,
++    # _get_num_sampled_and_rejected_kernel) into this launch.
++    # [num_reqs] int32, zeroed by _rejection_kernel
++    resample_counter_ptr,
++    # [num_reqs, num_speculative_steps + 1]
++    sampled_ptr,
++    sampled_stride,
++    # [num_reqs]
++    num_sampled_final_ptr,
++    # [num_reqs]
++    num_rejected_ptr,
++    # [num_reqs]
++    seq_lens_ptr,
++    # [num_reqs]
++    idx_mapping_ptr,
++    # [max_num_reqs]
++    prefill_len_ptr,
++    resample_num_blocks,
++    vocab_size,
++    BLOCK_SIZE: tl.constexpr,
++    HAS_DRAFT_LOGITS: tl.constexpr,
++    USE_FP64: tl.constexpr,
++    USE_BLOCK_VERIFICATION: tl.constexpr,
++    CONTEXT_WIDTH: tl.constexpr,
++    WATERMARK: tl.constexpr,
++    DEDUPLICATE_CONTEXTS: tl.constexpr,
++    FUSE_INSERT: tl.constexpr,
++    FUSE_NUM_REJECTED: tl.constexpr,
++    PADDED_RESAMPLE_NUM_BLOCKS: tl.constexpr,
++):
++    req_idx = tl.program_id(0)
++    resample_idx = tl.load(rejected_step_ptr + req_idx)
++    start_idx = tl.load(cu_num_logits_ptr + req_idx).to(tl.int64)
++    end_idx = tl.load(cu_num_logits_ptr + req_idx + 1)
++    resample_token_idx = start_idx + resample_idx
++    req_state_idx = tl.load(expanded_idx_mapping_ptr + resample_token_idx).to(tl.int64)
++
++    temp = tl.load(temp_ptr + req_state_idx).to(tl.float32)
++    is_bonus = resample_token_idx == end_idx - 1
++    # Greedy + non-bonus token. No resampling needed because the target argmax
++    # is already in the sampled tensor.
++    skip_resample = temp == 0.0 and not is_bonus
++    if FUSE_INSERT:
++        if not skip_resample:
++            _resample_block(
++                target_logits_ptr,
++                target_logits_stride,
++                target_rejected_logsumexp_ptr,
++                draft_logits_ptr,
++                draft_logits_stride_0,
++                draft_logits_stride_1,
++                draft_logits_row_mapping_ptr,
++                draft_rejected_logsumexp_ptr,
++                expanded_idx_mapping_ptr,
++                draft_sampled_ptr,
++                temp_ptr,
++                seed_ptr,
++                pos_ptr,
++                cumulative_log_p_ptr,
++                contexts_ptr,
++                contexts_stride,
++                watermarking_ptr,
++                watermarking_skip_mask_ptr,
++                watermark_key_0,
++                watermark_key_1,
++                resampled_local_argmax_ptr,
++                resampled_local_argmax_stride,
++                resampled_local_max_ptr,
++                resampled_local_max_stride,
++                req_idx,
++                resample_idx,
++                resample_token_idx,
++                req_state_idx,
++                temp,
++                is_bonus,
++                vocab_size,
++                BLOCK_SIZE,
++                HAS_DRAFT_LOGITS,
++                USE_FP64,
++                USE_BLOCK_VERIFICATION,
++                CONTEXT_WIDTH,
++                WATERMARK,
++                DEDUPLICATE_CONTEXTS,
++            )
++        if FUSE_NUM_REJECTED:
++            # Independent of the other blocks: issue these loads before the
++            # atomic so they are off the tail's dependent chain.
++            batch_req_state_idx = tl.load(idx_mapping_ptr + req_idx)
++            seq_len = tl.load(seq_lens_ptr + req_idx)
++            prefill_len = tl.load(prefill_len_ptr + batch_req_state_idx)
++        # Publish this block's partial result, then let the last block of the
++        # request finish the job. The release/acquire atomic orders the partial
++        # stores above before the counter; the tail reads them with volatile
++        # (L1-bypassing) loads.
++        arrived = tl.atomic_add(
++            resample_counter_ptr + req_idx, 1, sem="acq_rel", scope="gpu"
++        )
++        if arrived == resample_num_blocks - 1:
++            # === _insert_resampled_kernel ===
++            # Increment the number of sampled tokens.
++            num_sampled = resample_idx + 1
++            tl.store(rejected_step_ptr + req_idx, num_sampled)
++            if not skip_resample:
++                block = tl.arange(0, PADDED_RESAMPLE_NUM_BLOCKS)
++                mask = block < resample_num_blocks
++                resampled_local_max = tl.load(
++                    resampled_local_max_ptr
++                    + req_idx * resampled_local_max_stride
++                    + block,
++                    mask=mask,
++                    other=float("-inf"),
++                    volatile=True,
++                )
++                # NaN max values (from NaN target logits) make tl.argmax return
++                # an out-of-range block index (into the padded region), causing
++                # an OOB read of resampled_local_argmax. Map NaN to -inf so
++                # argmax stays in range.
++                resampled_local_max = tl.where(
++                    resampled_local_max != resampled_local_max,
++                    float("-inf"),
++                    resampled_local_max,
++                )
++                resampled_max_block_idx = tl.argmax(resampled_local_max, axis=0)
++                resampled = tl.load(
++                    resampled_local_argmax_ptr
++                    + req_idx * resampled_local_argmax_stride
++                    + resampled_max_block_idx,
++                    volatile=True,
++                )
++                tl.store(
++                    sampled_ptr + req_idx * sampled_stride + resample_idx,
++                    resampled,
++                )
++            if FUSE_NUM_REJECTED:
++                # === _get_num_sampled_and_rejected_kernel ===
++                # The finalized count goes to a separate tensor: the logprobs
++                # path still reads the pre-finalization num_sampled, as before.
++                is_chunked_prefilling = seq_len < prefill_len
++                num_sampled = tl.where(is_chunked_prefilling, 0, num_sampled)
++                tl.store(num_sampled_final_ptr + req_idx, num_sampled)
++                num_logits = end_idx - start_idx
++                num_rejected = num_logits - num_sampled
++                num_rejected = tl.where(is_chunked_prefilling, 0, num_rejected)
++                tl.store(num_rejected_ptr + req_idx, num_rejected)
++        return
++
++    if skip_resample:
++        return
++
++    _resample_block(
++        target_logits_ptr,
++        target_logits_stride,
++        target_rejected_logsumexp_ptr,
++        draft_logits_ptr,
++        draft_logits_stride_0,
++        draft_logits_stride_1,
++        draft_logits_row_mapping_ptr,
++        draft_rejected_logsumexp_ptr,
++        expanded_idx_mapping_ptr,
++        draft_sampled_ptr,
++        temp_ptr,
++        seed_ptr,
++        pos_ptr,
++        cumulative_log_p_ptr,
++        contexts_ptr,
++        contexts_stride,
++        watermarking_ptr,
++        watermarking_skip_mask_ptr,
++        watermark_key_0,
++        watermark_key_1,
++        resampled_local_argmax_ptr,
++        resampled_local_argmax_stride,
++        resampled_local_max_ptr,
++        resampled_local_max_stride,
++        req_idx,
++        resample_idx,
++        resample_token_idx,
++        req_state_idx,
++        temp,
++        is_bonus,
++        vocab_size,
++        BLOCK_SIZE,
++        HAS_DRAFT_LOGITS,
++        USE_FP64,
++        USE_BLOCK_VERIFICATION,
++        CONTEXT_WIDTH,
++        WATERMARK,
++        DEDUPLICATE_CONTEXTS,
++    )
++
++
+ @triton.jit
+ def _insert_resampled_kernel(
+     # [num_reqs, num_speculative_steps + 1]
+@@ -1138,13 +1355,33 @@
+     fly_window_size: int = 0,
+     fly_entropy_threshold: float = 0.3,
+     fly_entropy_top_k: int = 3,
+-) -> tuple[torch.Tensor, torch.Tensor]:
++    # [vllm-moet] Fusion controls. fuse_insert folds _insert_resampled_kernel
++    # into the last-arriving vocab block of _resample_kernel. With seq_lens
++    # ([num_reqs], device) and prefill_len ([max_num_reqs], DEVICE memory - not
++    # the UVA view) given, _get_num_sampled_and_rejected_kernel is folded in as
++    # well and a third tensor, num_rejected, is returned.
++    fuse_insert: bool = True,
++    seq_lens: torch.Tensor | None = None,
++    prefill_len: torch.Tensor | None = None,
++    resample_counter: torch.Tensor | None = None,
++) -> tuple[torch.Tensor, ...]:
+     assert target_logits.ndim == 2 and target_logits.stride(-1) == 1
+     draft_logits = None
+     draft_logits_row_mapping = None
+     if draft_logits_cache is not None:
+         draft_logits = draft_logits_cache.values
+         draft_logits_row_mapping = draft_logits_cache.row_mapping
++    fuse_num_rejected = seq_lens is not None  # [vllm-moet]
++    if fuse_num_rejected:
++        assert prefill_len is not None
++        fuse_insert = True
++    if fuse_insert and resample_counter is None:
++        # Zeroed by _rejection_kernel before _resample_kernel reads it.
++        resample_counter = torch.empty(
++            cu_num_logits.shape[0] - 1, dtype=torch.int32, device=target_logits.device
++        )
++    elif not fuse_insert:
++        resample_counter = None
+     assert draft_logits is None or (
+         draft_logits.ndim == 3 and draft_logits.stride(-1) == 1
+     )
+@@ -1368,6 +1605,7 @@
+         local_residual_mass.stride(0) if local_residual_mass is not None else 0,
+         fly_entropy,
+         fly_entropy_threshold,
++        resample_counter,  # [vllm-moet]
+         vocab_num_blocks,
+         PADDED_VOCAB_NUM_BLOCKS=padded_vocab_num_blocks,
+         HAS_DRAFT_LOGITS=has_draft_logits,
+@@ -1389,6 +1627,11 @@
+         resample_num_blocks,
+         dtype=torch.float64 if use_fp64 else torch.float32,
+     )
++    num_rejected = None  # [vllm-moet]
++    num_sampled_final = None
++    if fuse_num_rejected:
++        num_rejected = torch.empty_like(num_sampled)
++        num_sampled_final = torch.empty_like(num_sampled)
+     _resample_kernel[(num_reqs, resample_num_blocks)](
+         resampled_local_argmax,
+         resampled_local_argmax.stride(0),
+@@ -1416,6 +1659,16 @@
+         watermarking_skip_mask_bytes,
+         watermark_key_0,
+         watermark_key_1,
++        # [vllm-moet] fused tail
++        resample_counter,
++        sampled,
++        sampled.stride(0),
++        num_sampled_final,
++        num_rejected,
++        seq_lens,
++        idx_mapping,
++        prefill_len,
++        resample_num_blocks,
+         vocab_size,
+         BLOCK_SIZE=RESAMPLE_BLOCK_SIZE,
+         HAS_DRAFT_LOGITS=has_draft_logits,
+@@ -1424,7 +1677,14 @@
+         CONTEXT_WIDTH=context_width,
+         WATERMARK=watermark,
+         DEDUPLICATE_CONTEXTS=watermarking_skip_mask is not None,
++        FUSE_INSERT=fuse_insert,
++        FUSE_NUM_REJECTED=fuse_num_rejected,
++        PADDED_RESAMPLE_NUM_BLOCKS=padded_resample_num_blocks,
+     )
++    if fuse_insert:  # [vllm-moet]
++        if fuse_num_rejected:
++            return sampled, num_sampled, num_sampled_final, num_rejected
++        return sampled, num_sampled
+ 
+     # Insert the resampled tokens into the output sampled.
+     _insert_resampled_kernel[(num_reqs,)](

@@ -31,3 +31,39 @@ IMAGE=vllm-moet-b300:k3-v0.32.0-r5 MODEL_DIR=/data/models/Kimi-K3 CACHE_DIR=/dat
   SPEC_TOKENS=5 DRAFT_DIR=/data/models/Kimi-K3-speculator-redhat DRAFT_ATTENTION_BACKEND="" \
   MAX_CUDAGRAPH_CAPTURE_SIZE=768 USE_RECOVERSSM=1 docker/b300/run-k3.sh
 ```
+
+## Kimi-K3.1-Pro (`Dockerfile.b300-k31`)
+
+The K3.1 image is `vllm/vllm-openai:kimi-k31` plus three steps, each described in the Dockerfile header. The K3
+patchers above do not apply to it: their fixes are upstream in that line.
+
+| file | role |
+|---|---|
+| `patch_vllm_k31_experts_grid.py` | step 1: idempotent, anchored patcher for the specialized decode's persistent routed-experts kernel. Its grid table is sized for 152 SMs and the path refuses to start on a 148-SM B300; the patch caps the table at the device's SM count. `--check` verifies without writing. |
+| `k31/r2.patch` | step 2 (build arg `VLLM_MOET_K31_R2_PATCH`, images `-r2` and later): the DSpark drafter and the MoE tail of the specialized path, ten files, one of them new. |
+| `k31/r3.patch` | step 3 (build arg `VLLM_MOET_K31_R3_PATCH`, images `-r3`): the Markov head sharded across the TP ranks and the sampler chain, eight files; cut against the files step 2 leaves, so it needs step 2. |
+| `apply_file_patches.py` | applies a file patch set: unified diffs under a manifest with the sha256 of every file before and after. A file whose hash is neither of the two stops the build instead of being patched approximately; hunks apply without fuzz; nothing is written unless the whole set applies and every result has the recorded hash; a second run changes nothing; `--check` verifies without writing. |
+| `make_file_patches.py` | cuts a set from two directory trees with the same relative paths (`vllm/` copied out of an image before and after a change) and emits it only when the applier reproduces the second tree from the first, byte for byte. |
+
+Runtime switches of steps 2 and 3. They are read from the server's environment at start (through the launcher:
+`EXTRA_DOCKER_ARGS="-e NAME=0"`), default to on, and `=0` runs the stock code of that part:
+
+| switch | step | default | `=0` |
+|---|---|---|---|
+| `VLLM_MOET_DRAFT_SWIGLU` | 2 | the gate_up GEMM of the drafter's MLP with a SwiGLU epilogue, one launch per layer | the stock GEMM + `SiluAndMul` |
+| `VLLM_MOET_DRAFT_CONTEXT_KV` | 2 | the drafter's context KV (grouped norm, RoPE, FP8 quantization, paged insert) in one launch | the stock chain of six launches |
+| `VLLM_MOET_MARKOV_SHARD` | 3 | the vocab-sharded Markov step wherever its conditions hold (a drafter mailbox, BF16 draft logits, FP32 Gumbel keys, the lm_head layout it expects); the server log names the reason otherwise | step 2's replicated kernel |
+| `VLLM_MOET_FUSED_PREP` | 3 | positions, sequence lengths, input ids and logits indices of a step in one launch | the two stock launches |
+
+The rest of the two sets has no switch (the causal draft block on the DCP drafter attention, the schedule of the
+Markov step, the 3-4-row MoE tail, the sampler's device-side parameters and its fused resample tail); a build with
+`--build-arg VLLM_MOET_K31_R3_PATCH=0`, and `VLLM_MOET_K31_R2_PATCH=0` as well, leaves them out. The image's
+`com.vllm-moet.k31.r2` / `.r3` labels say which sets it carries.
+
+```bash
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r3 .
+python3 -m unittest bench/tests/test_file_patches.py     # applier, maker, the two sets against the Dockerfile (CPU)
+# a further set: vllm/ copied out of the image before and after the change (docker cp), then
+python3 tools/k3_b300/make_file_patches.py --name k31-r4 --before before/ --after after/ \
+  --out tools/k3_b300/k31/r4.patch
+```

@@ -1,0 +1,1770 @@
+# vllm-moet file patch set: k31-r2
+# cut against vllm/vllm-openai:kimi-k31 (vLLM 0.1.dev24216+g266e88c05) after step 1 of Dockerfile.b300-k31
+# sha256 d9511ba5bd3eca66edfa99eed8ca387c8342be6261b38839a836b933ced7841d 4a819f8c779b755142d6e416dcef2ad94113eeef7d0d3ee3eecba00c50a5469b vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/warp_splitk.py
+# sha256 178da94ddc642c13f10983222c0ea3cb988439fa552762fa44968143c4c27af3 51b87438ec6c5e07970e9d7a83ac405ebeef098bc9af118343a623560bd32420 vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py
+# sha256 2483acf55ea9da45db7d598882bc4cdfb147f18ffd728fe769617db50b07c3ba 6142964a7b469b0bdce0d8be56eccd12483ba47b8a4f261384622739511d7678 vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py
+# sha256 8387cd2a461a1caa344767ab561f551757f9606505afa6c7181c56bd4ee50183 3153b4fdb06e35bd57262c7e0b9cada8c0a9a5617a14400c15ce3e26d6e5f91c vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py
+# sha256 2da5ca86db82e192c897b325ef6ba13a9d5876ca614292591dd269f198f6eff6 4c8319b8a4d189f2df22aa7e908bedacb5b79ff56dba6983ce917ee727ff30c6 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/attention.py
+# sha256 - 9cde77de4675704829165e7d94da6ba560a652181c3216641a2561dda2f691df vllm/models/kimi_k3/nvidia/specialized_decode/drafter/context_kv.py
+# sha256 ffb879f98ab24c306bdb1fa89c0a2744da3e8d5506029a35cd67c25ad11a8cd3 dac6641deb45a54f0c39daa0e93023b2bdaa39cb72b4d943f243df91406fc326 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/linears.py
+# sha256 f30cb3ea6aedb417514c3de7eaf7651369c5c7a5ec3175e6839e4d7d972d0ae9 bfa768f2283906816f8deea38bf482284e084b47e467c73e412a012e602d3158 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/markov.py
+# sha256 58d08357d2d70861655cdab2d98d34454592f4fb721abf05f7d0bb915f804f80 50b2889ece3888c1e28e4a79b8aaad41d87b7bf505a8c451fb95b192b15b6245 vllm/models/kimi_k3/nvidia/specialized_decode/drafter/model.py
+# sha256 ecdbefa0deaca98a9e19e56290bc4afb1e7768c5fed6134bf87f9b0c8618022f 2996171f019442e9a9076986c074e56b7a514830f7fc877823cd4c86806eb31e vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/warp_splitk.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/gemm/warp_splitk.py
+@@ -240,8 +240,52 @@
+     )
+ 
+ 
++# [vllm-moet] SwiGLU epilogue (``swiglu``): the weight's rows are interleaved in
++# groups of SWIGLU_GROUP (gate rows 8b..8b+7, then up rows 8b..8b+7, ...; see
++# swiglu_permute), so within one output tile the lane holding feature f and the
++# lane holding feature f + 8 of the same token hold a (gate, up) pair, whatever the
++# output tile (16 or 32). The gate lane writes silu(g) * u into an [M, N / 2]
++# output, as vLLM's SiluAndMul does from the BF16 GEMM output: g and u rounded to
++# BF16, silu(g) = g / (1 + exp(-g)) in FP32 rounded to BF16, the product rounded
++# to BF16. Everything before the epilogue is the unchanged kernel.
++SWIGLU_GROUP = 8
++
++
++def swiglu_permute(weight):
++    """The [2 * I, K] gate_up weight (gate rows, then up rows) in the row order the
++    ``swiglu`` epilogue reads: groups of SWIGLU_GROUP gate rows alternating with
++    the matching up rows. A copy; ``I`` must be a multiple of SWIGLU_GROUP."""
++    n, k = weight.shape
++    inter = n // 2
++    assert n % (2 * SWIGLU_GROUP) == 0, weight.shape
++    return (
++        weight.view(2, inter // SWIGLU_GROUP, SWIGLU_GROUP, k)
++        .permute(1, 0, 2, 3)
++        .reshape(n, k)
++        .contiguous()
++    )
++
++
++def swiglu_unpermute_columns(gate_up):
++    """The columns of a GEMM output computed with a ``swiglu_permute``d weight back
++    in the stock [gate | up] order (a copy): the stock SiluAndMul can follow."""
++    m, n = gate_up.shape
++    inter = n // 2
++    return (
++        gate_up.view(m, inter // SWIGLU_GROUP, 2, SWIGLU_GROUP)
++        .permute(0, 2, 1, 3)
++        .reshape(m, n)
++    )
++
++
+ class CpAsyncWarpSplitKKernel:
+-    def __init__(self, tactic: WarpSplitKTactic, use_pdl: bool, has_bias: bool) -> None:
++    def __init__(
++        self,
++        tactic: WarpSplitKTactic,
++        use_pdl: bool,
++        has_bias: bool,
++        swiglu: bool = False,  # [vllm-moet]
++    ) -> None:
+         self.output_tile = tactic.output_tile
+         self.token_tile = tactic.token_tile
+         self.k_tile = tactic.k_tile
+@@ -252,6 +296,8 @@
+         self.load_threads = self.compute_warp_base * 32
+         self.use_pdl = use_pdl
+         self.has_bias = has_bias
++        self.swiglu = swiglu
++        assert not swiglu or self.output_tile % (2 * SWIGLU_GROUP) == 0
+         self.smem_bytes = _smem_bytes(tactic)
+ 
+     @cute.experimental.jit
+@@ -570,14 +616,46 @@
+ 
+             output_base = output_tile_idx * self.output_tile
+             token_base = token_tile_idx * self.token_tile
+-            for value in cutlass.range_constexpr(values_per_lane):
+-                linear = value * cute.arch.WARP_SIZE + lane_idx
+-                feature = linear % self.output_tile
+-                token = linear // self.output_tile
+-                if token_base + token < cute.size(output, mode=[0]):
+-                    output[token_base + token, output_base + feature] = final_acc[
+-                        value
+-                    ].to(output.element_type)
++            if const_expr(self.swiglu):
++                # [vllm-moet] see SWIGLU_GROUP: lane (feature f) pairs with lane + 8
++                # (feature f + 8, the same token: 8 divides the output tile); the
++                # gate lanes (f % 16 < 8) write silu(g) * u to column
++                # tile * N/2-stride + (f // 16) * 8 + f % 16 of the [M, N / 2] output.
++                half_base = output_tile_idx * (self.output_tile // 2)
++                for value in cutlass.range_constexpr(values_per_lane):
++                    linear = value * cute.arch.WARP_SIZE + lane_idx
++                    feature = linear % self.output_tile
++                    token = linear // self.output_tile
++                    gate_acc = final_acc[value]
++                    up_acc = cute.arch.shuffle_sync_down(gate_acc, SWIGLU_GROUP)
++                    is_gate = feature % (2 * SWIGLU_GROUP) < SWIGLU_GROUP
++                    if is_gate & (token_base + token < cute.size(output, mode=[0])):
++                        g = cutlass.Float32(cutlass.BFloat16(gate_acc))
++                        u = cutlass.Float32(cutlass.BFloat16(up_acc))
++                        denominator = cutlass.Float32(1) + cute.math.exp(
++                            -g, fastmath=False
++                        )
++                        silu = cute.math.div(
++                            g, denominator, rounding=cute.math.RoundingMode.NEAREST_EVEN
++                        )
++                        silu = cutlass.Float32(cutlass.BFloat16(silu))
++                        column = (
++                            half_base
++                            + (feature // (2 * SWIGLU_GROUP)) * SWIGLU_GROUP
++                            + feature % (2 * SWIGLU_GROUP)
++                        )
++                        output[token_base + token, column] = (silu * u).to(
++                            output.element_type
++                        )
++            else:
++                for value in cutlass.range_constexpr(values_per_lane):
++                    linear = value * cute.arch.WARP_SIZE + lane_idx
++                    feature = linear % self.output_tile
++                    token = linear // self.output_tile
++                    if token_base + token < cute.size(output, mode=[0]):
++                        output[token_base + token, output_base + feature] = final_acc[
++                            value
++                        ].to(output.element_type)
+ 
+ 
+ def _view(tensor, *, dynamic_m=False):
+@@ -609,37 +687,43 @@
+ 
+ 
+ @functools.cache
+-def compile_warp_splitk(device_index: int, n: int, k: int, tactic: WarpSplitKTactic):
+-    """Code for an [n, k] weight with dynamic M (at most 32 rows), PDL on."""
++def compile_warp_splitk(
++    device_index: int, n: int, k: int, tactic: WarpSplitKTactic, swiglu: bool = False
++):
++    """Code for an [n, k] weight with dynamic M (at most 32 rows), PDL on.
++    [vllm-moet] ``swiglu``: the SwiGLU epilogue into an [M, n / 2] output."""
+     check_tactic(tactic, n, k)
+     dtype = _torch.bfloat16
+     with _torch.cuda.device(device_index):
+         shapes = (((n, k), False), ((_MAX_M, k), True), ((n,), False))
+-        shapes += (((_MAX_M, n), True),)
++        shapes += (((_MAX_M, n // 2 if swiglu else n), True),)
+         args = tuple(
+             _view(_torch.empty(s, device="cuda", dtype=dtype), dynamic_m=d)
+             for s, d in shapes
+         )
+         stream = _cuda.CUstream(_torch.cuda.current_stream().cuda_stream)
+         return cute_ext.compile(
+-            CpAsyncWarpSplitKKernel(tactic, True, False), *args, stream
++            CpAsyncWarpSplitKKernel(tactic, True, False, swiglu), *args, stream
+         )
+ 
+ 
+ class PreparedWarpSplitK:
+     """``out[M, N] = x[M, K] @ weight[N, K]^T`` for M <= 32 with a tactic per M;
+-    ``x`` and ``out`` packed row-major, 32 B aligned."""
++    ``x`` and ``out`` packed row-major, 32 B aligned. [vllm-moet] ``swiglu``: the
++    weight is a ``swiglu_permute``d gate_up weight and ``out`` is [M, N / 2] =
++    silu(gate) * up (SWIGLU_GROUP)."""
+ 
+-    def __init__(self, weight, tactics):
++    def __init__(self, weight, tactics, swiglu: bool = False):
+         n, k = weight.shape
+         if weight.dtype != _torch.bfloat16 or weight.stride() != (k, 1):
+             raise ValueError("warp split-K weights are packed BF16 [N, K]")
+         if weight.data_ptr() % 32 or any(m > _MAX_M for m in tactics):
+             raise ValueError("warp split-K: 32 B aligned weight, M <= 32")
+-        self.weight, self.tactics = weight, dict(tactics)
++        self.weight, self.tactics, self.swiglu = weight, dict(tactics), swiglu
+         index = weight.device.index
+         self.codes = {
+-            m: compile_warp_splitk(index, n, k, t) for m, t in self.tactics.items()
++            m: compile_warp_splitk(index, n, k, t, swiglu)
++            for m, t in self.tactics.items()
+         }
+         self.weight_view = _view(weight)
+ 
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/experts_runtime.py
+@@ -161,7 +161,12 @@
+         self.weights = (w13, s13, w2, s2)
+         # TP8: B3-4 on 148 CTAs; B5-8 publish on 128-136 CTAs, leaving SMs for the
+         # one-wave tail; grouped B9-64 on 152.
+-        grids = "3-4:148,5-6:128,7:132,9-64:152" if self.tp == 8 else ""
++        # [vllm-moet] B3-4 publish too (tail_runtime.published): 128 CTAs as B5-6, so
++        # 20 SMs take WaveMoeTail CTAs (and the shared expert's kernels, which now run
++        # beside the experts: PreparedMoE.run's ``before`` is False) while the experts
++        # drain. Isolated B4 D48 experts: 148 CTAs 20.9 us, 128 CTAs 20.7 us
++        # (the grid is a non-knob at B4).
++        grids = "3-4:128,5-6:128,7:132,9-64:152" if self.tp == 8 else ""
+         grids += f",65-{WIDE_ROWS}:152"  # wide: every SM
+         self.grids = batch_table(grids)
+         # [vllm-moet] the persistent grid capped at the device's SM count (GB300: 152, B300: 148)
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/front.py
+@@ -366,7 +366,10 @@
+ # the shared expert's split-K gate/up GEMM has taken its SMs, so the early experts
+ # do not starve it. GB300 TP8 K3.1 DSpark k=4 step, ms: DCP8 R1 136K 9.465 -> 9.371,
+ # TP8 R1 32K 8.858 -> 8.794.
+-EARLY_ROUTE = {8: "5-8:1", 16: ""}
++# [vllm-moet] B3-4 as B5-8 (tail_runtime.published covers them): the routing kernel
++# releases the experts at entry, the shared expert runs on the urgent stream and the
++# published tail Lamport-polls its RS rows instead of joining the side stream.
++EARLY_ROUTE = {8: "3-8:1", 16: ""}
+ # Split batches whose front GEMM rows join the gate/up kernel as extra M-tiles (one
+ # kernel instead of two that slow each other ~2x side by side).
+ MERGED = {8: "41-64:1", 16: "33-64:1"}
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/cutedsl/moe/tail_runtime.py
+@@ -50,7 +50,14 @@
+ def published(tp, batch):
+     """The experts publish the latent and WaveMoeTail runs the tail (else MoeTail
+     front)."""
+-    return batch > (4 if tp == 8 else 8)
++    # [vllm-moet] TP8: B3-4 published as well (B5-8's path: the experts' epilogue
++    # multicasts the finalized latent partial, WaveMoeTail polls it at entry instead
++    # of draining the whole experts grid at a PDL wait and re-reading gemm2, and the
++    # EARLY table releases the next AttnRes at entry). The experts grid for B3-4 drops
++    # to 128 (experts_runtime.PersistentExperts.grids) like B5-6 so the 112-CTA
++    # one-wave tail finds SMs while the experts drain. B1 stays on the small-batch
++    # chain, B2 on MoeTail front (its experts engine differs: not streamed/paired).
++    return batch > (2 if tp == 8 else 8)
+ 
+ 
+ def twoshot_batches(tp):
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/attention.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/attention.py
+@@ -24,6 +24,18 @@
+ The output ``[R, 1, k * H, L]`` and LSE ``[R, k * H]`` are the stock
+ ``[R * k, H, L]`` / ``[R * k, H]`` in the same memory order (token-major,
+ then head), so the DCP combine and the ``W_UV`` up-projection are unchanged.
++
++[vllm-moet] Causal draft blocks. A DSpark checkpoint whose ``dflash_config.causal``
++is true (Kimi-K3.1-Pro-DSpark-preview: ``"dflash_config": {"causal": true}``)
++drafts a *causal* block: token ``i`` of the block attends to the context and to
++block tokens ``0 .. i``. The speculator then builds causal metadata
++(``DFlashSpeculator.requires_non_causal`` is False, so ``_group_causal`` is True
++and ``MLACommonMetadataBuilder.build`` sets ``causal=True``), ``foldable`` is 0 by
++design (folding tokens into heads would drop the in-block mask) and the stock
++``FlashInferMLAImpl.forward_mqa`` runs its uniform DCP branch, ``q.view(R, k, H, D)``
++on the cute-dsl kernel with ``causal_seqlens_kv_global``. ``DraftDcp`` serves that
++block too (``causal_block`` / ``causal_decode``): the same kernel call on the
++mailbox-gathered query, then ``DcpValue``; only the transport changes.
+ """
+ 
+ import functools
+@@ -121,6 +133,87 @@
+     if getattr(decode, "max_query_len", k) != k:
+         return 0
+     return k
++
++
++def causal_block(attn_metadata, num_rows: int) -> int:
++    """[vllm-moet] Query tokens per request when the decode batch is a uniform
++    *causal* block, else 0.
++
++    The condition is the stock FlashInfer MLA DCP decode's own (flashinfer_mla.py,
++    ``forward_mqa``: causal metadata, decode rows only, ``num_decode_tokens ==
++    num_decodes * decode.max_query_len`` -> ``q.view(num_decodes, -1, H, D)``), so
++    every batch this accepts is one the stock path runs as a uniform block, with
++    the same per-token causal bound inside the kernel. A ragged block (adaptive
++    drafting) returns 0: the stock path flattens it per token and does not return
++    an LSE row per request there, so it keeps the stock collectives."""
++    if not getattr(attn_metadata, "causal", True):
++        return 0
++    decode = attn_metadata.decode
++    if decode is None:
++        return 0
++    num_reqs = attn_metadata.num_decodes
++    if num_reqs <= 0 or num_rows != attn_metadata.num_decode_tokens:
++        return 0
++    k = getattr(decode, "max_query_len", 1)
++    if k < 1 or num_rows != num_reqs * k or decode.block_table.shape[0] < num_reqs:
++        return 0
++    return k
++
++
++def causal_decode(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    max_seq_len: int,
++    tokens_per_request: int,
++    *,
++    kv_lora_rank: int,
++    qk_nope_head_dim: int,
++    qk_rope_head_dim: int,
++    bmm1_scale: float,
++    bmm2_scale: float,
++    workspace: torch.Tensor,
++    dcp_world_size: int,
++    dcp_rank: int,
++    dcp_tot_seq_lens: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """[vllm-moet] The stock ``FlashInferMLAImpl.forward_mqa`` DCP decode of a
++    uniform causal block of ``R`` requests x ``k`` query tokens, on a caller-owned
++    query (the DCP q mailbox). Argument for argument the stock call: the query as
++    ``[R, k, heads, 576]`` (``q`` is ``[R * k, heads, 576]`` token-major, the same
++    bytes), the per-request block table / local lengths, ``enable_dcp`` with the
++    global lengths as ``causal_seqlens_kv_global`` (the kernel bounds token ``i``
++    of a block at ``tot - (k - 1 - i)`` in global positions), the cute-dsl backend
++    (the only one that returns the LSE under DCP) and the stock bmm scales.
++    Returns ``[R * k, heads, kv_lora_rank]`` BF16 and ``[R * k, heads]`` FP32 LSE
++    (natural log, as the stock), the stock rows in the stock order."""
++    from flashinfer.decode import trtllm_batch_decode_with_kv_cache_mla
++
++    rows, heads, dim = q.shape
++    k = tokens_per_request
++    num_reqs = rows // k
++    assert num_reqs * k == rows, (rows, k)
++    out, lse = trtllm_batch_decode_with_kv_cache_mla(
++        query=q.view(num_reqs, k, heads, dim),
++        kv_cache=kv_cache.unsqueeze(1),
++        workspace_buffer=workspace,
++        qk_nope_head_dim=qk_nope_head_dim,
++        kv_lora_rank=kv_lora_rank,
++        qk_rope_head_dim=qk_rope_head_dim,
++        block_tables=block_table,
++        seq_lens=seq_lens,
++        max_seq_len=max_seq_len,
++        bmm1_scale=bmm1_scale,
++        bmm2_scale=bmm2_scale,
++        return_lse=True,
++        enable_dcp=True,
++        cp_world=dcp_world_size,
++        cp_rank=dcp_rank,
++        causal_seqlens_kv_global=dcp_tot_seq_lens,
++        backend="cute-dsl",
++    )
++    return out.view(rows, heads, out.shape[-1]), lse.view(rows, heads)
+ 
+ 
+ def _counter_buffer(max_reqs: int, num_heads: int, device: torch.device):
+@@ -662,7 +755,10 @@
+                  (``comm.Gather``, in place) and polls until all landed
+       decode     the stock folded draft decode (``folded_decode``: the k tokens of a
+                  request folded into heads, every DCP*H head over the local KV
+-                 shard, rank-local BF16 rows + LSE), reading the mailbox
++                 shard, rank-local BF16 rows + LSE), reading the mailbox; for a
++                 causal block ([vllm-moet] ``causal_block``) the stock uniform
++                 causal DCP decode instead (``causal_decode``: ``[R, k, DCP*H, 576]``
++                 on the same cute-dsl kernel), reading the mailbox
+       value      ``mla.dcp.DcpValue``: re-arms the q mailbox, pushes each row to its
+                  head owner, the owner merges its H heads over the DCP sources
+                  (exp2(lse - max) / sum in FP32, one BF16 rounding, as the stock
+@@ -742,13 +838,24 @@
+         if metadata.num_decode_tokens != n or not 1 <= n <= self.cap or n > rows:
+             return None
+         k = foldable(metadata, n)
++        # [vllm-moet] A causal draft block (the served checkpoint's
++        # dflash_config.causal) is never foldable; it runs the stock uniform causal
++        # DCP decode on the mailbox query instead (causal_decode).
++        causal = False
++        if k == 0:
++            k = causal_block(metadata, n)
++            causal = k > 0
+         if k == 0 or metadata.decode.dcp_tot_seq_lens is None:
+             return None
+         if torch.cuda.is_current_stream_capturing() and (n, k) not in self.values:
+             return None  # compiled at the eager warmup of every captured size
+-        return self._forward(attn, positions, hidden, metadata, context, n, k, parity)
++        return self._forward(
++            attn, positions, hidden, metadata, context, n, k, parity, causal
++        )
+ 
+-    def _forward(self, attn, positions, hidden, metadata, context, n, k, parity):
++    def _forward(
++        self, attn, positions, hidden, metadata, context, n, k, parity, causal=False
++    ):
+         from vllm.models.common.ops import fused_q_kv_rmsnorm
+ 
+         from ..cutedsl.common.host import stream, to_cute
+@@ -802,25 +909,45 @@
+         bmm1, bmm2 = _scales(impl, attn)
+         from vllm.v1.attention.backends.mla.flashinfer_mla import _get_workspace_buffer
+ 
+-        o, lse = folded_decode(
+-            query,
+-            attn._attn_read_kv_cache(),
+-            decode.block_table,
+-            decode.seq_lens,
+-            metadata.max_seq_len,
+-            k,
+-            kv_lora_rank=attn.kv_lora_rank,
+-            qk_nope_head_dim=attn.qk_nope_head_dim,
+-            qk_rope_head_dim=attn.qk_rope_head_dim,
+-            bmm1_scale=bmm1,
+-            bmm2_scale=bmm2,
+-            workspace=_get_workspace_buffer(True),
+-            return_lse=True,
+-            dcp_world_size=self.size,
+-            dcp_rank=self.rank,
+-            dcp_tot_seq_lens=decode.dcp_tot_seq_lens,
+-            table_cache=decode.__dict__.setdefault("_draft_fold_tables", {}),
+-        )
++        if causal:
++            # [vllm-moet] the stock uniform causal DCP decode, on the mailbox query
++            o, lse = causal_decode(
++                query,
++                attn._attn_read_kv_cache(),
++                decode.block_table,
++                decode.seq_lens,
++                metadata.max_seq_len,
++                k,
++                kv_lora_rank=attn.kv_lora_rank,
++                qk_nope_head_dim=attn.qk_nope_head_dim,
++                qk_rope_head_dim=attn.qk_rope_head_dim,
++                bmm1_scale=bmm1,
++                bmm2_scale=bmm2,
++                workspace=_get_workspace_buffer(True),
++                dcp_world_size=self.size,
++                dcp_rank=self.rank,
++                dcp_tot_seq_lens=decode.dcp_tot_seq_lens,
++            )
++        else:
++            o, lse = folded_decode(
++                query,
++                attn._attn_read_kv_cache(),
++                decode.block_table,
++                decode.seq_lens,
++                metadata.max_seq_len,
++                k,
++                kv_lora_rank=attn.kv_lora_rank,
++                qk_nope_head_dim=attn.qk_nope_head_dim,
++                qk_rope_head_dim=attn.qk_rope_head_dim,
++                bmm1_scale=bmm1,
++                bmm2_scale=bmm2,
++                workspace=_get_workspace_buffer(True),
++                return_lse=True,
++                dcp_world_size=self.size,
++                dcp_rank=self.rank,
++                dcp_tot_seq_lens=decode.dcp_tot_seq_lens,
++                table_cache=decode.__dict__.setdefault("_draft_fold_tables", {}),
++            )
+         reqs = n // k
+         w_uv = self.uv[id(attn)]
+         value = self.value(n, k, w_uv)
+--- /dev/null
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/context_kv.py
+@@ -0,0 +1,224 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# [vllm-moet] new file
++"""The DSpark drafter's context-KV insert in one launch.
++
++``K3DSparkModel._precompute_fused_context_kv`` (dspark_mla.py) follows the
++``context_kv_proj`` GEMM ([R * (k + 1), 5 * 576] BF16, every draft layer's
++``kv_a_proj_with_mqa`` stacked) with six launches per step on the step's critical
++path (trace of 2026-11-05, offsets 187.9-200.6 us: 12.7 us for 4 rows x 5 layers):
++
++  permute(1, 0, 2).contiguous() of the latents          at::native elementwise 2.9 us
++  grouped kv_a_layernorm (ops.rms_norm, 2-D weights)    rms_norm 2.7
++  permute(1, 0, 2).contiguous() of k_pe                 elementwise 2.5
++  positions repeated per layer (copy_)                  elementwise 1.8
++  RoPE of k_pe (ops.rotary_embedding, interleaved)      rotary_embedding 1.8
++  FP8 quantization + paged insert of every layer        concat_and_cache_mla_grouped 1.5
++
++``store_context_kv`` does the same work in one Triton launch, one program per
++(layer, context token), reading the GEMM output in place ([R', 5, 576]: no
++permutes, no repeated positions): RMSNorm of the 512 latents with layer ``l``'s
++``kv_a_layernorm`` weight (FP32 sum of squares, ``rsqrt(var + eps)``,
++``x * rstd * w`` rounded once to BF16: the grouped ``rms_norm`` op's order), RoPE
++of the 64 ``k_pe`` values from the FP32 cos/sin table at the token's position
++(interleaved pairs, ``x cos - y sin`` / ``y cos + x sin`` in FP32, rounded to
++BF16: ``rotary_embedding`` non-neox), then ``fp8(x / k_scale[l])`` (IEEE division,
++saturating E4M3: ``scaled_convert``) of the 576 bytes into layer ``l``'s paged
++cache at ``slot_mapping[l, t]`` (``PAD_SLOT_ID`` < 0 skips the row). Everything
++else (which rows, which slots, the GEMM) is unchanged.
++
++Precision: bit-identical cache bytes to the stock chain with random data at the
++real shapes (every stage was bisected against its vLLM op); GPU time 10.5 ->
++2.2 us per step under a graph.
++
++Served when every draft layer's cache is a plain per-tensor FP8 one ("fp8" /
++"fp8_e4m3": ``_context_kv_scales`` set) with one block layout, the latent
++geometry is 512 + 64 and the rotary table is FP32 with 64 columns; anything else
++keeps the stock chain (the caller runs ``super()``).
++"""
++
++import torch
++
++from vllm.triton_utils import tl, triton
++
++LORA, ROPE = 512, 64
++WIDTH = LORA + ROPE
++# The kernel's compile-time copies (Triton reads globals only as tl.constexpr).
++_LORA, _ROPE, _HALF, _WIDTH = (tl.constexpr(v) for v in (LORA, ROPE, ROPE // 2, WIDTH))
++
++
++@triton.jit
++def _context_kv_kernel(
++    kv_ptr,  # [T, L, 576] BF16 (the context_kv_proj output, row-major)
++    kv_row_stride,  # elements per token row (L * 576)
++    norm_w_ptr,  # [L, 512] BF16
++    pos_ptr,  # [T] int64
++    cos_sin_ptr,  # [max_pos, 64] FP32: cos(32) | sin(32)
++    slot_ptr,  # [L, T] int64 (slot_stride 0 broadcasts one row)
++    slot_stride,
++    cache_ptrs,  # [L] int64: each layer's cache base (uint8 elements)
++    scales_ptr,  # [L] FP32: k_scale per layer
++    block_size,
++    block_stride,
++    entry_stride,
++    eps,
++    T,
++    LAYERS: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    layer = pid // T
++    token = pid % T
++    slot = tl.load(slot_ptr + layer * slot_stride + token)
++    if slot >= 0:
++        base = kv_ptr + token.to(tl.int64) * kv_row_stride + layer * _WIDTH
++        # -- RMSNorm of the latent (the grouped rms_norm op: fp32 variance,
++        #    rsqrt(var / n + eps), one BF16 rounding of x * rstd * w; measured
++        #    bit-identical to ops.rms_norm with 2-D weights, see the test) --
++        cols = tl.arange(0, _LORA)
++        x = tl.load(base + cols).to(tl.float32)
++        var = tl.sum(x * x, axis=0) / _LORA
++        rstd = tl.rsqrt(var + eps)
++        w = tl.load(norm_w_ptr + layer * _LORA + cols).to(tl.float32)
++        normed = (x * rstd * w).to(tl.bfloat16)
++        # -- RoPE of k_pe, interleaved pairs (rotary_embedding, is_neox False) --
++        half = tl.arange(0, _HALF)
++        pos = tl.load(pos_ptr + token)
++        cos = tl.load(cos_sin_ptr + pos * _ROPE + half)
++        sin = tl.load(cos_sin_ptr + pos * _ROPE + _HALF + half)
++        px = tl.load(base + _LORA + 2 * half).to(tl.float32)
++        py = tl.load(base + _LORA + 2 * half + 1).to(tl.float32)
++        rx = (px * cos - py * sin).to(tl.bfloat16)
++        ry = (py * cos + px * sin).to(tl.bfloat16)
++        # -- fp8(x / scale) into the paged cache (concat_and_cache_mla, scaled) --
++        scale = tl.load(scales_ptr + layer)
++        cache = tl.load(cache_ptrs + layer).to(tl.pointer_type(tl.float8e4nv))
++        block = slot // block_size
++        offset = slot % block_size
++        dst = cache + block * block_stride + offset * entry_stride
++        q_lat = tl.math.div_rn(normed.to(tl.float32), scale).to(tl.float8e4nv)
++        tl.store(dst + cols, q_lat)
++        q_x = tl.math.div_rn(rx.to(tl.float32), scale).to(tl.float8e4nv)
++        q_y = tl.math.div_rn(ry.to(tl.float32), scale).to(tl.float8e4nv)
++        tl.store(dst + _LORA + 2 * half, q_x)
++        tl.store(dst + _LORA + 2 * half + 1, q_y)
++
++
++def store_context_kv(
++    all_kv: torch.Tensor,
++    norm_weights: torch.Tensor,
++    positions: torch.Tensor,
++    cos_sin_cache: torch.Tensor,
++    slot_mapping: torch.Tensor,
++    cache_ptrs: torch.Tensor,
++    k_scales: torch.Tensor,
++    block_size: int,
++    block_stride: int,
++    entry_stride: int,
++    eps: float,
++) -> None:
++    """One launch: norm + RoPE + FP8 quant + paged insert of ``all_kv``
++    ([T, L, 576] BF16, the GEMM output in place) into the ``L`` layers' caches.
++    ``slot_mapping``: [L, T] int64, or [T] shared by every layer."""
++    tokens, layers, width = all_kv.shape
++    assert width == WIDTH and all_kv.stride(2) == 1 and all_kv.stride(1) == WIDTH
++    assert norm_weights.shape == (layers, LORA) and norm_weights.is_contiguous()
++    assert cos_sin_cache.dtype == torch.float32 and cos_sin_cache.shape[1] == ROPE
++    assert cos_sin_cache.is_contiguous() and positions.dtype == torch.int64
++    assert k_scales.dtype == torch.float32 and k_scales.numel() == layers
++    assert cache_ptrs.dtype == torch.int64 and cache_ptrs.numel() == layers
++    if slot_mapping.dim() == 1:
++        slot_stride = 0
++    else:
++        assert slot_mapping.shape == (layers, tokens)
++        slot_mapping = slot_mapping.contiguous()
++        slot_stride = slot_mapping.stride(0)
++    assert slot_mapping.dtype == torch.int64
++    if tokens == 0:
++        return
++    _context_kv_kernel[(layers * tokens,)](
++        all_kv,
++        all_kv.stride(0),
++        norm_weights,
++        positions,
++        cos_sin_cache,
++        slot_mapping,
++        slot_stride,
++        cache_ptrs,
++        k_scales,
++        block_size,
++        block_stride,
++        entry_stride,
++        eps,
++        tokens,
++        LAYERS=layers,
++        num_warps=4,
++    )
++
++
++def eligible(backbone) -> bool:
++    """Whether ``precompute_context_kv`` serves this drafter: plain per-tensor FP8
++    caches (the grouped scales exist), one block layout, 512 + 64 latents, an FP32
++    64-column rotary table (``_build_fused_context_kv_metadata`` has run)."""
++    if getattr(backbone, "_context_kv_scales", None) is None:
++        return False
++    layers = [layer.self_attn for layer in backbone.layers]
++    if any(a.kv_cache_dtype not in ("fp8", "fp8_e4m3") for a in layers):
++        return False
++    if backbone._context_kv_lora_rank != LORA or backbone._context_rope_dim != ROPE:
++        return False
++    rotary = layers[0].rotary_emb
++    if rotary is None or rotary.cos_sin_cache.dtype != torch.float32:
++        return False
++    if rotary.cos_sin_cache.shape[1] != ROPE or rotary.is_neox_style:
++        return False
++    return all(a.kv_cache.numel() > 0 and a.kv_cache.dtype == torch.uint8 for a in layers)
++
++
++def precompute_context_kv(backbone, context_states, context_positions, slots) -> bool:
++    """``K3DSparkModel.precompute_and_store_context_kv`` with the post-GEMM chain
++    fused (``store_context_kv``); False when this batch keeps the stock chain
++    (no slots to write, a mixed slot layout, a cache this does not serve)."""
++    if slots is None:
++        return False
++    if not hasattr(backbone, "_num_context_layers"):
++        backbone._build_fused_context_kv_metadata()
++    # Eligibility is decided once the caches are bound (the memory profile runs
++    # on unbound placeholder caches: stock chain); a True verdict is final.
++    if not getattr(backbone, "_context_kv_fused_ok", False):
++        if not eligible(backbone):
++            return False
++        backbone._context_kv_fused_ok = True
++    layers = [layer.self_attn for layer in backbone.layers]
++    if not backbone._has_uniform_block_layout(layers):
++        return False
++    num_layers = backbone._num_context_layers
++    if isinstance(slots, (list, tuple)):
++        rows = [s for s in slots if s is not None]
++        if len(rows) != num_layers:
++            return False
++        if len({s.data_ptr() for s in rows}) == 1:
++            slot_mapping = rows[0]
++        else:
++            slot_mapping = torch.stack(rows, dim=0)
++    else:
++        slot_mapping = slots
++    if slot_mapping.dtype != torch.int64:
++        return False
++    all_kv = backbone.context_kv_proj(context_states)
++    tokens = context_states.shape[0]
++    all_kv = all_kv.view(tokens, num_layers, WIDTH)
++    ref = layers[0].kv_cache
++    store_context_kv(
++        all_kv,
++        backbone._context_kv_norm_weights,
++        context_positions,
++        layers[0].rotary_emb.cos_sin_cache,
++        slot_mapping,
++        backbone._get_context_kv_cache_ptrs(layers),
++        backbone._context_kv_scales,
++        ref.size(1),
++        ref.stride(0),
++        ref.stride(1),
++        backbone._context_rms_norm_eps,
++    )
++    return True
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/linears.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/linears.py
+@@ -17,6 +17,8 @@
+ BF16 operands, FP32 accumulation, one BF16 rounding, as cuBLAS; only the
+ summation order differs.
+ """
++
++from functools import cache  # [vllm-moet]
+ 
+ import torch
+ 
+@@ -39,18 +41,27 @@
+ 
+ 
+ class DraftGemm:
+-    """``out[M, N] = x[M, K] @ weight[N, K]^T`` with an engine per prepared M."""
++    """``out[M, N] = x[M, K] @ weight[N, K]^T`` with an engine per prepared M.
+ 
+-    def __init__(self, weight):
++    [vllm-moet] ``swiglu``: ``weight`` is a ``swiglu_permute``d gate_up weight and
++    the engine writes ``out[M, N / 2] = silu(gate) * up`` (the warp split-K SwiGLU
++    epilogue, bit-identical to the plain GEMM followed by vLLM's silu_and_mul);
++    ``run_swiglu`` returns False when no engine serves ``m`` (the caller runs the
++    stock math on the permuted weight)."""
++
++    def __init__(self, weight, swiglu: bool = False):
+         self.weight = weight
+         n, k = weight.shape
+         self.n, self.k = n, k
++        self.swiglu = swiglu
++        self.n_out = n // 2 if swiglu else n
+         self.sms = torch.cuda.get_device_properties(weight.device).multi_processor_count
+         self.eligible = (
+             weight.dtype == torch.bfloat16
+             and weight.stride() == (k, 1)
+             and weight.data_ptr() % 32 == 0
+             and warp_eligible(n, k)
++            and (not swiglu or n % 32 == 0)
+         )
+         self.engines = {}
+ 
+@@ -66,14 +77,16 @@
+ 
+         try:
+             tactic = warp_tactic(m, self.n, self.k, self.sms)
+-            self.engines[m] = PreparedWarpSplitK(self.weight, {m: tactic})
++            self.engines[m] = PreparedWarpSplitK(
++                self.weight, {m: tactic}, swiglu=self.swiglu
++            )
+         except Exception as exc:  # capability fallback: cuBLAS
+             logger.warning_once(
+                 "DSpark drafter GEMM %dx%d (M %d) on cuBLAS: %s", self.n, self.k, m, exc
+             )
+             self.eligible = False
+ 
+-    def run(self, x, out):
++    def _engine(self, x, out):
+         m = x.shape[0]
+         engine = self.engines.get(m)
+         if engine is None and not torch.cuda.is_current_stream_capturing():
+@@ -83,11 +96,28 @@
+             engine is None
+             or x.stride() != (self.k, 1)
+             or x.data_ptr() % 32
+-            or out.stride() != (self.n, 1)
++            or out.stride() != (self.n_out, 1)
+             or out.data_ptr() % 32
+         ):
++            return None
++        return engine
++
++    def run(self, x, out):
++        assert not self.swiglu
++        engine = self._engine(x, out)
++        if engine is None:
+             return torch.mm(x, self.weight.t(), out=out)
+         return engine.run(x, out)
++
++    def run_swiglu(self, x, out) -> bool:
++        """[vllm-moet] ``out[M, N / 2] = silu(gate) * up`` in one launch; False
++        when ``m`` has no engine (or the operands are not packed / aligned)."""
++        assert self.swiglu
++        engine = self._engine(x, out)
++        if engine is None:
++            return False
++        engine.run(x, out)
++        return True
+ 
+ 
+ def _linear_method_base():
+@@ -140,6 +170,87 @@
+     return count
+ 
+ 
++# ---------------------------------------------------------------------------
++# [vllm-moet] The draft MLP's gate_up GEMM + SiLU-and-mul in one
++# launch (the warp split-K SwiGLU epilogue), then down_proj as before.
++# ---------------------------------------------------------------------------
++
++
++@cache
++def _fused_mlp_class(base):
++    """``base`` (the layer's MLP class, KimiMLP) whose forward runs the SwiGLU
++    engine on the permuted gate_up weight; the stock math (GEMM on the permuted
++    weight, columns restored, SiluAndMul) for a row count without an engine
++    (eager batches past WARP_ROWS). Keeps the class name."""
++    from ..cutedsl.gemm.warp_splitk import swiglu_unpermute_columns
++
++    class Fused(base):
++        def forward(self, x):
++            gemm = self._swiglu_gemm
++            x = x.contiguous()
++            hidden = torch.empty(
++                x.shape[0], gemm.n_out, dtype=x.dtype, device=x.device
++            )
++            if not (x.dtype == torch.bfloat16 and gemm.run_swiglu(x, hidden)):
++                gate_up = torch.mm(x, gemm.weight.t())
++                hidden = self.act_fn(swiglu_unpermute_columns(gate_up))
++            out, _ = self.down_proj(hidden)
++            return out
++
++    Fused.__name__ = base.__name__
++    Fused.__qualname__ = base.__qualname__
++    return Fused
++
++
++def install_swiglu(module) -> int:
++    """Fuse every plain SwiGLU MLP under ``module`` (unquantized BF16 gate_up and
++    down, SiluAndMul, no sequence-parallel sharding or GEMM-RS-AR): permute the
++    gate_up weight rows in place (``swiglu_permute``, exact) and swap the MLP's
++    class for one whose forward runs the fused engine. Skipped when the weights
++    are shared pre-processed tensors (a weight cache daemon owns them). Returns
++    the number of MLPs fused."""
++    from vllm.model_executor.layers.activation import SiluAndMul
++    from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++    from vllm.model_executor.utils import is_weights_pre_processed
++
++    from ..cutedsl.gemm.warp_splitk import SWIGLU_GROUP, swiglu_permute
++
++    if is_weights_pre_processed():
++        return 0
++    count = 0
++    for sub in module.modules():
++        gate_up = getattr(sub, "gate_up_proj", None)
++        down = getattr(sub, "down_proj", None)
++        act = getattr(sub, "act_fn", None)
++        if gate_up is None or down is None or not isinstance(act, SiluAndMul):
++            continue
++        if getattr(sub, "_swiglu_gemm", None) is not None:
++            continue  # already fused (process_weights_after_loading ran twice)
++        if getattr(sub, "shard_sequence_parallel", False):
++            continue
++        if getattr(sub, "gemm_rs_ar", None) is not None:
++            continue
++        weight = getattr(gate_up, "weight", None)
++        if (
++            weight is None
++            or weight.dtype != torch.bfloat16
++            or weight.dim() != 2
++            or weight.shape[0] % (2 * SWIGLU_GROUP)
++            or not isinstance(gate_up.quant_method, UnquantizedLinearMethod)
++            or getattr(gate_up, "bias", None) is not None
++        ):
++            continue
++        gemm = DraftGemm(weight, swiglu=True)
++        if not gemm.eligible:
++            continue
++        with torch.no_grad():
++            weight.data.copy_(swiglu_permute(weight.data))
++        sub._swiglu_gemm = gemm
++        sub.__class__ = _fused_mlp_class(type(sub))
++        count += 1
++    return count
++
++
+ def draft_logits(model, hidden_states):
+     """``model.compute_draft_logits``: the lm_head shard (the target's lm_head weight,
+     shared; on ``DraftGemm`` for a plain BF16 head, else its own method), then the
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/markov.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/markov.py
+@@ -2,21 +2,50 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ """DSpark's sequential Markov sampling, one launch per draft step.
+ 
++Image path: /usr/local/lib/python3.12/dist-packages/vllm/models/kimi_k3/nvidia/
++specialized_decode/drafter/markov.py (source tree: vllm/models/kimi_k3/nvidia/
++specialized_decode/drafter/markov.py). Changes against the stock file are marked
++``# [vllm-moet]``.
++
+ ``DSparkSpeculator._sample_sequential`` runs, for each of the ``k`` draft steps,
+ the Markov embedding of the previous token, the bias GEMV over the whole
+-vocabulary (``markov_w2``: 163840 x 256 BF16, 84 MB, replicated), the add to the
+-base logits ([R, 163840] written twice), the Gumbel sample (its kernel, a torch
+-argmax over the block maxima and a gather) and the copy into ``draft_tokens``:
+-about nine launches and three full-vocabulary [R, V] tensors per step.
++vocabulary (``markov_w2``: 163840 x rank BF16, 168 MB at rank 512, replicated on
++every TP rank), the add to the base logits ([R, 163840] written twice), the Gumbel
++sample (its kernel, a torch argmax over the block maxima and a gather) and the copy
++into ``draft_tokens``: about nine launches and three full-vocabulary [R, V] tensors
++per step.
+ 
+-Here each step is two launches. The step kernel's programs each own 256
+-vocabulary entries and 16 request rows: they gather the rows' Markov embeddings
+-(``markov_w1[prev]``), stream their ``markov_w2`` range in [64, rank] tiles and
+-multiply all rows at once on the tensor cores (FP32 accumulation), add the base
+-logits, write the step's logits into the draft logits cache and keep each row's
+-Gumbel-max over their range. A select launch (one program per row) takes the
+-first of the largest per-program maxima, which is the step's token: it writes
+-``draft_tokens`` and the next step's previous token.
++Here each step is one launch (two with ``FUSED_SELECT`` off). The step kernel is
++persistent over the vocabulary: ``CTAS_PER_SM`` programs per SM per chunk of ``RB``
++request rows, each owning a contiguous range of ``TPC * VT`` vocabulary entries.
++A program gathers its rows' Markov embeddings (``markov_w1[prev]``) once, then
++streams its ``markov_w2`` range in [VT, rank] tiles through a (``STAGES`` - 1)-deep
++cp.async ring (Triton's software pipeline), and per tile multiplies all rows at
++once on the tensor cores (FP32 accumulation), adds the base logits, writes the
++step's logits into the draft logits cache and keeps each row's Gumbel-max over its
++range as a per-slot running max (reduced once at the end). The last program of a
++row chunk to finish (a device-scope counter) takes the first of the largest
++per-program maxima, which is the step's token: it writes ``draft_tokens`` and the
++next step's previous token (``_markov_select_kernel`` does the same as a second
++launch when the fused select is off).
++
++# [vllm-moet] Why the rewrite (B300, rank 512, batch 1, k = 3): the stock kernel
++# ran 640 programs of 256 vocabulary entries, 4 tiles of [64, 512] each (64 KB
++# tiles, two stages: 128 KB of shared memory, one program per SM), so the
++# markov_w2 stream paid a dependent prev -> markov_w1 -> first tile prologue plus a
++# drained pipeline 4.3 times per SM, and a cross-warp (max, argmax) reduction per
++# tile: 43 us per step for 168 MB (3.9 TB/s) in a profile of the served step. The
++# persistent form pays the prologue once per program, keeps a tile in flight per
++# program with two programs per SM, balances the vocabulary to within one 32-row
++# tile per program and reduces once. Measured on a B300 GPU that was serving a TP
++# rank at the time (so against ~5-5.8 TB/s of attainable HBM read bandwidth, not
++# 8): original 45.7 us (3.7 TB/s) -> 35.4 us (4.7 TB/s) per step at batch 1.
++# What did NOT help in Triton 3.8 (kept out of the file): tcgen05 via
++# ``tl.dot`` with the tile as the M operand (bit-identical, but 53-92 us: the
++# MMAv5 pipeline serialises per K chunk without warp specialisation, which fails
++# to compile for this loop), CUDA-core FMA dots for batch 1 (non-dot loads are
++# not pipelined into shared memory: 54-108 us), 8-warp or 64-row tiles, PDL and
++# an L2 software prefetch (both within noise or slower).
+ 
+ Exactness: the same sampling as vLLM's loop. The bias is the FP32 dot product of
+ the embedding and the ``markov_w2`` row rounded once to the logits dtype (the GEMV
+@@ -25,8 +54,12 @@
+ vLLM's own draw (``murmur3`` keyed by the request seed mixed with the draft step,
+ the position before the sampled token plus the draft salt, and the token id),
+ divided by the temperature exactly as ``gumbel_noised_argmax`` does. Only the
+-summation order of the 256-term bias dot product differs from cuBLAS's GEMV, as
++summation order of the rank-term bias dot product differs from cuBLAS's GEMV, as
+ any GEMM tiling may; ties keep the first token as vLLM's two-level argmax does.
++# [vllm-moet] Against the stock fused kernel the bias is bit-identical: the dot is
++# the same ``tl.dot`` of a [RB, rank] x [rank, VT] BF16 tile (mma.sync m16n8k16,
++# the rank accumulated in the same order), only the tile's N and the vocabulary
++# range a program owns changed, which touch no arithmetic.
+ """
+ 
+ import torch
+@@ -43,8 +76,10 @@
+ 
+ logger = init_logger(__name__)
+ 
+-# Vocabulary rows of markov_w2 a tile multiplies at a time (tensor-core N).
+-VT = 64
++# [vllm-moet] Vocabulary rows of markov_w2 a tile multiplies at a time (tensor-core
++# N): a [32, 512] BF16 tile is 32 KB; STAGES - 1 = 2 of them (plus ~16 KB of
++# layout scratch) make an 80 KB program, two of which share an SM.
++VT = 32
+ _DRAFT_NOISE_SALT = 1 << 30
+ 
+ 
+@@ -121,6 +156,261 @@
+     )
+ 
+ 
++# [vllm-moet] The per-tile body of the step kernel, shared by the peeled first tile
++# (PDL: loaded before the wait on the previous step) and the pipelined loop.
++@triton.jit
++def _markov_tile(
++    w,  # [VT, RANK] BF16 markov_w2 tile of vocabulary entries vs .. vs + VT
++    emb,  # [RB, RANK] BF16 Markov embeddings of the rows' previous tokens
++    vs,
++    vocab,
++    rows64,
++    rmask,
++    base_ptr,
++    base_stride,
++    cache_ptr,
++    cache_stride0,
++    cache_stride1,
++    crow,
++    cmask,
++    temp,
++    seed,
++    pos,
++    noise_ptr,
++    noise_stride0,
++    noise_stride1,
++    best_val,
++    best_idx,
++    STEP: tl.constexpr,
++    VT: tl.constexpr,
++    USE_FP64: tl.constexpr,
++    NOISE: tl.constexpr,
++):
++    # The bias: one FP32 dot product per (row, token) on the tensor cores.
++    acc = tl.dot(emb, tl.trans(w))
++    return _markov_epilogue(
++        acc, vs, vocab, rows64, rmask, base_ptr, base_stride,
++        cache_ptr, cache_stride0, cache_stride1, crow, cmask, temp, seed, pos,
++        noise_ptr, noise_stride0, noise_stride1, best_val, best_idx,
++        STEP, VT, USE_FP64, NOISE,
++    )  # fmt: skip
++
++
++# [vllm-moet] From the FP32 bias of a [RB, VT] tile on: the add to the base
++# logits, the draft logits cache row, the Gumbel keys and the running max.
++@triton.jit
++def _markov_epilogue(
++    acc,  # [RB, VT] FP32 bias of vocabulary entries vs .. vs + VT
++    vs,
++    vocab,
++    rows64,
++    rmask,
++    base_ptr,
++    base_stride,
++    cache_ptr,
++    cache_stride0,
++    cache_stride1,
++    crow,
++    cmask,
++    temp,
++    seed,
++    pos,
++    noise_ptr,
++    noise_stride0,
++    noise_stride1,
++    best_val,
++    best_idx,
++    STEP: tl.constexpr,
++    VT: tl.constexpr,
++    USE_FP64: tl.constexpr,
++    NOISE: tl.constexpr,
++):
++    v = vs + tl.arange(0, VT)
++    vmask = v < vocab
++    # The bias rounds to the logits dtype like the GEMV output; the add rounds
++    # once like a tensor add.
++    bmask = rmask[:, None] & vmask[None, :]
++    base = tl.load(
++        base_ptr + rows64[:, None] * base_stride + v[None, :],
++        mask=bmask,
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    dt = base.dtype
++    logits = _add_rn(base.to(tl.float32), acc.to(dt).to(tl.float32)).to(dt)
++    tl.store(
++        cache_ptr + crow[:, None] * cache_stride0 + STEP * cache_stride1 + v[None, :],
++        logits,
++        mask=cmask[:, None] & vmask[None, :],
++    )
++    if NOISE:
++        # ``_gumbel_key``'s FP32 path with the hash and the inner log read
++        # back: the same operations, in the same kernel, from the outer log on.
++        noisy = temp[:, None] != 0.0
++        arg = tl.load(
++            noise_ptr + rows64[:, None] * noise_stride0 + STEP * noise_stride1 + v[None, :],
++            mask=bmask & noisy,
++            other=1.0,
++        )
++        lf = logits.to(tl.float32)
++        lf = tl.where(noisy, lf / temp[:, None], lf)
++        x = tl.where(noisy, lf + -tl.log(arg), lf)
++    else:
++        x = _gumbel_key(
++            logits.to(tl.float32),
++            temp[:, None],
++            seed[:, None],
++            pos[:, None],
++            v[None, :],
++            USE_FP64,
++        )
++    x = tl.where(vmask[None, :], x, float("-inf"))
++    # [vllm-moet] Per-element running max over this program's tiles (no reduction
++    # per tile): a strict > keeps the earliest, i.e. lowest, token of equal keys in
++    # a slot; ``_markov_reduce`` finds the lowest token among the maximal slots.
++    take = x > best_val
++    best_val = tl.where(take, x, best_val)
++    best_idx = tl.where(take, v[None, :], best_idx)
++    return best_val, best_idx
++
++
++# [vllm-moet] The program's (max, first argmax) of each row from the per-slot
++# running maxima: the first of the largest keys, as ``gumbel_noised_argmax``'s
++# ``tl.max(return_indices=True)`` over the whole row (tie: the lowest token id).
++@triton.jit
++def _markov_reduce(best_val, best_idx):
++    m = tl.max(best_val, axis=1)
++    cand = tl.where(best_val == m[:, None], best_idx, 2147483647)
++    return m, tl.min(cand, axis=1).to(tl.int64)
++
++
++# [vllm-moet] The epilogue of one request row (small batches, NR = 1 .. SMALL_ROWS):
++# the same operations as ``_markov_epilogue`` on the row's [VT] vector, so the
++# padding rows of the 16-row tensor-core tile cost no log / division / loads.
++@triton.jit
++def _markov_row_epilogue(
++    acc,  # [VT] FP32 bias of the row for vocabulary entries vs .. vs + VT
++    vs,
++    vocab,
++    row64,
++    crow,
++    cmask,
++    temp,
++    seed,
++    pos,
++    base_ptr,
++    base_stride,
++    cache_ptr,
++    cache_stride0,
++    cache_stride1,
++    noise_ptr,
++    noise_stride0,
++    noise_stride1,
++    best_val,
++    best_idx,
++    STEP: tl.constexpr,
++    VT: tl.constexpr,
++    USE_FP64: tl.constexpr,
++    NOISE: tl.constexpr,
++):
++    v = vs + tl.arange(0, VT)
++    vmask = v < vocab
++    base = tl.load(
++        base_ptr + row64 * base_stride + v,
++        mask=vmask,
++        other=0.0,
++        eviction_policy="evict_first",
++    )
++    dt = base.dtype
++    logits = _add_rn(base.to(tl.float32), acc.to(dt).to(tl.float32)).to(dt)
++    tl.store(
++        cache_ptr + crow * cache_stride0 + STEP * cache_stride1 + v,
++        logits,
++        mask=vmask & cmask,
++    )
++    if NOISE:
++        noisy = temp != 0.0
++        arg = tl.load(
++            noise_ptr + row64 * noise_stride0 + STEP * noise_stride1 + v,
++            mask=vmask & noisy,
++            other=1.0,
++        )
++        lf = logits.to(tl.float32)
++        lf = tl.where(noisy, lf / temp, lf)
++        x = tl.where(noisy, lf + -tl.log(arg), lf)
++    else:
++        x = _gumbel_key(logits.to(tl.float32), temp, seed, pos, v, USE_FP64)
++    x = tl.where(vmask, x, float("-inf"))
++    take = x > best_val
++    best_val = tl.where(take, x, best_val)
++    best_idx = tl.where(take, v, best_idx)
++    return best_val, best_idx
++
++
++@triton.jit
++def _markov_row_reduce(best_val, best_idx):
++    m = tl.max(best_val, axis=0)
++    cand = tl.where(best_val == m, best_idx, 2147483647)
++    return m, tl.min(cand, axis=0).to(tl.int64)
++
++
++@triton.jit
++def _markov_row_state(
++    row64, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride,
++    STEP: tl.constexpr, SALT: tl.constexpr,
++):
++    """The sampling state of one row: (cache row, cache row valid, temperature,
++    seed, position), as the vector loads of the step kernel compute them."""
++    req = tl.load(idx_map_ptr + row64 * idx_stride + STEP).to(tl.int64)
++    valid = req >= 0
++    crow = draft_logits_row(req, row_map_ptr)
++    temp = tl.load(temp_ptr + req, mask=valid, other=0.0).to(tl.float32)
++    seed = spec_step_seed(tl.load(seeds_ptr + req, mask=valid, other=0), STEP)
++    pos = tl.load(pos_ptr + row64 * pos_stride + STEP) - 1
++    pos = pos.to(tl.int64) + SALT
++    return crow, valid & (crow >= 0), temp, seed, pos
++
++
++# [vllm-moet] One tile of the small-batch path: the tensor-core dot, then the
++# NR rows' epilogues (row r of the [RB, VT] bias extracted by a masked sum).
++@triton.jit
++def _markov_tile_rows(
++    w, emb, vs, vocab, rr, base_ptr, base_stride, cache_ptr, cache_stride0, cache_stride1,
++    noise_ptr, noise_stride0, noise_stride1,
++    r0, c0, m0, t0, s0, p0, bx0, bi0,
++    r1, c1, m1, t1, s1, p1, bx1, bi1,
++    r2, c2, m2, t2, s2, p2, bx2, bi2,
++    r3, c3, m3, t3, s3, p3, bx3, bi3,
++    STEP: tl.constexpr, VT: tl.constexpr, USE_FP64: tl.constexpr, NOISE: tl.constexpr,
++    NR: tl.constexpr,
++):
++    acc = tl.dot(emb, tl.trans(w))
++    a = tl.sum(tl.where((rr == 0)[:, None], acc, 0.0), axis=0)
++    bx0, bi0 = _markov_row_epilogue(
++        a, vs, vocab, r0, c0, m0, t0, s0, p0, base_ptr, base_stride, cache_ptr,
++        cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx0, bi0,
++        STEP, VT, USE_FP64, NOISE)  # fmt: skip
++    if NR > 1:
++        a = tl.sum(tl.where((rr == 1)[:, None], acc, 0.0), axis=0)
++        bx1, bi1 = _markov_row_epilogue(
++            a, vs, vocab, r1, c1, m1, t1, s1, p1, base_ptr, base_stride, cache_ptr,
++            cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx1, bi1,
++            STEP, VT, USE_FP64, NOISE)  # fmt: skip
++    if NR > 2:
++        a = tl.sum(tl.where((rr == 2)[:, None], acc, 0.0), axis=0)
++        bx2, bi2 = _markov_row_epilogue(
++            a, vs, vocab, r2, c2, m2, t2, s2, p2, base_ptr, base_stride, cache_ptr,
++            cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx2, bi2,
++            STEP, VT, USE_FP64, NOISE)  # fmt: skip
++    if NR > 3:
++        a = tl.sum(tl.where((rr == 3)[:, None], acc, 0.0), axis=0)
++        bx3, bi3 = _markov_row_epilogue(
++            a, vs, vocab, r3, c3, m3, t3, s3, p3, base_ptr, base_stride, cache_ptr,
++            cache_stride0, cache_stride1, noise_ptr, noise_stride0, noise_stride1, bx3, bi3,
++            STEP, VT, USE_FP64, NOISE)  # fmt: skip
++    return bx0, bi0, bx1, bi1, bx2, bi2, bx3, bi3
++
++
+ @triton.jit
+ def _markov_step_kernel(
+     prev_tok_ptr,  # [rows_cap] the previous step's tokens (select kernel)
+@@ -145,24 +435,47 @@
+     noise_ptr,  # [rows_cap, k, V] FP32 ``_gumbel_log_arg32`` (``_markov_noise_kernel``)
+     noise_stride0,
+     noise_stride1,
++    tokens_ptr,  # [vllm-moet] draft_tokens [rows_cap, k] (fused select)
++    tokens_stride,
++    counter_ptr,  # [vllm-moet] [row chunks] int32 programs done, 0 between launches
+     num_rows,
+     vocab,
+-    NB,
++    NB,  # programs per row chunk (the grid's second axis)
+     STEP: tl.constexpr,
+     RANK: tl.constexpr,
+-    VB: tl.constexpr,  # vocabulary entries a program owns (multiple of VT)
+     VT: tl.constexpr,
++    TPC: tl.constexpr,  # [vllm-moet] tiles a program owns (contiguous)
+     RB: tl.constexpr,  # rows a program holds (tensor-core M)
+     USE_FP64: tl.constexpr,
+     SALT: tl.constexpr,
+     NOISE: tl.constexpr,  # read the precomputed noise instead of hashing
++    PDL: tl.constexpr,  # [vllm-moet] launched with programmatic dependent launch
++    SELECT: tl.constexpr,  # [vllm-moet] the last program of a chunk selects the token
++    NB_POW2: tl.constexpr,
++    NR: tl.constexpr,  # [vllm-moet] rows of the launch when <= SMALL_ROWS, else 0
+ ):
++    # [vllm-moet] Persistent over a contiguous vocabulary range: program (chunk,
++    # pid) owns rows chunk * RB .. and entries pid * TPC * VT .. of the vocabulary.
+     # Row chunks of one vocabulary range run as neighbouring programs, so the
+     # range's markov_w2 tiles come from L2 for all but the first.
+     pid = tl.program_id(1)
+-    rows = tl.program_id(0) * RB + tl.arange(0, RB)
++    chunk = tl.program_id(0)
++    rows = chunk * RB + tl.arange(0, RB)
+     rmask = rows < num_rows
+     rows64 = rows.to(tl.int64)
++    k = tl.arange(0, RANK)
++    v0 = pid * (TPC * VT)
++    if PDL:
++        # [vllm-moet] The first markov_w2 tile depends on no earlier kernel: issue
++        # it, then wait for the previous step's token (and the base logits, when
++        # the previous kernel is the lm_head's gather) before anything that does.
++        va = v0 + tl.arange(0, VT)
++        w = tl.load(
++            w2_ptr + va[:, None].to(tl.int64) * RANK + k[None, :],
++            mask=(va < vocab)[:, None],
++            other=0.0,
++        )
++        tl.extra.cuda.gdc_wait()
+     # The previous token of each row: the anchor at step 0, else the select
+     # launch's token of the previous step.
+     if STEP == 0:
+@@ -170,7 +483,6 @@
+         prev = tl.load(input_ids_ptr + anchor, mask=rmask, other=0).to(tl.int64)
+     else:
+         prev = tl.load(prev_tok_ptr + rows64, mask=rmask, other=0)
+-    k = tl.arange(0, RANK)
+     # [RB, RANK] Markov embeddings of the previous tokens.
+     emb = tl.load(
+         w1_ptr + prev[:, None] * RANK + k[None, :], mask=rmask[:, None], other=0.0
+@@ -185,71 +497,131 @@
+     pos = pos.to(tl.int64) + SALT
+     cmask = rmask & valid & (crow >= 0)
+ 
+-    best_val = tl.full([RB], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
+-    best_idx = tl.zeros([RB], tl.int64)
+-    v0 = pid * VB
+-    for t in range(0, VB, VT):
+-        v = v0 + t + tl.arange(0, VT)
+-        vmask = v < vocab
+-        w = tl.load(
+-            w2_ptr + v[:, None].to(tl.int64) * RANK + k[None, :],
+-            mask=vmask[:, None],
+-            other=0.0,
+-            eviction_policy="evict_last",
+-        )
+-        # The bias: one FP32 dot product per (row, token), rounded to the logits
+-        # dtype like the GEMV output; the add rounds once like a tensor add.
+-        acc = tl.dot(emb, tl.trans(w))
+-        bmask = rmask[:, None] & vmask[None, :]
+-        base = tl.load(
+-            base_ptr + rows64[:, None] * base_stride + v[None, :],
+-            mask=bmask,
+-            other=0.0,
+-            eviction_policy="evict_first",
+-        )
+-        dt = base.dtype
+-        logits = _add_rn(base.to(tl.float32), acc.to(dt).to(tl.float32)).to(dt)
+-        tl.store(
+-            cache_ptr
+-            + crow[:, None] * cache_stride0
+-            + STEP * cache_stride1
+-            + v[None, :],
+-            logits,
+-            mask=cmask[:, None] & vmask[None, :],
+-        )
+-        if NOISE:
+-            # ``_gumbel_key``'s FP32 path with the hash and the inner log read
+-            # back: the same operations, in the same kernel, from the outer log on.
+-            noisy = temp[:, None] != 0.0
+-            arg = tl.load(
+-                noise_ptr
+-                + rows64[:, None] * noise_stride0
+-                + STEP * noise_stride1
+-                + v[None, :],
+-                mask=bmask & noisy,
+-                other=1.0,
++    if PDL:
++        T0: tl.constexpr = 1
++    else:
++        T0: tl.constexpr = 0
++    if NR == 0:
++        best_val = tl.full([RB, VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
++        best_idx = tl.zeros([RB, VT], tl.int32)
++        if PDL:
++            best_val, best_idx = _markov_tile(
++                w, emb, v0, vocab, rows64, rmask, base_ptr, base_stride,
++                cache_ptr, cache_stride0, cache_stride1, crow, cmask, temp, seed, pos,
++                noise_ptr, noise_stride0, noise_stride1, best_val, best_idx,
++                STEP, VT, USE_FP64, NOISE,
++            )  # fmt: skip
++        # [vllm-moet] The pipelined stream: STAGES - 1 tiles of markov_w2 (and the
++        # matching base logits / noise tiles) in flight ahead of the tensor cores.
++        for t in range(T0, TPC):
++            vs = v0 + t * VT
++            va = vs + tl.arange(0, VT)
++            w = tl.load(
++                w2_ptr + va[:, None].to(tl.int64) * RANK + k[None, :],
++                mask=(va < vocab)[:, None],
++                other=0.0,
+             )
+-            lf = logits.to(tl.float32)
+-            lf = tl.where(noisy, lf / temp[:, None], lf)
+-            x = tl.where(noisy, lf + -tl.log(arg), lf)
+-        else:
+-            x = _gumbel_key(
+-                logits.to(tl.float32),
+-                temp[:, None],
+-                seed[:, None],
+-                pos[:, None],
+-                v[None, :],
+-                USE_FP64,
++            best_val, best_idx = _markov_tile(
++                w, emb, vs, vocab, rows64, rmask, base_ptr, base_stride,
++                cache_ptr, cache_stride0, cache_stride1, crow, cmask, temp, seed, pos,
++                noise_ptr, noise_stride0, noise_stride1, best_val, best_idx,
++                STEP, VT, USE_FP64, NOISE,
++            )  # fmt: skip
++        if PDL:
++            # [vllm-moet] The next step may launch: it prefetches its first tile and
++            # waits (griddepcontrol.wait) for this grid's completion before reading
++            # the token written below.
++            tl.extra.cuda.gdc_launch_dependents()
++        best_val, best_idx = _markov_reduce(best_val, best_idx)
++        tl.store(out_max_ptr + rows64 * NB + pid, best_val, mask=rmask)
++        tl.store(out_arg_ptr + rows64 * NB + pid, best_idx, mask=rmask)
++    else:
++        # [vllm-moet] Small batches (one row chunk): per-row state and running
++        # maxima as scalars / [VT] vectors; the dot still runs the 16-row tile.
++        rr = tl.arange(0, RB)
++        r0 = (chunk * RB + 0).to(tl.int64)
++        # rows past NR alias the last row (their state is loaded, never used)
++        r1 = (chunk * RB + (1 if NR > 1 else NR - 1)).to(tl.int64)
++        r2 = (chunk * RB + (2 if NR > 2 else NR - 1)).to(tl.int64)
++        r3 = (chunk * RB + (3 if NR > 3 else NR - 1)).to(tl.int64)
++        c0, m0, t0, s0, p0 = _markov_row_state(
++            r0, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++        c1, m1, t1, s1, p1 = _markov_row_state(
++            r1, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++        c2, m2, t2, s2, p2 = _markov_row_state(
++            r2, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++        c3, m3, t3, s3, p3 = _markov_row_state(
++            r3, idx_map_ptr, idx_stride, row_map_ptr, temp_ptr, seeds_ptr, pos_ptr, pos_stride, STEP, SALT)
++        bx0 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
++        bx1 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
++        bx2 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
++        bx3 = tl.full([VT], float("-inf"), tl.float64 if USE_FP64 else tl.float32)
++        bi0 = tl.zeros([VT], tl.int32)
++        bi1 = tl.zeros([VT], tl.int32)
++        bi2 = tl.zeros([VT], tl.int32)
++        bi3 = tl.zeros([VT], tl.int32)
++        if PDL:
++            bx0, bi0, bx1, bi1, bx2, bi2, bx3, bi3 = _markov_tile_rows(
++                w, emb, v0, vocab, rr, base_ptr, base_stride, cache_ptr, cache_stride0,
++                cache_stride1, noise_ptr, noise_stride0, noise_stride1,
++                r0, c0, m0, t0, s0, p0, bx0, bi0, r1, c1, m1, t1, s1, p1, bx1, bi1,
++                r2, c2, m2, t2, s2, p2, bx2, bi2, r3, c3, m3, t3, s3, p3, bx3, bi3,
++                STEP, VT, USE_FP64, NOISE, NR,
++            )  # fmt: skip
++        for t in range(T0, TPC):
++            vs = v0 + t * VT
++            va = vs + tl.arange(0, VT)
++            w = tl.load(
++                w2_ptr + va[:, None].to(tl.int64) * RANK + k[None, :],
++                mask=(va < vocab)[:, None],
++                other=0.0,
+             )
+-        x = tl.where(vmask[None, :], x, float("-inf"))
+-        bv, bi = tl.max(
+-            x, axis=1, return_indices=True, return_indices_tie_break_left=True
+-        )
+-        take = bv > best_val
+-        best_val = tl.where(take, bv, best_val)
+-        best_idx = tl.where(take, (v0 + t + bi).to(tl.int64), best_idx)
+-    tl.store(out_max_ptr + rows64 * NB + pid, best_val, mask=rmask)
+-    tl.store(out_arg_ptr + rows64 * NB + pid, best_idx, mask=rmask)
++            bx0, bi0, bx1, bi1, bx2, bi2, bx3, bi3 = _markov_tile_rows(
++                w, emb, vs, vocab, rr, base_ptr, base_stride, cache_ptr, cache_stride0,
++                cache_stride1, noise_ptr, noise_stride0, noise_stride1,
++                r0, c0, m0, t0, s0, p0, bx0, bi0, r1, c1, m1, t1, s1, p1, bx1, bi1,
++                r2, c2, m2, t2, s2, p2, bx2, bi2, r3, c3, m3, t3, s3, p3, bx3, bi3,
++                STEP, VT, USE_FP64, NOISE, NR,
++            )  # fmt: skip
++        if PDL:
++            tl.extra.cuda.gdc_launch_dependents()
++        mx, ix = _markov_row_reduce(bx0, bi0)
++        tl.store(out_max_ptr + r0 * NB + pid, mx)
++        tl.store(out_arg_ptr + r0 * NB + pid, ix)
++        if NR > 1:
++            mx, ix = _markov_row_reduce(bx1, bi1)
++            tl.store(out_max_ptr + r1 * NB + pid, mx)
++            tl.store(out_arg_ptr + r1 * NB + pid, ix)
++        if NR > 2:
++            mx, ix = _markov_row_reduce(bx2, bi2)
++            tl.store(out_max_ptr + r2 * NB + pid, mx)
++            tl.store(out_arg_ptr + r2 * NB + pid, ix)
++        if NR > 3:
++            mx, ix = _markov_row_reduce(bx3, bi3)
++            tl.store(out_max_ptr + r3 * NB + pid, mx)
++            tl.store(out_arg_ptr + r3 * NB + pid, ix)
++    if SELECT:
++        # [vllm-moet] The chunk's last program to arrive (release / acquire at GPU
++        # scope, after a CTA barrier so every thread's maxima precede the count)
++        # reads all NB maxima (L2, past L1) and takes the first of the largest, as
++        # ``_markov_select_kernel`` does; it re-arms the counter for the next
++        # launch (this grid never touches it again; the next step's programs
++        # count only after their wait for this grid).
++        tl.debug_barrier()
++        done = tl.atomic_add(counter_ptr + chunk, 1, sem="acq_rel", scope="gpu")
++        if done == NB - 1:
++            j = tl.arange(0, NB_POW2)
++            m = tl.load(
++                out_max_ptr + rows64[:, None] * NB + j[None, :],
++                mask=rmask[:, None] & (j < NB)[None, :],
++                other=float("-inf"),
++                volatile=True,
++            )
++            best = tl.argmax(m, axis=1, tie_break_left=True)
++            tok = tl.load(out_arg_ptr + rows64 * NB + best, mask=rmask, other=0, volatile=True)
++            tl.store(prev_tok_ptr + rows64, tok, mask=rmask)
++            tl.store(tokens_ptr + rows64 * tokens_stride + STEP, tok, mask=rmask)
++            tl.store(counter_ptr + chunk, 0)
+ 
+ 
+ @triton.jit
+@@ -274,13 +646,38 @@
+     tl.store(tokens_ptr + r * tokens_stride + STEP, tok)
+ 
+ 
+-# Vocabulary entries a program owns: 640 programs at 163840, about four per SM
+-# (GB300, one cold step, us: VB 256 -> 22, 1024 -> 40; a bare markov_w2 read
+-# streams at 15 us, bytes / 7.5 TB/s + the ~3.5 us kernel boundary).
+-VB = 256
++# [vllm-moet] Programs per SM per row chunk (the grid's second axis is CTAS_PER_SM
++# x SMs): two of 4 warps, each with a (STAGES - 1) x [VT, 512] BF16 cp.async ring
++# (2 x 32 KB + the base logits / noise tiles: ~78 KB, so both fit an SM). The
++# vocabulary splits into TPC tiles per program (cdiv(163840 / 32, 296) = 18 tiles,
++# 576 entries, the last programs fewer). Measured on B300 at batch 1, k = 3
++# (graph replays, GPU shared with a serving rank): one 4-warp program per SM is
++# 46-51 us whatever its depth, two are 35-36 us; 8 warps or 64-wide tiles do not
++# help (the mma.sync issue rate is the limit).
++CTAS_PER_SM = 2
++STAGES = 3
++NUM_WARPS = 4
++# [vllm-moet] Batches up to which the epilogue runs per row ([VT] vectors: ~300
++# instructions per thread per tile against ~410 for the 16-row tile) instead of
++# over the whole tensor-core tile (NR constexpr). At 1 row it is within noise of
++# the tile epilogue on a shared B300 (35.4 vs 35.8 us); at 4 rows the per-row
++# extraction costs more than it saves (84 vs 46 us), so only batch 1 takes it.
++SMALL_ROWS = 1
+ # Request rows a program multiplies at once (the tensor-core M; more rows run as
+ # further programs over the same, then L2-resident, markov_w2 range).
+ RB = 16
++# [vllm-moet] One launch per step: the last program selects the token; else the
++# select kernel runs as a second launch. Off: in graph replays on B300 the
++# two-launch form is ~1 us per step faster (the fused form ends with one program's
++# atomic -> 2-32 KB volatile read -> select tail) and needs no memory-model
++# argument; the fused path stays tested and selectable.
++FUSED_SELECT = False
++# [vllm-moet] Programmatic dependent launch (sm_90+): step s + 1 is resident and
++# has its first tile in flight while step s drains. Off by default (within noise
++# of the plain launch at two programs per SM, and one more graph-edge kind to
++# capture); the kernel is PDL-correct either way (``gdc_wait`` before any read of
++# an earlier kernel's output).
++USE_PDL = False
+ # Sampled rows (requests x draft steps) up to which the Gumbel noise of all the
+ # steps is computed ahead, up to its last log, beside the lm_head
+ # (``_markov_noise_kernel``): the step kernels then read it instead of hashing
+@@ -289,25 +686,65 @@
+ # scheduler, L2 at 17 %). They keep the last log, so that the keys round as in
+ # ``gumbel_noised_argmax`` (bit-equal; a fully precomputed noise is 1 ulp off on
+ # about a fifth of the keys). R1 k=4 graph with the noise kernel, us: 94 -> 82.
+-NOISE_ROWS = 32
++# [vllm-moet] 0: the persistent kernel hashes the noise itself. Its tiles read the
++# precomputed noise with plain loads the pipeline does not prefetch, which costs
++# more than the hashes it saves (B300 graph replays, us per step, noise / hashed:
++# R1 35.5 / 35.8, R4 45.8 / 38.1, R8 47.4 / 39.0); the keys are bit-equal either
++# way (tokens identical to the stock kernel's precomputed-noise path, 16/16 cases),
++# and the side-stream noise launch and its join go away.
++NOISE_ROWS = 0
+ NOISE_BLOCK = 1024
++
++
++def _pdl_supported(device) -> bool:
++    # [vllm-moet]
++    if not USE_PDL or not torch.cuda.is_available():
++        return False
++    major, _ = torch.cuda.get_device_capability(device)
++    return major >= 9
+ 
+ 
+ class FusedMarkov:
+     """The fused Markov steps of one speculator (scratch sized for its largest
+     batch, allocated once so captured graphs keep their addresses)."""
+ 
+-    def __init__(self, vocab, rank, max_rows, device, use_fp64):
++    def __init__(
++        self,
++        vocab,
++        rank,
++        max_rows,
++        device,
++        use_fp64,
++        ctas_per_sm=None,  # [vllm-moet] tuning hooks (tests / benchmarks)
++        stages=None,
++        vt=None,
++        fused_select=None,
++        pdl=None,
++        num_warps=None,
++        small_rows=None,
++    ):
+         self.vocab, self.rank, self.use_fp64 = vocab, rank, use_fp64
+-        self.vb = VB
+-        self.nb = triton.cdiv(vocab, self.vb)
++        # [vllm-moet] persistent grid: programs per row chunk and tiles per program
++        sms = torch.cuda.get_device_properties(device).multi_processor_count
++        self.vt = VT if vt is None else vt
++        self.stages = STAGES if stages is None else stages
++        self.num_warps = NUM_WARPS if num_warps is None else num_warps
++        self.small_rows = SMALL_ROWS if small_rows is None else small_rows
++        self.nb = sms * (CTAS_PER_SM if ctas_per_sm is None else ctas_per_sm)
++        self.tpc = triton.cdiv(triton.cdiv(vocab, self.vt), self.nb)
+         self.nb_pow2 = triton.next_power_of_2(self.nb)
++        self.fused_select = FUSED_SELECT if fused_select is None else fused_select
++        self.pdl = _pdl_supported(device) if pdl is None else pdl
+         dt = torch.float64 if use_fp64 else torch.float32
+         self.bufs = (
+             torch.empty(max_rows, self.nb, dtype=dt, device=device),
+             torch.empty(max_rows, self.nb, dtype=torch.int64, device=device),
+         )
+         self.prev = torch.zeros(max_rows, dtype=torch.int64, device=device)
++        # [vllm-moet] programs done per row chunk (the fused select); 0 at rest
++        self.counter = torch.zeros(
++            triton.cdiv(max_rows, RB), dtype=torch.int32, device=device
++        )
+         self.max_rows = max_rows
+         self.device = device
+         self.noise = None  # [NOISE_ROWS * V] FP32, at the first noise launch
+@@ -322,10 +759,12 @@
+         """Launch this draft step's Gumbel noise on a side stream (it depends only
+         on the seeds, the positions and the token ids, not on any logits), so it
+         runs beside the lm_head; ``join`` before the steps read it."""
+-        if self.noise is None:
+-            self.noise = torch.empty(
+-                NOISE_ROWS * self.vocab, dtype=torch.float32, device=self.device
+-            )
++        # [vllm-moet] sized for NOISE_ROWS, or for this call when it asks for more
++        # (tests of the noise path with NOISE_ROWS = 0; never under capture)
++        need = max(NOISE_ROWS, num_reqs * n_spec) * self.vocab
++        if self.noise is None or self.noise.numel() < need:
++            self.noise = torch.empty(need, dtype=torch.float32, device=self.device)
++        if self.stream is None:
+             self.stream = torch.cuda.Stream(device=self.device)
+         main = torch.cuda.current_stream(self.device)
+         self.stream.wait_stream(main)
+@@ -368,7 +807,9 @@
+         else:
+             noise_strides = (noise.stride(0), noise.stride(1))
+         rb = RB
+-        grid = (triton.cdiv(num_reqs, rb), self.nb)
++        nb, nb_pow2, vt, tpc = self.nb, self.nb_pow2, self.vt, self.tpc
++        warps, stages = self.num_warps, self.stages
++        grid = (triton.cdiv(num_reqs, rb), nb)
+         idx_map = spec.sample_idx_mapping[: num_reqs * n_spec].view(num_reqs, n_spec)
+         sample_pos = spec.sample_pos[: num_reqs * n_spec].view(num_reqs, n_spec)
+         cache = spec.draft_logits.values
+@@ -397,31 +838,40 @@
+                 out_arg,
+                 noise,
+                 *noise_strides,
++                tokens,
++                tokens.stride(0),
++                self.counter,
+                 num_reqs,
+                 self.vocab,
+-                self.nb,
++                nb,
+                 STEP=step,
+                 RANK=self.rank,
+-                VB=self.vb,
+-                VT=VT,
++                VT=vt,
++                TPC=tpc,
+                 RB=rb,
+                 USE_FP64=self.use_fp64,
+                 SALT=_DRAFT_NOISE_SALT,
+                 NOISE=use_noise,
+-                num_warps=4,
+-                num_stages=2,
++                PDL=self.pdl,
++                SELECT=self.fused_select,
++                NB_POW2=nb_pow2,
++                NR=num_reqs if num_reqs <= self.small_rows else 0,
++                num_warps=warps,
++                num_stages=stages,
++                launch_pdl=self.pdl,
+             )
+-            _markov_select_kernel[(num_reqs,)](
+-                out_max,
+-                out_arg,
+-                self.prev,
+-                tokens,
+-                tokens.stride(0),
+-                num_reqs,
+-                self.nb,
+-                STEP=step,
+-                NB_POW2=self.nb_pow2,
+-            )
++            if not self.fused_select:
++                _markov_select_kernel[(num_reqs,)](
++                    out_max,
++                    out_arg,
++                    self.prev,
++                    tokens,
++                    tokens.stride(0),
++                    num_reqs,
++                    nb,
++                    STEP=step,
++                    NB_POW2=nb_pow2,
++                )
+ 
+ 
+ def why_not(spec, model, num_reqs):
+@@ -509,10 +959,17 @@
+         fused = FusedMarkov(vocab, rank, spec.max_num_reqs, device, key[-1])
+         _FUSED[key] = fused
+         logger.info_once(
+-            "DSpark fused Markov sampling: vocabulary %d, rank %d, %d programs",
++            # [vllm-moet]
++            "DSpark fused Markov sampling: vocabulary %d, rank %d, %d programs x %d "
++            "tiles of %d, %d stages, fused select %s, PDL %s",
+             vocab,
+             rank,
+             fused.nb,
++            fused.tpc,
++            fused.vt,
++            fused.stages,
++            fused.fused_select,
++            fused.pdl,
+         )
+     return fused
+ 
+--- a/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/model.py
++++ b/vllm/models/kimi_k3/nvidia/specialized_decode/drafter/model.py
+@@ -26,6 +26,7 @@
+ replicated one is allocated and freed once, at load).
+ """
+ 
++import os  # [vllm-moet]
+ from functools import cache
+ 
+ import torch
+@@ -36,6 +37,11 @@
+ 
+ # The DSpark draft checkpoint's architecture (``ModelRegistry``).
+ DRAFT_ARCH = "K3DSparkModel"
++# [vllm-moet] Switches (default on; =0 runs the stock code):
++#   VLLM_MOET_DRAFT_CONTEXT_KV=0  the stock six-launch context-KV chain (context_kv.py)
++#   VLLM_MOET_DRAFT_SWIGLU=0      the stock gate_up GEMM + SiluAndMul (linears.install_swiglu)
++CONTEXT_KV_FUSED = os.environ.get("VLLM_MOET_DRAFT_CONTEXT_KV", "1") != "0"
++SWIGLU_FUSED = os.environ.get("VLLM_MOET_DRAFT_SWIGLU", "1") != "0"
+ 
+ 
+ def register() -> None:
+@@ -96,6 +102,25 @@
+         from .linears import draft_logits
+ 
+         return draft_logits(self, hidden_states)
++
++    def precompute_and_store_context_kv(
++        self,
++        context_states: torch.Tensor,
++        context_positions: torch.Tensor,
++        context_slot_mapping=None,
++    ) -> None:
++        # [vllm-moet] the post-GEMM chain (permutes, grouped norm, RoPE, FP8
++        # insert: 6 launches) in one launch (context_kv.py); the stock chain for a
++        # batch / cache it does not serve.
++        from .context_kv import precompute_context_kv
++
++        if CONTEXT_KV_FUSED and precompute_context_kv(
++            self.model, context_states, context_positions, context_slot_mapping
++        ):
++            return
++        super().precompute_and_store_context_kv(
++            context_states, context_positions, context_slot_mapping
++        )
+ 
+     def sample_sequential(self, speculator, num_reqs, head_hidden) -> bool:
+         """The speculator asks the model for its own Markov sampling first."""
+@@ -211,6 +236,8 @@
+     from .attention import reserve_cake_workspace
+ 
+     n = linears.install(model.model)
++    # [vllm-moet] gate_up GEMM + SiLU-and-mul in one launch per layer
++    fused_mlps = linears.install_swiglu(model.model) if SWIGLU_FUSED else 0
+     shape = getattr(model, "draft_shape", None)
+     reserved = 0
+     if shape is not None:
+@@ -218,9 +245,12 @@
+         reserved = reserve_cake_workspace(device, **shape)
+     comm, dcp = install_collectives(model)
+     init_logger(__name__).info_once(
+-        "Specialized DSpark drafter: %d linears on DraftGemm, CAKE workspace %.0f MiB, "
++        "Specialized DSpark drafter: %d linears on DraftGemm, %d MLPs on the fused "
++        "SwiGLU GEMM, context KV insert %s, CAKE workspace %.0f MiB, "
+         "collectives %s, DCP attention %s",
+         n,
++        fused_mlps,
++        "fused" if CONTEXT_KV_FUSED else "stock",
+         reserved / 2**20,
+         "mailbox" if comm is not None else "stock",
+         "mailbox" if dcp is not None else "stock",
+--- a/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
++++ b/vllm/v1/worker/gpu/spec_decode/dflash/speculator.py
+@@ -386,10 +386,17 @@
+         if dummy_run:
+             context_slots: torch.Tensor | list[torch.Tensor | None] | None = None
+         elif self._layer_group_idx is not None:
+-            context_slots = [
+-                self._kernel_context_slots(gidx, start, end)
+-                for gidx in self._layer_group_idx
+-            ]
++            # [vllm-moet] one kernel-slot mapping per distinct KV group, not per
++            # layer: the K3 DSpark draft's 5 layers share one group, so the stock
++            # list ran the same _kernel_slots launch 5 times per step (the
++            # grouped cache insert already treats equal data pointers as one
++            # mapping, so the result is unchanged).
++            per_group: dict[int, torch.Tensor] = {}
++            context_slots = []
++            for gidx in self._layer_group_idx:
++                if gidx not in per_group:
++                    per_group[gidx] = self._kernel_context_slots(gidx, start, end)
++                context_slots.append(per_group[gidx])
+         else:
+             context_slots = self._kernel_context_slots(0, start, end)
+         self.model.precompute_and_store_context_kv(
