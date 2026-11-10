@@ -1,5 +1,5 @@
-# vLLM-Moet: Kimi-K3.1-Pro + DSpark on 8x B300 (HGX, sm_103) -- the day-0 vLLM image plus the fix it needs there and two
-# patch sets for its decode step.
+# vLLM-Moet: Kimi-K3.1-Pro + DSpark on 8x B300 (HGX, sm_103) -- the day-0 vLLM image plus the fix it needs there, two
+# patch sets for its decode step and one for what its API clients send.
 #
 # Base: vllm/vllm-openai:kimi-k31 (vLLM 0.1.dev24216+g266e88c05, the K3.1 line before its first release: K3.1 missed
 # v0.33.0, the recipe's minimum is 0.34.0), served on hgx-02 as TP8 + DCP8, FP8 KV, prefix caching, SimpleCPUOffloadConnector
@@ -45,14 +45,30 @@
 #      c. Positions, sequence lengths, the sampled / draft input ids and the logits indices of a step in one launch
 #         (v1/worker/gpu/input_batch.py `prepare_pos_seq_lens_and_combine`, model_runner.py). VLLM_MOET_FUSED_PREP=0
 #         keeps the two stock launches.
+#   4. (-r3a) What clients of the chat and Responses APIs send that the model's own encoding (encoding_k3: the roles
+#      user / system / tool / assistant, every tool message under a tool name) answers with HTTP 400, two files
+#      (tools/k3_b300/k31/api.patch, cut against the base image's files: independent of steps 2 and 3):
+#      a. renderers/kimi_k3.py: OpenAI's `developer` role is rendered as K3's `system` ("Unknown message role
+#         'developer'"; Codex sends its instructions as developer messages). No switch.
+#      b. entrypoints/openai/responses/utils.py: a `function_call_output` item that names its tool itself keeps the name
+#         on the tool message, flattened with its namespace like a namespaced call. Codex Desktop sends the state of
+#         its companion page as such items - a name, no `call_id`, no call in the input - and the encoding has nothing
+#         to name the result by ("Kimi K3 tool messages need a resolvable tool name"). No switch.
+#      c. renderers/kimi_k3.py `_rejoin_k3_tool_results`: tool results whose call is not in the most recent assistant
+#         message - a turn the Responses conversion split into several assistant messages (a second text or reasoning
+#         item), a result of an earlier turn, a result in one block with a result that has no call - fail the same
+#         way. The assistant messages of the turn are merged, or the results get their tool name by `tool_call_id`; a
+#         block the encoding resolves as a whole is left as it is. VLLM_MOET_K3_REJOIN_TOOL_RESULTS=0 makes the
+#         function a pass-through.
 #
-# Steps 2 and 3 are file patch sets: unified diffs anchored on the sha256 of every file before and after
+# Steps 2 to 4 are file patch sets: unified diffs anchored on the sha256 of every file before and after
 # (tools/k3_b300/apply_file_patches.py; cut with make_file_patches.py). A base image whose files differ stops the build.
 #
-# Build:  DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r3 .   (~5 min)
-#         --build-arg VLLM_MOET_K31_R3_PATCH=0 builds -r2; with --build-arg VLLM_MOET_K31_R2_PATCH=0 as well, -r1
-#         (step 3 is cut against step 2's files, so it does not apply without step 2).
-# Serve:  IMAGE=vllm-moet-b300:k31-266e88c0-r3 DECODE_BACKEND=latency_specialized ... docker/b300/run-k3.sh
+# Build:  DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r3a .   (~5 min)
+#         --build-arg VLLM_MOET_K31_API_PATCH=0 builds -r3; with --build-arg VLLM_MOET_K31_R3_PATCH=0 as well, -r2;
+#         with --build-arg VLLM_MOET_K31_R2_PATCH=0 too, -r1 (step 3 is cut against step 2's files, so it does not
+#         apply without step 2; step 4 applies with or without them).
+# Serve:  IMAGE=vllm-moet-b300:k31-266e88c0-r3a DECODE_BACKEND=latency_specialized ... docker/b300/run-k3.sh
 ARG BASE_IMAGE=vllm/vllm-openai:kimi-k31
 FROM ${BASE_IMAGE}
 
@@ -86,8 +102,16 @@ RUN if [ "$VLLM_MOET_K31_R3_PATCH" = "1" ]; then python3 /opt/vllm-moet/k3_b300/
       v1/worker/gpu/input_batch.py v1/worker/gpu/model_runner.py \
  && find /usr/local/lib/python3.12/dist-packages/vllm -name '__pycache__' -type d -prune -exec rm -rf {} +; fi
 
+ARG VLLM_MOET_K31_API_PATCH=1
+RUN if [ "$VLLM_MOET_K31_API_PATCH" = "1" ]; then python3 /opt/vllm-moet/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/k31/api.patch --check \
+ && python3 /opt/vllm-moet/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/k31/api.patch \
+ && cd /usr/local/lib/python3.12/dist-packages/vllm && python3 -m py_compile \
+      renderers/kimi_k3.py entrypoints/openai/responses/utils.py \
+ && rm -rf renderers/__pycache__ entrypoints/openai/responses/__pycache__; fi
+
 LABEL org.opencontainers.image.title="vLLM-Moet B300 Kimi-K3.1" \
-      org.opencontainers.image.description="vllm/vllm-openai:kimi-k31 + the specialized decode's experts grid capped at the device's SM count (B300: 148) + the decode-step patch sets named by the com.vllm-moet.k31.r2 / .r3 labels (1 = applied): the DSpark drafter and MoE tail, the sharded Markov head and sampler chain" \
+      org.opencontainers.image.description="vllm/vllm-openai:kimi-k31 + the specialized decode's experts grid capped at the device's SM count (B300: 148) + the patch sets named by the com.vllm-moet.k31.r2 / .r3 / .api labels (1 = applied): the DSpark drafter and MoE tail, the sharded Markov head and sampler chain, the developer role and tool results of API clients" \
       org.opencontainers.image.source="https://github.com/kacper-daftcode/vLLM-Moet" \
       com.vllm-moet.k31.r2="${VLLM_MOET_K31_R2_PATCH}" \
-      com.vllm-moet.k31.r3="${VLLM_MOET_K31_R3_PATCH}"
+      com.vllm-moet.k31.r3="${VLLM_MOET_K31_R3_PATCH}" \
+      com.vllm-moet.k31.api="${VLLM_MOET_K31_API_PATCH}"

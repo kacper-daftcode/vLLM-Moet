@@ -34,7 +34,7 @@ IMAGE=vllm-moet-b300:k3-v0.32.0-r5 MODEL_DIR=/data/models/Kimi-K3 CACHE_DIR=/dat
 
 ## Kimi-K3.1-Pro (`Dockerfile.b300-k31`)
 
-The K3.1 image is `vllm/vllm-openai:kimi-k31` plus three steps, each described in the Dockerfile header. The K3
+The K3.1 image is `vllm/vllm-openai:kimi-k31` plus four steps, each described in the Dockerfile header. The K3
 patchers above do not apply to it: their fixes are upstream in that line.
 
 | file | role |
@@ -42,10 +42,12 @@ patchers above do not apply to it: their fixes are upstream in that line.
 | `patch_vllm_k31_experts_grid.py` | step 1: idempotent, anchored patcher for the specialized decode's persistent routed-experts kernel. Its grid table is sized for 152 SMs and the path refuses to start on a 148-SM B300; the patch caps the table at the device's SM count. `--check` verifies without writing. |
 | `k31/r2.patch` | step 2 (build arg `VLLM_MOET_K31_R2_PATCH`, images `-r2` and later): the DSpark drafter and the MoE tail of the specialized path, ten files, one of them new. |
 | `k31/r3.patch` | step 3 (build arg `VLLM_MOET_K31_R3_PATCH`, images `-r3`): the Markov head sharded across the TP ranks and the sampler chain, eight files; cut against the files step 2 leaves, so it needs step 2. |
+| `k31/api.patch` | step 4 (build arg `VLLM_MOET_K31_API_PATCH`, images `-r3a`): what clients of the chat and Responses APIs send that K3's own encoding answers with HTTP 400. Two files, cut against the base image's files, so the step applies with or without steps 2 and 3: the renderer (`renderers/kimi_k3.py`: OpenAI's `developer` role rendered as `system`; tool results put back next to the turn that issued their calls or named by `tool_call_id`) and the Responses conversion (`entrypoints/openai/responses/utils.py`: an output item that names its own tool keeps the name - Codex Desktop sends the state of its companion page as such items, with no call in the input). |
+| `test_k31_api_patch.py`, `fixtures/`, `make_request_skeleton.py` | the CPU test of step 4, run inside the built image with a checkpoint directory mounted (the model's tokenizer and `encoding_k3.py`): the server's own code from a Responses request to tokens. With `--stock` (the base image's two files) it also shows what the unpatched code rejects and that the conversations it accepts render to the same tokens. `fixtures/` holds content-free skeletons of rejected requests, cut with `make_request_skeleton.py`. |
 | `apply_file_patches.py` | applies a file patch set: unified diffs under a manifest with the sha256 of every file before and after. A file whose hash is neither of the two stops the build instead of being patched approximately; hunks apply without fuzz; nothing is written unless the whole set applies and every result has the recorded hash; a second run changes nothing; `--check` verifies without writing. |
 | `make_file_patches.py` | cuts a set from two directory trees with the same relative paths (`vllm/` copied out of an image before and after a change) and emits it only when the applier reproduces the second tree from the first, byte for byte. |
 
-Runtime switches of steps 2 and 3. They are read from the server's environment at start (through the launcher:
+Runtime switches of steps 2 to 4. They are read from the server's environment at start (through the launcher:
 `EXTRA_DOCKER_ARGS="-e NAME=0"`), default to on, and `=0` runs the stock code of that part:
 
 | switch | step | default | `=0` |
@@ -54,15 +56,28 @@ Runtime switches of steps 2 and 3. They are read from the server's environment a
 | `VLLM_MOET_DRAFT_CONTEXT_KV` | 2 | the drafter's context KV (grouped norm, RoPE, FP8 quantization, paged insert) in one launch | the stock chain of six launches |
 | `VLLM_MOET_MARKOV_SHARD` | 3 | the vocab-sharded Markov step wherever its conditions hold (a drafter mailbox, BF16 draft logits, FP32 Gumbel keys, the lm_head layout it expects); the server log names the reason otherwise | step 2's replicated kernel |
 | `VLLM_MOET_FUSED_PREP` | 3 | positions, sequence lengths, input ids and logits indices of a step in one launch | the two stock launches |
+| `VLLM_MOET_K3_REJOIN_TOOL_RESULTS` | 4 | tool results whose call is not in the most recent assistant message (a turn the Responses conversion split into several assistant messages, a result of an earlier turn, a result in one block with a result that has no call) are rejoined with their turn or named by `tool_call_id`; a block the encoding resolves as a whole is left as it is | the conversation goes to the encoding as it came: such requests get HTTP 400 "Kimi K3 tool messages need a resolvable tool name" |
 
-The rest of the two sets has no switch (the causal draft block on the DCP drafter attention, the schedule of the
-Markov step, the 3-4-row MoE tail, the sampler's device-side parameters and its fused resample tail); a build with
-`--build-arg VLLM_MOET_K31_R3_PATCH=0`, and `VLLM_MOET_K31_R2_PATCH=0` as well, leaves them out. The image's
-`com.vllm-moet.k31.r2` / `.r3` labels say which sets it carries.
+The rest of the sets has no switch (the causal draft block on the DCP drafter attention, the schedule of the
+Markov step, the 3-4-row MoE tail, the sampler's device-side parameters and its fused resample tail; in step 4 the
+`developer` role and the name of an output item); a build with `--build-arg VLLM_MOET_K31_API_PATCH=0`,
+`VLLM_MOET_K31_R3_PATCH=0` or `VLLM_MOET_K31_R2_PATCH=0` leaves a set out (step 3 needs step 2). The image's
+`com.vllm-moet.k31.r2` / `.r3` / `.api` labels say which sets it carries.
+
+What step 4 changes for a request the unpatched code serves: nothing, with one exception. With two assistant
+messages in a row, the unpatched code names a result of the first one's call by position, after the second one's
+call; it now gets the name of the call it answers. A result with a `tool_call_id` that matches no call of the
+conversation, and no name of its own, is still rejected.
 
 ```bash
-DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r3 .
-python3 -m unittest bench/tests/test_file_patches.py     # applier, maker, the two sets against the Dockerfile (CPU)
+DOCKER_BUILDKIT=0 docker build -f Dockerfile.b300-k31 -t vllm-moet-b300:k31-266e88c0-r3a .
+python3 -m unittest bench/tests/test_file_patches.py     # applier, maker, the three sets against the Dockerfile (CPU)
+# step 4 on CPU; $MODEL = a Kimi-K3.1-Pro checkpoint directory, stock/ = the base image's two files:
+mkdir -p stock && docker run --rm --entrypoint tar vllm/vllm-openai:kimi-k31 -C /usr/local/lib/python3.12/dist-packages \
+  -c vllm/renderers/kimi_k3.py vllm/entrypoints/openai/responses/utils.py | tar -x -C stock
+docker run --rm --network none --entrypoint python3 -e CUDA_VISIBLE_DEVICES= -e PYTHONDONTWRITEBYTECODE=1 \
+  -v "$PWD/tools/k3_b300:/t:ro" -v "$MODEL:/model:ro" -v "$PWD/stock:/stock:ro" \
+  vllm-moet-b300:k31-266e88c0-r3a /t/test_k31_api_patch.py --stock /stock
 # a further set: vllm/ copied out of the image before and after the change (docker cp), then
 python3 tools/k3_b300/make_file_patches.py --name k31-r4 --before before/ --after after/ \
   --out tools/k3_b300/k31/r4.patch

@@ -273,20 +273,21 @@ class Refusals(Trees):
 
 
 class K31Sets(unittest.TestCase):
-    """The two sets Dockerfile.b300-k31 applies."""
+    """The three sets Dockerfile.b300-k31 applies."""
+
+    NAMES = ("r2", "r3", "api")
 
     @classmethod
     def setUpClass(cls):
         cls.sets = {}
-        for name in ("r2", "r3"):
+        for name in cls.NAMES:
             set_name, manifest, hunks = ap.parse((TOOLS / "k31" / f"{name}.patch").read_bytes())
             cls.sets[name] = (set_name, {path: (before, after) for path, before, after in manifest}, hunks)
         cls.dockerfile = (ROOT / "Dockerfile.b300-k31").read_text()
 
     def test_sets_parse_and_name_themselves(self):
-        self.assertEqual(self.sets["r2"][0], "k31-r2")
-        self.assertEqual(self.sets["r3"][0], "k31-r3")
-        self.assertEqual((len(self.sets["r2"][1]), len(self.sets["r3"][1])), (10, 8))
+        self.assertEqual([self.sets[name][0] for name in self.NAMES], ["k31-r2", "k31-r3", "k31-api"])
+        self.assertEqual([len(self.sets[name][1]) for name in self.NAMES], [10, 8, 2])
         for _, manifest, hunks in self.sets.values():
             for path, (before, after) in manifest.items():
                 self.assertTrue(path.startswith("vllm/") and path.endswith(".py"), path)
@@ -298,7 +299,8 @@ class K31Sets(unittest.TestCase):
     def test_r2_creates_exactly_the_context_kv_module(self):
         created = [p for p, (before, _) in self.sets["r2"][1].items() if before == "-"]
         self.assertEqual(created, ["vllm/models/kimi_k3/nvidia/specialized_decode/drafter/context_kv.py"])
-        self.assertFalse([p for p, (before, _) in self.sets["r3"][1].items() if before == "-"])
+        for name in ("r3", "api"):
+            self.assertFalse([p for p, (before, _) in self.sets[name][1].items() if before == "-"], name)
 
     def test_r3_is_cut_against_the_files_r2_leaves(self):
         r2, r3 = self.sets["r2"][1], self.sets["r3"][1]
@@ -307,8 +309,19 @@ class K31Sets(unittest.TestCase):
         for path in shared:
             self.assertEqual(r3[path][0], r2[path][1], path)
 
+    def test_api_set_is_independent_of_the_decode_step_sets(self):
+        api = set(self.sets["api"][1])
+        self.assertEqual(sorted(api), ["vllm/entrypoints/openai/responses/utils.py", "vllm/renderers/kimi_k3.py"])
+        self.assertFalse(api & (set(self.sets["r2"][1]) | set(self.sets["r3"][1])))
+
+    def test_dockerfile_steps_have_a_build_arg_and_a_label(self):
+        for name in self.NAMES:
+            arg = f"VLLM_MOET_K31_{name.upper()}_PATCH"
+            self.assertIn(f"\nARG {arg}=1\nRUN if [ \"${arg}\" = \"1\" ]; then ", self.dockerfile)
+            self.assertIn(f'com.vllm-moet.k31.{name}="${{{arg}}}"', self.dockerfile)
+
     def test_dockerfile_steps_compile_the_files_of_their_set(self):
-        for name in ("r2", "r3"):
+        for name in self.NAMES:
             block = re.search(rf"RUN if \[[^\n]*k31/{name}\.patch --check.*?; fi\n", self.dockerfile, re.S)
             self.assertIsNotNone(block, name)
             compiled = block.group(0).split("py_compile", 1)[1].split("&&", 1)[0]
@@ -318,7 +331,7 @@ class K31Sets(unittest.TestCase):
     def test_dockerfile_copies_the_applier_and_the_sets(self):
         self.assertIn("COPY tools/k3_b300/apply_file_patches.py /opt/vllm-moet/k3_b300/", self.dockerfile)
         self.assertIn("COPY tools/k3_b300/k31/ /opt/vllm-moet/k3_b300/k31/", self.dockerfile)
-        self.assertEqual(sorted(p.name for p in (TOOLS / "k31").iterdir()), ["r2.patch", "r3.patch"])
+        self.assertEqual(sorted(p.name for p in (TOOLS / "k31").iterdir()), ["api.patch", "r2.patch", "r3.patch"])
 
 
 if __name__ == "__main__":

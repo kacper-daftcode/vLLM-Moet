@@ -1,0 +1,242 @@
+# vllm-moet file patch set: k31-api
+# cut against vllm/vllm-openai:kimi-k31 (vLLM 0.1.dev24216+g266e88c05); independent of steps 2 and 3 of Dockerfile.b300-k31
+# sha256 f9e87ed884b620f69a6d22d41cb030ba57eda211d4f1751a0b4efa6cf36c7828 8d89eeba263c44759119073f788a495ac3f944053a563ba9384438288e9e18dd vllm/entrypoints/openai/responses/utils.py
+# sha256 1068bc0af321d4cb3381a40d30906c333e56c6b67a4dd44a98067294685c6995 a79af3db4a00f445893efa700baf1cc0e965b14377d62c1338172b3af1753b90 vllm/renderers/kimi_k3.py
+--- a/vllm/entrypoints/openai/responses/utils.py
++++ b/vllm/entrypoints/openai/responses/utils.py
+@@ -429,11 +429,23 @@
+         )
+     elif _item_type(item) in ("function_call_output", "custom_tool_call_output"):
+         output = _item_dict(item)
+-        return ChatCompletionToolMessageParam(
++        tool_message = ChatCompletionToolMessageParam(
+             role="tool",
+             content=output.get("output"),
+             tool_call_id=output.get("call_id"),
+         )
++        # [vllm-moet] An output item may name its tool itself. Codex Desktop sends the state of
++        # its companion page as ``function_call_output`` items with ``name`` + ``namespace`` and
++        # no ``call_id``: there is no call in the input to take a name from, and a renderer that
++        # needs one (Kimi K3: "tool messages need a resolvable tool name" -> HTTP 400) rejects
++        # the request. The name stays on the tool message, flattened like a namespaced call.
++        name = output.get("name")
++        if isinstance(name, str) and name:
++            namespace = output.get("namespace")
++            if isinstance(namespace, str) and namespace:
++                name = flat_namespace_tool_name(namespace, name)
++            tool_message["name"] = name  # type: ignore[typeddict-unknown-key]
++        return tool_message
+     elif isinstance(item, dict) and item.get("role") == "assistant":
+         content = item.get("content")
+         text: str | None = None
+--- a/vllm/renderers/kimi_k3.py
++++ b/vllm/renderers/kimi_k3.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import os
+ from typing import Any, cast
+ 
+ from vllm.config import VllmConfig
+@@ -65,6 +66,175 @@
+             parameter="thinking_effort",
+             value=thinking_effort,
+         )
++
++
++# [vllm-moet] OpenAI's ``developer`` role (Codex and other Responses-API clients send it in
++# ``input``; the chat API accepts it too) is not in encoding_k3's vocabulary (user / system /
++# tool / assistant: ``encoding_k3.build_chat_segments`` raises "Unknown message role" -> HTTP 400).
++# K3's single ``system`` role is the equivalent (Moonshot's own API has no developer role), so
++# developer messages are rendered as system messages; ``name``, content and the dynamic ``tools``
++# of the message are kept (``system`` + ``tools`` is K3's dynamic tool-declare message).
++_K3_ROLE_MAP = {"developer": "system"}
++
++
++def _normalize_k3_roles(
++    conversation: list[ConversationMessage],
++) -> list[ConversationMessage]:
++    """[vllm-moet] Map the roles encoding_k3 does not know onto K3's (``developer`` -> ``system``).
++
++    Returns a new list; caller-owned message dicts are not mutated.
++    """
++    normalized: list[ConversationMessage] = []
++    for message in conversation:
++        target = _K3_ROLE_MAP.get(message.get("role"))  # type: ignore[arg-type]
++        if target is not None:
++            message = cast(ConversationMessage, {**message, "role": target})
++        normalized.append(message)
++    return normalized
++
++
++# [vllm-moet] A tool result must be nameable. ``encoding_k3`` names a tool message from its own
++# ``tool`` / ``name``, else from the ``tool_calls`` of the most recent assistant message (by
++# ``tool_call_id`` when every result of the block matches, else by position), and raises "Kimi K3
++# tool messages need a resolvable tool name" -> HTTP 400 when that fails. Conversations built from
++# Responses API items fail that way:
++#   * vLLM starts a new assistant message at the second text or reasoning item of a turn
++#     (``entrypoints/openai/responses/utils.py`` ``_construct_message_from_response_item``): the
++#     items "reasoning, text, call, text, output" arrive as an assistant message with the call, an
++#     assistant message with the second text, and the tool result;
++#   * a result of an earlier turn arrives after a later assistant message, or a result that names
++#     its own tool and has no ``tool_call_id`` (Codex Desktop's companion-page items; this patch
++#     set's ``responses/utils.py`` keeps their name) stands in a block before a result that is
++#     named by position.
++# Every later request of such a thread is rejected. ``_rejoin_k3_tool_results`` restores what the
++# encoding expects and leaves alone a block it already resolves - every result's call in the most
++# recent assistant message, or no ``tool_call_id`` in the block at all:
++#   * the consecutive assistant messages in front of a block of tool results are one turn. When
++#     the calls of the results are not all in the last of them, the messages from the first one
++#     that holds such a call are merged into one (reasoning and text joined in order, ``tool_calls``
++#     concatenated): K3's own form of a turn - think, response, calls, then the results;
++#   * in any other block that is not resolved as a whole, every result with a ``tool_call_id``
++#     gets its ``tool`` name from its call - in the most recent assistant message or an earlier
++#     one - so that none of them is left to the by-position rule.
++# A result whose ``tool_call_id`` matches no call of the conversation is left alone (the 400 stays).
++# VLLM_MOET_K3_REJOIN_TOOL_RESULTS=0 makes the function a pass-through.
++_K3_REJOIN_TOOL_RESULTS = os.environ.get("VLLM_MOET_K3_REJOIN_TOOL_RESULTS", "1") != "0"
++_K3_ASSISTANT_TEXT_FIELDS = ("content", "reasoning", "reasoning_content")
++
++
++def _k3_call_names(message: Any, aliases: bool = False) -> dict[str, str]:
++    """[vllm-moet] ``tool_calls[].id`` -> function name of one assistant message; with
++    ``aliases`` also the ``name:position`` keys ``_normalize_k3_tool_messages`` resolves a
++    ``tool_call_id`` against."""
++    names: dict[str, str] = {}
++    tool_calls = message.get("tool_calls")
++    if not isinstance(tool_calls, list):
++        return names
++    for position, tool_call in enumerate(tool_calls):
++        function = tool_call.get("function") if isinstance(tool_call, dict) else None
++        name = function.get("name") if isinstance(function, dict) else None
++        if not isinstance(name, str) or not name:
++            continue
++        if call_id := tool_call.get("id"):
++            names.setdefault(str(call_id), name)
++        if aliases:
++            names.setdefault(f"{name}:{position}", name)
++    return names
++
++
++def _k3_earlier_call_name(messages: list[ConversationMessage], call_id: str) -> str | None:
++    """[vllm-moet] The function name of the most recent call with this id, or None."""
++    for message in reversed(messages):
++        if message.get("role") == "assistant":
++            name = _k3_call_names(message).get(call_id)
++            if name is not None:
++                return name
++    return None
++
++
++def _merge_k3_assistant_messages(
++    messages: list[ConversationMessage],
++) -> ConversationMessage | None:
++    """[vllm-moet] One assistant message from the consecutive assistant messages of one turn,
++    or None when a field is not plain text (the messages are then left as they are)."""
++    merged: dict[str, Any] = dict(messages[0])
++    for field in _K3_ASSISTANT_TEXT_FIELDS:
++        values = [message.get(field) for message in messages]
++        if any(value is not None and not isinstance(value, str) for value in values):
++            return None
++        texts = [value for value in values if value]
++        if texts:
++            merged[field] = "\n\n".join(texts)
++    tool_calls: list[Any] = []
++    for message in messages:
++        calls = message.get("tool_calls")
++        if calls is None:
++            continue
++        if not isinstance(calls, list):
++            return None
++        tool_calls.extend(calls)
++    if tool_calls:
++        merged["tool_calls"] = tool_calls
++    return cast(ConversationMessage, merged)
++
++
++def _rejoin_k3_tool_results(
++    conversation: list[ConversationMessage],
++) -> list[ConversationMessage]:
++    """[vllm-moet] Put tool results next to the assistant turn that issued their calls, or
++    name them by ``tool_call_id`` where that is not possible (see the comment above).
++
++    Returns a new list; caller-owned message dicts are not mutated.
++    """
++    if not _K3_REJOIN_TOOL_RESULTS:
++        return conversation
++    out: list[ConversationMessage] = []
++    i = 0
++    while i < len(conversation):
++        if conversation[i].get("role") != "tool":
++            out.append(conversation[i])
++            i += 1
++            continue
++        end = i
++        while end < len(conversation) and conversation[end].get("role") == "tool":
++            end += 1
++        block = conversation[i:end]
++        i = end
++        ids = [str(m["tool_call_id"]) for m in block if m.get("tool_call_id") is not None]
++
++        # One turn split into several assistant messages: merge from the first that holds a call.
++        start = len(out)
++        while start > 0 and out[start - 1].get("role") == "assistant":
++            start -= 1
++        run = out[start:]
++        if len(run) > 1 and not all(x in _k3_call_names(run[-1], aliases=True) for x in ids):
++            owner = next(
++                (k for k, m in enumerate(run) if any(x in _k3_call_names(m) for x in ids)),
++                None,
++            )
++            if owner is not None and owner < len(run) - 1:
++                merged = _merge_k3_assistant_messages(run[owner:])
++                if merged is not None:
++                    out[start + owner :] = [merged]
++
++        # A block the encoding resolves as a whole stays as it is; in any other, name by id.
++        latest = next((m for m in reversed(out) if m.get("role") == "assistant"), None)
++        latest_names = _k3_call_names(latest, aliases=True) if latest is not None else {}
++        if not ids or (len(ids) == len(block) and all(x in latest_names for x in ids)):
++            out.extend(block)
++            continue
++        for tool_message in block:
++            call_id = tool_message.get("tool_call_id")
++            if (
++                call_id is not None
++                and tool_message.get("tool") is None  # type: ignore[typeddict-item]
++                and tool_message.get("name") is None
++            ):
++                name = latest_names.get(str(call_id)) or _k3_earlier_call_name(out, str(call_id))
++                if name is not None:
++                    tool_message = cast(ConversationMessage, {**tool_message, "tool": name})
++            out.append(tool_message)
++    return out
+ 
+ 
+ def _normalize_k3_tool_messages(
+@@ -193,7 +363,11 @@
+             mm_processor_kwargs=params.mm_processor_kwargs,
+         )
+ 
+-        rendered_conversation = _normalize_k3_tool_messages(conversation)
++        rendered_conversation = _normalize_k3_tool_messages(
++            _rejoin_k3_tool_results(  # [vllm-moet] tool results next to their calls
++                _normalize_k3_roles(conversation)  # [vllm-moet] developer -> system
++            )
++        )
+         prompt = parse_dec_only_prompt(
+             self._apply_chat_template(rendered_conversation, params)
+         )
+@@ -217,7 +391,11 @@
+             mm_processor_kwargs=params.mm_processor_kwargs,
+         )
+ 
+-        rendered_conversation = _normalize_k3_tool_messages(conversation)
++        rendered_conversation = _normalize_k3_tool_messages(
++            _rejoin_k3_tool_results(  # [vllm-moet] tool results next to their calls
++                _normalize_k3_roles(conversation)  # [vllm-moet] developer -> system
++            )
++        )
+         token_ids = await self._apply_chat_template_async(rendered_conversation, params)
+         prompt = parse_dec_only_prompt(token_ids)
+         if mm_data is not None:

@@ -1,0 +1,295 @@
+{
+ "input": [
+  {
+   "type": "message",
+   "role": "system",
+   "id": "msg_1",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "system",
+   "id": "msg_2",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    },
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "user",
+   "id": "msg_3",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "system",
+   "id": "msg_4",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "function_call_output",
+   "name": "codex_apps_open_page",
+   "namespace": "agent",
+   "id": "fco_1",
+   "output": "x"
+  },
+  {
+   "type": "message",
+   "role": "system",
+   "id": "msg_5",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "system",
+   "id": "msg_6",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "function_call_output",
+   "name": "codex_apps_selected_page_part_1_of_1",
+   "namespace": "agent",
+   "id": "fco_2",
+   "output": "x"
+  },
+  {
+   "type": "message",
+   "role": "user",
+   "id": "msg_7",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "system",
+   "id": "msg_8",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  },
+  {
+   "type": "message",
+   "role": "user",
+   "id": "msg_9",
+   "content": [
+    {
+     "type": "input_text",
+     "text": "x"
+    }
+   ]
+  }
+ ],
+ "tools": [
+  {
+   "type": "function",
+   "name": "exec_command",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "write_stdin",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "list_mcp_resources",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "list_mcp_resource_templates",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "read_mcp_resource",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "request_user_input",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "view_image",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "namespace",
+   "name": "mcp__cua_repl",
+   "description": "x",
+   "tools": [
+    {
+     "type": "function",
+     "name": "js",
+     "description": "x",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    },
+    {
+     "type": "function",
+     "name": "js_reset",
+     "description": "x",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   ]
+  },
+  {
+   "type": "function",
+   "name": "get_goal",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "create_goal",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "function",
+   "name": "update_goal",
+   "description": "x",
+   "parameters": {
+    "type": "object",
+    "properties": {}
+   }
+  },
+  {
+   "type": "namespace",
+   "name": "image_gen",
+   "description": "x",
+   "tools": [
+    {
+     "type": "function",
+     "name": "imagegen",
+     "description": "x",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   ]
+  },
+  {
+   "type": "tool_search"
+  },
+  {
+   "type": "web_search"
+  }
+ ],
+ "tool_choice": "auto",
+ "parallel_tool_calls": true,
+ "reasoning": {
+  "effort": "max",
+  "summary": "detailed"
+ },
+ "include": [
+  "reasoning.encrypted_content"
+ ],
+ "stream": true,
+ "store": false
+}
