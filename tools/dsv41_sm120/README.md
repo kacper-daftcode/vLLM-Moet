@@ -55,6 +55,18 @@ In the tree, not yet a Dockerfile step (off by default): `patch_vllm_prefill_dev
 pipelined step's reduce-scatters / all-gathers from the device over PCIe P2P in NCCL's summation order —
 `sp_pipeline/test_device_comm_unit.py`, CPU, 9 checks; the kernel's 4-rank GPU test is not in the tree yet).
 
+Also off by default, inside step 47's module: `VLLM_MOET_PREFILL_PIPE_GREEN=N` (`sp_pipeline/moet_prefill_pipe.py`,
+`green_sms`) — a static split of the GPU's SMs for the pipelined step: its comm stream (NCCL, the mHC kernels, the shard
+GEMMs) on a CUDA green context of N SMs, its compute stream and the attention's aux streams on the remaining ones, the
+fast prefill MoE's grids capped to the partition, the replay tails on the caller's stream with today's graphs
+(`_GREEN_TAIL=compute`: on the compute partition, their graphs captured there), one warm-up step at engine start, and
+with `VLLM_MOET_RUNTIME_AB=1` the control-file key `PREFILL_PIPE_GREEN` (0 | N) per forward; the same kernels in the same
+order, so the bits are today's. `sp_pipeline/test_prefill_pipe_green_unit.py`: CPU, 30 checks (the control-file reader,
+the grid caps, the refused configurations); one GPU, 21 checks (the handoff protocol on the split, the key between
+forwards, the tails in both modes, graphs captured on the partition; with `--smid-lib` also which SMs the kernels ran
+on); `torchrun` × 4 with `--tp`, 15 checks (NCCL's reduce-scatter / all-gather in the comm phases, a TP all-reduce in a
+captured graph: split against unsplit on every rank). The time of a served prefill with it is not measured yet.
+
 Not in the image: `patch_vllm_mxfp8_gemm_b12x_sm120.py` + `mxfp8_gemm_b12x/` (the dense GEMMs on
 b12x's block-scaled GEMM: −28 % in the harness, +2.3 % end to end — a negative result),
 `patch_vllm_moe_act_skip_padding_sm120.py` (GLM-5.3-Flash line, unmeasured),

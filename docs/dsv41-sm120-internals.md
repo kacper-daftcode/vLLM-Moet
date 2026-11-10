@@ -111,6 +111,13 @@ sources in `kernels/sass/` are canonical for it.
   `torch.equal`, a 2-group × 40-phase interleave 0 mismatches), reduce-scatter 896–944 µs against NCCL's 909 alone; every
   device-side wait is `%globaltimer`-bounded with a pinned error record. The in-situ gain against the 9.66-ms period is
   the open measurement; the expected whole is −11…−13 % at 163K.
+- A static SM split for the pipelined step (`VLLM_MOET_PREFILL_PIPE_GREEN=N`, off): the comm stream on a CUDA green
+  context of N SMs, the compute stream on the other 188 − N, so that the boundary chain and the compute kernels stop
+  queueing for the same SMs. On a model of the layer pair (two streams + NCCL) 10.1 → 8.5–8.7 ms per pair at N = 32 and
+  10.0 → 8.5 under a 300 W cap, bits identical; the served kernels pay the SM share on 156 SMs — attention +19 %, `wo_a`
+  +24 %, the MXFP8 GEMMs +7…+10 %, fc1 +10 %, fc2 +9 % with their grids capped to the partition (a grid sized for the
+  whole device runs into FC2's watchdog there). Whether the overlap wins that back in the served forward, which is denser
+  than the model, is the open measurement.
 - The reduce-scatter in fewer bytes (fp8 with a per-row scale, 1 850 → ≈ 950 µs per layer-chunk): a change of the
   prefill's arithmetic, quality-gated.
 - The prefill MoE's distance to its DRAM floor: FC1 and FC2 in one persistent launch
