@@ -133,7 +133,7 @@ def main() -> int:
             f1 = facts()
             c1 = mt_counters()
             fc1, fc2 = f1.get("fc1_kernel_wg_mt<4, 1>"), f1.get("fc2_kernel_ws_mt<4, 2>")
-            good = (ch == ["MT_LOOPS 0 -> 1"] and bad1 == 0 and fc1 is not None and fc1[1] == 1 and fc1[2] == 1 and fc2 is not None and fc2[1] == 2
+            good = (ch == [f"{KEY} 0 -> 1"] and bad1 == 0 and fc1 is not None and fc1[1] == 1 and fc1[2] == 1 and fc2 is not None and fc2[1] == 2
                     and fc2[2] == 2 and fc2[0] <= 96 and c1 == (calls1, rows1, calls1, rows1))
             print(f"on: change {ch}; {calls1} calls, {bad1} differ from b12x; fc1_kernel_wg_mt<4, 1> {fc1}, fc2_kernel_ws_mt<4, 2> {fc2} "
                   f"(registers, CTAs per SM, measured with, SMs; device SMs {sms}); m-tile-loop counters {c1} (expected {(calls1, rows1, calls1, rows1)})")
@@ -163,7 +163,7 @@ def main() -> int:
             c3 = mt_counters()
             print(f"dropped: change {ch3}; {calls3} calls, {bad3} differ from b12x; MT_LOOPS now {m.runtime_switches().get('MT_LOOPS')}; "
                   f"m-tile-loop counters {c3} (unchanged: {c3 == c2})")
-            ok &= ch3 == ["MT_LOOPS 1 -> 0"] and bad3 == 0 and m.runtime_switches().get("MT_LOOPS") == 0 and c3 == c2
+            ok &= ch3 == [f"{KEY} 1 -> 0"] and bad3 == 0 and m.runtime_switches().get("MT_LOOPS") == 0 and c3 == c2
     text = err.getvalue()
     sys.stderr.write(text)
     warnings = [line for line in text.splitlines() if "WARNING" in line]

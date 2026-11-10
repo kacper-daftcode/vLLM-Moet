@@ -126,7 +126,8 @@ def route_rows_consumed() -> bool:
 #                                   reaches every rank). Keys of this module: B12X_MOE_PREFILL_FAST_SUM_ITEMS (0 / 1 - the sum items with
 #                                   their _DISCARD / _ROUTE_HINT companions as one unit), B12X_MOE_PREFILL_FAST_WS1 (0..11; 0 = v8,
 #                                   9 = v10) and B12X_MOE_PREFILL_FAST_MT_LOOPS (0 / 1 - the m-tile loops of the served FC1 / FC2
-#                                   modes). Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
+#                                   modes; in the log lines this key carries its full name, the two older keys their short tokens
+#                                   SUM_ITEMS / WS1). Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
 #                                   at a MoE-call boundary - this module has no view of the prefill forward; the states are bit-identical
 #                                   alternatives, so a flip between two calls of one step changes no bits), re-reads it only when mtime or
 #                                   size changed, applies the values through the extension's set_runtime_switches, logs one line per rank
@@ -250,7 +251,7 @@ def apply_runtime_switches(values: dict) -> list[str]:
     if now["WS1"] != cur["WS1"]:
         changes.append(f"WS1 {cur['WS1']} -> {now['WS1']}")
     if has_mt and now["MT_LOOPS"] != cur["MT_LOOPS"]:
-        changes.append(f"MT_LOOPS {cur['MT_LOOPS']} -> {now['MT_LOOPS']}")
+        changes.append(f"B12X_MOE_PREFILL_FAST_MT_LOOPS {cur['MT_LOOPS']} -> {now['MT_LOOPS']}")  # a newer key: its full name
     if (now["SUM_ITEMS"], now["SUM_DISCARD"], now["SUM_ROUTE_HINT"]) != (cur["SUM_ITEMS"], cur["SUM_DISCARD"], cur["SUM_ROUTE_HINT"]):
         changes.append(f"SUM_ITEMS {cur['SUM_ITEMS']} -> {now['SUM_ITEMS']} (DISCARD {cur['SUM_DISCARD']} -> {now['SUM_DISCARD']}, "
                        f"ROUTE_HINT {cur['SUM_ROUTE_HINT']} -> {now['SUM_ROUTE_HINT']})")
@@ -311,7 +312,7 @@ def _stats_line(reason: str) -> None:
     mt_cnt = mt_tok = ""
     if "MT_LOOPS" in sw and "fc1_mt_loops" in c:  # a build with the m-tile loops: their counters and their token join the line
         mt_cnt = f", fc1 m-tile loops {c['fc1_mt_loops'][0]} / {c['fc1_mt_loops'][1]}, fc2 m-tile loops {c['fc2_mt_loops'][0]} / {c['fc2_mt_loops'][1]}"
-        mt_tok = f" MT_LOOPS={sw['MT_LOOPS']}"
+        mt_tok = f" B12X_MOE_PREFILL_FAST_MT_LOOPS={sw['MT_LOOPS']}"
     _rt_log(f"activation counters ({reason}; calls / rows): fc1 v10 {c['fc1_v10'][0]} / {c['fc1_v10'][1]}, fc1 v8-v9 {c['fc1_v8_v9'][0]} / {c['fc1_v8_v9'][1]}, "
             f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}{mt_cnt}; "
             f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}{mt_tok}")
