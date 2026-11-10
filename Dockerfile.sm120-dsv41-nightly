@@ -452,15 +452,25 @@ RUN if [ "$VLLM_MOET_KV_SWAP_ASYNC_PATCH" = "1" ]; then \
 # 49. The interpreter's heap frozen again whenever a serving process has worked and gone idle (runtime switch
 #     VLLM_MOET_GC_IDLE_FREEZE=1, default off), and a log line for every garbage collection of 50 ms or more (always on;
 #     VLLM_MOET_GC_WARN_MS). Why: vLLM freezes each serving process's heap once, when its start-up is done (1.25 M objects in a
-#     TP worker); what becomes long-lived afterwards is not frozen - about 1 000 objects per fresh 19K + 163K prefill pair in
-#     every worker - and every full collection walks all of it on the thread that happened to allocate, with the interpreter
-#     lock held: 435 ns per object by the collector's own callbacks in a serving worker (550 ms for a worker's whole heap when
-#     un-frozen). On a 4x RTX PRO 6000 SE server that had served 160 M prompt tokens in nine hours one launch thread of one
-#     rank stopped for 0.3-0.4 s every 5-8 minutes of load per rank (per-thread scheduler statistics sampled from outside):
-#     8 of 23 fresh 163K prefills contained one (+160..+360 ms, +82 ms on the mean), and the pause had grown by 40 % in 2.7
-#     hours of traffic. What: one more gc.collect() right after the start-up freeze (it resets the old-generation size
-#     CPython's full-collection rule remembers) and gc.collect() + gc.freeze() whenever the process has worked and then been
-#     idle for 1 s, so that a full collection walks only what the last burst of requests left. No tensor code is touched.
+#     TP worker); what becomes long-lived afterwards is not frozen - in every worker about 800 objects for each step token
+#     count it has not seen before (b12x's fused-MoE plans, 20 plan sets of ~40 objects; a fresh prompt brings one new
+#     count), i.e. 1 450-1 600 per fresh 19K + 163K prefill pair, and in the EngineCore one KV-offload index entry per stored
+#     chunk (~1 450 per pair) - and every full collection walks all of it on the thread that happened to allocate, with the
+#     interpreter lock held: 0.13-0.36 us per such object by the collector's own callbacks in a serving worker (10-19 ms
+#     34 pairs after a start, inside a request, in all four ranks within a quarter of a second; 550-600 ms for a worker's
+#     whole heap when un-frozen). On the reference host (4x RTX PRO 6000), nine hours and 160 M prompt tokens after a start,
+#     one launch thread of one rank stopped for 0.3-0.4 s every 5-8 minutes of load per rank (per-thread scheduler statistics
+#     sampled from outside): 8 of 23 fresh 163K prefills contained one (+160..+360 ms, +82 ms on the mean), and the pause had
+#     grown by 40 % in 2.7 hours of traffic. What: one more gc.collect() right after the start-up freeze (it resets the
+#     old-generation size CPython's full-collection rule remembers) and gc.collect() + gc.freeze() whenever the process has
+#     worked and then been idle for 1 s, so that a full collection walks only what the requests since the last idle second
+#     left. No tensor code is touched. In situ (-r28 as built, 4x RTX PRO 6000 SE, the collector's callbacks logged in every
+#     process, one server lifetime): 12 pairs with 4 s between them - one freeze per gap in every worker and the EngineCore,
+#     1.5-2.1 ms each, no full collection inside a request, a forced one afterwards 0.01 ms; 6 pairs back to back - full
+#     collections of 1.3-3.0 ms inside requests, growing until the next idle second; fresh 163K 5 174 / 5 178 ms against
+#     5 188 without the switch at the same age; un-freezing a worker after 13 idle freezes and collecting its 1.32 M objects
+#     found no dead one. The API server is idle while the engine works on a long prompt: its freezes fall inside such
+#     requests (about 1 ms, off the path).
 #     CPU test 28/28 (gc_idle_freeze/test_gc_idle_freeze.py; 29/29 inside the image). Patcher on utils/gc_utils.py
 #     (freeze_gc_heap), module moet_gc_idle_freeze.py installed next to it.
 ARG VLLM_MOET_GC_IDLE_FREEZE_PATCH=1
