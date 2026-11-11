@@ -53,7 +53,7 @@ docstrings in code and to commit messages.
 
 `python3 tools/docs_lint.py` enforces the mechanical part (host paths, session jargon, deployment
 narrative, private references, broken links, `py_compile`, `bash -n`); CI runs it on every push and
-it must pass before one. It also holds the form: in `README.md` and `docs/*.md` no table cell longer than
+it must pass before one. It also holds the form: in `README.md`, `docs/*.md` and `kernels/MANIFEST.md` no table cell longer than
 400 characters and no line longer than 1 200, and in `docs/dsv41-sm120.md` the switch table's rows in step
 order with a `served` cell that is `on`, `off`, `not built` or a value plus at most one parenthesis of 40
 characters — a step's mechanism, its measurements and its image history go to the internals doc, a record
