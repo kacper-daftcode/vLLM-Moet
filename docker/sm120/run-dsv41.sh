@@ -11,6 +11,11 @@
 #                        The list is the environment of the -r32 image (the default IMAGE): the runtime keys, the second
 #                        attention cubin and the idle freeze (steps 42b, 46b, 49) came with it; step 42's _WS1=9 (FC1 on
 #                        the warpgroup kernel) and its five _SUM_* (the top-k sum as FC2 work items) with -r28.
+#            RUNTIME_AB_KEEP_FILE (0)  with the reader of the runtime keys on (VLLM_MOET_RUNTIME_AB=1; SERVED=1 sets it) the
+#                        launcher refuses to start while the reader's control file exists: /dev/shm/vllm_moet_ab.json, or
+#                        the /dev/shm path VLLM_MOET_RUNTIME_AB_FILE names. The container shares the host's /dev/shm, so a
+#                        file left behind would be applied at the first prefill and could select the second attention
+#                        cubin. 1 = start anyway (the file's keys then apply).
 #
 # Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r32)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
@@ -102,10 +107,11 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 # warpgroup kernel (_WS1=9), the top-k sum as work items of the FC2 kernel (the five _SUM_*); _WS1=9 and the _SUM_*
 # need the -r28 image or a later one. Three of the last four entries need the -r32 image: the reader of the runtime
 # keys (step 42b; its control file /dev/shm/vllm_moet_ab.json is a file of the HOST, because the container runs
-# --ipc host: none may exist when a server starts); a second attention cubin for that facility (step 46b: loaded and
-# compared with the shipped cubin, never selected - v43b, v43 and v42 must not be selected, docs/dsv41-sm120.md says
-# why); the idle freeze (step 49). The fourth is PyTorch's own pinned-allocator variable (no power-of-two rounding
-# above 256 MiB: the loader's pinned tables take 189.0 instead of 264.3 GiB of host memory).
+# --ipc host: the launcher refuses to start over one, see RUNTIME_AB_KEEP_FILE); a second attention cubin for that
+# facility (step 46b: loaded and compared with the shipped cubin, never selected - v43b, v43 and v42 must not be
+# selected, docs/dsv41-sm120.md says why); the idle freeze (step 49). The fourth is PyTorch's own pinned-allocator
+# variable (no power-of-two rounding above 256 MiB: the loader's pinned tables take 189.0 instead of 264.3 GiB of
+# host memory).
 SERVED_SWITCHES=(
   VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1
   VLLM_MOET_P2P_AR=1 VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8
@@ -248,6 +254,41 @@ fi
 
 if docker ps -q -f name="^${NAME}$" -f status=running | grep -q .; then
   echo "container $NAME already running - stop it first (docker stop -t 60 $NAME)"; exit 0
+fi
+
+# The value the container gets for a variable that SERVED_SWITCHES or EXTRA_DOCKER_ARGS may set: docker keeps the last
+# -e of a name, and EXTRA_DOCKER_ARGS comes after the profile's list on the command line.
+# shellcheck disable=SC2086
+passed_env() {
+  local name="$1" val="" prev="" w
+  for w in "${SERVED_ENV[@]}" ${EXTRA_DOCKER_ARGS}; do
+    if [[ ( "$prev" == "-e" || "$prev" == "--env" ) && "$w" == "$name="* ]]; then val="${w#*=}"; fi
+    if [[ "$w" == -e"$name="* || "$w" == --env="$name="* ]]; then val="${w#*"$name="}"; fi
+    prev="$w"
+  done
+  printf '%s' "$val"
+}
+# Step 42b's control file is a file of the host's /dev/shm (the container runs --ipc host) and outlives the container: one
+# left behind would be applied by the new server at its first prefill - under SERVED=1 it could select the second
+# attention cubin, which is loaded and must not be selected. With the reader on, do not start over such a file.
+RUNTIME_AB_KEEP_FILE="${RUNTIME_AB_KEEP_FILE:-0}"
+case "$RUNTIME_AB_KEEP_FILE" in
+  0|1) ;;
+  *) echo "RUNTIME_AB_KEEP_FILE must be 0 or 1, got $RUNTIME_AB_KEEP_FILE" >&2; exit 1 ;;
+esac
+if [[ "$(passed_env VLLM_MOET_RUNTIME_AB)" == "1" ]]; then
+  ab_file="$(passed_env VLLM_MOET_RUNTIME_AB_FILE)"
+  ab_file="${ab_file:-/dev/shm/vllm_moet_ab.json}"
+  if [[ "$ab_file" == /dev/shm/* && -e "$ab_file" ]]; then
+    if [[ "$RUNTIME_AB_KEEP_FILE" == "1" ]]; then
+      echo "the runtime keys' control file $ab_file exists and RUNTIME_AB_KEEP_FILE=1: its keys apply from the first prefill on"
+    else
+      echo "refusing to start $NAME: the runtime keys' control file $ab_file exists on this host, and with" >&2
+      echo "  VLLM_MOET_RUNTIME_AB=1 the new server would apply it at its first prefill (content: $(head -c 200 "$ab_file" 2>/dev/null | tr '\n' ' '))." >&2
+      echo "  Remove it (rm $ab_file) and start again, or keep it on purpose with RUNTIME_AB_KEEP_FILE=1." >&2
+      exit 1
+    fi
+  fi
 fi
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 if [[ "$KV_OFFLOAD_GIB" != "0" ]]; then
