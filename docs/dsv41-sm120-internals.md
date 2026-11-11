@@ -164,6 +164,12 @@ The file is the whole state of every step that has a key, each key read by its o
 `WOA_DEQUANT_FUSED` (step 3b) and `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` (step 46b) live in the same file.
 The two states of every key are bit-identical alternatives.
 
+The launcher runs the container with the host's IPC namespace, so the control file is a file of the
+host's `/dev/shm` and outlives the server: a file left behind is applied by the next server at its
+first prefill, and removing a file keeps the state it last set until a restart. Write `{}` before
+removing it, and start a server only without the file. `SERVED=1` turns the switch on with no control
+file: every key is in its environment's state (one warning per rank and module that the file is missing).
+
 The activation counters (calls / rows through FC1 v10 vs v8/v9, FC2 with the sum items vs with the
 separate sum kernel, and FC1 / FC2 with the m-tile loops) are printed per rank every
 `VLLM_MOET_B12X_MOE_PREFILL_FAST_STATS_EVERY` MoE calls or on `touch /dev/shm/vllm_moet_stats`.
@@ -203,9 +209,22 @@ into a CUDA graph keeps the cubin it was captured with. Without either variable 
 
 Cubins that `…_SASS_CUBIN_B` may name ship in the image under `/opt/vllm-moet/kernels/cubins-sm120/`
 (the build asserts each sha256, as for the default cubin): the second schedule
-`sparse_mla_prefill_v41s1.cubin`, and `sparse_mla_prefill_v43.cubin` — the kernel with its dequant by
+`sparse_mla_prefill_v41s1.cubin`; `sparse_mla_prefill_v43.cubin` — the kernel with its dequant by
 the scaled BF16 unpack, the candidate index loaded one chunk ahead and the prologue's loads issued back
-to back (bit-identical outputs; `kernels/MANIFEST.md` has its gate).
+to back; and `sparse_mla_prefill_v43b.cubin` — `v43`'s instruction words with one stall raised, so that
+the last tensor instruction stands 14 and 20 issue cycles in front of the two conditional branches
+behind it. All give bit-identical outputs (`kernels/MANIFEST.md` has their gates).
+
+**Which cubin may be selected.** `v42`, `v43` and `v43b` must not be: in the iteration of a token's
+last chunk each rewrites the data registers of a shared-memory store before anything has waited on
+that store (4 / 3 / 3 places; the shipped cubin and `v41s1` have none). A store reads its registers
+when the memory pipe serves it, not when it is issued. In these three the rewriting instruction is a
+shared-memory load, which the pipe serves behind the store, so no wrong bit was ever produced — a
+property measured on two card models, not a rule of the architecture, and a cubin that rests on it is
+never selected. `v43c` is `v43b` with those stores waited (one control word, the same time); it is in
+`kernels/cubins-sm120/` and in no image. `SERVED=1` names `v43b` as the second cubin: it is loaded and
+compared with the shipped one at each rank's first eager launch, and its key stays 0. The places, the
+probe and `v43c`'s checks: [record](benchmarks/sparse-mla-prefill-v43c-2026-11-10.md).
 
 ### Step 47 — the pipelined prefill
 
@@ -287,6 +306,14 @@ later dies inside a reference cycle is no longer reclaimed by the collector (as 
 freeze). In a worker and in the EngineCore no request is in flight at such a moment, but the API server
 is idle while the engine works on a long prompt, so its freezes fall inside such requests (≈ 1 ms, off
 the request's path).
+
+## Host memory
+
+The loader pins its tables in host memory on every rank, and PyTorch's pinned host allocator rounds
+each request up to a power of two: the tables hold 264.3 GiB of shared memory.
+`PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:256`, which `SERVED=1` sets, stops the rounding
+above 256 MiB: 189.0 GiB, with the same lookups. The KV offload region (64 GiB as served) comes on
+top ([record](benchmarks/dsv41-sm120-r32-2026-11-11.md#host-memory)).
 
 ## How changes are validated
 

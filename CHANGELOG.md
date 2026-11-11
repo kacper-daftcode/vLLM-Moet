@@ -5,11 +5,36 @@ commit an image was built from is in its release tag.
 
 ## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
 
-### In the tree after `-r28` (later image builds; not released)
-- Steps 3b, 42b, 46b and 49, and the occupancy guard and the m-tile loops of step 42 — every switch off by default.
-- Since `-r30` the image ships the second schedule of step 46's kernel at
-  `/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin` (the build asserts its sha256, as for the default
-  cubin); since `-r31` also `sparse_mla_prefill_v43.cubin` in the same directory.
+### In the tree after `-r32` (in no released image)
+- The m-tile loops of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS` and its runtime key), off by default.
+- `sparse_mla_prefill_v43c.cubin` — `v43b` with every dequant store waited on every path — in `kernels/cubins-sm120/`
+  (no Dockerfile step copies it), and the store path check `tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py`.
+
+### `dsv41-nightly-df3bd094-r32` — 2026-11-11 (commit `3e3d519`)
+`-r28`'s kernels and switches bit for bit, plus the following — every switch off by default in the image; `SERVED=1`
+sets the three marked *served*:
+- Step 42b, the runtime keys (`VLLM_MOET_RUNTIME_AB`, *served* with no control file): every rank reads a control file
+  and switches between bit-identical alternatives without a restart — step 42's sum items and FC1 kernel, step 3b's
+  dequant, step 46b's cubin — and prints activation counters per rank on request.
+- Step 3b: the prefill dequant of `wo_a` in one kernel (`VLLM_MOET_WOA_DEQUANT_FUSED`).
+- Step 46b: a second cubin of the attention kernel loaded next to the shipped one and selected per launch by a
+  runtime key (`VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B`, *served*: `v43b` loaded, never selected). The image ships
+  three more cubins under `/opt/vllm-moet/kernels/cubins-sm120/` (the build asserts each sha256, as for the default
+  cubin): the second schedule `sparse_mla_prefill_v41s1.cubin`, `sparse_mla_prefill_v43.cubin` and
+  `sparse_mla_prefill_v43b.cubin`. `v43` and `v43b` must not be selected (stores whose data registers are rewritten
+  without a wait; `docs/dsv41-sm120-internals.md`, step 46b).
+- Step 42's occupancy guard: one warning when a kernel of the family starts with fewer CTAs per SM than its mode was
+  measured with (`VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT=1` refuses the launch).
+- Step 49, the idle freeze (`VLLM_MOET_GC_IDLE_FREEZE`, *served*), and a log line for every garbage collection of
+  50 ms or more.
+- `SERVED=1` also sets `PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:256`: the loader's pinned tables take 189.0
+  instead of 264.3 GiB of host memory.
+- Measured at the change of the served image: fresh prefill 163K 5.44 s, 19K 0.66 s and decode 128.0 steps/s on runs
+  with no other request in flight; bits identical to `-r28`; in the serving server `-r28`'s step-42 kernels take
+  2.24 % ± 0.20 % less time at 163K than the set before them — [record](docs/benchmarks/dsv41-sm120-r32-2026-11-11.md).
+- `-r29`, `-r30` and `-r31` were builds on the way and were not served: `-r29` brought the runtime keys of step 42,
+  `-r30` steps 3b and 46b with `sparse_mla_prefill_v41s1.cubin`, `-r31` the occupancy guard, step 49 and
+  `sparse_mla_prefill_v43.cubin`; `-r32` adds `sparse_mla_prefill_v43b.cubin`.
 
 ### `dsv41-nightly-df3bd094-r28` — 2026-11-10
 - Step 42, two more of its stages on new kernels (`SERVED=1` sets the switches), bits identical: FC1 on the warpgroup

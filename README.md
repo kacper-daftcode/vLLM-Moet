@@ -19,14 +19,14 @@ behind a runtime switch.
 
 ### 4× RTX PRO 6000: DeepSeek-V4.1-Flash native
 
-DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r28`
+DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r32`
 (TP4, 512K context, DSpark k = 7, vision, thinking, tool calling, KV offload to host RAM and disk):
 
 | | vLLM-Moet | official vLLM image on the same cards |
 |---|---|---|
 | decode, 1 stream | prose ~293 tok/s, code ~802 tok/s (129 steps/s); Fraser bench 688 tok/s median, 746 best over 40 reps | 60 steps/s with only the fixes it needs to start |
 | decode, 8 streams | prose ~721, code ~2,258 tok/s aggregate | — |
-| fresh prefill | 163K tokens in 5.44 s (30K tok/s), 19K in 0.67 s (medians on an idle server; the pipelined sequence-parallel prefill with its replay layers as CUDA graphs and the prefill MoE on the producer-warp and warpgroup kernels, bit-identical to `-r26b`'s 5.6–5.8 s, `-r25`'s 6.6 s, `-r24`'s 6.8 s and `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
+| fresh prefill | 163K tokens in 5.44 s (30K tok/s), 19K in 0.66 s (medians of runs with no other request in flight; the pipelined sequence-parallel prefill with its replay layers as CUDA graphs and the prefill MoE on the producer-warp and warpgroup kernels, bit-identical to `-r26b`'s 5.6–5.8 s, `-r25`'s 6.6 s, `-r24`'s 6.8 s and `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
 | KV cache | 6.12M tokens on the GPUs (11.7× concurrency at 512K; 9.62M with the one-group prefill) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
 | quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; identical requests return identical logits at any batch size and prompt length | the same checkpoint's quality |
 
@@ -80,12 +80,13 @@ Measurement records for every line: [docs/benchmarks/](docs/benchmarks/).
 ## Quick start: DeepSeek-V4.1-Flash
 
 Four RTX PRO 6000 (an RTX 5090 does not fit the model at TP4), Docker with the NVIDIA container
-toolkit, PCIe peer-to-peer, ~330 GB of host shared memory (less: `KV_OFFLOAD_GIB=0`).
+toolkit, PCIe peer-to-peer, 264.3 GiB of host shared memory for the first start and 253.0 GiB as
+served (less: `KV_OFFLOAD_GIB=0`).
 
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /srv/models/DeepSeek-V4.1-Flash-1017
-export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r28 \
+export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r32 \
   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .     # ~11 min
 
