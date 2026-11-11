@@ -268,6 +268,217 @@ def host_timing() -> bool:
 _HOST = {"last_end": None, "plan_start": None, "plan_end": None, "rows": []}
 
 
+def phase_wait() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=1 (an instrument, off by default): per pipelined step one log line with the time the
+    compute stream sat behind the comm stream's phase-end events and the phases' slack, per (group, phase parity) - see
+    _phase_wait_harvest. Timing events and host clock reads only: no kernel, no order and no bit changes; a failure inside the
+    instrument switches it off with one line (_phase_wait_fail) and the step runs on. Works with or without HOST_TIMING."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0") in ("1", "2", "3") and not _PW["dead"]
+
+
+def phase_split() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=2 (the instrument's second stage): also the split of every comm phase into its
+    collectives and the glue between them, and how much of each lies after the compute stream was free - see _phase_split_line."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0") in ("2", "3") and not _PW["dead"]
+
+
+def phase_layers() -> bool:
+    """VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=3 (the instrument's third stage): also one line per step that names the phases with
+    slack (group, phase index, excess, the compute segment beside it) and the compute segments the host took long to issue."""
+    return os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0") == "3" and not _PW["dead"]
+
+
+_PW = {"pending": [], "dead": False, "lines": 0, "marks": {}, "start": {}, "timer": False, "host0": {}, "host": []}
+
+
+def _pw_capturing() -> bool:
+    """A CUDA graph is being captured on the current stream (the phase graphs, a replay graph): an event recorded now would be a
+    node of the graph, not a time - the instrument leaves such a phase alone."""
+    try:
+        return bool(torch.cuda.is_current_stream_capturing())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class CommTimer:
+    """Stands in for the TP group's `device_communicator.pynccl_comm` (the pattern of CommSwitch below): every attribute resolves
+    on the real communicator; a collective called inside an open comm phase of a pipelined group gets one timing event before and
+    one after it on the phase's stream. The real method is always called, with the caller's arguments, exactly once."""
+
+    _NAMES = ("all_reduce", "all_gather", "all_gatherv", "reduce_scatter", "reduce_scatterv")
+
+    def __init__(self, base) -> None:
+        self._base = base
+
+    def __getattr__(self, name):
+        if name == "_base":
+            raise AttributeError(name)
+        attr = getattr(self._base, name)
+        if name not in CommTimer._NAMES:
+            return attr
+
+        def timed(*args, **kwargs):
+            marks = e0 = st = None
+            try:
+                g = current_group()
+                if g is not None and g.phase_open and g.phase_kind == "comm" and phase_split():
+                    marks = _PW["marks"].get(g.idx)
+                    if marks is not None:
+                        st = kwargs.get("stream") or g.phase_stream
+                        e0 = torch.cuda.Event(enable_timing=True)
+                        e0.record(st)
+            except Exception as exc:  # noqa: BLE001 - never in the way of the collective
+                _phase_wait_fail("split before a collective", exc)
+                e0 = None
+            out = attr(*args, **kwargs)
+            if e0 is not None:
+                try:
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e1.record(st)
+                    marks.append((name, e0, e1))
+                except Exception as exc:  # noqa: BLE001
+                    _phase_wait_fail("split after a collective", exc)
+            return out
+
+        return timed
+
+    def __repr__(self) -> str:
+        return f"CommTimer({self._base!r})"
+
+
+def _phase_split_install() -> None:
+    """Group thread, at the first comm phase of the life: the timing proxy on the TP group's pynccl communicator (pure Python,
+    the same on every rank; no collective is involved)."""
+    if _PW["timer"]:
+        return
+    from vllm.distributed.parallel_state import get_tp_group
+
+    dc = getattr(get_tp_group(), "device_communicator", None)
+    base = getattr(dc, "pynccl_comm", None)
+    if dc is None or base is None or getattr(base, "disabled", True):
+        raise RuntimeError(f"no pynccl communicator to time ({base!r})")
+    if not isinstance(base, CommTimer):
+        dc.pynccl_comm = CommTimer(base)
+    _PW["timer"] = True
+    logger.info("prefill pipeline phase split: the collectives of the comm phases are timed (rank %d)", _tp_rank())
+
+
+def _phase_split_line(num_tokens: int, done: list) -> None:
+    """One line per step from the complete phases: per (group, kind) the elements of the phase in order, each as the sum of its
+    duration and of the part of it after the compute stream was free (ms)."""
+    acc: dict = {}
+    for gidx, pidx, ec, ev, es, marks in done:
+        if es is None or marks is None:
+            continue
+        t_end, t_free = es.elapsed_time(ev), es.elapsed_time(ec)
+        a = acc.setdefault((gidx, pidx & 1), {"n": 0, "total": 0.0, "free": 0.0, "el": {}, "order": []})
+        a["n"] += 1
+        a["total"] += t_end
+        a["free"] += t_free
+        cursor, seq = 0.0, []
+        for i, (name, e0, e1) in enumerate(marks):
+            t0, t1 = es.elapsed_time(e0), es.elapsed_time(e1)
+            seq.append((f"{2 * i}:glue", cursor, t0))
+            seq.append((f"{2 * i + 1}:{name}", t0, t1))
+            cursor = t1
+        seq.append((f"{2 * len(marks)}:tail", cursor, t_end))
+        for key, t0, t1 in seq:
+            if key not in a["el"]:
+                a["el"][key] = [0.0, 0.0, 0]
+                a["order"].append(key)
+            e = a["el"][key]
+            e[0] += t1 - t0
+            e[1] += max(0.0, t1 - max(t0, t_free))
+            e[2] += 1
+    if not acc:
+        return
+    name = {0: "before attention", 1: "before MoE"}
+    parts = []
+    for (g, p), a in sorted(acc.items()):
+        els = ", ".join(f"{k.split(':', 1)[1]} {a['el'][k][0]:.2f}/{a['el'][k][1]:.2f} x{a['el'][k][2]}" for k in a["order"])
+        parts.append(f"g{g} {name[p]}: n {a['n']}, total {a['total']:.2f}, compute free at {a['free']:.2f} | {els}")
+    logger.info("prefill pipeline phase split: at a step of %d tokens (rank %d): %s", num_tokens, _tp_rank(), "; ".join(parts))
+
+
+def _phase_layers_line(num_tokens: int, done: list) -> None:
+    """The phase-wait instrument, third stage: one more line per step - the phases with slack by name (`slack g<G> p<P>:<excess>/<segment>`:
+    group G's comm phase P of its step, P // 2 the layer, P even = before attention, odd = before MoE; ended `excess` ms before the
+    compute stream was free, the compute segment beside it - the OTHER group's - took `segment` ms from the phase's start) and the
+    compute segments a group's thread took 1 ms or more to issue (`host g<G> p<P>:<wall>/<cpu>`: the segment issued before its phase
+    P, wall and thread-CPU ms between the return of phase_end and the next phase_begin; the others as a count and medians)."""
+    slack = []
+    for gidx, pidx, ec, ev, es, _marks in done:
+        d = ec.elapsed_time(ev)
+        if d <= -0.3:
+            free = es.elapsed_time(ec) if es is not None else float("nan")
+            slack.append((gidx, pidx, -d, free))
+    host, _PW["host"] = _PW["host"], []
+    parts = []
+    for g in sorted({x[0] for x in slack}):
+        parts.append(f"slack g{g} " + " ".join(f"p{p}:{d:.2f}/{f:.2f}" for gi, p, d, f in sorted(slack) if gi == g))
+    for g in sorted({x[0] for x in host}):
+        mine = sorted(x for x in host if x[0] == g)
+        long_ = [x for x in mine if x[2] >= 1.0]
+        rest = sorted(x[2] for x in mine if x[2] < 1.0)
+        rest_c = sorted(x[3] for x in mine if x[2] < 1.0)
+        tail = f" (rest: n {len(rest)}, median {rest[len(rest) // 2]:.2f}/{rest_c[len(rest_c) // 2]:.2f})" if rest else ""
+        parts.append(f"host g{g} " + " ".join(f"p{p}:{w:.2f}/{c:.2f}" for _, p, w, c in long_) + tail)
+    if parts:
+        logger.info("prefill pipeline phase layers: at a step of %d tokens (rank %d): %s", num_tokens, _tp_rank(), "; ".join(parts))
+
+
+def _phase_wait_fail(where: str, exc: BaseException) -> None:
+    _PW["dead"] = True
+    _PW["host0"].clear()
+    _PW["host"].clear()
+    _PW["pending"].clear()
+    _PW["marks"].clear()
+    _PW["start"].clear()
+    logger.warning("prefill pipeline phase wait: instrument switched off (%s: %r)", where, exc)
+
+
+def _phase_wait_harvest(num_tokens: int) -> None:
+    """Runner thread, at a step's end: the pairs whose two events have completed (those of earlier steps) as one line."""
+    if not phase_wait():
+        return
+    try:
+        keep, acc, done = [], {}, []
+        for item in _PW["pending"]:
+            gidx, pidx, ec, ev, es, marks = item
+            ready = ec.query() and ev.query()
+            if ready and es is not None and marks is not None:
+                ready = es.query() and all(e0.query() and e1.query() for _, e0, e1 in marks)
+            if ready:
+                done.append(item)
+                d = ec.elapsed_time(ev)  # ms from "the compute stream is free" to "the phase ended": > 0 = the compute stream waited
+                a = acc.setdefault((gidx, pidx & 1), [0, 0.0, 0.0, 0])
+                a[0] += 1
+                if d > 0:
+                    a[1] += d
+                    a[3] += 1
+                else:
+                    a[2] -= d
+            else:
+                keep.append(item)
+        if len(keep) > 2000:  # never grow without bound (a stream that stopped completing events)
+            keep = keep[-2000:]
+        _PW["pending"] = keep
+        if acc:
+            name = {0: "before attention", 1: "before MoE"}
+            parts = [
+                f"g{g} {name[p]}: n {a[0]}, waited {a[1]:.2f} ms in {a[3]}, slack {a[2]:.2f} ms"
+                for (g, p), a in sorted(acc.items())
+            ]
+            _PW["lines"] += 1
+            logger.info("prefill pipeline phase wait: at a step of %d tokens (rank %d): %s", num_tokens, _tp_rank(), "; ".join(parts))
+        if done and phase_split():
+            _phase_split_line(num_tokens, done)
+        if done and phase_layers():
+            _phase_layers_line(num_tokens, done)
+    except Exception as exc:  # noqa: BLE001 - an instrument must never take the forward down
+        _phase_wait_fail("harvest", exc)
+
+
 def _host_mark(name: str) -> None:
     """Runner-thread timestamps of the step's segments (host_timing); a no-op otherwise."""
     if not host_timing():
@@ -277,6 +488,8 @@ def _host_mark(name: str) -> None:
 
 def _host_step_done(num_tokens: int, pipelined: bool, t_dispatch: float, t_end: float) -> None:
     if not host_timing():
+        if pipelined:
+            _phase_wait_harvest(num_tokens)  # the phase-wait instrument without the host-timing lines
         return
     ps, pe, last = _HOST.get("plan_start"), _HOST.get("plan_end"), _HOST.get("last_end")
     row = {
@@ -288,6 +501,8 @@ def _host_step_done(num_tokens: int, pipelined: bool, t_dispatch: float, t_end: 
     }
     _HOST["last_end"] = t_end
     _HOST["plan_start"] = _HOST["plan_end"] = None
+    if pipelined:
+        _phase_wait_harvest(num_tokens)
     rows = _HOST["rows"]
     rows.append(row)
     fmt = lambda v: "-" if v is None else f"{v:.1f}"  # noqa: E731
@@ -874,6 +1089,13 @@ def _phase_begin(kind: str) -> None:
         return
     if g.phase_open:
         raise RuntimeError(f"prefill pipeline: a {kind} phase was opened inside an open {g.phase_kind} phase")
+    if kind == "comm" and _PW["host0"]:  # phase-wait instrument, third stage: how long this thread took to issue its compute segment
+        try:
+            h0 = _PW["host0"].pop(g.idx, None)
+            if h0 is not None and g.phases_done > 0 and phase_layers():
+                _PW["host"].append((g.idx, g.phases_done, (time.perf_counter() - h0[0]) * 1e3, (time.thread_time() - h0[1]) * 1e3))
+        except Exception as exc:  # noqa: BLE001
+            _phase_wait_fail("layers begin", exc)
     step = g.step
     stream = step.comm_stream if kind == "comm" else step.replay_stream
     ev = torch.cuda.Event()
@@ -883,6 +1105,15 @@ def _phase_begin(kind: str) -> None:
     g.phase_open = True
     g.phase_stream = stream
     g.phase_kind = kind
+    if kind == "comm" and phase_split() and not _pw_capturing():  # phase-wait instrument, second stage: the phase's start on the comm stream + its collectives
+        try:
+            _phase_split_install()
+            es = torch.cuda.Event(enable_timing=True)
+            es.record(stream)
+            _PW["start"][g.idx] = es
+            _PW["marks"][g.idx] = []
+        except Exception as exc:  # noqa: BLE001
+            _phase_wait_fail("split begin", exc)
 
 
 def phase_begin() -> None:
@@ -898,7 +1129,10 @@ def phase_end() -> None:
     if g is None or g.step is None or not g.step.pipelined or not g.phase_open:
         return
     step = g.step
-    ev = torch.cuda.Event()
+    pw_on = g.phase_kind == "comm" and phase_wait() and not _pw_capturing()  # phase-wait instrument: the phase's end as a timing event
+    pw_idx = g.phases_done
+    pw_start, pw_marks = _PW["start"].pop(g.idx, None), _PW["marks"].pop(g.idx, None)
+    ev = torch.cuda.Event(enable_timing=True) if pw_on else torch.cuda.Event()
     ev.record(g.phase_stream)
     torch.cuda.set_stream(step.compute_stream)
     if g.phase_kind == "comm":
@@ -913,10 +1147,22 @@ def phase_end() -> None:
         g.phases_done += 1
         step.check_order(g)
     step.yield_(g)
+    if pw_on:  # phase-wait instrument: the moment the compute stream is free of what the other group issued during this group's phase
+        try:
+            ec = torch.cuda.Event(enable_timing=True)
+            ec.record(step.compute_stream)
+            _PW["pending"].append((g.idx, pw_idx, ec, ev, pw_start, pw_marks))
+        except Exception as exc:  # noqa: BLE001
+            _phase_wait_fail("record", exc)
     step.compute_stream.wait_event(ev)
     # the join is enqueued: the tensors the chain read on the comm stream may go back to the compute stream's pool (every
     # later compute-stream kernel is stream-ordered after the join) - see record_for_comm
     g.comm_held.clear()
+    if pw_on and phase_layers():  # phase-wait instrument, third stage: this thread starts issuing its next compute segment now
+        try:
+            _PW["host0"][g.idx] = (time.perf_counter(), time.thread_time())
+        except Exception as exc:  # noqa: BLE001
+            _phase_wait_fail("layers end", exc)
 
 
 def _tail_gate() -> None:
@@ -1694,7 +1940,7 @@ def run_groups(
     the captured graph (or is being captured, during capture_phase_graphs); fn stays the eager path of every other step."""
     runner = _RUNNER
     assert runner is not None, "prefill pipeline: groups without a runner"
-    if host_timing() and _PHASE["request"] is None:  # a dummy step at engine start is not a step of the served traffic
+    if (host_timing() or phase_wait()) and _PHASE["request"] is None:  # a dummy step at engine start is not a step of the served traffic
         t_dispatch = time.perf_counter()
         try:
             return _run_groups(runner, groups, fn, pipelined, phase)

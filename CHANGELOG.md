@@ -11,6 +11,8 @@ the release tag that points at it.
 - The first claim of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_FIRST_CLAIM` and its runtime key), off by default; the watchdog
   record of the prefill MoE is reported as set whenever it is filled.
 - The grid caps of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID1` / `_GRID2`) as runtime keys, and their tokens in the stats line.
+- The phase-wait instrument of step 47 (`VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=1|2|3`, off by default): log lines that say where a
+  pipelined prefill step waits — per comm phase, per element of a phase, per layer.
 - `sparse_mla_prefill_v43c.cubin` — `v43b` with every dequant store waited on every path — in `kernels/cubins-sm120/`
   (no Dockerfile step copies it), and the store path check `tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py`.
 
