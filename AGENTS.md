@@ -57,7 +57,9 @@ it must pass before one. It also holds the form: in `README.md` and `docs/*.md` 
 400 characters and no line longer than 1 200, and in `docs/dsv41-sm120.md` the switch table's rows in step
 order with a `served` cell that is `on`, `off`, `not built` or a value plus at most one parenthesis of 40
 characters — a step's mechanism, its measurements and its image history go to the internals doc, a record
-and `CHANGELOG.md`, not into its row.
+and `CHANGELOG.md`, not into its row. And it counts session labels (`K-12`), paths into working notes and
+deployment phrases ("the production window"): none in any file, except the code files its `LABEL_KNOWN` list
+names, which keep the count they have until they are cleaned — never more.
 
 Never commit: wheels (`patch/*.whl` is ignored), checkpoints, expert packs, smoke results
 (`bench/results/smoke/`).
