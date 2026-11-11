@@ -256,6 +256,19 @@ The bits are identical: every kernel runs at the row count and on the rows it ha
 Per-layer dumps cover the layers outside the graphs; layers 20–39 run inside the graphs and are covered
 by the end-to-end gates.
 
+The comm stream runs at the compute stream's priority. A higher one (`VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY=-1`,
+or the launch order `VLLM_MOET_PREFILL_PIPE_ORDER=comm2prio`) is refused with a warning while FC2's sum
+items of step 42 can be on, and the step runs at priority 0. Every CTA of the prefill MoE's FC1 and FC2
+kernels takes its first work item by its block index, and a sum item of FC2 waits, bounded by its
+watchdog, for every FC2 item of its column tile: FC1 cannot end, and FC2 makes no progress, while one CTA
+of the grid has not been dispatched. A kernel that holds whole SMs when one of the two starts — an NCCL
+collective is four CTAs that each need an empty SM — therefore delays the MoE call by its own length.
+At equal priority that is all: the work distributor gives freed SMs to the earlier grid's pending CTAs.
+Above the compute stream's priority a collective issued later takes them; dispatched in part on the SMs
+FC2's last CTAs wait for, it cannot complete itself, and the two wait for each other until the watchdog
+traps the launch. When a group of a pipelined step fails, the pipeline logs the MoE's watchdog record if
+it is not empty.
+
 ### Step 48 — the KV offload copy path
 
 With the host KV tier, each of the four TP workers registers the shared offload region with

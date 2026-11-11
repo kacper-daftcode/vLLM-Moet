@@ -388,6 +388,24 @@ try:
 except RuntimeError as exc:
     check(isinstance(exc.__cause__, ValueError) and time.time() - t0 < 60, f"(6) a failing group raises on the runner thread without hanging ({str(exc)[:60]})")
 
+# the failure path reads the fast prefill MoE's watchdog record when that extension is loaded in the process (a host read)
+import types  # noqa: E402
+
+_saved_fast = sys.modules.pop("b12x_moe_prefill_fast_sm120", None)
+check(pipe.moe_watchdog_record() is None, "(6) no fast prefill MoE module in the process -> no watchdog record")
+_fake_rec = [0, 100, 5, 4712, 4648, 39, 108, 2000]
+_fake_fast = types.ModuleType("b12x_moe_prefill_fast_sm120")
+_fake_fast._ext = lambda: types.SimpleNamespace(moe_prefill_ws_error=lambda clear: list(_fake_rec))
+sys.modules["b12x_moe_prefill_fast_sm120"] = _fake_fast
+check(pipe.moe_watchdog_record() == _fake_rec, "(6) a filled record is returned although its first word reads 0 (it is written last, before the trap)")
+_fake_rec[:] = [0, 0, 0, 0, 0, 0, 0, 0]
+check(pipe.moe_watchdog_record() is None, "(6) an empty record -> None")
+_fake_fast._ext = lambda: (_ for _ in ()).throw(RuntimeError("no extension"))
+check(pipe.moe_watchdog_record() is None, "(6) a reader that raises -> None (a diagnostic never raises)")
+del sys.modules["b12x_moe_prefill_fast_sm120"]
+if _saved_fast is not None:
+    sys.modules["b12x_moe_prefill_fast_sm120"] = _saved_fast
+
 # merge of (tensor, [aux...]) tuples
 a = (torch.ones(2, 3), [torch.zeros(2, 1), torch.zeros(2, 2)])
 b = (torch.ones(3, 3) * 2, [torch.ones(3, 1), torch.ones(3, 2)])
@@ -489,8 +507,36 @@ os.environ.pop("VLLM_MOET_PREFILL_PIPE_AFFINITY", None)
 pipe._PLACEMENT.update({"cpus": None, "warned": set(), "fifo_ok": None})
 os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "comm2"
 check(pipe.order() == "comm2" and pipe.comm2_enabled() and pipe._comm_priority() == 0, "(8) ORDER=comm2 -> COMM2 on, priority 0")
+_FAST = "VLLM_MOET_B12X_MOE_PREFILL_FAST"
+_prio_env = (_FAST, _FAST + "_WS2", _FAST + "_SUM_ITEMS", "VLLM_MOET_RUNTIME_AB", "VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY")
+_prio_saved = {k: os.environ.pop(k, None) for k in _prio_env}
 os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "comm2prio"
-check(pipe.order() == "comm2prio" and pipe.comm2_enabled() and pipe._comm_priority() == -1, "(8) ORDER=comm2prio -> COMM2 on, priority -1")
+check(pipe.order() == "comm2prio" and pipe.comm2_enabled() and pipe._comm_priority() == -1 and not pipe.comm_priority_refused(),
+      "(8) ORDER=comm2prio -> COMM2 on, priority -1 (the fast prefill MoE off)")
+# A comm stream priority is refused while FC2's sum items of the fast prefill MoE can be on: a sum item waits for every CTA of FC2's
+# grid, and a comm stream above the compute stream's priority can hold the SMs the last CTAs need until the watchdog traps the launch.
+os.environ.update({_FAST: "1", _FAST + "_WS2": "3", _FAST + "_SUM_ITEMS": "1"})
+pipe._PRIORITY_WARNED = False
+check(pipe.comm_priority_requested() == -1 and pipe.comm_priority_refused() and pipe._comm_priority() == 0 and pipe.comm2_enabled()
+      and pipe._PRIORITY_WARNED,
+      "(8) ORDER=comm2prio with the fast prefill MoE's sum items on -> the priority is refused (0, one warning), COMM2 stays on")
+os.environ[_FAST + "_SUM_ITEMS"] = "0"
+check(not pipe.comm_priority_refused() and pipe._comm_priority() == -1, "(8) the sum items off and no runtime reader -> priority -1")
+os.environ["VLLM_MOET_RUNTIME_AB"] = "1"
+check(pipe.comm_priority_refused() and pipe._comm_priority() == 0, "(8) the sum items reachable through the runtime A/B reader -> refused")
+os.environ.pop("VLLM_MOET_RUNTIME_AB")
+os.environ.update({_FAST + "_SUM_ITEMS": "1", _FAST + "_WS2": "0"})
+check(not pipe.comm_priority_refused() and pipe._comm_priority() == -1, "(8) FC2 on the v8 kernel (WS2 = 0: no sum items) -> priority -1")
+os.environ.update({_FAST + "_WS2": "3", "VLLM_MOET_PREFILL_PIPE_ORDER": "today", "VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY": "-1"})
+check(pipe.order() == "today" and not pipe.comm2_enabled() and pipe.comm_priority_refused() and pipe._comm_priority() == 0,
+      "(8) COMM_PRIORITY=-1 with the sum items on -> refused, one communicator")
+os.environ["VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY"] = "0"
+check(not pipe.comm_priority_refused() and pipe._comm_priority() == 0, "(8) priority 0 is never refused")
+for _k, _v in _prio_saved.items():
+    if _v is None:
+        os.environ.pop(_k, None)
+    else:
+        os.environ[_k] = _v
 os.environ["VLLM_MOET_PREFILL_PIPE_ORDER"] = "nonsense"
 check(pipe.order() == "today" and not pipe.comm2_enabled(), "(8) an unknown ORDER value is today's")
 os.environ.pop("VLLM_MOET_PREFILL_PIPE_ORDER", None)

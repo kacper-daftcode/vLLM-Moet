@@ -22,7 +22,8 @@ Bits: every kernel of a group runs at the group's row count with the group's row
 and the moment differ. PIPE=0 at 8 192 batched tokens is *not* today's numerics (the reference is the served 4 096).
 
 Switches: VLLM_MOET_PREFILL_PIPE (0 = off, 2 = two groups), VLLM_MOET_PREFILL_PIPE_ROWS (4096), VLLM_MOET_PREFILL_PIPE_MIXED
-(pipe | today | error: a step whose rows are not all prefill), VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY (0; -1 = high),
+(pipe | today | error: a step whose rows are not all prefill), VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY (0; -1 = high - refused,
+with a warning, while the fast prefill MoE's sum items can be on: see comm_priority_refused),
 VLLM_MOET_PREFILL_PIPE_REPLAY (serial | stream: the replay section on its own stream with handoffs - measured neutral),
 VLLM_MOET_PREFILL_PIPE_TAIL (serial | barrier | sync: when a group's replay tail may start relative to the other
 group's last sequence-parallel phase, see tail_mode), VLLM_MOET_PREFILL_PIPE_LOG_STEPS (0 | 1 = one log line per
@@ -118,18 +119,96 @@ def order() -> str:
     Measured (second 4x RTX PRO 6000 host, kv16+FS, "comm2prio"): bits identical on every gate, 163K 5 389 / 5 321 / 5 344 ms = -0.6 % vs
     5 376-5 391 as built, 19K -1 %; the compute stream's gaps in the SP phase 48 -> 25 ms per step (the indexer all_gatherv waits
     are gone) but the compute kernels slow down under a priority -1 comm stream (attention +5 ms, MXFP8 GEMMs +6 per 19K step),
-    net -4 % of the SP phase; no protection against host CPU load (+35 %, it never touches the tails). Opt-in."""
+    net -4 % of the SP phase; no protection against host CPU load (+35 %, it never touches the tails). Opt-in.
+    That measurement predates the sum items of the fast prefill MoE's FC2: with them the priority is refused and "comm2prio" runs
+    as "comm2" (comm_priority_refused)."""
     variant = os.environ.get("VLLM_MOET_PREFILL_PIPE_ORDER", "today")
     return variant if variant in ("today", "comm2", "comm2prio") else "today"
 
 
-def _comm_priority() -> int:
+def comm_priority_requested() -> int:
+    """The comm stream priority the environment asks for: -1 with ORDER=comm2prio, else VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY (0)."""
     if order() == "comm2prio":
         return -1
     try:
         return int(os.environ.get("VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY", "0"))
     except ValueError:
         return 0
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
+def moe_sum_items_possible() -> bool:
+    """Whether FC2 of the fast prefill MoE can run with its sum items in this process: the fast prefill MoE on
+    (VLLM_MOET_B12X_MOE_PREFILL_FAST=1), FC2 on the producer-warp kernel (_WS2 >= 1), and the sum items either set
+    (_SUM_ITEMS=1) or reachable at run time (VLLM_MOET_RUNTIME_AB=1: the control-file key SUM_ITEMS)."""
+    p = "VLLM_MOET_B12X_MOE_PREFILL_FAST"
+    if os.environ.get(p, "0") != "1" or _env_int(p + "_WS2") < 1:
+        return False
+    return _env_int(p + "_SUM_ITEMS") >= 1 or os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
+
+
+def comm_priority_refused() -> bool:
+    """A comm stream priority other than 0 is REFUSED while FC2's sum items can be on. Why: every CTA of the fast prefill MoE's FC1 /
+    FC2 kernels takes its first work item by its block index, and a sum item of FC2 waits (bounded by a 2 000-ms watchdog that
+    traps the launch) until every FC2 item of its column tile has arrived - so FC2 makes no progress while one CTA of its grid has
+    not been dispatched. With the streams at equal priority the work distributor gives freed SMs to the earlier grid's pending
+    CTAs: a kernel of the comm stream that holds SMs at FC2's start delays FC2 by its own length, no more. Above the compute
+    stream's priority a kernel issued later takes them: an NCCL collective (4 CTAs that each need an empty SM) can then be
+    dispatched in part on the very SMs FC2's last CTAs wait for, cannot complete itself, and the two wait for each other until the
+    watchdog expires - `unspecified launch failure`, the worker is gone. The step then runs with the comm stream at priority 0
+    (ORDER=comm2prio keeps its second communicator)."""
+    return comm_priority_requested() != 0 and moe_sum_items_possible()
+
+
+def moe_watchdog_record() -> list[int] | None:
+    """The fast prefill MoE's watchdog record (pinned host memory, written by the CTA whose bounded wait expired, just before it
+    traps the launch) if the extension is loaded in this process and the record is not empty; None otherwise. A host read: no CUDA
+    call, so it works after the launch failure that the trap causes. The record's first word is written last and may still read 0."""
+    try:
+        import sys
+
+        module = sys.modules.get("b12x_moe_prefill_fast_sm120")
+        loader = getattr(module, "_ext", None)
+        if loader is None or (hasattr(loader, "cache_info") and loader.cache_info().currsize == 0):
+            return None
+        record = [int(v) for v in loader().moe_prefill_ws_error(False)]
+        return record if any(record[:5]) else None
+    except Exception:  # noqa: BLE001 - a diagnostic of an error path must not raise
+        return None
+
+
+_PRIORITY_WARNED = False
+
+
+def _comm_priority() -> int:
+    """The comm stream's priority: the requested one, or 0 when it is refused (one warning per process, see comm_priority_refused)."""
+    global _PRIORITY_WARNED
+    asked = comm_priority_requested()
+    if asked == 0 or not comm_priority_refused():
+        return asked
+    if not _PRIORITY_WARNED:
+        _PRIORITY_WARNED = True
+        source = (
+            "VLLM_MOET_PREFILL_PIPE_ORDER=comm2prio"
+            if order() == "comm2prio"
+            else f"VLLM_MOET_PREFILL_PIPE_COMM_PRIORITY={asked}"
+        )
+        logger.warning(
+            "vllm-moet sm_120 prefill pipeline: comm stream priority %d REFUSED (%s) - the fast prefill MoE's sum items can be on "
+            "(VLLM_MOET_B12X_MOE_PREFILL_FAST=1 with _WS2 >= 1 and _SUM_ITEMS=1 or the runtime A/B reader): FC2 waits for every CTA "
+            "of its grid, and a comm stream above the compute stream's priority can hold the SMs its last CTAs need until the "
+            "2 000-ms watchdog traps the launch. The pipelined step runs with the comm stream at priority 0%s.",
+            asked,
+            source,
+            " (the second communicator of ORDER=comm2prio stays on: the step is ORDER=comm2)" if order() == "comm2prio" else "",
+        )
+    return 0
 
 
 def affinity_policy() -> frozenset[str]:
@@ -753,6 +832,15 @@ class PipeStep:
                 g.comm_held = []
         if self.errors:
             failed = min(self.errors)
+            record = moe_watchdog_record()
+            if record is not None:
+                logger.error(
+                    "vllm-moet sm_120 prefill pipeline: a group failed and the fast prefill MoE's watchdog record is not empty: "
+                    "[set, what, item, need, seen, smid, block, watchdog_ms] = %s (what 100 + n = FC2's sum items of column tile n "
+                    "waited for the tile's FC2 items: need - seen arrivals missing, 8 per CTA that was never dispatched; `set` can "
+                    "read 0 after a trap)",
+                    record,
+                )
             raise RuntimeError(f"prefill pipeline: group {failed} of {len(self.groups)} failed") from self.errors[
                 failed
             ]
