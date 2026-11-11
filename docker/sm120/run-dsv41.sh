@@ -4,14 +4,15 @@
 #
 # Required:  MODEL_DIR   the official DeepSeek-V4.1-Flash checkpoint directory
 #
-# Profile:   SERVED (0)  1 = the production configuration: --moe-backend b12x, DSpark k = 7 on the b12x backend,
-#                        --enable-prompt-tokens-details and the runtime switches production runs with (the list is
-#                        SERVED_SWITCHES below; docs/dsv41-sm120.md explains each). EXTRA_DOCKER_ARGS="-e VAR=0" after it
-#                        overrides a single switch. 0 = vLLM's defaults plus the image's build-time changes only.
-#                        Six switches of the list need the -r28 image (the default IMAGE) or a later one: step 42's
-#                        _WS1=9 (FC1 on the warpgroup kernel) and its five _SUM_* (the top-k sum as FC2 work items).
+# Profile:   SERVED (0)  1 = the served configuration: --moe-backend b12x, DSpark k = 7 on the b12x backend,
+#                        --enable-prompt-tokens-details and the runtime environment the reference host serves with (the
+#                        list is SERVED_SWITCHES below; docs/dsv41-sm120.md explains each). EXTRA_DOCKER_ARGS="-e VAR=0"
+#                        after it overrides a single switch. 0 = vLLM's defaults plus the image's build-time changes only.
+#                        The list is the environment of the -r32 image (the default IMAGE): the runtime keys, the second
+#                        attention cubin and the idle freeze (steps 42b, 46b, 49) came with it; step 42's _WS1=9 (FC1 on
+#                        the warpgroup kernel) and its five _SUM_* (the top-k sum as FC2 work items) with -r28.
 #
-# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r28)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r32)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
 #            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results + DeepGEMM JIT; the first start fills it (~22 min)
 #            SERVED_NAME (deepseek-ai/DeepSeek-V4.1-Flash)  the model name the API answers to
@@ -41,8 +42,9 @@
 #            INDEXER_TP_SHARD_MIN_ROWS ("")  from this many prefill rows per step the indexer shards its rows over the TP
 #                        ranks; "" keeps vLLM's 65,536 (never reached with 4096-token chunks); production runs 2048
 #            KV_OFFLOAD_GIB (0)      > 0: evicted KV kept in N GiB of pinned host RAM (one /dev/shm region for all ranks,
-#                        896 B per token) and restored on a prefix hit; the host needs ~330 GB of shared memory in total
-#                        with 64 GiB - on a host with less RAM keep 0 (nothing changes below the GPU KV capacity)
+#                        896 B per token) and restored on a prefix hit; with 64 GiB the host needs 253.0 GiB of shared
+#                        memory in total under SERVED=1 (328.3 GiB without its allocator variable) - on a host with
+#                        less RAM keep 0 (nothing changes below the GPU KV capacity)
 #            KV_OFFLOAD_FS_DIR ("")  with KV_OFFLOAD_GIB > 0: a disk tier behind the RAM tier (one file per 128-token
 #                        block, survives restarts). vLLM never deletes the files: run docker/sm120/kvcache-ttl.sh from
 #                        cron. Images labeled com.vllm-moet.v41-kv-records=interleaved write under DIR/v41-interleaved;
@@ -60,7 +62,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r28}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r32}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -94,11 +96,16 @@ else
 fi
 REPLAY_CAPTURE_SIZES="${REPLAY_CAPTURE_SIZES:-128,256}"
 GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
-# The production configuration (docs/dsv41-sm120.md, "Switches"): the runtime switches of the image's steps that are
-# off by default, in the state production serves them. EXTRA_DOCKER_ARGS comes later on the docker command line, so
+# The served configuration (docs/dsv41-sm120.md, "Switches"): the runtime switches of the image's steps that are
+# off by default, in their served state. EXTRA_DOCKER_ARGS comes later on the docker command line, so
 # "-e VAR=0" there overrides one of these. Step 42's stages: FC2 on the producer-warp kernel (_WS2=3), FC1 on the
 # warpgroup kernel (_WS1=9), the top-k sum as work items of the FC2 kernel (the five _SUM_*); _WS1=9 and the _SUM_*
-# need the -r28 image or a later one.
+# need the -r28 image or a later one. Three of the last four entries need the -r32 image: the reader of the runtime
+# keys (step 42b; its control file /dev/shm/vllm_moet_ab.json is a file of the HOST, because the container runs
+# --ipc host: none may exist when a server starts); a second attention cubin for that facility (step 46b: loaded and
+# compared with the shipped cubin, never selected - v43b, v43 and v42 must not be selected, docs/dsv41-sm120.md says
+# why); the idle freeze (step 49). The fourth is PyTorch's own pinned-allocator variable (no power-of-two rounding
+# above 256 MiB: the loader's pinned tables take 189.0 instead of 264.3 GiB of host memory).
 SERVED_SWITCHES=(
   VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1
   VLLM_MOET_P2P_AR=1 VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8
@@ -111,6 +118,9 @@ SERVED_SWITCHES=(
   VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_TOKENS=128 VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_MIN_ROWS=512
   VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
   VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE} VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=${PREFILL_PIPE_REPLAY_GRAPHS}
+  VLLM_MOET_RUNTIME_AB=1
+  VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B=/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin
+  VLLM_MOET_GC_IDLE_FREEZE=1 PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:256
 )
 if [[ "$SERVED" == "1" ]]; then
   : "${SPEC_TOKENS:=7}"
