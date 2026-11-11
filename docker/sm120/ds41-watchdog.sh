@@ -10,7 +10,12 @@
 #   - running longer than STARTUP_GRACE_MIN minutes but GET /health fails PROBE_FAILS times in a row (one probe per
 #     run, 20 s timeout; vLLM answers 500 once its engine is dead) -> the same, after `docker stop -t 60`;
 #   - at most one restart per COOLDOWN_MIN minutes and MAX_RESTARTS per 6 h per container; above that it only logs
-#     ("needs a human") - a server that cannot stay up should not be restarted in a loop.
+#     ("needs a human") - a server that cannot stay up should not be restarted in a loop;
+#   - before it starts a new ds41 container it moves a control file of the runtime keys it finds (AB_FILE, default
+#     /dev/shm/vllm_moet_ab.json; docs/dsv41-sm120.md, step 42b) to <file>.stale-<UTC>: the file is the host's and
+#     outlives the server that read it, the next server would apply it at its first prefill, and the launcher refuses
+#     to start over it. The server it belonged to is gone - the safe state is no file, every key at its environment's
+#     value. A running, healthy server's file is never touched.
 # A maintenance window: `touch WRAPPER_DIR/MAINTENANCE` before stopping anything by hand (w8_stop.sh ds41-flash does
 # it), `rm` it when the window is over; while it exists the watchdog does nothing but remind every hour.
 # Output only when something is wrong or done (a healthy minute prints nothing), one line per event, UTC.
@@ -22,6 +27,7 @@ LOG_DIR="${LOG_DIR:-/mnt/k3x/logs}"
 STATE_DIR="${STATE_DIR:-$WRAPPER_DIR/.watchdog}"
 MAINTENANCE="${MAINTENANCE:-$WRAPPER_DIR/MAINTENANCE}"
 NAME="${NAME:-ds41-flash}"; PORT="${PORT:-8001}"
+AB_FILE="${AB_FILE:-/dev/shm/vllm_moet_ab.json}"   # the control file of ds41's runtime keys (the launcher's default)
 QWEN="${QWEN:-qwen38}"; QWEN_PORT="${QWEN_PORT:-8000}"
 STARTUP_GRACE_MIN="${STARTUP_GRACE_MIN:-35}"   # a DeepSeek start takes 17-25 min on 4x RTX PRO 6000
 PROBE_FAILS="${PROBE_FAILS:-3}"
@@ -74,8 +80,14 @@ save_and_rename() {  # name -> saves docker logs + inspect, renames the containe
   fi
 }
 note_restart() { [[ "$DRY_RUN" == 1 ]] || echo "$now_s" >> "$STATE_DIR/$1.restarts"; }
+set_aside_ab_file() {  # a control file of the runtime keys left by the server that is gone -> <file>.stale-<UTC>
+  [[ -e "$AB_FILE" ]] || return 0
+  local to; to="$AB_FILE.stale-$(stamp)"
+  log "$NAME: control file of the runtime keys found ($AB_FILE) - moving it to $to; the new server starts with every key at its environment's value"
+  run mv -f "$AB_FILE" "$to"
+}
 
-# --- the production server: wrapper start (a fresh container, the launcher clears stale /dev/shm regions)
+# --- the DeepSeek server: wrapper start (a fresh container, the launcher clears stale /dev/shm regions)
 check_ds41() {
   local st started age_min fails f="$STATE_DIR/$NAME.fails"
   st=$(docker inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null || echo missing)
@@ -83,6 +95,7 @@ check_ds41() {
     log "$NAME: $st (exit $(docker inspect "$NAME" --format '{{.State.ExitCode}} OOMKilled={{.State.OOMKilled}} finished {{.State.FinishedAt}}' 2>/dev/null || echo '-'))"
     may_restart "$NAME" || return
     save_and_rename "$NAME"
+    set_aside_ab_file
     log "$NAME: starting a new container with $WRAPPER_DIR/run.sh"
     run bash -c "cd '$WRAPPER_DIR' && ./run.sh > '$LOG_DIR/$NAME-watchdog-start-$(stamp).log' 2>&1 < /dev/null"
     note_restart "$NAME"; rm -f "$f"; return
@@ -98,6 +111,7 @@ check_ds41() {
   log "$NAME: unhealthy $fails times - stopping and starting a new container"
   run docker stop -t 60 "$NAME"
   save_and_rename "$NAME"
+  set_aside_ab_file
   run bash -c "cd '$WRAPPER_DIR' && ./run.sh > '$LOG_DIR/$NAME-watchdog-start-$(stamp).log' 2>&1 < /dev/null"
   note_restart "$NAME"; rm -f "$f"
 }
