@@ -5,7 +5,10 @@ tools compile; launchers parse; the reference docs keep the form of a
 reference: README.md and docs/*.md have no table cell longer than 400
 characters and no line longer than 1 200, and the switch table of
 docs/dsv41-sm120.md has its rows in step order with a `served` cell that is a
-state (on / off / not built / a value, plus at most one short parenthesis).
+state (on / off / not built / a value, plus at most one short parenthesis); no
+session label (K-12), no path into working notes (K/k12/..., MK/REPORT.md) and
+no deployment narrative ("the production window") outside the files that
+LABEL_KNOWN still tolerates, each at the count it has.
 
     python3 tools/docs_lint.py          # exit 1 on any finding
 
@@ -74,6 +77,38 @@ STEP_RE = re.compile(r"(\d+)([a-z]?)")
 SERVED_RE = re.compile(r"(?:on|off|not built|`[^\s`|]+`|[^\s`|()]+)(?: \([^()]{1,40}\))?")
 
 
+# What AGENTS.md rules out and the word list above does not see: session labels (K-12, MK-2), paths into working notes
+# (K/k12/DESIGN.md, MK/REPORT.md) and the narrative of a deployment ("the production window", "production runs 2048").
+# The files of LABEL_KNOWN carried such text when the check was introduced and are code that the introducing commit did
+# not edit: each keeps the number of findings recorded here - one more is a finding, and so is an entry whose file has
+# fewer (lower the number; delete the entry at zero). Every other file must have none.
+LABEL_RULES = [
+    (re.compile(r"(?<![\w-])(?:K|MK|SCH|HS|CS|EM|SD|TW|WN|BQ|RA|DOC)-\d{1,2}[a-z]?\b(?![-\w])"), "session label"),
+    (re.compile(r"(?<![\w./-])(?:K|MK|SCH|HS|CS|EM|SD|TW|WN|BQ|RA|DOC|W|L|V|U|R|T)/"
+                r"(?:REPORT|NEEDS_OWNER|BRIEF|STATE|[a-z]+\d{1,2}[a-z]?/)[\w./-]*"), "working-note path"),
+    (re.compile(r"\bproduction (?:window|runs|serves)\b|\bthe state production\b"), "deployment narrative"),
+]
+LABEL_KNOWN = {
+    "tools/dsv41_sm120/b12x_moe_prefill_fast/b12x_moe_prefill_fast_sm120.cu": 61,  # 55 session labels, 6 working-note paths
+    "tools/dsv41_sm120/b12x_moe_prefill_fast/b12x_moe_prefill_fast_sm120.py": 9,  # 8 session labels, 1 working-note path
+    "tools/dsv41_sm120/b12x_moe_prefill_fast/test_b12x_moe_prefill_fast_sm120.py": 1,  # 1 session label
+    "tools/dsv41_sm120/bf16_gemm/bf16_replica_gemm_sm120.py": 1,  # 1 session label
+    "tools/dsv41_sm120/kv_offload/kv_swap_async.py": 2,  # 2 session labels
+    "tools/dsv41_sm120/kv_offload/patch_vllm_kv_swap_async_sm120.py": 2,  # 2 session labels
+    "tools/dsv41_sm120/patch_vllm_mxfp8_gemm_b12x_sm120.py": 1,  # 1 working-note path
+    "tools/dsv41_sm120/patch_vllm_prefill_device_comm_sm120.py": 8,  # 8 session labels
+    "tools/dsv41_sm120/patch_vllm_prefill_pipe_sm120.py": 17,  # 17 session labels
+    "tools/dsv41_sm120/sm120_gemv/vllm_sm120_gemv_bmm.py": 2,  # 2 session labels
+    "tools/dsv41_sm120/sp_moe_gather/sp_moe_gather_sm120.py": 2,  # 2 session labels
+    "tools/dsv41_sm120/sp_pipeline/compare_dumps.py": 2,  # 2 session labels
+    "tools/dsv41_sm120/sp_pipeline/moet_device_comm.py": 27,  # 20 session labels, 7 working-note paths
+    "tools/dsv41_sm120/sp_pipeline/moet_device_comm_sm120.cu": 30,  # 29 session labels, 1 working-note path
+    "tools/dsv41_sm120/sp_pipeline/moet_prefill_pipe.py": 67,  # 3 deployment narratives, 59 session labels, 5 working-note paths
+    "tools/dsv41_sm120/sp_pipeline/test_device_comm_unit.py": 6,  # 5 session labels, 1 working-note path
+    "tools/dsv41_sm120/sp_pipeline/test_prefill_pipe_unit.py": 3,  # 3 session labels
+}
+
+
 def tracked_files() -> list[str]:
     out = subprocess.run(["git", "-C", ROOT, "ls-files", "-z"], check=True, capture_output=True).stdout
     return [f for f in out.decode().split("\0") if f]
@@ -115,6 +150,40 @@ def check_links(files: list[str]) -> list[str]:
                     path = os.path.normpath(os.path.join(base, target))
                     if not os.path.exists(path):
                         findings.append(f"{f}:{n}: broken link {target}")
+    return findings
+
+
+def label_hits(path: str) -> list[tuple[int, str, str]]:
+    """(line number, kind, line) of every session label, working-note path and deployment phrase of a file."""
+    hits = []
+    with open(path, encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            for rx, why in LABEL_RULES:
+                hits += [(n, why, line.strip())] * len(rx.findall(line))
+    return hits
+
+
+def check_labels(files: list[str]) -> list[str]:
+    findings = []
+    for f in files:
+        if f in WORDING_EXEMPT or f.startswith(WORDING_EXEMPT_PREFIXES) or not is_text(f):
+            continue
+        try:
+            hits = label_hits(os.path.join(ROOT, f))
+        except UnicodeDecodeError:
+            continue
+        known = LABEL_KNOWN.get(f)
+        if known is None:
+            findings += [f"{f}:{n}: {why}: {text[:120]}" for n, why, text in hits]
+        elif len(hits) > known:
+            n, why, text = hits[-1]
+            findings.append(f"{f}: {len(hits)} session labels / working-note paths / deployment phrases, LABEL_KNOWN allows "
+                            f"{known}: remove the new one(s), e.g. line {n}: {why}: {text[:80]}")
+        elif len(hits) < known:
+            findings.append(f"{f}: {len(hits)} session labels / working-note paths / deployment phrases where LABEL_KNOWN "
+                            f"records {known}: {'delete its entry' if not hits else 'lower its entry'}")
+    for f in sorted(set(LABEL_KNOWN) - set(files)):
+        findings.append(f"{f}: LABEL_KNOWN entry for a file that is not tracked: delete it")
     return findings
 
 
@@ -222,7 +291,8 @@ def check_sources(files: list[str]) -> list[str]:
 
 def main() -> int:
     files = tracked_files()
-    findings = check_wording(files) + check_links(files) + check_form(files) + check_switch_table(files) + check_sources(files)
+    findings = (check_wording(files) + check_labels(files) + check_links(files) + check_form(files)
+                + check_switch_table(files) + check_sources(files))
     for line in findings:
         print(line)
     if findings:
