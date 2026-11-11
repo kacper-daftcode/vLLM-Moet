@@ -53,7 +53,8 @@ bases). The changes behind it:
 input's all-gather alone 15 %), the MoE **19 %** (0.94 ms per layer-chunk against a 0.83 ms DRAM floor), the
 sparse-MLA prefill kernel **13 %** (BF16, one CTA per SM, latency-bound), CUTLASS MXFP8 **9 %**, cuBLAS bf16 4 %,
 GPU idle 2 %. The steps that took it from ~15.5 s (the official image) through ~8.5–9 s (newer vLLM bases: the SWA
-bounded replay, the indexer's row sharding) to 7.2 s, and on to 5.6–5.8 s:
+bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.44 s with
+step 42's later kernels (−2 %) and the host's CPU governor `performance` (−5.49 %):
 
 - **Step 40** — the V4.1-record prefill rows on sm_120 went through FlashInfer's single-group FP8 kernel (Q, QK, P and
   PV in FP8; H100 / B200 compute the same attention in BF16). The full-BF16 SM120 kernel FlashInfer also ships is 24×
@@ -146,12 +147,18 @@ real prefill a row chunk has 2.9 of 4 on average, and on FC1's 64-column tile ev
 the four. With the switch an item branches once to a loop that holds only its own m-tiles' loads and
 QMMAs: the same QMMAs on the same operands in the same order per accumulator, identical on the harness
 in every mode. FC2's specialised kernel is built for two CTAs per SM (92 registers per thread; the
-warning above covers it as `fc2_kernel_ws_mt<4, 2>`). The loops are measured on the kernel harness and
-not yet in the served forward.
+warning above covers it as `fc2_kernel_ws_mt<4, 2>`). On one card the loops make the MoE call's kernels
+6.9 % shorter. In the served forward they are bit-identical and worth 0.19–0.32 % of a 163K prefill at a
+400 W limit, 1.1–1.3 % at 300 W, and 0.84 % at 400 W when the two row groups run one after the other:
+the pipelined step is paced by the communication phase that runs beside the MoE, not by the MoE — the
+compute stream waits about 0.6 ms after every MoE call for that phase to end, 24 ms of a 239-ms step,
+and a shorter MoE lengthens the wait. The arms:
+[record](benchmarks/dsv41-sm120-steps-2026-11-10.md#step-42--the-prefill-moe-kernels).
 
 ### Step 42b — the runtime keys
 
-The runtime A/B switch of step 42's level-B paths, for paired A/B measurements in one server lifetime.
+The runtime switch between the bit-identical kernel alternatives of step 42, for paired A/B
+measurements in one server lifetime.
 With `VLLM_MOET_RUNTIME_AB=1` every rank reads the control file — one flat JSON object switch → value,
 written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/vllm_moet_ab.json'` — at
 most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the

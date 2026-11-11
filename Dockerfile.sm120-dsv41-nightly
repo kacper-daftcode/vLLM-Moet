@@ -5,10 +5,10 @@
 # interleaved V4.1 KV records (2), anchored patchers on the installed vLLM / FlashInfer and CUDA extensions compiled
 # here so nothing JIT-compiles at boot (3-42). Every step is a build argument (--build-arg VLLM_MOET_<STEP>=0 leaves
 # it out) and lands in a com.vllm-moet.* label the launcher and the tests read. What each step does, its runtime
-# switch and the state production serves: docs/dsv41-sm120.md; the measurements behind it:
+# switch and its served state: docs/dsv41-sm120.md; the measurements behind it:
 # docs/dsv41-sm120-internals.md; the patchers, kernels and tests by step: tools/dsv41_sm120/README.md.
 #
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r23 .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r32 .
 #   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 SERVED=1 docker/sm120/run-dsv41.sh      # docker/sm120/run-dsv41.sh
 #
 # Steps 7 and 9 (the SWA bounded replay, the fused query-norm + quantization gate) and 24, 25, 29, 35 are vLLM's own
@@ -432,8 +432,8 @@ RUN if [ "$VLLM_MOET_PREFILL_PIPE_PATCH" = "1" ] && [ "$VLLM_MOET_PREFILL_SP_PAT
     && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu/model_runner.py \
     && grep -q "sm_120 prefill pipeline" /usr/local/lib/python3.12/dist-packages/vllm/models/deepseek_v41/nvidia/model.py; fi
 
-# 48. The KV offload connector's copy path off the runner's main thread (runtime switch VLLM_MOET_KV_SWAP_ASYNC=1, default off;
-#     K-10). Why: the connector's CPU region (/dev/shm, 17 GB) is cudaHostRegistered by the four TP workers at start-up and in
+# 48. The KV offload connector's copy path off the runner's main thread (runtime switch VLLM_MOET_KV_SWAP_ASYNC=1, default
+#     off). Why: the connector's CPU region (/dev/shm, 17 GB) is cudaHostRegistered by the four TP workers at start-up and in
 #     14 of 14 r26/r27 server logs three of the four registrations failed (the pin of the whole range at once under the loaded
 #     host's memory state) - the region stays pageable on those ranks and cuMemcpyBatchAsync into pageable memory is
 #     host-synchronous, so rank 0 (the store writer) blocked 211-219 ms per 8192-token step when it lost the lottery (HOST_TIMING
