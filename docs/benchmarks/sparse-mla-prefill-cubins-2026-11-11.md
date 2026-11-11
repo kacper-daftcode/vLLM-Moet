@@ -125,5 +125,6 @@ dependency-aware schedule (`v41s1` and every cubin after it) runs on cards with 
 sha256 `7e812fa2d9c47770…`, 30 344 B: `v43b` with one control word changed, so that every store of the dequant is
 waited before a register it reads is rewritten, on every path — the branch behind the loop-top `BAR.SYNC` waits on
 scoreboards 3, 4 and 5. Build: `KERNEL=v43c tools/dsv41_sm120/sparse_mla_sass/build_sparse_mla_sass.sh`. The
-instruction words, stalls and time of `v43b`; bit-identical with the reference kernel; in no image. Its gate, the
+instruction words, stalls and time of `v43b`; bit-identical with the reference kernel; not in the served image (image
+step 46e copies it from the next build on). Its gate, the
 probe and its times: [record](sparse-mla-prefill-v43c-2026-11-10.md).
