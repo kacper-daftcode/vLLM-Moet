@@ -16,7 +16,8 @@ the release tag that points at it.
 - The instrument's level as a runtime key (`PREFILL_PIPE_PHASE_WAIT` in step 42b's control file): a running server takes the
   instrument on for a few requests and off again; `sp_pipeline/phase_balance.py` reads its lines as one line per rank.
 - `sparse_mla_prefill_v43c.cubin` — `v43b` with every dequant store waited on every path — in `kernels/cubins-sm120/`
-  (no Dockerfile step copies it), and the store path check `tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py`.
+  and, from image step 46e on, in the image (loaded only when named as the second cubin of step 46b), and the store path
+  check `tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py`.
 
 ### `dsv41-nightly-df3bd094-r32` — 2026-11-11 (commit `3e3d519`)
 `-r28`'s kernels and switches bit for bit, plus the following — every switch off by default in the image; `SERVED=1`

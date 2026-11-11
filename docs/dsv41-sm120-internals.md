@@ -295,7 +295,8 @@ when the memory pipe serves it, not when it is issued. In these three the rewrit
 shared-memory load, which the pipe serves behind the store, so no wrong bit was ever produced — a
 property measured on two card models, not a rule of the architecture, and a cubin that rests on it is
 never selected. `v43c` is `v43b` with those stores waited (one control word, the same time); it is in
-`kernels/cubins-sm120/` and in no image. `SERVED=1` names `v43b` as the second cubin: it is loaded and
+`kernels/cubins-sm120/` and, from image step 46e on, in the image; the served image does not carry it.
+`SERVED=1` names `v43b` as the second cubin: it is loaded and
 compared with the shipped one at each rank's first eager launch, and its key stays 0. The places, the
 probe and `v43c`'s checks: [record](benchmarks/sparse-mla-prefill-v43c-2026-11-10.md).
 

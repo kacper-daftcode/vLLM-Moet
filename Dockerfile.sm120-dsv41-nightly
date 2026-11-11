@@ -404,6 +404,12 @@ COPY kernels/cubins-sm120/sparse_mla_prefill_v43.cubin /opt/vllm-moet/kernels/cu
 #     kernels/MANIFEST.md; the times differ by less than the measurement. NOT loaded by default:
 #     VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B may name it instead of the file of 46b or 46c.
 COPY kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin /opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin
+# 46e. sparse_mla_prefill_v43c: v43b's instruction words and stalls with one wait added, so that every shared-memory store of
+#     the dequant is waited before a register it reads is rewritten, on every path (the store path check of
+#     tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py finds none left; v43b, v43 and v42 have such stores and are not to be
+#     selected). Bit-identical with v43b on the gate in kernels/MANIFEST.md. NOT loaded by default:
+#     VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B may name it instead of the file of 46b, 46c or 46d.
+COPY kernels/cubins-sm120/sparse_mla_prefill_v43c.cubin /opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43c.cubin
 ARG VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH=1
 RUN if [ "$VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH" = "1" ] && [ "$VLLM_MOET_SPARSE_MLA_PREFILL_BF16_PATCH" = "1" ]; then \
        python3 /opt/vllm-moet/dsv41_sm120/patch_vllm_sparse_mla_prefill_sass_sm120.py \
@@ -412,7 +418,8 @@ RUN if [ "$VLLM_MOET_SPARSE_MLA_PREFILL_SASS_PATCH" = "1" ] && [ "$VLLM_MOET_SPA
     && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v41.cubin', 'rb').read()).hexdigest(); assert h.startswith('c896234bc76d6938'), h; print('sparse-MLA prefill SASS cubin', h[:16])" \
     && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v41s1.cubin', 'rb').read()).hexdigest(); assert h.startswith('5924622b6289fca4'), h; print('sparse-MLA prefill SASS cubin, schedule s1', h[:16])" \
     && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43.cubin', 'rb').read()).hexdigest(); assert h.startswith('43f04db5cc9e9874'), h; print('sparse-MLA prefill SASS cubin v43', h[:16])" \
-    && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin', 'rb').read()).hexdigest(); assert h.startswith('a163aea6d869c55e'), h; print('sparse-MLA prefill SASS cubin v43b', h[:16])"; fi
+    && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin', 'rb').read()).hexdigest(); assert h.startswith('a163aea6d869c55e'), h; print('sparse-MLA prefill SASS cubin v43b', h[:16])" \
+    && python3 -c "import hashlib; h = hashlib.sha256(open('/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43c.cubin', 'rb').read()).hexdigest(); assert h.startswith('7e812fa2d9c47770'), h; print('sparse-MLA prefill SASS cubin v43c', h[:16])"; fi
 
 # 47. The pipelined sequence-parallel prefill (runtime switch VLLM_MOET_PREFILL_PIPE=2 with --max-num-batched-tokens 8192,
 #     default off; needs steps 41 and 45). An eager step of > 4096 tokens is split into two 4096-row groups run one layer apart
