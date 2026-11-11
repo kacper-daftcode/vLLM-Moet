@@ -1,7 +1,8 @@
 # Changelog
 
 Released images and what changed between them. Image tags are `vllm-moet-sm120:<line>-<base>-rNN`; the
-commit an image was built from is in its release tag.
+commit an image was built from stands in its entry's heading where it is on record — as a commit, or as
+the release tag that points at it.
 
 ## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
 
@@ -36,7 +37,7 @@ sets the three marked *served*:
   `-r30` steps 3b and 46b with `sparse_mla_prefill_v41s1.cubin`, `-r31` the occupancy guard, step 49 and
   `sparse_mla_prefill_v43.cubin`; `-r32` adds `sparse_mla_prefill_v43b.cubin`.
 
-### `dsv41-nightly-df3bd094-r28` — 2026-11-10
+### `dsv41-nightly-df3bd094-r28` — 2026-11-10 (commit `7e2b74f`)
 - Step 42, two more of its stages on new kernels (`SERVED=1` sets the switches), bits identical: FC1 on the warpgroup
   kernel v10 (`_WS1=9`: −12 % of FC1's kernel time per step), and the top-k sum as work items of the FC2 kernel, the
   routed rows summed while still in L2 and dropped from it instead of written to DRAM and read back (`_SUM_ITEMS=1

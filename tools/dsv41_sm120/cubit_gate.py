@@ -9,7 +9,7 @@ A kernel that fails here uses an encoding the SM120 ISA table does not describe 
 pin it (blackwell-isa) before anyone edits the kernel at the SASS level.
 
 usage: cubit_gate.py IMAGE [--cubit PATH] [--table PATH] [--out DIR] [--only NAME ...]
-    cubit_gate.py vllm-moet-sm120:dsv41-nightly-df3bd094-r21
+    cubit_gate.py vllm-moet-sm120:dsv41-nightly-df3bd094-r32
 
 Needs docker (to read the image), cuobjdump (CUDA toolkit on the host or inside the image) and a
 cubit binary built from kacper-daftcode/cubit `main` with its vendored tables/sm120.json. Writes

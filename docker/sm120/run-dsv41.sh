@@ -29,9 +29,9 @@
 #                        8192-token step one layer apart; needs the steps SERVED=1 turns on); MAX_NUM_BATCHED_TOKENS then defaults to 8192
 #            PREFILL_PIPE_REPLAY_GRAPHS (1 with PREFILL_PIPE=2, else 0)  the 128-row replay layers 20-39 of every step as CUDA graphs
 #                        (vLLM's decoder-replay graphs, captured per row-group slot as well): the pipelined step's two replay tails
-#                        are ~1,400 launches each and CPU-bound when the host's cores are loaded - the 2026-11-07 production window
-#                        (+31 % at 163K, rolled back) was that; measured under 100 nice'd CPU hogs +3.3 % with the graphs vs +26.6 %
-#                        without, bits identical, -1 GiB KV per GPU. Passes --compilation-config decoder_replay_cudagraph_capture_sizes
+#                        are ~1,400 launches each and CPU-bound when the host's cores are loaded (+31 % at 163K on such a host);
+#                        measured under 100 nice'd CPU hogs +4.8 % with the graphs vs +26.6 % without, bits identical,
+#                        -1 GiB KV per GPU. Passes --compilation-config decoder_replay_cudagraph_capture_sizes
 #                        [REPLAY_CAPTURE_SIZES (128,256)]; vLLM's default captures none under --max-cudagraph-capture-size 64
 #            GPU_MEM_UTIL (0.94)     0.92 for the very first start (the autotune sweep OOMs at 0.95 on a cold CACHE_DIR)
 #            SPEC_TOKENS (5; 7 with SERVED=1)  DSpark draft tokens, 0 = no drafter (-2.4 GiB per GPU)
@@ -45,7 +45,7 @@
 #            KV_MODE (auto)          how KV_RECORD reaches vLLM: auto reads the image label com.vllm-moet.kv-mode
 #                        (upstream = --kv-cache-dtype nvfp4_ds_mla / fp8_ds_mla; moet = the 0909 image's plumbing)
 #            INDEXER_TP_SHARD_MIN_ROWS ("")  from this many prefill rows per step the indexer shards its rows over the TP
-#                        ranks; "" keeps vLLM's 65,536 (never reached with 4096-token chunks); production runs 2048
+#                        ranks; "" keeps vLLM's 65,536 (never reached with 4096-token chunks); the served configuration uses 2048
 #            KV_OFFLOAD_GIB (0)      > 0: evicted KV kept in N GiB of pinned host RAM (one /dev/shm region for all ranks,
 #                        896 B per token) and restored on a prefix hit; with 64 GiB the host needs 253.0 GiB of shared
 #                        memory in total under SERVED=1 (328.3 GiB without its allocator variable) - on a host with
@@ -84,7 +84,7 @@ case "$SERVED" in
 esac
 # Step 47 (PREFILL_PIPE=2 with 8192 batched tokens) is -22.6 % at 163K on an idle host; its eager replay tails are launch-bound, so a
 # host whose CPUs other processes load on the server's NUMA node pays +31 % (not the KV offload tier: with it +0.5 %). The -r26b
-# image's PREFILL_PIPE_REPLAY_GRAPHS=1 runs those tails as CUDA graphs (+3.3 % under 100 nice'd hogs instead of +26.6 % on the second
+# image's PREFILL_PIPE_REPLAY_GRAPHS=1 runs those tails as CUDA graphs (+4.8 % under 100 nice'd hogs instead of +26.6 % on the second
 # host; on the reference host 163K 6.6 -> 5.6-5.8 s, +1.7 % under 100 hogs, KV 12.5 -> 10.5 GiB). SERVED=1 turns it on (PREFILL_PIPE=0
 # keeps the one-group path).
 PREFILL_PIPE="${PREFILL_PIPE:-$([[ "$SERVED" == "1" ]] && echo 2 || echo 0)}"
