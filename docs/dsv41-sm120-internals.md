@@ -197,6 +197,46 @@ The step-40 prefill attention chunks (> 64 rows) run on the cubit-assembled SASS
 register prefetch of the next 64-candidate chunk), 0.66–0.72× its time on the harness. Chunks of ≤ 64
 rows stay on FlashInfer, and any launch problem disables the route after one warning.
 
+**The cubins.** One entry symbol and one launcher for all of them; `kernels/MANIFEST.md` has the status
+of each file, [the record](benchmarks/sparse-mla-prefill-cubins-2026-11-11.md) its build, gates and
+times.
+
+- `v41`, the default: a stall behind every producer, the MMA chain between writeback drains.
+- `v41s1`: the same instruction words under the dependency-aware schedule — a stall is charged where a
+  consumer needs it instead of behind every producer (cubit's pair-latency table for sm_120: ptxas's
+  practice on 1.8 M instructions, measured on RTX PRO 6000 silicon, enforced on every control-flow
+  path), and the HMMA chain runs at ptxas's issue distances instead of between writeback drains.
+- `v42`: the dequant of the staged records by sm_120's scaled BF16 unpack,
+  `F2FP.BF16.<E4M3|E2M1>.UNPACK_B Rd, Rs[.sel], Rscale.B0` — two codes of `Rs` become two bf16 halves,
+  each times 2^(byte 0 of `Rscale` − 127). nvdisasm names the instruction for SM120 and it executes
+  there; ptxas does not emit it for this target (0 of the 1.8 M instructions of the sm_120 census). An
+  fp8 chunk is an e4m3 pair × UE8M0 block scale in one instruction, the scale byte straight from its
+  staging register (`v41`: unpack to f16, 2 × widen to f32, pack to bf16, `HMUL2` by the unpacked
+  scale). An FP4 chunk is an e2m1 pair → bf16 with the unit scale code, the four bytes of a word
+  through the source's byte selector instead of three shifts, the E4M3 block scale by one more scaled
+  unpack, then the `HMUL2.BF16_V2` of `v41`. A task's store data rotates over two register sets, because
+  a store latches its data when the memory pipe serves it. Everything else is the text of `v41`.
+- `v43`: `v42` with two load waits taken out — the same values, the same arithmetic, the same order;
+  loads are issued earlier. `v41` / `v42` load the candidate index of chunk c+1 at the top of the loop
+  and store it into `valid[]` at once: warps 0–1 wait for a load of the token's own index row and the
+  other six wait for them at the barrier. `v43` issues the load for chunk c+2 behind the gather loads of
+  chunk c+1 (after the barrier, branch-free, the `valid[]` threads selected by the load's predicate),
+  reads it once in front of the dequant and stores it at the next loop top. And the prologue's two
+  length loads and four `q` loads are issued together and stored afterwards, where `v41` / `v42` ran six
+  load latencies in a row per token. It is assembled with a rule that gives long loads a scoreboard of
+  their own: scoreboards are counters, and under cubit's sharing policy other uses ended up on the
+  scoreboard of the gather prefetch (in `v41s1` / `v42` the fifth `LDSM` of QK waits for all sixteen
+  gather loads); with the prologue change the gather moved to a scoreboard the first QK instruction
+  waits on.
+- `v41s1b`, `v43b`: `v41s1` and `v43` with one stall raised, so that the last `HMMA` of PV stands at
+  least 14 issue cycles in front of the two conditional branches behind it. The result of a warp-wide
+  MMA is to land before an instruction that can change the warp's set of threads, and ptxas never
+  issues a conditional branch closer. Both branches are uniform over the CTA (their predicates depend
+  on the token's chunk counter only), so the cubins without the distance are bit-identical in every
+  gate; these two are the builds that do not rely on that.
+- `v43c`: `v43b` with every store of the dequant waited on every path
+  ([below](#step-46b--two-cubins-of-the-attention-kernel)).
+
 ### Step 46b — two cubins of the attention kernel
 
 The runtime A/B of step 46 between two cubins of the attention kernel — two schedules of the same
@@ -217,12 +257,10 @@ into a CUDA graph keeps the cubin it was captured with. Without either variable 
 `stat`, one cubin per device).
 
 Cubins that `…_SASS_CUBIN_B` may name ship in the image under `/opt/vllm-moet/kernels/cubins-sm120/`
-(the build asserts each sha256, as for the default cubin): the second schedule
-`sparse_mla_prefill_v41s1.cubin`; `sparse_mla_prefill_v43.cubin` — the kernel with its dequant by
-the scaled BF16 unpack, the candidate index loaded one chunk ahead and the prologue's loads issued back
-to back; and `sparse_mla_prefill_v43b.cubin` — `v43`'s instruction words with one stall raised, so that
-the last tensor instruction stands 14 and 20 issue cycles in front of the two conditional branches
-behind it. All give bit-identical outputs (`kernels/MANIFEST.md` has their gates).
+(the build asserts each sha256, as for the default cubin): `sparse_mla_prefill_v41s1.cubin`,
+`sparse_mla_prefill_v43.cubin` and `sparse_mla_prefill_v43b.cubin` —
+[what each is](#step-46--the-prefill-attention-in-sass). All give bit-identical outputs
+(`kernels/MANIFEST.md` has their status).
 
 **Which cubin may be selected.** `v42`, `v43` and `v43b` must not be: in the iteration of a token's
 last chunk each rewrites the data registers of a shared-memory store before anything has waited on

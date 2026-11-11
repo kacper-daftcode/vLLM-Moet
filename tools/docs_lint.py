@@ -2,8 +2,8 @@
 """Public-tree hygiene: no host paths, session jargon or internal references in
 what the repository publishes; every relative Markdown link resolves; Python
 tools compile; launchers parse; the reference docs keep the form of a
-reference: README.md and docs/*.md have no table cell longer than 400
-characters and no line longer than 1 200, and the switch table of
+reference: README.md, docs/*.md and kernels/MANIFEST.md have no table cell
+longer than 400 characters and no line longer than 1 200, and the switch table of
 docs/dsv41-sm120.md has its rows in step order with a `served` cell that is a
 state (on / off / not built / a value, plus at most one short parenthesis); no
 session label (K-12), no path into working notes (K/k12/..., MK/REPORT.md) and
@@ -52,12 +52,12 @@ TEXT_SUFFIXES = (".md", ".py", ".sh", ".yml", ".yaml", ".cu", ".cuh", ".h", ".tx
 
 LINK_RE = re.compile(r"\]\(([^)\s#]+)(#[^)]*)?\)")
 
-# The form of a reference doc (README.md and docs/*.md; the records under docs/benchmarks/ keep their raw tables and
-# logs): a table cell holds a fact, not a narrative. What does not fit goes where AGENTS.md says - the mechanism to the
+# The form of a reference doc (README.md, docs/*.md and the kernel manifest; the records under docs/benchmarks/ keep their
+# raw tables and logs): a table cell holds a fact, not a narrative. What does not fit goes where AGENTS.md says - the mechanism to the
 # line's internals doc, the measurement to a record under docs/benchmarks/, the image history to CHANGELOG.md.
 MAX_CELL = 400  # characters of one Markdown table cell
 MAX_LINE = 1200  # characters of one line
-FORM_DOC_RE = re.compile(r"README\.md|docs/[^/]+\.md")
+FORM_DOC_RE = re.compile(r"README\.md|docs/[^/]+\.md|kernels/MANIFEST\.md")
 # Rows that were over MAX_CELL when the check was introduced, in docs of other lines of work that the introducing
 # commit did not rewrite: (file, first cell of the row) -> the cell length the row may keep. The way out is to shorten
 # the row and delete its entry: an entry whose row is gone or fits MAX_CELL is itself a finding.
