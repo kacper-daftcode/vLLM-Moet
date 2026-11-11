@@ -39,7 +39,9 @@ watchdog-bounded - an expired wait records to pinned host memory and traps; the 
 _WS_LEAD (the work list's lead in experts, default 64; >= the expert count = every fc1 item before the first fc2 item), _WS_MIN_ROWS (default 0),
 _WS_WATCHDOG_MS (2000), _WS_STATS=1 (per-item %globaltimer statistics, moe_prefill_ws_stats()), _WS_ROUTE_CS (streaming route-row stores, 1).
 Bit-identical to v8/v9/v10 on W's harness (6/6 at 4096 and 128 rows, 3 runs); measured +2.6 % vs WS1=9 + WS2=3 at call1 4096 rows
-(MK/REPORT.md 2) - off by default.
+(MK/REPORT.md 2) - off by default. The persistent launch needs contiguous rows and at least _WS_MIN_ROWS of them; a call without them runs
+the separate kernels. In a process with _WS >= 20 no call runs the sum items below (`sum_items_mode()` is 0, the route rows are written
+by every call and the separate topk_sum_kernel follows), whatever _SUM_ITEMS says.
 
 K-12 (the route rows' DRAM round trip): `VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1` (with WS2 >= 1) puts the FC2 work list in column-tile-major
 order and runs the top-k sum as work items of `fc2_kernel_ws` (the sum items of a tile follow the FC2 items of tile + _SUM_LAG (2) and wait for
