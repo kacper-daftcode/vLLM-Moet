@@ -11,6 +11,8 @@ the release tag that points at it.
 - The first claim of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_FIRST_CLAIM` and its runtime key), off by default; the watchdog
   record of the prefill MoE is reported as set whenever it is filled.
 - The grid caps of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID1` / `_GRID2`) as runtime keys, and their tokens in the stats line.
+- The `FZ` form of step 42's served FC1 kernels (`VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ` and its runtime key), off by default:
+  the FC1 epilogue's values defined on every path — the same bits with fewer registers per thread.
 - The phase-wait instrument of step 47 (`VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=1|2|3`, off by default): log lines that say where a
   pipelined prefill step waits — per comm phase, per element of a phase, per layer.
 - The instrument's level as a runtime key (`PREFILL_PIPE_PHASE_WAIT` in step 42b's control file): a running server takes the

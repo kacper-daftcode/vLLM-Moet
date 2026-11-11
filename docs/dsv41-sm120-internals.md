@@ -169,6 +169,17 @@ same; which CTA computes an item changes, as it already does for every item but 
 of an expired wait (`watchdog_record()`) is read without relying on its first word, which the kernel
 stores last and which does not always reach the host before the trap.
 
+**The FC1 epilogue's values on every path.** `_FC1_FZ=1` (off by default) launches the served FC1 mode
+with the kernel's `FZ` form, with or without the m-tile loops and the first claim. FC1's epilogue packs
+an item's activated values into 32 floats per thread. They are written for an active m-tile before the
+consumers' barrier and read behind it under the same condition — two tests the compiler cannot join, so
+on the path that skips the write the values are undefined, stay live around the whole item loop and
+hold 32 registers of every consumer thread through the stage loops. The `FZ` form zero-fills them at
+the head of the epilogue. The zeros are never read: the bits are the same and the kernel takes fewer
+registers per thread, still one CTA per SM. FC2, the other FC1 modes and the calls below
+`_WS1_MIN_ROWS` rows, which launch FC1 v8, are not affected. `test_fc1_fz_sm120.py` holds the key's
+states against b12x and the launch counters.
+
 **The grid caps.** `_GRID1` and `_GRID2` cap the number of CTAs FC1 and FC2 launch (0, the default, is
 the occupancy grid: one FC1 CTA and two FC2 CTAs on every SM). The work list does not change, the CTAs
 that run take every item, and every grid computes the same bits. A cap of the SM count or more is spread
@@ -187,7 +198,8 @@ With `VLLM_MOET_RUNTIME_AB=1` every rank reads the control file — one flat JSO
 written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/vllm_moet_ab.json'` — at
 most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the
 sum-items unit), `B12X_MOE_PREFILL_FAST_WS1` (0..11), `B12X_MOE_PREFILL_FAST_MT_LOOPS` (0/1, the
-m-tile loops of step 42), `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first claim) and
+m-tile loops of step 42), `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first claim),
+`B12X_MOE_PREFILL_FAST_FC1_FZ` (0/1, the `FZ` form of its served FC1 kernel) and
 `B12X_MOE_PREFILL_FAST_GRID1` / `_GRID2` (0 … 4096, its grid caps) without a restart. A missing / malformed file or an unknown value keeps the state (one warning), a key the file
 drops goes back to the environment's value, each change is logged once per rank.
 
