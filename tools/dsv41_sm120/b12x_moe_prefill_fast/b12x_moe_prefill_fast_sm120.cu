@@ -3053,6 +3053,13 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
 #pragma unroll
       for (int mt = 0; mt < 4; ++mt) {
         am[mt][0] = am[mt][1] = 0.f;
+        // v[mt] is defined on every path: it is written below only for an active m-tile and read behind the consumers' barrier under
+        // the same condition, which the compiler cannot see as the same - left undefined on the other path, its 32 values are live
+        // around the whole item loop and hold 32 registers in the K-loops of every item. The zeros are never read.
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf)
+#pragma unroll
+          for (int kx = 0; kx < 4; ++kx) v[mt][hf][kx] = 0.f;
         if (mt >= m_tiles) continue;  // CTA-uniform
         if (act[mt]) {
 #pragma unroll
