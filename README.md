@@ -24,7 +24,7 @@ DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nig
 
 | | vLLM-Moet | official vLLM image on the same cards |
 |---|---|---|
-| decode, 1 stream | prose ~293 tok/s, code ~802 tok/s (129 steps/s); Fraser bench 688 tok/s median, 746 best over 40 reps (the last 40-rep series, image `-r23`; 128.0 steps/s on `-r32`) | 60 steps/s with only the fixes it needs to start |
+| decode, 1 stream | prose ~293 tok/s, code ~802 tok/s (129 steps/s); Fraser bench 671.5 tok/s median, 724.5 best at 128.4 steps/s over 40 reps | 60 steps/s with only the fixes it needs to start |
 | decode, 8 streams | prose ~721, code ~2,258 tok/s aggregate | — |
 | fresh prefill | 163K tokens in 5.44 s (30K tok/s), 19K in 0.66 s (medians of runs with no other request in flight; the pipelined sequence-parallel prefill with its replay layers as CUDA graphs and the prefill MoE on the producer-warp and warpgroup kernels, bit-identical to `-r26b`'s 5.6–5.8 s, `-r25`'s 6.6 s, `-r24`'s 6.8 s and `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
 | KV cache | 6.14M tokens on the GPUs (11.7× concurrency at 512K; 9.62M with the one-group prefill) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
