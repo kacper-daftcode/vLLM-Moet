@@ -169,6 +169,16 @@ same; which CTA computes an item changes, as it already does for every item but 
 of an expired wait (`watchdog_record()`) is read without relying on its first word, which the kernel
 stores last and which does not always reach the host before the trap.
 
+**The grid caps.** `_GRID1` and `_GRID2` cap the number of CTAs FC1 and FC2 launch (0, the default, is
+the occupancy grid: one FC1 CTA and two FC2 CTAs on every SM). The work list does not change, the CTAs
+that run take every item, and every grid computes the same bits. A cap of the SM count or more is spread
+over all SMs: the work distributor fills every SM with one CTA before it gives any a second, so
+`_GRID2=320` on 188 SMs leaves 56 of them with one FC2 CTA. A cap below the SM count leaves SMs without
+a CTA of the kernel. What a cap buys is room for what runs beside the MoE in a pipelined prefill step
+(step 47): FC2's two CTAs take nearly all registers of an SM, so the other row group's glue kernels wait
+for them to exit, and a collective, which needs empty SMs, waits for FC2 to end. What it costs is FC2's
+own time, which grows as the grid shrinks — little while every SM keeps a CTA, in proportion below that.
+
 ### Step 42b — the runtime keys
 
 The runtime switch between the bit-identical kernel alternatives of step 42, for paired A/B
@@ -177,8 +187,8 @@ With `VLLM_MOET_RUNTIME_AB=1` every rank reads the control file — one flat JSO
 written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/vllm_moet_ab.json'` — at
 most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the
 sum-items unit), `B12X_MOE_PREFILL_FAST_WS1` (0..11), `B12X_MOE_PREFILL_FAST_MT_LOOPS` (0/1, the
-m-tile loops of step 42) and `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first claim) without a
-restart. A missing / malformed file or an unknown value keeps the state (one warning), a key the file
+m-tile loops of step 42), `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first claim) and
+`B12X_MOE_PREFILL_FAST_GRID1` / `_GRID2` (0 … 4096, its grid caps) without a restart. A missing / malformed file or an unknown value keeps the state (one warning), a key the file
 drops goes back to the environment's value, each change is logged once per rank.
 
 The file is the whole state of every step that has a key, each key read by its own module:
