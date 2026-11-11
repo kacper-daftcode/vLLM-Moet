@@ -155,6 +155,20 @@ compute stream waits about 0.6 ms after every MoE call for that phase to end, 24
 and a shorter MoE lengthens the wait. The arms:
 [record](benchmarks/dsv41-sm120-steps-2026-11-10.md#step-42--the-prefill-moe-kernels).
 
+**The first claim.** `_FIRST_CLAIM=1` (off by default) launches the served FC1 / FC2 kernels with every
+CTA claiming its first work item from the work counter, as it claims every later one. In the served
+kernels a CTA's first item is the one of its block index, so the first items of the list belong to
+CTAs whether they run or not: FC1 cannot end, and the sum items of FC2's first column tile cannot pass,
+before the last CTA of the grid has run its item. A kernel of another stream that holds whole SMs when
+FC1 or FC2 starts - a collective - then holds the call for as long as it stays, and if it cannot leave
+before FC2's CTAs do, the sum items' watchdog traps the launch. With the switch a CTA that has not been
+dispatched owns nothing and the CTAs that run take every item; the launch still ends only when its
+last CTA has been dispatched, its work does not wait for it. The items and their arithmetic are the
+same; which CTA computes an item changes, as it already does for every item but the first.
+`test_first_claim_sm120.py` holds both behaviours, the trap of the served kernels included. The record
+of an expired wait (`watchdog_record()`) is read without relying on its first word, which the kernel
+stores last and which does not always reach the host before the trap.
+
 ### Step 42b — the runtime keys
 
 The runtime switch between the bit-identical kernel alternatives of step 42, for paired A/B
@@ -162,10 +176,10 @@ measurements in one server lifetime.
 With `VLLM_MOET_RUNTIME_AB=1` every rank reads the control file — one flat JSON object switch → value,
 written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/vllm_moet_ab.json'` — at
 most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the
-sum-items unit), `B12X_MOE_PREFILL_FAST_WS1` (0..11) and `B12X_MOE_PREFILL_FAST_MT_LOOPS` (0/1, the
-m-tile loops of step 42) without a restart. A missing / malformed file or an unknown value keeps the
-state (one warning), a key the file drops goes back to the environment's value, each change is logged
-once per rank.
+sum-items unit), `B12X_MOE_PREFILL_FAST_WS1` (0..11), `B12X_MOE_PREFILL_FAST_MT_LOOPS` (0/1, the
+m-tile loops of step 42) and `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first claim) without a
+restart. A missing / malformed file or an unknown value keeps the state (one warning), a key the file
+drops goes back to the environment's value, each change is logged once per rank.
 
 The file is the whole state of every step that has a key, each key read by its own module:
 `WOA_DEQUANT_FUSED` (step 3b) and `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` (step 46b) live in the same file.
