@@ -2763,7 +2763,11 @@ __device__ __forceinline__ void ps_stage_next(ItemRing& ring, ProducerNext& nx, 
 // tile each, like fc1's two projections), A 4 KB at kF1B, the scale words at fc1's offsets - so a consumer warp issues 32 QMMAs per 8
 // A-fragment LDS.128 like fc1 (v9's item: 16 per 8; the A fragments, read once per warp, were the LDS co-limiter at 2 warps per sub-partition),
 // half the items, and the route rows go out 512 B per row. Bits: per element the same k32 chain and epilogue; only the warp->column map differs.
-template <int STAGES, int N2>
+// ST = 1: the per-CTA statistics of _WS_STATS=1 (bench only). They are seven 64-bit counters that live in registers across the consumers'
+// whole item loop, K-loops included, also when a.stats is null: with them ptxas schedules the consumer K-loops worse (<4, 2>: QMMA words
+// at stall 15 31 instead of 21 per FC1 pass and 27 instead of 14 per FC2 pass, read from the two builds' listings) - so the launch takes
+// ST = 1 only when the statistics are asked for, and the form without them (ST = 0) is the one every timing and every served call runs.
+template <int STAGES, int N2, int ST = 0>
 __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistArgs a) {
   // an FC2 item has 9 stages and its hand-off writes the ring slot at stages 7 / 8: the consumers must have left the slot's previous
   // reader (the epilogue of the item before the current one), which the `empty` wait of stage 7 guarantees only for STAGES <= 7
@@ -2962,7 +2966,7 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
   RingPos pos;
   int k = 0;
   // statistics (warp 0 lane 0 of the CTA): per-item-type time, idle between items, the CTA's span
-  const bool keep_stats = a.stats != nullptr && tid == 0;
+  const bool keep_stats = ST != 0 && a.stats != nullptr && tid == 0;
   unsigned long long st_t0 = 0, st_prev_end = 0, st_fc1 = 0, st_fc2 = 0, st_idle = 0, st_n1 = 0, st_n2 = 0;
   if (keep_stats) st_prev_end = st_t0 = globaltimer_ns();
   while (true) {
@@ -3420,41 +3424,47 @@ static uint32_t* ps_err_dev() {
   }();
   return d;
 }
-template <int S, int N2>
-struct PsLaunch {  // MK-2: moe_persistent_kernel<S, N2> (12 warps, 1 CTA/SM; the stage slot is the FC1 stage size)
+template <int S, int N2, int ST = 0>
+struct PsLaunch {  // MK-2: moe_persistent_kernel<S, N2, ST> (12 warps, 1 CTA/SM; the stage slot is the FC1 stage size; ST = 1: the statistics)
   static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
   static constexpr int kN2 = N2;
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(moe_persistent_kernel<S, N2>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, moe_persistent_kernel<S, N2>, kT, S * kF1Stage);
+    if (!done) { cudaFuncSetAttribute(moe_persistent_kernel<S, N2, ST>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, moe_persistent_kernel<S, N2, ST>, kT, S * kF1Stage);
     return sms * (occ > 0 ? occ : 1);  // every CTA resident (the deadlock-freedom argument of the work list)
   }
   static void run(const b12x_moe_prefill_fast::PersistArgs& p, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    moe_persistent_kernel<S, N2><<<grid, kT, S * kF1Stage, stream>>>(p);
+    moe_persistent_kernel<S, N2, ST><<<grid, kT, S * kF1Stage, stream>>>(p);
   }
 };
 // 20-25: one 128-column tile per FC2 item (4 / 6 / 7 / 3 / 5 / 2 stages); 30-35: n256 FC2 items (round 3), the same stage counts
 static int ws_f2_group(int mode) { return mode >= 30 ? 2 : 1; }
+template <int ST, typename Fn>
+static void with_ws_st(int mode, Fn fn) {
+  switch (mode) {
+    case 21: fn(PsLaunch<6, 1, ST>{}); break;
+    case 22: fn(PsLaunch<7, 1, ST>{}); break;
+    case 23: fn(PsLaunch<3, 1, ST>{}); break;
+    case 24: fn(PsLaunch<5, 1, ST>{}); break;
+    case 25: fn(PsLaunch<2, 1, ST>{}); break;
+    case 30: fn(PsLaunch<4, 2, ST>{}); break;
+    case 31: fn(PsLaunch<6, 2, ST>{}); break;
+    case 32: fn(PsLaunch<7, 2, ST>{}); break;
+    case 33: fn(PsLaunch<3, 2, ST>{}); break;
+    case 34: fn(PsLaunch<5, 2, ST>{}); break;
+    case 35: fn(PsLaunch<2, 2, ST>{}); break;
+    default: fn(PsLaunch<4, 1, ST>{}); break;
+  }
+}
+// the statistics form of the kernel (ST = 1) only when _WS_STATS=1 asks for the statistics
 template <typename Fn>
 static void with_ws(int mode, Fn fn) {
-  switch (mode) {
-    case 21: fn(PsLaunch<6, 1>{}); break;
-    case 22: fn(PsLaunch<7, 1>{}); break;
-    case 23: fn(PsLaunch<3, 1>{}); break;
-    case 24: fn(PsLaunch<5, 1>{}); break;
-    case 25: fn(PsLaunch<2, 1>{}); break;
-    case 30: fn(PsLaunch<4, 2>{}); break;
-    case 31: fn(PsLaunch<6, 2>{}); break;
-    case 32: fn(PsLaunch<7, 2>{}); break;
-    case 33: fn(PsLaunch<3, 2>{}); break;
-    case 34: fn(PsLaunch<5, 2>{}); break;
-    case 35: fn(PsLaunch<2, 2>{}); break;
-    default: fn(PsLaunch<4, 1>{}); break;
-  }
+  if (ws_stats_enabled()) with_ws_st<1>(mode, fn);
+  else with_ws_st<0>(mode, fn);
 }
 // below this many rows fc1 stays on v8 (_WS1_MIN_ROWS, default 256): at 128 rows (the replay layers) both kernels are at the DRAM
 // floor and the one-CTA/SM v9 fc1 is 4 % slower there (K-4 §6.2); fc2's v9 is neutral at 128 rows and keeps its mode

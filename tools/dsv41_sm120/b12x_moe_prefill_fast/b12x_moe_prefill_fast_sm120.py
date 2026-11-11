@@ -37,7 +37,8 @@ MK-2 (megakernel stage 1, milestone 1): `VLLM_MOET_B12X_MOE_PREFILL_FAST_WS` >= 
 watchdog-bounded - an expired wait records to pinned host memory and traps; the separate topk_sum_kernel follows). 20-25 = fc2 items of one
 128-column tile with 4 / 6 / 7 / 3 / 5 / 2 ring stages, 30-35 = fc2 items of two tiles (the fc1-shaped stage; the faster form). Knobs:
 _WS_LEAD (the work list's lead in experts, default 64; >= the expert count = every fc1 item before the first fc2 item), _WS_MIN_ROWS (default 0),
-_WS_WATCHDOG_MS (2000), _WS_STATS=1 (per-item %globaltimer statistics, moe_prefill_ws_stats()), _WS_ROUTE_CS (streaming route-row stores, 1).
+_WS_WATCHDOG_MS (2000), _WS_STATS=1 (per-item %globaltimer statistics, moe_prefill_ws_stats(); it selects the kernel's statistics form, whose
+consumer K-loops ptxas schedules worse - a bench switch, never beside a timing), _WS_ROUTE_CS (streaming route-row stores, 1).
 Bit-identical to v8/v9/v10 on W's harness (6/6 at 4096 and 128 rows, 3 runs); measured +2.6 % vs WS1=9 + WS2=3 at call1 4096 rows
 (MK/REPORT.md 2) - off by default. The persistent launch needs contiguous rows and at least _WS_MIN_ROWS of them; a call without them runs
 the separate kernels. In a process with _WS >= 20 no call runs the sum items below (`sum_items_mode()` is 0, the route rows are written
