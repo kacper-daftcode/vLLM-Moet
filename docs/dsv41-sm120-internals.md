@@ -332,6 +332,31 @@ FC2's last CTAs wait for, it cannot complete itself, and the two wait for each o
 traps the launch. When a group of a pipelined step fails, the pipeline logs the MoE's watchdog record if
 it is not empty.
 
+**The phase-wait instrument.** `VLLM_MOET_PREFILL_PIPE_PHASE_WAIT` (off by default) says where a
+pipelined step waits, in log lines per step and rank; it records timing events and reads the host's
+clock, and changes no kernel, no order and no bit. A layer of a step is four slots, each a comm phase
+of one group beside a compute segment of the other: group 0's phase before its attention beside group
+1's MoE of the layer before, group 1's phase before attention beside group 0's attention, group 0's
+phase before its MoE beside group 1's attention, group 1's phase before MoE beside group 0's MoE.
+
+- `=1` — `phase wait`: per group and phase kind the number of phases, the time the compute stream sat
+  behind the phase's end (`waited … in N` phases) and the phases' `slack`, the time a phase was done
+  before the compute stream was free.
+- `=2` — also `phase split`: the phases' total length, the length of the compute segment beside them
+  (`compute free at`), and the phase's elements in order — every collective and the glue between two —
+  each with the part of it that lies after the compute stream was free.
+- `=3` — also `phase layers`: every phase that had slack by its index in the step (the layer and the
+  kind), with the excess and the length of the segment beside it, and the compute segments a group's
+  thread took 1 ms or more to issue, as wall and thread-CPU time. `sp_pipeline/phase_layers_table.py`
+  turns these lines into a table of the segments that outlast their phase.
+
+A step's last compute segment — the first group's KV write of the first replay layer and its replay
+tail — is booked beside the second group's last phase: one long segment per step by construction, to
+be taken out before any per-layer arithmetic on the sums. A phase issued during a CUDA graph capture is
+left alone. A failure inside the instrument switches it off with one line; the step runs on.
+`sp_pipeline/test_prefill_pipe_instrument.py` holds the lines and that behaviour on fake streams and
+clocks, without a GPU.
+
 ### Step 48 — the KV offload copy path
 
 With the host KV tier, each of the four TP workers registers the shared offload region with
