@@ -167,8 +167,10 @@ The two states of every key are bit-identical alternatives.
 The launcher runs the container with the host's IPC namespace, so the control file is a file of the
 host's `/dev/shm` and outlives the server: a file left behind is applied by the next server at its
 first prefill, and removing a file keeps the state it last set until a restart. Write `{}` before
-removing it, and start a server only without the file. `SERVED=1` turns the switch on with no control
-file: every key is in its environment's state (one warning per rank and module that the file is missing).
+removing it. With the switch on the launcher refuses to start while a control file exists in the host's
+`/dev/shm` (`RUNTIME_AB_KEEP_FILE=1` starts anyway) — also when the watchdog restarts a server that died
+with its file in place. `SERVED=1` turns the switch on with no control file: every key is in its
+environment's state (one warning per rank and module that the file is missing).
 
 The activation counters (calls / rows through FC1 v10 vs v8/v9, FC2 with the sum items vs with the
 separate sum kernel, and FC1 / FC2 with the m-tile loops) are printed per rank every
