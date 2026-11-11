@@ -3579,7 +3579,7 @@ struct Routing {
 };
 using b12x_moe_prefill_fast::kCountsWords;  // counts[0..7] + fc1_done[kMaxE] (MK-2) + tile_done[kMaxTiles] + the sum need (K-12), one memset
 // K-12: the top-k sum as items of fc2_kernel_ws's column-tile-major list (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1; needs WS2 >= 1, not
-// with the persistent launch): _SUM_TOKENS = tokens per sum item (256), _SUM_LAG = tiles between an FC2 tile and its sum
+// in a process with the persistent mode, WS >= 20): _SUM_TOKENS = tokens per sum item (256), _SUM_LAG = tiles between an FC2 tile and its sum
 // items (2), _SUM_DISCARD=1 = drop the summed route lines from L2 (the route buffer becomes scratch), _SUM_MIN_ROWS = below this many rows
 // the separate topk_sum_kernel runs (0), _W2_EVICT_FIRST=1 = W2's copies with an L2 evict_first hint, _SUM_WATCHDOG_MS (2000)
 static int sum_items_env() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS"); return g_rt_sum_items >= 0 ? g_rt_sum_items : m; }
@@ -3748,8 +3748,12 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   // MK-2: the fused persistent launch (WS >= 20): contiguous rows, at or above _WS_MIN_ROWS rows
   const int lda_b = prequant ? (int)a_values.stride(0) : K, lds_b = prequant ? (int)a_scales.stride(0) : K / 32;
   const bool persistent = ws_mode() >= 20 && lda_b == K && lds_b == K / 32 && T >= ws_min_rows();
-  // K-12: the sum items of fc2_kernel_ws (the column-tile-major list): with the v9 fc2 kernel, not with the persistent launch
-  const bool sum_items = topk_sum && !persistent && sum_items_env() >= 1 && ws2_mode() >= 1 && T >= sum_min_rows_env() &&
+  // K-12: the sum items of fc2_kernel_ws (the column-tile-major list): with the v9 fc2 kernel, and in no call of a process that runs the
+  // persistent mode (WS >= 20) - not in the persistent launch, and not in its calls that fall back to the separate kernels either
+  // (row-strided rows, fewer than _WS_MIN_ROWS rows). sum_items_mode() / route_rows_consumed() answer once for the process, so every
+  // call of it has to leave the route rows written: with the sum items and _SUM_DISCARD=1 such a fallback call returned scratch route
+  // rows in a process that had reported them as valid.
+  const bool sum_items = topk_sum && ws_mode() < 20 && sum_items_env() >= 1 && ws2_mode() >= 1 && T >= sum_min_rows_env() &&
                          K / 128 <= kMaxTiles && topk <= kSumMaxTopk;
   {  // K-13 task B: the activation counters (one add per call per counter pair)
     const bool fc1_v10 = !persistent && ws1_mode() >= 8 && T >= ws1_min_rows() && lda_b == K && lds_b == K / 32;
@@ -3925,7 +3929,8 @@ std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
   if (clear) for (auto& c : g_cnt) c = 0;
   return r;
 }
-// K-12: the sum-items mode of this process (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS; active only with WS2 >= 1 and the separate kernels), and
+// K-12: the sum-items mode of this process (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS; active only with WS2 >= 1 and without the persistent
+// mode: with WS >= 20 no call of the process runs the sum items, whichever kernels it launches), and
 // whether the route rows are consumed in-kernel (summed and discarded from L2: their content after the call is unspecified - the harness
 // then compares the output only)
 int64_t sum_items_mode() { return (sum_items_env() >= 1 && ws2_mode() >= 1 && ws_mode() < 20) ? sum_items_env() : 0; }
