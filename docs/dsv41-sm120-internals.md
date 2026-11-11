@@ -192,7 +192,8 @@ m-tile loops of step 42), `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first cl
 drops goes back to the environment's value, each change is logged once per rank.
 
 The file is the whole state of every step that has a key, each key read by its own module:
-`WOA_DEQUANT_FUSED` (step 3b) and `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` (step 46b) live in the same file.
+`WOA_DEQUANT_FUSED` (step 3b), `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` (step 46b) and `PREFILL_PIPE_PHASE_WAIT`
+(the level of step 47's phase-wait instrument, which changes no bit) live in the same file.
 The two states of every key are bit-identical alternatives.
 
 The launcher runs the container with the host's IPC namespace, so the control file is a file of the
@@ -356,6 +357,24 @@ be taken out before any per-layer arithmetic on the sums. A phase issued during 
 left alone. A failure inside the instrument switches it off with one line; the step runs on.
 `sp_pipeline/test_prefill_pipe_instrument.py` holds the lines and that behaviour on fake streams and
 clocks, without a GPU.
+
+With `VLLM_MOET_RUNTIME_AB=1` the instrument's level is also the key `PREFILL_PIPE_PHASE_WAIT` (0 … 3)
+of step 42b's control file, so that a running server takes the instrument on for a few requests and off
+again; a key the file drops gives the environment's level back. The pipeline reads the file at the
+dispatch of a forward, at most once per 100 ms, and the level holds for that forward as a whole. A
+change is logged once per rank, and a `touch` of the stats file prints the level in effect (`switches
+now PREFILL_PIPE_PHASE_WAIT=<level>`; 0 once the instrument has switched itself off). When the level
+goes down, the phases of the last instrumented forward are harvested first; at 0 nothing stays pending,
+and below 2 the timing proxy leaves the communicator — the process then holds nothing of the
+instrument. Without the master switch the file is never looked at.
+
+`sp_pipeline/phase_balance.py LOG` reads the three lines as one line per rank: per layer the compute
+work (the four segments), the comm work (the four phases) and the period, the four slots with the
+phase's reduce-scatter, glue and all-gather, and the replay tail on its own. Two readings follow the
+rank lines: which rank has the longest MoE segment and whether its compute stream still waits behind
+the phase — if it does not while the other ranks' do, that rank's card sets the pace of the MoE slots —
+and whether the smallest wait behind a MoE is larger than what a grid cap of step 42 adds to the MoE
+segment, the condition under which a cap can shorten a slot at all.
 
 ### Step 48 — the KV offload copy path
 

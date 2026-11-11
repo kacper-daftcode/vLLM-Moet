@@ -268,27 +268,54 @@ def host_timing() -> bool:
 _HOST = {"last_end": None, "plan_start": None, "plan_end": None, "rows": []}
 
 
+def _pw_env_level() -> int:
+    """The instrument's level the environment asks for: VLLM_MOET_PREFILL_PIPE_PHASE_WAIT = 1 | 2 | 3, anything else = 0."""
+    value = os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0")
+    return int(value) if value in ("1", "2", "3") else 0
+
+
+def phase_wait_level() -> int:
+    """The level of the phase-wait instrument for the work being issued: 0 = off, 1 | 2 | 3 = its stages. Without the runtime A/B
+    reader (VLLM_MOET_RUNTIME_AB != 1) the environment's level, read at every call; with it the level latched at the dispatch of
+    the forward on the runner thread (_pw_runtime_hooks: the control-file key PREFILL_PIPE_PHASE_WAIT, else the environment's) -
+    a forward runs at one level as a whole."""
+    level = _PWK["level"]
+    return _pw_env_level() if level is None else level
+
+
 def phase_wait() -> bool:
     """VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=1 (an instrument, off by default): per pipelined step one log line with the time the
     compute stream sat behind the comm stream's phase-end events and the phases' slack, per (group, phase parity) - see
     _phase_wait_harvest. Timing events and host clock reads only: no kernel, no order and no bit changes; a failure inside the
-    instrument switches it off with one line (_phase_wait_fail) and the step runs on. Works with or without HOST_TIMING."""
-    return os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0") in ("1", "2", "3") and not _PW["dead"]
+    instrument switches it off with one line (_phase_wait_fail) and the step runs on. Works with or without HOST_TIMING.
+    With VLLM_MOET_RUNTIME_AB=1 the level is also the control-file key PREFILL_PIPE_PHASE_WAIT (0 | 1 | 2 | 3; absent = the
+    environment's level): a running server takes the instrument on for a few requests and off again - see _pw_runtime_hooks."""
+    return phase_wait_level() >= 1 and not _PW["dead"]
 
 
 def phase_split() -> bool:
     """VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=2 (the instrument's second stage): also the split of every comm phase into its
     collectives and the glue between them, and how much of each lies after the compute stream was free - see _phase_split_line."""
-    return os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0") in ("2", "3") and not _PW["dead"]
+    return phase_wait_level() >= 2 and not _PW["dead"]
 
 
 def phase_layers() -> bool:
     """VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=3 (the instrument's third stage): also one line per step that names the phases with
     slack (group, phase index, excess, the compute segment beside it) and the compute segments the host took long to issue."""
-    return os.environ.get("VLLM_MOET_PREFILL_PIPE_PHASE_WAIT", "0") == "3" and not _PW["dead"]
+    return phase_wait_level() == 3 and not _PW["dead"]
 
 
 _PW = {"pending": [], "dead": False, "lines": 0, "marks": {}, "start": {}, "timer": False, "host0": {}, "host": []}
+
+# The instrument's level as a runtime A/B key. "ab": the master switch, read once; "level": None = the environment is read at
+# every call (the master switch off, or no forward dispatched yet), an integer = the level of the forward being dispatched;
+# "override": the control file's value, -1 = the key is absent (the environment's level); the reader's state as in the other
+# modules; the counters of the forwards dispatched with the instrument on / off while the master switch is set.
+_PWK: dict[str, Any] = {
+    "ab": None, "level": None, "override": -1, "next_poll": 0.0, "sig": None, "warned": set(), "stats_mtime": None,
+    "forwards_on": 0, "rows_on": 0, "forwards_off": 0, "rows_off": 0,
+}
+_PW_KEY = "PREFILL_PIPE_PHASE_WAIT"
 
 
 def _pw_capturing() -> bool:
@@ -361,6 +388,22 @@ def _phase_split_install() -> None:
         dc.pynccl_comm = CommTimer(base)
     _PW["timer"] = True
     logger.info("prefill pipeline phase split: the collectives of the comm phases are timed (rank %d)", _tp_rank())
+
+
+def _phase_split_remove() -> None:
+    """Runner thread, at the dispatch of a forward whose level is below the second stage (the runtime key went down): the TP
+    group's communicator is again the object it was before the timing proxy. No group thread runs and no collective is in
+    flight at a dispatch. A proxy that something else has wrapped meanwhile stays where it is (a pass-through at this level)."""
+    if not _PW["timer"]:
+        return
+    from vllm.distributed.parallel_state import get_tp_group
+
+    dc = getattr(get_tp_group(), "device_communicator", None)
+    cur = getattr(dc, "pynccl_comm", None)
+    if isinstance(cur, CommTimer):
+        dc.pynccl_comm = cur._base
+        _PW["timer"] = False
+        logger.info("prefill pipeline phase split: the timing proxy is off the communicator (rank %d)", _tp_rank())
 
 
 def _phase_split_line(num_tokens: int, done: list) -> None:
@@ -477,6 +520,156 @@ def _phase_wait_harvest(num_tokens: int) -> None:
             _phase_layers_line(num_tokens, done)
     except Exception as exc:  # noqa: BLE001 - an instrument must never take the forward down
         _phase_wait_fail("harvest", exc)
+
+
+def _pw_log(msg: str) -> None:
+    """The control-file contract's line format: `[<module tag>, device <n>] <text>` on stderr, one line per rank."""
+    import sys
+
+    try:
+        dev: Any = torch.cuda.current_device()
+    except Exception:  # noqa: BLE001
+        dev = "?"
+    print(f"[vllm-moet prefill pipeline instrument, device {dev}] {msg}", file=sys.stderr, flush=True)
+
+
+def _pw_warn_once(key: str, msg: str) -> None:
+    if key not in _PWK["warned"]:
+        _PWK["warned"].add(key)
+        _pw_log("WARNING: " + msg)
+
+
+def _pw_stats_line(reason: str) -> None:
+    """The counters line in the control-file contract's format; `switches now` is the read-back a driver confirms a flip by. The
+    token is the level in effect - 0 once the instrument has switched itself off. This reader's `call` is one served forward."""
+    st = _PWK
+    _pw_log(
+        f"activation counters ({reason}, call {st['forwards_on'] + st['forwards_off']}; calls / rows): instrumented forwards "
+        f"{st['forwards_on']} / {st['rows_on']}, plain forwards {st['forwards_off']} / {st['rows_off']}; switches now "
+        f"{_PW_KEY}={0 if _PW['dead'] else phase_wait_level()}"
+    )
+
+
+def _pw_set_level(new: int, num_tokens: int) -> str | None:
+    """Runner thread, at a forward's dispatch: the instrument's level is `new` from this forward on. On the way down what the level
+    being left has recorded is harvested first, with that level's lines - the pairs of the last instrumented forward, whose events
+    have completed by now; at 0 nothing stays pending, and below the second stage the timing proxy leaves the communicator.
+    Returns the change description, None when the level stays."""
+    old = phase_wait_level()
+    if new == old:
+        _PWK["level"] = new
+        return None
+    dropped = 0
+    try:
+        if new < old:
+            _phase_wait_harvest(num_tokens)
+    finally:
+        _PWK["level"] = new
+    if new == 0:
+        dropped = len(_PW["pending"])
+        _PW["pending"].clear()
+        _PW["marks"].clear()
+        _PW["start"].clear()
+    if new < 3:
+        _PW["host0"].clear()
+        _PW["host"].clear()
+    if new < 2:
+        try:
+            _phase_split_remove()
+        except Exception as exc:  # noqa: BLE001 - the proxy then stays, a pass-through at this level
+            _pw_warn_once("proxy", f"runtime A/B: the timing proxy could not be taken off the communicator ({exc!r}) - it stays, a pass-through")
+    note = ""
+    if dropped:
+        note += f" ({dropped} phases of the last forward had not completed - not reported)"
+    if _PW["dead"]:
+        note += " (the instrument switched itself off earlier in this process and stays off)"
+    return f"{_PW_KEY} {old} -> {new}{note}"
+
+
+def pw_apply_runtime(values: dict, num_tokens: int = 0) -> list[str]:
+    """Apply the control file's object to the instrument: PREFILL_PIPE_PHASE_WAIT = 0 | 1 | 2 | 3 = its level from the forward
+    being dispatched on; absent = the environment's level; anything else = the current level kept (one WARNING). The SM split's
+    key PREFILL_PIPE_GREEN belongs to its own reader; another key of this module's namespace is ignored with one WARNING; other
+    modules' keys are ignored silently. Returns the change descriptions (also logged, one line per change)."""
+    want = -1
+    for key, val in values.items():
+        if not isinstance(key, str) or not key.startswith("PREFILL_PIPE_"):
+            continue
+        if key == _PW_KEY:
+            if isinstance(val, int) and not isinstance(val, bool) and 0 <= val <= 3:
+                want = val
+            else:
+                want = phase_wait_level()
+                _pw_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 | 1 | 2 | 3) - kept {want}")
+        elif key != "PREFILL_PIPE_GREEN":
+            _pw_warn_once("key:" + key, f"runtime A/B: unknown key {key} of this module - ignored")
+    _PWK["override"] = want
+    change = _pw_set_level(want if want >= 0 else _pw_env_level(), num_tokens)
+    if change is None:
+        return []
+    _pw_log("runtime A/B: " + change)
+    return [change]
+
+
+def _pw_ab_poll(num_tokens: int) -> None:
+    """The control-file reader of the instrument's key (the contract of the fast prefill MoE's runtime switch, its own copy): at
+    most one os.stat per 100 ms, the JSON re-read only when (mtime, size) changed; a missing or malformed file keeps the state."""
+    st = _PWK
+    now = time.monotonic()
+    if now < st["next_poll"]:
+        return
+    st["next_poll"] = now + 0.1
+    path = os.environ.get("VLLM_MOET_RUNTIME_AB_FILE", "/dev/shm/vllm_moet_ab.json")
+    try:
+        s = os.stat(path)
+    except OSError:
+        _pw_warn_once("missing", f"runtime A/B: control file {path} missing or unreadable - the current state is kept until it appears")
+        return
+    sig = (s.st_mtime_ns, s.st_size)
+    if sig == st["sig"]:
+        return
+    st["sig"] = sig
+    try:
+        with open(path, encoding="utf-8") as fh:
+            values = json.load(fh)
+        if not isinstance(values, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError) as exc:
+        _pw_warn_once("malformed", f"runtime A/B: control file {path} malformed ({exc}) - the current state is kept")
+        return
+    st["warned"].discard("missing")
+    st["warned"].discard("malformed")
+    pw_apply_runtime(values, num_tokens)
+
+
+def _pw_runtime_hooks(groups: list) -> None:
+    """Runner thread, at the dispatch of every served forward that runs row groups, before anything of the forward reads the
+    instrument's level. A no-op unless VLLM_MOET_RUNTIME_AB=1 (read once per process: no stat, no state otherwise). With it: the
+    control-file poll, the level latched for this forward as a whole (a flip never lands inside a step), the counters of the
+    forwards dispatched with the instrument on / off, and the on-demand counters line (`touch` the stats file: one os.stat per
+    forward). Nothing is built at a flip: the instrument's events and its proxy are created by the phases that use them."""
+    st = _PWK
+    if st["ab"] is None:
+        st["ab"] = os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
+    if not st["ab"]:
+        return
+    try:
+        num_tokens = sum(g.num_tokens for g in groups)
+        if st["level"] is None:
+            st["level"] = _pw_env_level()
+        _pw_ab_poll(num_tokens)
+        on = phase_wait()
+        st["forwards_on" if on else "forwards_off"] += 1
+        st["rows_on" if on else "rows_off"] += num_tokens
+        try:
+            mtime = os.stat(os.environ.get("VLLM_MOET_RUNTIME_STATS_FILE", "/dev/shm/vllm_moet_stats")).st_mtime_ns
+        except OSError:
+            mtime = None
+        if mtime is not None and mtime != st["stats_mtime"]:
+            st["stats_mtime"] = mtime
+            _pw_stats_line("on demand")
+    except Exception as exc:  # noqa: BLE001 - the reader of an instrument must never take the forward down
+        _pw_warn_once("hooks", f"runtime A/B: the instrument's reader failed ({exc!r}) - the current level is kept")
 
 
 def _host_mark(name: str) -> None:
@@ -1765,6 +1958,8 @@ def green_apply_runtime(values: dict) -> list[str]:
     for key, val in values.items():
         if not isinstance(key, str) or not key.startswith("PREFILL_PIPE_"):
             continue
+        if key == _PW_KEY:  # the phase-wait instrument's key has its own reader (pw_apply_runtime)
+            continue
         if key != "PREFILL_PIPE_GREEN":
             _green_warn_once("key:" + key, f"runtime A/B: unknown key {key} of this module - ignored")
             continue
@@ -1940,6 +2135,8 @@ def run_groups(
     the captured graph (or is being captured, during capture_phase_graphs); fn stays the eager path of every other step."""
     runner = _RUNNER
     assert runner is not None, "prefill pipeline: groups without a runner"
+    if _PHASE["request"] is None:
+        _pw_runtime_hooks(groups)  # the phase-wait instrument's level as a runtime A/B key: a no-op unless VLLM_MOET_RUNTIME_AB=1
     if (host_timing() or phase_wait()) and _PHASE["request"] is None:  # a dummy step at engine start is not a step of the served traffic
         t_dispatch = time.perf_counter()
         try:
