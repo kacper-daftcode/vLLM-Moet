@@ -74,6 +74,14 @@ def main() -> int:
         return torch.equal(x.view(torch.int16) if x.dtype == torch.bfloat16 else x,
                            y.view(torch.int16) if y.dtype == torch.bfloat16 else y)
 
+    def sentinel_route(T):
+        # A route buffer of our own, every element a bf16 pattern no route row holds in all 5 120 columns: a call that does not write a
+        # route row cannot pass the comparison on what an earlier call left in a recycled allocation (the extension's own buffer for the
+        # pre-quantized / strided entries is often the allocation of the temporary `route_m[valid]` freed just before it - the same rows).
+        r = torch.empty(T * TOPK, H, dtype=torch.bfloat16, device=dev)
+        r.view(torch.int16).fill_(0x5A5A)
+        return r
+
     def compare(tag, x, ids, w, served, out_ref=None, kw=None):
         kw = kw_fast if kw is None else kw
         T = int(x.shape[0])
@@ -172,7 +180,7 @@ def main() -> int:
         # the pre-quantized-rows entry (the MXFP8 all-gather): the same rows fed back as a_values / a_scales must give
         # the same route rows and output (the quant stage is skipped, everything else is the same code)
         if prequant_rows_supported():
-            res_q = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=av_m, a_scales=as_m, **kw)
+            res_q = moe_prefill_fast(None, ids, w, planes, LIMIT, route_out=sentinel_route(T), a_values=av_m, a_scales=as_m, **kw)
             torch.cuda.synchronize()
             pq_ok = same(res_q[0], out_m) and (route_scratch or same(res_q[1][valid], route_m[valid])) and same(res_q[4][valid, :N], inter_m[valid, :N])
             msg.append(f"pre-quantized rows entry {'identical' if pq_ok else 'DIFFER'}")
@@ -184,7 +192,8 @@ def main() -> int:
                 buf = torch.randint(0, 256, (Tq, Kq + Kq // 32 + 48), device=av_m.device, dtype=torch.uint8)
                 buf[:, :Kq] = av_m
                 buf[:, Kq:Kq + Kq // 32] = as_m
-                res_s = moe_prefill_fast(None, ids, w, planes, LIMIT, a_values=buf[:, :Kq], a_scales=buf[:, Kq:Kq + Kq // 32], **kw)
+                res_s = moe_prefill_fast(None, ids, w, planes, LIMIT, route_out=sentinel_route(T), a_values=buf[:, :Kq],
+                                         a_scales=buf[:, Kq:Kq + Kq // 32], **kw)
                 torch.cuda.synchronize()
                 st_ok = same(res_s[0], out_m) and (route_scratch or same(res_s[1][valid], route_m[valid])) and same(res_s[4][valid, :N], inter_m[valid, :N])
                 msg.append(f"strided rows (one-buffer layout, row stride {Kq + Kq // 32 + 48}) {'identical' if st_ok else 'DIFFER'}")

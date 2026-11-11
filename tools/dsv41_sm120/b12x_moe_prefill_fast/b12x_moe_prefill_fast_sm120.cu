@@ -646,6 +646,16 @@ struct ItemRing {
 __device__ __forceinline__ int claim_next_item(int32_t* counter, int cur, int dynamic_schedule) {
   return dynamic_schedule ? (int)gridDim.x + atomicAdd(counter, 1) : cur + (int)gridDim.x;
 }
+// FC = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_FIRST_CLAIM; fc1_kernel_wg, fc2_kernel_ws): a CTA claims its FIRST item from the work counter
+// as well - the item indices are the counter's values from 0 on, and a CTA that has not been dispatched owns no item. With FC = 0
+// the first gridDim.x items belong to the blocks by index: FC1 cannot end, and FC2's sum items of the first column tile cannot pass,
+// before the last CTA of the grid has run its first item - a kernel of another stream that holds one of the grid's SMs holds the call
+// for as long as it stays (and past the watchdog the launch traps). One atomic per CTA; needs the dynamic schedule.
+__device__ __forceinline__ int claim_first_item(int32_t* counter, int lane) {
+  int c = 0;
+  if (lane == 0) c = atomicAdd(counter, 1);
+  return __shfl_sync(0xffffffffu, c, 0);
+}
 
 // the staged hand-off of the next work item (see above): d = the stage being issued minus claim_at, nb = the next item's
 // slot (the current issue item is ring.items[nb ^ 1]); the three global loads share one staging register (`nxt`: their
@@ -1382,13 +1392,17 @@ struct ProducerNext {
   int4 meta = make_int4(0, 0, 0, 0);
   int pr0 = -1, pr1 = -1;
 };
-template <typename AoffFn, typename ExtraFn>
-__device__ __forceinline__ void producer_stage_next(ItemRing& ring, ProducerNext& nx, int d, int nb, int lane, int cur_item,
-                                                    int n_items, const int4* items, const int32_t* row_pair, int32_t* counter,
-                                                    int dynamic_schedule, AoffFn aoff_of, ExtraFn extra) {
+template <bool FC, typename AoffFn, typename ExtraFn>
+__device__ __forceinline__ void producer_stage_next_t(ItemRing& ring, ProducerNext& nx, int d, int nb, int lane, int cur_item,
+                                                      int n_items, const int4* items, const int32_t* row_pair, int32_t* counter,
+                                                      int dynamic_schedule, AoffFn aoff_of, ExtraFn extra) {
   if (d == 0) {
     int c = 0;
-    if (lane == 0) c = claim_next_item(counter, cur_item, dynamic_schedule);
+    if constexpr (FC) {
+      if (lane == 0) c = atomicAdd(counter, 1);  // every claim is the counter's value (claim_first_item)
+    } else {
+      if (lane == 0) c = claim_next_item(counter, cur_item, dynamic_schedule);
+    }
     nx.item = __shfl_sync(0xffffffffu, c, 0);
   }
   if (d == 2) nx.w = (lane < 4 && nx.item < n_items) ? __ldg(reinterpret_cast<const int32_t*>(items) + (size_t)nx.item * 4 + lane) : 0;
@@ -1407,6 +1421,12 @@ __device__ __forceinline__ void producer_stage_next(ItemRing& ring, ProducerNext
     ring.aoff[nb][lane + 32] = nx.pr1 >= 0 ? aoff_of(nx.pr1) : 0xFFFFFFFFu;
   }
   extra(d, nb, nx.pr0, nx.pr1);
+}
+template <typename AoffFn, typename ExtraFn>
+__device__ __forceinline__ void producer_stage_next(ItemRing& ring, ProducerNext& nx, int d, int nb, int lane, int cur_item,
+                                                    int n_items, const int4* items, const int32_t* row_pair, int32_t* counter,
+                                                    int dynamic_schedule, AoffFn aoff_of, ExtraFn extra) {
+  producer_stage_next_t<false>(ring, nx, d, nb, lane, cur_item, n_items, items, row_pair, counter, dynamic_schedule, aoff_of, extra);
 }
 
 // the A rows of a stage: 64 rows x 64 B as 256 16-B chunks, 8 cp.async16 per lane; instruction i covers rows 8i..8i+7, a row's
@@ -1889,7 +1909,7 @@ __device__ __forceinline__ void wg_copy_a(uint32_t sb_a, const uint8_t* a_base, 
 }
 
 // MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
-template <int STAGES, int MINB, int MT = 0>
+template <int STAGES, int MINB, int MT = 0, int FC = 0>
 __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
   constexpr int NCW = kWgConsumers;
   extern __shared__ __align__(128) uint8_t smem[];
@@ -1908,7 +1928,7 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
   if (tid < 2) mbar_init(smem_addr(&bar_meta[tid]), 1);
   if (warp == NCW) {  // the first item straight from global memory
     int4 m = make_int4(0, 0, 0, 0);
-    const int item = blockIdx.x;
+    const int item = FC != 0 ? claim_first_item(a.counts + 3, lane) : (int)blockIdx.x;
     if (item < n_items) {
       const int w = lane < 4 ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + lane) : 0;
       m = make_int4(__shfl_sync(0xffffffffu, w, 0), __shfl_sync(0xffffffffu, w, 1), __shfl_sync(0xffffffffu, w, 2),
@@ -1962,8 +1982,8 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
           if (round0 > 0) --round0;
           else mbar_wait_sleep(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
           const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
-          producer_stage_next(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 3, a.dynamic_schedule,
-                              aoff_of, meta_extra);
+          producer_stage_next_t<FC != 0>(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 3,
+                                         a.dynamic_schedule, aoff_of, meta_extra);
           __syncwarp();  // the ring writes of this stage (if any) precede lane 0's release arrive
           if (lane == 0) mbar_arrive(full);
           wg_copy_a(sb + kF1B, a_base, rows, 0, t, lane);
@@ -2259,7 +2279,7 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
 
 // FC2 with the producer-warp skeleton
 // MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
-template <int STAGES, int MINB, int MT = 0>
+template <int STAGES, int MINB, int MT = 0, int FC = 0>
 __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
@@ -2296,7 +2316,7 @@ __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
       }
     };
     const uint8_t* a_base = reinterpret_cast<const uint8_t*>(a.inter);
-    int item = blockIdx.x, k = 0;
+    int item = FC != 0 ? claim_first_item(a.counts + 4, lane) : (int)blockIdx.x, k = 0;
     {
       int4 m = make_int4(0, 0, 0, 0);
       if (item < n_items) {
@@ -2337,7 +2357,7 @@ __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
           if (round0 > 0) --round0;
           else mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
           const uint32_t full = smem_addr(&bar_full[pos.buf]);
-          producer_stage_next(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 4, a.dynamic_schedule,
+          producer_stage_next_t<FC != 0>(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 4, a.dynamic_schedule,
                               aoff_of, tw_extra);
           __syncwarp();
           if (lane == 0) mbar_arrive(full);
@@ -2357,7 +2377,7 @@ __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
         if (round0 > 0) --round0;
         else mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u);
         const uint32_t sb = sbase0 + pos.buf * kF2Stage, full = smem_addr(&bar_full[pos.buf]);
-        producer_stage_next(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 4, a.dynamic_schedule,
+        producer_stage_next_t<FC != 0>(ring, nx, t - claim_at, nb, lane, item, n_items, a.items, a.row_pair, a.counts + 4, a.dynamic_schedule,
                             aoff_of, tw_extra);
         __syncwarp();
         {
@@ -3343,6 +3363,19 @@ static int mt_loops_mode() {
 }
 // the activation counters of the m-tile loops: [FC1 calls, rows, FC2 calls, rows] launched with the specialised kernels
 static unsigned long long g_cnt_mt[4] = {0, 0, 0, 0};
+// The first claim (VLLM_MOET_B12X_MOE_PREFILL_FAST_FIRST_CLAIM=1; run-time override set_first_claim, -1 = the env value): the served FC1
+// mode (WS1 = 9) and the served FC2 mode (WS2 = 3) launch the kernels whose CTAs claim their first item from the work counter
+// (fc1_kernel_wg<4, 1, MT, 1>, fc2_kernel_ws<4, 2, MT, 1>; with or without the m-tile loops) - the same items, the same arithmetic per
+// item, only which CTA runs which item differs, as it already does for every later item: bit-identical alternatives. Needs the
+// dynamic schedule (a call with the static one launches the kernels above). g_fc_call: this call's decision, set at its entry.
+static int g_rt_first_claim = -1;
+static int first_claim_mode() {
+  static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_FIRST_CLAIM") >= 1 ? 1 : 0;
+  return g_rt_first_claim >= 0 ? g_rt_first_claim : m;
+}
+static bool g_fc_call = false;
+// their activation counters: [FC1 calls, rows, FC2 calls, rows] launched with the first-claim kernels
+static unsigned long long g_cnt_fc[4] = {0, 0, 0, 0};
 // K-13 (task B): activation counters of the switched paths, one add per call (moe_prefill_fast_counters() reads them: calls / rows through
 // fc1 v10 (WS1 >= 8) vs fc1 v8/v9 (WS1 < 8), fc2 with the sum items vs fc2 + the separate topk_sum_kernel, the persistent launch)
 static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -3444,45 +3477,47 @@ struct WsLaunch1 {
     fc1_kernel_ws<S, MB, MH><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB, int MT = 0>
-struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2; MT = 1: the m-tile loops)
+template <int S, int MB, int MT = 0, int FC = 0>
+struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2; MT = 1: the m-tile loops; FC = 1: the first claim)
   static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT>, kT, S * kF1Stage);
+    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT, FC>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT, FC>, kT, S * kF1Stage);
     // on record: <4, 1> one CTA per SM (167 registers, the served mode), <3, 2> two (setmaxnreg)
     static bool noted = false;
-    occ_check(MT == 1 ? "fc1_kernel_wg_mt" : "fc1_kernel_wg", fc1_kernel_wg<S, MB, MT>, noted, S, MB, occ,
+    occ_check(FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc" : "fc1_kernel_wg_fc") : (MT == 1 ? "fc1_kernel_wg_mt" : "fc1_kernel_wg"),
+              fc1_kernel_wg<S, MB, MT, FC>, noted, S, MB, occ,
               occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC1", (S == 4 && MB == 1) ? 1 : (S == 3 && MB == 2) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc1_kernel_wg<S, MB, MT><<<grid, kT, S * kF1Stage, stream>>>(f1);
+    fc1_kernel_wg<S, MB, MT, FC><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB, int MT = 0>
+template <int S, int MB, int MT = 0, int FC = 0>
 struct WsLaunch2 {
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB, MT>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB, MT>, kWsThreads, S * kF2Stage);
+    if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB, MT, FC>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB, MT, FC>, kWsThreads, S * kF2Stage);
     // on record: <4, 1> (the served mode) and <3, 2> two CTAs per SM - at 96 registers per thread, the most two CTAs of 9 warps get;
-    // the m-tile loops' <4, 2, 1> two as well (92 registers)
+    // the m-tile loops' <4, 2, 1> two as well (92 registers); the first-claim kernels <4, 2, MT, 1> are built for two
     static bool noted = false;
-    occ_check(MT == 1 ? "fc2_kernel_ws_mt" : "fc2_kernel_ws", fc2_kernel_ws<S, MB, MT>, noted, S, MB, occ,
+    occ_check(FC == 1 ? (MT == 1 ? "fc2_kernel_ws_mt_fc" : "fc2_kernel_ws_fc") : (MT == 1 ? "fc2_kernel_ws_mt" : "fc2_kernel_ws"),
+              fc2_kernel_ws<S, MB, MT, FC>, noted, S, MB, occ,
               occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC2",
-                         ((S == 4 && MB == 1) || (S == 3 && MB == 2) || (S == 4 && MB == 2 && MT == 1)) ? 2 : 0), sms);
+                         ((S == 4 && MB == 1) || (S == 3 && MB == 2) || (S == 4 && MB == 2 && (MT == 1 || FC == 1))) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc2Args& f2, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc2_kernel_ws<S, MB, MT><<<grid, kWsThreads, S * kF2Stage, stream>>>(f2);
+    fc2_kernel_ws<S, MB, MT, FC><<<grid, kWsThreads, S * kF2Stage, stream>>>(f2);
   }
 };
 template <typename Fn>
@@ -3497,7 +3532,10 @@ static void with_ws1(int mode, Fn fn) {
     case 7: fn(WsLaunch1<7, 1, 2>{}); break;
     case 8: fn(WgLaunch1<3, 2>{}); break;
     case 9:
-      if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1>{});
+      if (g_fc_call) {
+        if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1, 1>{});
+        else fn(WgLaunch1<4, 1, 0, 1>{});
+      } else if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1>{});
       else fn(WgLaunch1<4, 1>{});
       break;
     case 10: fn(WgLaunch1<6, 1>{}); break;
@@ -3510,7 +3548,10 @@ static void with_ws2(int mode, Fn fn) {
     case 1: fn(WsLaunch2<3, 2>{}); break;
     case 2: fn(WsLaunch2<6, 1>{}); break;
     case 3:
-      if (mt_loops_mode() >= 1) fn(WsLaunch2<4, 2, 1>{});
+      if (g_fc_call) {
+        if (mt_loops_mode() >= 1) fn(WsLaunch2<4, 2, 1, 1>{});
+        else fn(WsLaunch2<4, 2, 0, 1>{});
+      } else if (mt_loops_mode() >= 1) fn(WsLaunch2<4, 2, 1>{});
       else fn(WsLaunch2<4, 1>{});
       break;
     default: fn(WsLaunch2<7, 1>{}); break;
@@ -3763,6 +3804,11 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
       if (fc1_v10 && ws1_mode() == 9) { g_cnt_mt[0] += 1; g_cnt_mt[1] += (unsigned long long)T; }
       if (!persistent && ws2_mode() == 3) { g_cnt_mt[2] += 1; g_cnt_mt[3] += (unsigned long long)T; }
     }
+    g_fc_call = !persistent && first_claim_mode() >= 1 && dynamic_schedule == 1;  // the first claim: this call's kernels
+    if (g_fc_call) {
+      if (fc1_v10 && ws1_mode() == 9) { g_cnt_fc[0] += 1; g_cnt_fc[1] += (unsigned long long)T; }
+      if (ws2_mode() == 3) { g_cnt_fc[2] += 1; g_cnt_fc[3] += (unsigned long long)T; }
+    }
   }
   // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
   const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
@@ -3924,6 +3970,17 @@ std::vector<int64_t> moe_prefill_fast_mt_counters(bool clear) {
   if (clear) for (auto& c : g_cnt_mt) c = 0;
   return r;
 }
+// The first claim's run-time override (-1 = the env value, 0 / 1), the effective value, and its counters [FC1 calls, rows, FC2 calls, rows].
+void set_first_claim(int64_t v) {
+  TORCH_CHECK(v >= -1 && v <= 1, "set_first_claim: -1 (the env value), 0 or 1");
+  g_rt_first_claim = (int)v;
+}
+int64_t get_first_claim() { return first_claim_mode(); }
+std::vector<int64_t> moe_prefill_fast_fc_counters(bool clear) {
+  std::vector<int64_t> r(g_cnt_fc, g_cnt_fc + 4);
+  if (clear) for (auto& c : g_cnt_fc) c = 0;
+  return r;
+}
 std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
   std::vector<int64_t> r(g_cnt, g_cnt + 8);
   if (clear) for (auto& c : g_cnt) c = 0;
@@ -3935,13 +3992,16 @@ std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
 // then compares the output only)
 int64_t sum_items_mode() { return (sum_items_env() >= 1 && ws2_mode() >= 1 && ws_mode() < 20) ? sum_items_env() : 0; }
 bool route_rows_consumed() { return sum_items_mode() >= 1 && sum_discard_env() >= 1; }
-// the persistent kernel's watchdog record (pinned host memory, readable after a trapped launch): [set, item, expert, need, seen, smid, block,
-// watchdog_ms]; set == 0: no expired wait since the process started. `clear` resets it.
+// the watchdog record of the bounded waits (pinned host memory, readable after a trapped launch): [set, what, item, need, seen, smid, block,
+// watchdog_ms]; set == 0: no expired wait since the process started (or since `clear`). The kernel stores `set` last, right before it
+// traps, and that store does not always reach the host: a filled record (every expired wait writes a non-zero `what` and a
+// watchdog of at least 1 ms) is reported as set.
 std::vector<int64_t> moe_prefill_ws_error(bool clear) {
   std::vector<int64_t> r(8, 0);
   uint32_t* h = ps_err_host();
   if (h == nullptr) return r;
   for (int i = 0; i < 8; ++i) r[i] = (int64_t)h[i];
+  if (r[0] == 0 && (r[1] != 0 || r[7] != 0)) r[0] = 1;
   if (clear) memset(h, 0, 32);
   return r;
 }
@@ -3981,6 +4041,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_mt_loops", &set_mt_loops);
   m.def("get_mt_loops", &get_mt_loops);
   m.def("moe_prefill_fast_mt_counters", &moe_prefill_fast_mt_counters);
+  m.def("set_first_claim", &set_first_claim);
+  m.def("get_first_claim", &get_first_claim);
+  m.def("moe_prefill_fast_fc_counters", &moe_prefill_fast_fc_counters);
   m.def("moe_prefill_fast_counters", &moe_prefill_fast_counters);
   m.def("moe_prefill_ws_error", &moe_prefill_ws_error);
   m.def("moe_prefill_ws_stats", &moe_prefill_ws_stats);
