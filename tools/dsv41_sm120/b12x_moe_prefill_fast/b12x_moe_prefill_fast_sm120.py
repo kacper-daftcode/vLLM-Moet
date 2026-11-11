@@ -70,6 +70,14 @@ starts (a collective needs whole SMs) holds the call for as long as it stays, an
 CTA that has not been dispatched owns nothing; the CTAs that run take every item. Which CTA computes an item changes, as it already does
 for every item but the first; the items and their arithmetic do not: bit-identical alternatives. `first_claim_supported()` tells whether
 the built extension has the kernels; `watchdog_record()` returns the record of an expired wait.
+
+The FC1 epilogue with its values defined on every path: `VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ=1` (default 0) launches the served FC1
+mode (WS1 = 9; with or without the m-tile loops and the first claim) with the kernel's `FZ` form. The epilogue packs an item's
+activated values into 32 floats per thread, written for an active m-tile before the consumers' barrier and read behind it under the
+same condition - which the compiler cannot join, so on the other path the values are undefined, stay live around the whole item loop
+and hold 32 registers of every consumer thread through the stage loops. The `FZ` form zero-fills them at the head of the epilogue; the
+zeros are never read: the same bits, fewer registers per thread. FC2, the other FC1 modes and the calls below `_WS1_MIN_ROWS` rows
+(FC1 v8) are not affected. `fc1_fz_supported()` tells whether the built extension has the kernels.
 """
 from __future__ import annotations
 
@@ -138,8 +146,10 @@ def route_rows_consumed() -> bool:
 #                                   reaches every rank). Keys of this module: B12X_MOE_PREFILL_FAST_SUM_ITEMS (0 / 1 - the sum items with
 #                                   their _DISCARD / _ROUTE_HINT companions as one unit), B12X_MOE_PREFILL_FAST_WS1 (0..11; 0 = v8,
 #                                   9 = v10), B12X_MOE_PREFILL_FAST_MT_LOOPS (0 / 1 - the m-tile loops of the served FC1 / FC2
-#                                   modes) and B12X_MOE_PREFILL_FAST_FIRST_CLAIM (0 / 1 - the first-claim kernels of the same modes); in
-#                                   the log lines the two newer keys carry their full names, the two older keys their short tokens
+#                                   modes), B12X_MOE_PREFILL_FAST_FIRST_CLAIM (0 / 1 - the first-claim kernels of the same modes) and
+#                                   B12X_MOE_PREFILL_FAST_FC1_FZ (0 / 1 - the served FC1 mode's kernel with its epilogue values defined
+#                                   on every path); in
+#                                   the log lines the newer keys carry their full names, the two older keys their short tokens
 #                                   SUM_ITEMS / WS1. Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
 #                                   at a MoE-call boundary - this module has no view of the prefill forward; the states are bit-identical
 #                                   alternatives, so a flip between two calls of one step changes no bits), re-reads it only when mtime or
@@ -225,6 +235,12 @@ def first_claim_supported() -> bool:
     return hasattr(_ext(), "set_first_claim")
 
 
+def fc1_fz_supported() -> bool:
+    """Whether the built extension has the FZ form of the served FC1 kernels (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ and its runtime
+    key): the FC1 epilogue with its values defined on every path."""
+    return hasattr(_ext(), "set_fc1_fz")
+
+
 def watchdog_record(clear: bool = False) -> list[int]:
     """The record of an expired bounded wait of this process: [set, what, item, need, seen, smid, block, watchdog_ms] (pinned host
     memory: readable after the trapped launch, without a CUDA call). what 100 + n = a sum item of FC2 waited for the FC2 items of
@@ -242,7 +258,7 @@ def watchdog_record(clear: bool = False) -> list[int]:
 
 def runtime_switches() -> dict:
     """The effective switch values of this process (env or runtime override): ws1, sum_items, sum_discard, sum_route_hint and, with a
-    build that has them, mt_loops and first_claim."""
+    build that has them, mt_loops, first_claim and fc1_fz."""
     e = _ext()
     if not hasattr(e, "get_runtime_switches"):
         return {}
@@ -252,12 +268,15 @@ def runtime_switches() -> dict:
         sw["MT_LOOPS"] = int(e.get_mt_loops())
     if hasattr(e, "get_first_claim"):
         sw["FIRST_CLAIM"] = int(e.get_first_claim())
+    if hasattr(e, "get_fc1_fz"):
+        sw["FC1_FZ"] = int(e.get_fc1_fz())
     return sw
 
 
 def apply_runtime_switches(values: dict) -> list[str]:
     """Apply {"B12X_MOE_PREFILL_FAST_SUM_ITEMS": 0|1, "B12X_MOE_PREFILL_FAST_WS1": 0..11, "B12X_MOE_PREFILL_FAST_MT_LOOPS": 0|1,
-    "B12X_MOE_PREFILL_FAST_FIRST_CLAIM": 0|1, "B12X_MOE_PREFILL_FAST_GRID1": 0..4096, "B12X_MOE_PREFILL_FAST_GRID2": 0..4096}
+    "B12X_MOE_PREFILL_FAST_FIRST_CLAIM": 0|1, "B12X_MOE_PREFILL_FAST_FC1_FZ": 0|1, "B12X_MOE_PREFILL_FAST_GRID1": 0..4096,
+    "B12X_MOE_PREFILL_FAST_GRID2": 0..4096}
     (keys of other modules ignored); returns the change descriptions. A key the file does not carry goes back to its env value (-1); an
     out-of-range value keeps the current effective value (one WARNING). The sum-items unit sets SUM_ITEMS, SUM_DISCARD and
     SUM_ROUTE_HINT together."""
@@ -266,11 +285,12 @@ def apply_runtime_switches(values: dict) -> list[str]:
         _rt_warn_once("ext", "this build of the extension has no set_runtime_switches entry: runtime A/B inactive")
         return []
     cur = runtime_switches()
-    ws1_arg, si_arg, mt_arg, fc_arg = -1, -1, -1, -1
+    ws1_arg, si_arg, mt_arg, fc_arg, fz_arg = -1, -1, -1, -1, -1
     grid_arg = {"GRID1": -1, "GRID2": -1}
     grid_was = {k: _grid_eff(k) for k in grid_arg}
     has_mt = hasattr(e, "set_mt_loops")
     has_fc = hasattr(e, "set_first_claim")
+    has_fz = hasattr(e, "set_fc1_fz")
     for key, val in values.items():
         if not isinstance(key, str) or not key.startswith("B12X_MOE_PREFILL_FAST_"):
             continue
@@ -302,6 +322,12 @@ def apply_runtime_switches(values: dict) -> list[str]:
             else:
                 fc_arg = cur["FIRST_CLAIM"]
                 _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1) - kept {cur['FIRST_CLAIM']}")
+        elif key == "B12X_MOE_PREFILL_FAST_FC1_FZ" and has_fz:
+            if v in (0, 1):
+                fz_arg = v
+            else:
+                fz_arg = cur["FC1_FZ"]
+                _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1) - kept {cur['FC1_FZ']}")
         elif key in ("B12X_MOE_PREFILL_FAST_GRID1", "B12X_MOE_PREFILL_FAST_GRID2"):
             name = key[-5:]
             if 0 <= v <= 4096:
@@ -317,6 +343,8 @@ def apply_runtime_switches(values: dict) -> list[str]:
         e.set_mt_loops(int(mt_arg))
     if has_fc:
         e.set_first_claim(int(fc_arg))
+    if has_fz:
+        e.set_fc1_fz(int(fz_arg))
     now = runtime_switches()
     changes = []
     _RT_GRID.update(grid_arg)  # a key the file does not carry goes back to its environment value
@@ -329,6 +357,8 @@ def apply_runtime_switches(values: dict) -> list[str]:
         changes.append(f"B12X_MOE_PREFILL_FAST_MT_LOOPS {cur['MT_LOOPS']} -> {now['MT_LOOPS']}")  # a newer key: its full name
     if has_fc and now["FIRST_CLAIM"] != cur["FIRST_CLAIM"]:
         changes.append(f"B12X_MOE_PREFILL_FAST_FIRST_CLAIM {cur['FIRST_CLAIM']} -> {now['FIRST_CLAIM']}")
+    if has_fz and now["FC1_FZ"] != cur["FC1_FZ"]:
+        changes.append(f"B12X_MOE_PREFILL_FAST_FC1_FZ {cur['FC1_FZ']} -> {now['FC1_FZ']}")
     if (now["SUM_ITEMS"], now["SUM_DISCARD"], now["SUM_ROUTE_HINT"]) != (cur["SUM_ITEMS"], cur["SUM_DISCARD"], cur["SUM_ROUTE_HINT"]):
         changes.append(f"SUM_ITEMS {cur['SUM_ITEMS']} -> {now['SUM_ITEMS']} (DISCARD {cur['SUM_DISCARD']} -> {now['SUM_DISCARD']}, "
                        f"ROUTE_HINT {cur['SUM_ROUTE_HINT']} -> {now['SUM_ROUTE_HINT']})")
@@ -384,6 +414,9 @@ def activation_counters(clear: bool = False) -> dict:
         t = [int(v) for v in e.moe_prefill_fast_fc_counters(bool(clear))]
         out["fc1_first_claim"] = (t[0], t[1])
         out["fc2_first_claim"] = (t[2], t[3])
+    if hasattr(e, "moe_prefill_fast_fz_counters"):
+        t = [int(v) for v in e.moe_prefill_fast_fz_counters(bool(clear))]
+        out["fc1_fz"] = (t[0], t[1])
     return out
 
 
@@ -397,6 +430,9 @@ def _stats_line(reason: str) -> None:
     if "FIRST_CLAIM" in sw and "fc1_first_claim" in c:  # a build with the first-claim kernels: the same
         mt_cnt += f", fc1 first claim {c['fc1_first_claim'][0]} / {c['fc1_first_claim'][1]}, fc2 first claim {c['fc2_first_claim'][0]} / {c['fc2_first_claim'][1]}"
         mt_tok += f" B12X_MOE_PREFILL_FAST_FIRST_CLAIM={sw['FIRST_CLAIM']}"
+    if "FC1_FZ" in sw and "fc1_fz" in c:  # a build with the FZ form of the served FC1 kernels: the same
+        mt_cnt += f", fc1 fz {c['fc1_fz'][0]} / {c['fc1_fz'][1]}"
+        mt_tok += f" B12X_MOE_PREFILL_FAST_FC1_FZ={sw['FC1_FZ']}"
     _rt_log(f"activation counters ({reason}; calls / rows): fc1 v10 {c['fc1_v10'][0]} / {c['fc1_v10'][1]}, fc1 v8-v9 {c['fc1_v8_v9'][0]} / {c['fc1_v8_v9'][1]}, "
             f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}{mt_cnt}; "
             f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}{mt_tok}"

@@ -1909,7 +1909,8 @@ __device__ __forceinline__ void wg_copy_a(uint32_t sb_a, const uint8_t* a_base, 
 }
 
 // MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
-template <int STAGES, int MINB, int MT = 0, int FC = 0>
+// FZ = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ): the epilogue's packed values `v` are zero-filled on every path, see the epilogue
+template <int STAGES, int MINB, int MT = 0, int FC = 0, int FZ = 0>
 __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
   constexpr int NCW = kWgConsumers;
   extern __shared__ __align__(128) uint8_t smem[];
@@ -2220,6 +2221,16 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
 #pragma unroll
     for (int mt = 0; mt < 4; ++mt) {
       am[mt][0] = am[mt][1] = 0.f;
+      // FZ = 1: `v` is defined on every path. It is written below and read behind the consumers' barrier under the same condition
+      // (an active m-tile of the item), which the compiler cannot join: without the zeros the 32 values are undefined on the
+      // other path, so they stay live around the whole item loop and hold 32 registers of every consumer thread through the
+      // stage loops. The zeros are never read: the same bits, fewer registers per thread.
+      if constexpr (FZ != 0) {
+#pragma unroll
+        for (int hf = 0; hf < 2; ++hf)
+#pragma unroll
+          for (int kx = 0; kx < 4; ++kx) v[mt][hf][kx] = 0.f;
+      }
       if (mt >= m_tiles) continue;  // CTA-uniform
       if (act[mt]) {
 #pragma unroll
@@ -3387,6 +3398,18 @@ static int first_claim_mode() {
 static bool g_fc_call = false;
 // their activation counters: [FC1 calls, rows, FC2 calls, rows] launched with the first-claim kernels
 static unsigned long long g_cnt_fc[4] = {0, 0, 0, 0};
+// The FC1 epilogue with its values defined on every path (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ=1; run-time override set_fc1_fz,
+// -1 = the env value): the served FC1 mode (WS1 = 9) launches fc1_kernel_wg<4, 1, MT, FC, 1> - the kernel of the call's other
+// switches (the m-tile loops, the first claim) with the epilogue's 32 packed values zero-filled before the item's m-tiles write
+// them. The zeros are never read: a bit-identical alternative with fewer registers per thread (141 against 167; with the m-tile
+// loops 137 against 168). Other modes, FC2 and the calls below _WS1_MIN_ROWS rows (FC1 v8) are not affected.
+static int g_rt_fc1_fz = -1;
+static int fc1_fz_mode() {
+  static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ") >= 1 ? 1 : 0;
+  return g_rt_fc1_fz >= 0 ? g_rt_fc1_fz : m;
+}
+// its activation counters: [FC1 calls, rows] launched with those kernels
+static unsigned long long g_cnt_fz[2] = {0, 0};
 // K-13 (task B): activation counters of the switched paths, one add per call (moe_prefill_fast_counters() reads them: calls / rows through
 // fc1 v10 (WS1 >= 8) vs fc1 v8/v9 (WS1 < 8), fc2 with the sum items vs fc2 + the separate topk_sum_kernel, the persistent launch)
 static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -3494,25 +3517,27 @@ struct WsLaunch1 {
     fc1_kernel_ws<S, MB, MH><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB, int MT = 0, int FC = 0>
-struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2; MT = 1: the m-tile loops; FC = 1: the first claim)
+template <int S, int MB, int MT = 0, int FC = 0, int FZ = 0>
+struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2; MT = 1: the m-tile loops; FC = 1: the first claim;
+                    // FZ = 1: the epilogue's values defined on every path)
   static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT, FC>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT, FC>, kT, S * kF1Stage);
-    // on record: <4, 1> one CTA per SM (167 registers, the served mode), <3, 2> two (setmaxnreg)
+    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT, FC, FZ>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT, FC, FZ>, kT, S * kF1Stage);
+    // on record: <4, 1> one CTA per SM (167 registers, the served mode; its FZ form 141), <3, 2> two (setmaxnreg)
     static bool noted = false;
-    occ_check(FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc" : "fc1_kernel_wg_fc") : (MT == 1 ? "fc1_kernel_wg_mt" : "fc1_kernel_wg"),
-              fc1_kernel_wg<S, MB, MT, FC>, noted, S, MB, occ,
+    occ_check(FZ == 1 ? (FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc_fz" : "fc1_kernel_wg_fc_fz") : (MT == 1 ? "fc1_kernel_wg_mt_fz" : "fc1_kernel_wg_fz"))
+                      : (FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc" : "fc1_kernel_wg_fc") : (MT == 1 ? "fc1_kernel_wg_mt" : "fc1_kernel_wg")),
+              fc1_kernel_wg<S, MB, MT, FC, FZ>, noted, S, MB, occ,
               occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC1", (S == 4 && MB == 1) ? 1 : (S == 3 && MB == 2) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc1_kernel_wg<S, MB, MT, FC><<<grid, kT, S * kF1Stage, stream>>>(f1);
+    fc1_kernel_wg<S, MB, MT, FC, FZ><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
 template <int S, int MB, int MT = 0, int FC = 0>
@@ -3549,7 +3574,13 @@ static void with_ws1(int mode, Fn fn) {
     case 7: fn(WsLaunch1<7, 1, 2>{}); break;
     case 8: fn(WgLaunch1<3, 2>{}); break;
     case 9:
-      if (g_fc_call) {
+      if (fc1_fz_mode() >= 1) {  // the epilogue's values defined on every path: the same four kernels in their FZ form
+        if (g_fc_call) {
+          if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1, 1, 1>{});
+          else fn(WgLaunch1<4, 1, 0, 1, 1>{});
+        } else if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1, 0, 1>{});
+        else fn(WgLaunch1<4, 1, 0, 0, 1>{});
+      } else if (g_fc_call) {
         if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1, 1>{});
         else fn(WgLaunch1<4, 1, 0, 1>{});
       } else if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1>{});
@@ -3826,6 +3857,8 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
       if (fc1_v10 && ws1_mode() == 9) { g_cnt_fc[0] += 1; g_cnt_fc[1] += (unsigned long long)T; }
       if (ws2_mode() == 3) { g_cnt_fc[2] += 1; g_cnt_fc[3] += (unsigned long long)T; }
     }
+    // the FC1 epilogue's values defined on every path: the calls whose FC1 launch is the FZ form of the served mode's kernel
+    if (fc1_fz_mode() >= 1 && fc1_v10 && ws1_mode() == 9) { g_cnt_fz[0] += 1; g_cnt_fz[1] += (unsigned long long)T; }
   }
   // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
   const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
@@ -3998,6 +4031,17 @@ std::vector<int64_t> moe_prefill_fast_fc_counters(bool clear) {
   if (clear) for (auto& c : g_cnt_fc) c = 0;
   return r;
 }
+// The run-time override of the FC1 epilogue's FZ form (-1 = the env value, 0 / 1), the effective value, and its counters [FC1 calls, rows].
+void set_fc1_fz(int64_t v) {
+  TORCH_CHECK(v >= -1 && v <= 1, "set_fc1_fz: -1 (the env value), 0 or 1");
+  g_rt_fc1_fz = (int)v;
+}
+int64_t get_fc1_fz() { return fc1_fz_mode(); }
+std::vector<int64_t> moe_prefill_fast_fz_counters(bool clear) {
+  std::vector<int64_t> r(g_cnt_fz, g_cnt_fz + 2);
+  if (clear) for (auto& c : g_cnt_fz) c = 0;
+  return r;
+}
 std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
   std::vector<int64_t> r(g_cnt, g_cnt + 8);
   if (clear) for (auto& c : g_cnt) c = 0;
@@ -4061,6 +4105,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_first_claim", &set_first_claim);
   m.def("get_first_claim", &get_first_claim);
   m.def("moe_prefill_fast_fc_counters", &moe_prefill_fast_fc_counters);
+  m.def("set_fc1_fz", &set_fc1_fz);
+  m.def("get_fc1_fz", &get_fc1_fz);
+  m.def("moe_prefill_fast_fz_counters", &moe_prefill_fast_fz_counters);
   m.def("moe_prefill_fast_counters", &moe_prefill_fast_counters);
   m.def("moe_prefill_ws_error", &moe_prefill_ws_error);
   m.def("moe_prefill_ws_stats", &moe_prefill_ws_stats);
