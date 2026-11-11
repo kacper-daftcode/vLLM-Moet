@@ -157,6 +157,23 @@ def route_rows_consumed() -> bool:
 _RT_STATE: dict = {"on": None, "next_poll": 0.0, "sig": None, "warned": set(), "calls": 0, "stats_mtime": None, "stats_every": None}
 
 
+# The grid caps as runtime keys: a control-file value overrides the environment's VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID1 / _GRID2
+# (-1 = no override). The caps were always arguments of the extension's entry, taken per call; every grid computes the same bits.
+_RT_GRID = {"GRID1": -1, "GRID2": -1}
+
+
+def _grid_eff(name: str) -> int:
+    v = _RT_GRID[name]
+    return v if v >= 0 else _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_" + name, 0)
+
+
+def grid_caps() -> dict:
+    """The effective CTA caps of FC1 / FC2 of this process (0 = no cap = the occupancy grid): the runtime key's value, else the
+    environment's. A cap of the SM count or more is spread over all SMs (the SMs beyond `cap - SMs` carry one CTA instead of the
+    kernel's CTAs per SM); a cap below the SM count leaves SMs without a CTA of the kernel."""
+    return {"GRID1": _grid_eff("GRID1"), "GRID2": _grid_eff("GRID2")}
+
+
 def _rt_log(msg: str) -> None:
     import sys
 
@@ -239,7 +256,8 @@ def runtime_switches() -> dict:
 
 def apply_runtime_switches(values: dict) -> list[str]:
     """Apply {"B12X_MOE_PREFILL_FAST_SUM_ITEMS": 0|1, "B12X_MOE_PREFILL_FAST_WS1": 0..11, "B12X_MOE_PREFILL_FAST_MT_LOOPS": 0|1,
-    "B12X_MOE_PREFILL_FAST_FIRST_CLAIM": 0|1} (keys of other modules ignored); returns the change descriptions. A key the file does not carry goes back to its env value (-1); an
+    "B12X_MOE_PREFILL_FAST_FIRST_CLAIM": 0|1, "B12X_MOE_PREFILL_FAST_GRID1": 0..4096, "B12X_MOE_PREFILL_FAST_GRID2": 0..4096}
+    (keys of other modules ignored); returns the change descriptions. A key the file does not carry goes back to its env value (-1); an
     out-of-range value keeps the current effective value (one WARNING). The sum-items unit sets SUM_ITEMS, SUM_DISCARD and
     SUM_ROUTE_HINT together."""
     e = _ext()
@@ -248,6 +266,8 @@ def apply_runtime_switches(values: dict) -> list[str]:
         return []
     cur = runtime_switches()
     ws1_arg, si_arg, mt_arg, fc_arg = -1, -1, -1, -1
+    grid_arg = {"GRID1": -1, "GRID2": -1}
+    grid_was = {k: _grid_eff(k) for k in grid_arg}
     has_mt = hasattr(e, "set_mt_loops")
     has_fc = hasattr(e, "set_first_claim")
     for key, val in values.items():
@@ -281,6 +301,13 @@ def apply_runtime_switches(values: dict) -> list[str]:
             else:
                 fc_arg = cur["FIRST_CLAIM"]
                 _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1) - kept {cur['FIRST_CLAIM']}")
+        elif key in ("B12X_MOE_PREFILL_FAST_GRID1", "B12X_MOE_PREFILL_FAST_GRID2"):
+            name = key[-5:]
+            if 0 <= v <= 4096:
+                grid_arg[name] = v
+            else:
+                grid_arg[name] = grid_was[name]
+                _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0..4096) - kept {grid_was[name]}")
         else:
             _rt_warn_once("key:" + key, f"runtime A/B: unknown key {key} of this module - ignored")
     sd_arg = sh_arg = si_arg  # the unit: discard + evict_last hint follow the sum items (-1 = env for all three)
@@ -291,6 +318,10 @@ def apply_runtime_switches(values: dict) -> list[str]:
         e.set_first_claim(int(fc_arg))
     now = runtime_switches()
     changes = []
+    _RT_GRID.update(grid_arg)  # a key the file does not carry goes back to its environment value
+    for name in ("GRID1", "GRID2"):
+        if _grid_eff(name) != grid_was[name]:
+            changes.append(f"B12X_MOE_PREFILL_FAST_{name} {grid_was[name]} -> {_grid_eff(name)}")
     if now["WS1"] != cur["WS1"]:
         changes.append(f"WS1 {cur['WS1']} -> {now['WS1']}")
     if has_mt and now["MT_LOOPS"] != cur["MT_LOOPS"]:
@@ -367,7 +398,8 @@ def _stats_line(reason: str) -> None:
         mt_tok += f" B12X_MOE_PREFILL_FAST_FIRST_CLAIM={sw['FIRST_CLAIM']}"
     _rt_log(f"activation counters ({reason}; calls / rows): fc1 v10 {c['fc1_v10'][0]} / {c['fc1_v10'][1]}, fc1 v8-v9 {c['fc1_v8_v9'][0]} / {c['fc1_v8_v9'][1]}, "
             f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}{mt_cnt}; "
-            f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}{mt_tok}")
+            f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}{mt_tok}"
+            f" B12X_MOE_PREFILL_FAST_GRID1={_grid_eff('GRID1')} B12X_MOE_PREFILL_FAST_GRID2={_grid_eff('GRID2')}")
 
 
 def _runtime_hooks() -> None:
@@ -409,9 +441,9 @@ def moe_prefill_fast(hidden: torch.Tensor | None, ids: torch.Tensor, weights: to
     cfg1 = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_CFG1", 0) if cfg1 is None else cfg1
     cfg2 = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_CFG2", 0) if cfg2 is None else cfg2
     dynamic = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_DYNAMIC", 1) if dynamic is None else dynamic
-    grid1 = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID1", 0) if grid1 is None else grid1
-    grid2 = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID2", 0) if grid2 is None else grid2
     _runtime_hooks()  # K-13: the runtime A/B poll (VLLM_MOET_RUNTIME_AB=1) and the activation-counter lines (task B); no-ops by default
+    grid1 = _grid_eff("GRID1") if grid1 is None else grid1  # after the poll: the control file's cap, else the environment's
+    grid2 = _grid_eff("GRID2") if grid2 is None else grid2
     ids = ids.to(torch.int32).contiguous()
     args = (ids, weights.to(torch.float32).contiguous(), planes["w13"],
             planes["w13_sf"], planes["w2"], planes["w2_sf"],
