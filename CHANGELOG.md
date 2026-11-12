@@ -9,6 +9,11 @@ the release tag that points at it.
 ### In the tree after `-r33` (in no released image)
 - A test that makes a wait of the persistent prefill MoE launch last, and expire (`test_persistent_watchdog_sm120.py`);
   no kernel, module or default changes.
+- The reader of the phase-wait instrument (`sp_pipeline/phase_balance.py`) prints where a phase's glue ends against
+  the MoE segment beside it and which ranks wait in the all-gather, and its `pace:` reading no longer takes a waiting
+  compute stream for a comm-bound slot (`sp_pipeline/test_phase_balance.py`, three recorded states); the two plan
+  dictionaries of the b12x MoE path are held to one rule by a comment and a test (`test_b12x_plan_dicts.py`). A tool,
+  a comment and tests: no kernel, module or default changes.
 
 ### `dsv41-nightly-df3bd094-r33` — 2026-11-12 (commit `7cadfa3`)
 `-r32` bit for bit in its environment state, plus the following — every switch and key of it off by default in the

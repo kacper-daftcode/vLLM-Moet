@@ -393,11 +393,20 @@ instrument. Without the master switch the file is never looked at.
 
 `sp_pipeline/phase_balance.py LOG` reads the three lines as one line per rank: per layer the compute
 work (the four segments), the comm work (the four phases) and the period, the four slots with the
-phase's reduce-scatter, glue and all-gather, and the replay tail on its own. Two readings follow the
-rank lines: which rank has the longest MoE segment and whether its compute stream still waits behind
-the phase — if it does not while the other ranks' do, that rank's card sets the pace of the MoE slots —
-and whether the smallest wait behind a MoE is larger than what a grid cap of step 42 adds to the MoE
-segment, the condition under which a cap can shorten a slot at all.
+phase's reduce-scatter, glue and all-gather, and the replay tail on its own. Behind the rank lines
+it prints, for the two slots beside a MoE, where each rank's glue ends against the end of the MoE
+segment beside it — from the sums and from the split line's second numbers — with the slope of the
+glue's end on the segment's end over the rank's steps, and, across the ranks, which of them end their
+glue earlier than the rank with the longest MoE segment and stay that much longer in the all-gather.
+Two readings follow. `pace:` is given per MoE slot: a compute stream that waits behind the phase does
+not by itself mean that the comm stream sets the pace — where the glue ends with the MoE segment (the
+slope's 95 % interval above 0.5) the phase is that segment plus a fixed remainder and a shorter MoE
+shortens the slot, and where the other ranks wait in the all-gather for that rank's glue its card
+paces the slot; the comm stream is named only when the interval lies below 0.5, and fewer than six
+steps decide nothing. `cap:` says whether the smallest wait behind a MoE is larger than what a grid
+cap of step 42 adds to the MoE segment, the condition under which a cap can shorten a slot at all.
+`sp_pipeline/test_phase_balance.py` holds the reader on the lines of three recorded states and on
+synthetic steps, without a GPU.
 
 ### Step 48 — the KV offload copy path
 

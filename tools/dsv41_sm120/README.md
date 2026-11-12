@@ -23,7 +23,7 @@ switch: [`docs/dsv41-sm120.md`](../../docs/dsv41-sm120.md); the reasoning and me
 | 14 | `patch_vllm_moe_fc2_discard_sm120.py` | `moe_l2/` — FC2 padding rows out of L2 | `moe_l2/test_moe_l2_discard_sm120.py` |
 | 15 | `patch_vllm_prefill_dbo_sm120.py` (build arg 0 by default) | `prefill_dbo/` | four GPUs: `prefill_dbo/test_prefill_dbo_tp4.py` |
 | 16 | `patch_vllm_indexer_shard_rows.py` (vllm#61647 backport) | — | — |
-| 17 | `patch_flashinfer_b12x_compact_bind.py` | b12x's compact N64 launchers bound at TP4 | `test_b12x_moe_compact_bind.py` |
+| 17 | `patch_flashinfer_b12x_compact_bind.py` | b12x's compact N64 launchers bound at TP4 | `test_b12x_moe_compact_bind.py`; without a GPU `test_b12x_plan_dicts.py` (the patch's cache and vLLM's plan dictionary: bounded together or not at all) |
 | 18 | `patch_vllm_dspark_lm_head_mxfp8_sm120.py` | step 3's GEMV | `sm120_gemv/test_vllm_integration.py` |
 | 19 | `patch_vllm_dsv4_topk_sm120.py` | `dsv4_topk/` — the router's top-6 | `dsv4_topk/test_dsv4_topk_sm120.py` |
 | 20 | `patch_vllm_dspark_fused_markov_sm120.py` | Triton | `fused_markov/test_fused_markov_sm120.py` |
