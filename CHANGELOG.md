@@ -31,10 +31,12 @@ image and off as served. `SERVED=1` changes in one entry: the second attention c
 - The persistent prefill MoE launch (`VLLM_MOET_B12X_MOE_PREFILL_FAST_WS` ≥ 20, not served): a process in that mode
   runs the sum items in none of its calls; the kernel's statistics are a template form the served form does not
   carry; its FC1 epilogue defines its values on every path.
-- Measured at the change of the served image: fresh prefill 163K 5.29 s and 19K 0.65 s on runs with no other
-  request in flight — at 163K 2.25 % less than `-r32` at the same server age; in the serving server `v43c` takes
-  2.57 % ± 0.32 % less time than the shipped cubin at 163K and 2.31 % ± 1.13 % at 19K (8 pairs each, read by order);
-  bits identical to `-r32` — [record](docs/benchmarks/dsv41-sm120-r33-2026-11-12.md).
+- Measured at the change of the served image: with `v43c` selected, fresh prefill 163K 5.29 s and 19K 0.65 s on
+  runs with no other request in flight — at 163K 2.25 % less than `-r32` at the same server age (in its environment
+  state the image is `-r32` bit for bit); in the serving server `v43c` takes 2.57 % ± 0.32 % less time than the
+  shipped cubin at 163K and 2.31 % ± 1.13 % at 19K (8 pairs each, read by order). Bits against `-r32`: identical in
+  the environment state; with `v43c` selected, long_agree identical and agree identical by the rule for runs beside
+  other clients' requests — [record](docs/benchmarks/dsv41-sm120-r33-2026-11-12.md).
 
 ### `dsv41-nightly-df3bd094-r32` — 2026-11-11 (commit `3e3d519`)
 `-r28`'s kernels and switches bit for bit, plus the following — every switch off by default in the image; `SERVED=1`
