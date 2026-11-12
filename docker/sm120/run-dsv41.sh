@@ -8,16 +8,20 @@
 #                        --enable-prompt-tokens-details and the runtime environment the reference host serves with (the
 #                        list is SERVED_SWITCHES below; docs/dsv41-sm120.md explains each). EXTRA_DOCKER_ARGS="-e VAR=0"
 #                        after it overrides a single switch. 0 = vLLM's defaults plus the image's build-time changes only.
-#                        The list is the environment of the -r32 image (the default IMAGE): the runtime keys, the second
-#                        attention cubin and the idle freeze (steps 42b, 46b, 49) came with it; step 42's _WS1=9 (FC1 on
-#                        the warpgroup kernel) and its five _SUM_* (the top-k sum as FC2 work items) with -r28.
+#                        The list is the environment of the -r33 image (the default IMAGE): the second attention cubin
+#                        it names is in the image from -r33 on; the runtime keys, a second attention cubin and the idle
+#                        freeze (steps 42b, 46b, 49) came with -r32; step 42's _WS1=9 (FC1 on the warpgroup kernel) and
+#                        its five _SUM_* (the top-k sum as FC2 work items) with -r28.
+#                        The profile loads the second attention cubin and does not select it: a start serves on the
+#                        shipped cubin. The reference host serves with v43c selected through its runtime key;
+#                        docs/dsv41-sm120.md ("Switches") has the three commands that select it on a running server.
 #            RUNTIME_AB_KEEP_FILE (0)  with the reader of the runtime keys on (VLLM_MOET_RUNTIME_AB=1; SERVED=1 sets it) the
 #                        launcher refuses to start while the reader's control file exists: /dev/shm/vllm_moet_ab.json, or
 #                        the /dev/shm path VLLM_MOET_RUNTIME_AB_FILE names. The container shares the host's /dev/shm, so a
 #                        file left behind would be applied at the first prefill and could select the second attention
 #                        cubin. 1 = start anyway (the file's keys then apply).
 #
-# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r32)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
+# Container: IMAGE (vllm-moet-sm120:dsv41-nightly-df3bd094-r33)  NAME (ds41-flash)  GPUS (0,1,2,3)  TP (4)  PORT (8001)
 #            BIND (127.0.0.1:)  "" publishes on all interfaces - put an authenticating proxy in front
 #            CACHE_DIR ($PWD/cache-$NAME)  FlashInfer autotune results + DeepGEMM JIT; the first start fills it (~22 min)
 #            SERVED_NAME (deepseek-ai/DeepSeek-V4.1-Flash)  the model name the API answers to
@@ -67,7 +71,7 @@
 set -euo pipefail
 
 : "${MODEL_DIR:?MODEL_DIR (DeepSeek-V4.1-Flash checkpoint directory) is required}"
-IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r32}"
+IMAGE="${IMAGE:-vllm-moet-sm120:dsv41-nightly-df3bd094-r33}"
 NAME="${NAME:-ds41-flash}"
 GPUS="${GPUS:-0,1,2,3}"
 TP="${TP:-4}"
@@ -105,13 +109,14 @@ GPU_MEM_UTIL="${GPU_MEM_UTIL:-0.94}"
 # off by default, in their served state. EXTRA_DOCKER_ARGS comes later on the docker command line, so
 # "-e VAR=0" there overrides one of these. Step 42's stages: FC2 on the producer-warp kernel (_WS2=3), FC1 on the
 # warpgroup kernel (_WS1=9), the top-k sum as work items of the FC2 kernel (the five _SUM_*); _WS1=9 and the _SUM_*
-# need the -r28 image or a later one. Three of the last four entries need the -r32 image: the reader of the runtime
-# keys (step 42b; its control file /dev/shm/vllm_moet_ab.json is a file of the HOST, because the container runs
-# --ipc host: the launcher refuses to start over one, see RUNTIME_AB_KEEP_FILE); a second attention cubin for that
-# facility (step 46b: loaded and compared with the shipped cubin, never selected - v43b, v43 and v42 must not be
-# selected, docs/dsv41-sm120.md says why); the idle freeze (step 49). The fourth is PyTorch's own pinned-allocator
-# variable (no power-of-two rounding above 256 MiB: the loader's pinned tables take 189.0 instead of 264.3 GiB of
-# host memory).
+# need the -r28 image or a later one. Three of the last four entries need the -r32 image, and the cubin the second
+# of them names the -r33 image: the reader of the runtime keys (step 42b; its control file /dev/shm/vllm_moet_ab.json
+# is a file of the HOST, because the container runs --ipc host: the launcher refuses to start over one, see
+# RUNTIME_AB_KEEP_FILE); a second attention cubin for that facility (step 46b: v43c, loaded next to the shipped cubin
+# and compared with it at each rank's first launch; a start serves on the shipped cubin, and the key
+# SPARSE_MLA_PREFILL_SASS_CUBIN_SEL of the control file selects v43c - v43b, v43 and v42 must not be selected,
+# docs/dsv41-sm120.md says why); the idle freeze (step 49). The fourth is PyTorch's own pinned-allocator variable (no
+# power-of-two rounding above 256 MiB: the loader's pinned tables take 189.0 instead of 264.3 GiB of host memory).
 SERVED_SWITCHES=(
   VLLM_MOET_B12X_MOE_FUSED=1 VLLM_MOET_SPARSE_MLA_LDG=1 VLLM_MOET_TARGET_LM_HEAD_MXFP8=1
   VLLM_MOET_P2P_AR=1 VLLM_MOET_P2P_AR_FUSED_MAX_ROWS=8
@@ -125,7 +130,7 @@ SERVED_SWITCHES=(
   VLLM_MOET_PREFILL_SP_GATHER=mxfp8 VLLM_MOET_DET_TOPK=1 VLLM_MOET_SPARSE_MLA_PREFILL_SASS=1
   VLLM_MOET_PREFILL_PIPE=${PREFILL_PIPE} VLLM_MOET_PREFILL_PIPE_REPLAY_GRAPHS=${PREFILL_PIPE_REPLAY_GRAPHS}
   VLLM_MOET_RUNTIME_AB=1
-  VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B=/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43b.cubin
+  VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B=/opt/vllm-moet/kernels/cubins-sm120/sparse_mla_prefill_v43c.cubin
   VLLM_MOET_GC_IDLE_FREEZE=1 PYTORCH_ALLOC_CONF=pinned_max_round_threshold_mb:256
 )
 if [[ "$SERVED" == "1" ]]; then
@@ -269,8 +274,8 @@ passed_env() {
   printf '%s' "$val"
 }
 # Step 42b's control file is a file of the host's /dev/shm (the container runs --ipc host) and outlives the container: one
-# left behind would be applied by the new server at its first prefill - under SERVED=1 it could select the second
-# attention cubin, which is loaded and must not be selected. With the reader on, do not start over such a file.
+# left behind would be applied by the new server at its first prefill, whatever it holds - a key of a measurement that
+# ended badly, or the selection of the second attention cubin. With the reader on, do not start over such a file.
 RUNTIME_AB_KEEP_FILE="${RUNTIME_AB_KEEP_FILE:-0}"
 case "$RUNTIME_AB_KEEP_FILE" in
   0|1) ;;

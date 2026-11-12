@@ -53,8 +53,9 @@ bases). The changes behind it:
 input's all-gather alone 15 %), the MoE **19 %** (0.94 ms per layer-chunk against a 0.83 ms DRAM floor), the
 sparse-MLA prefill kernel **13 %** (BF16, one CTA per SM, latency-bound), CUTLASS MXFP8 **9 %**, cuBLAS bf16 4 %,
 GPU idle 2 %. The steps that took it from ~15.5 s (the official image) through ~8.5–9 s (newer vLLM bases: the SWA
-bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.44 s with
-step 42's later kernels (−2 %) and the host's CPU governor `performance` (−5.49 %):
+bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.29 s with
+step 42's later kernels (−2 %), the host's CPU governor `performance` (−5.49 %) and the attention chunks on the
+`v43c` cubin (−2.6 %):
 
 - **Step 40** — the V4.1-record prefill rows on sm_120 went through FlashInfer's single-group FP8 kernel (Q, QK, P and
   PV in FP8; H100 / B200 compute the same attention in BF16). The full-BF16 SM120 kernel FlashInfer also ships is 24×
@@ -211,7 +212,8 @@ The two states of every key are bit-identical alternatives.
 The launcher runs the container with the host's IPC namespace, so the control file is a file of the
 host's `/dev/shm` and outlives the server: a file left behind is applied by the next server at its
 first prefill, and removing a file keeps the state it last set until a restart. Write `{}` before
-removing it. With the switch on the launcher refuses to start while a control file exists in the host's
+removing it, unless the state is meant to stay (as served: the attention cubin's key, step 46b). With
+the switch on the launcher refuses to start while a control file exists in the host's
 `/dev/shm` (`RUNTIME_AB_KEEP_FILE=1` starts anyway). The watchdog, before it restarts a server that died
 with its file in place, moves the file aside (`<file>.stale-<UTC>`, one line in its log): the restart
 comes up in the environment's state. `SERVED=1` turns the switch on with no control file: every key is
@@ -277,8 +279,9 @@ times.
 
 ### Step 46b — two cubins of the attention kernel
 
-The runtime A/B of step 46 between two cubins of the attention kernel — two schedules of the same
-instruction words, e.g. `sparse_mla_prefill_v41.cubin` and `sparse_mla_prefill_v41s1.cubin`. With
+The runtime A/B of step 46 between two cubins of the attention kernel with bit-identical outputs: beside
+the shipped cubin, another schedule of its instruction words (`sparse_mla_prefill_v41s1.cubin`) or another
+instruction stream (`sparse_mla_prefill_v43c.cubin`). With
 `VLLM_MOET_RUNTIME_AB=1` and `VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B` naming the second cubin, it is
 loaded next to the first when a device's launcher is created, and the key
 `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` of the control file (0 = the cubin of `…_SASS_CUBIN`, the start-up
@@ -296,7 +299,7 @@ into a CUDA graph keeps the cubin it was captured with. Without either variable 
 
 Cubins that `…_SASS_CUBIN_B` may name ship in the image under `/opt/vllm-moet/kernels/cubins-sm120/`
 (the build asserts each sha256, as for the default cubin): `sparse_mla_prefill_v41s1.cubin`,
-`sparse_mla_prefill_v43.cubin` and `sparse_mla_prefill_v43b.cubin` —
+`sparse_mla_prefill_v43.cubin`, `sparse_mla_prefill_v43b.cubin` and `sparse_mla_prefill_v43c.cubin` —
 [what each is](#step-46--the-prefill-attention-in-sass). All give bit-identical outputs
 (`kernels/MANIFEST.md` has their status).
 
@@ -306,11 +309,18 @@ that store (4 / 3 / 3 places; the shipped cubin and `v41s1` have none). A store 
 when the memory pipe serves it, not when it is issued. In these three the rewriting instruction is a
 shared-memory load, which the pipe serves behind the store, so no wrong bit was ever produced — a
 property measured on two card models, not a rule of the architecture, and a cubin that rests on it is
-never selected. `v43c` is `v43b` with those stores waited (one control word, the same time); it is in
-`kernels/cubins-sm120/` and, from image step 46e on, in the image; the served image does not carry it.
-`SERVED=1` names `v43b` as the second cubin: it is loaded and
-compared with the shipped one at each rank's first eager launch, and its key stays 0. The places, the
-probe and `v43c`'s checks: [record](benchmarks/sparse-mla-prefill-v43c-2026-11-10.md).
+never selected. `v43c` is `v43b` with those stores waited (one control word, the same time): it has no
+such place, and it is the second cubin that may be selected. The places, the probe and `v43c`'s checks:
+[record](benchmarks/sparse-mla-prefill-v43c-2026-11-10.md).
+
+**As served.** `SERVED=1` names `v43c` as the second cubin: it is loaded and compared with the shipped
+one at each rank's first eager launch. On the reference server its key was then written as 1 and, once
+every rank had logged the change, the control file was removed: a removed file keeps the state it last
+set, so the eager attention chunks run on `v43c` and no file is left for a later start to pick up. The
+launches recorded into the replay graphs at start-up keep the shipped cubin they were captured with.
+The state is the running server's, not its environment's: a restart comes up on the shipped cubin with
+`v43c` loaded beside it, until the key is written again. The two cubins in the serving server:
+[record](benchmarks/dsv41-sm120-r33-2026-11-12.md#the-runtime-keys-in-the-serving-server).
 
 ### Step 47 — the pipelined prefill
 

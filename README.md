@@ -19,16 +19,18 @@ behind a runtime switch.
 
 ### 4× RTX PRO 6000: DeepSeek-V4.1-Flash native
 
-DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r32`
-(TP4, 512K context, DSpark k = 7, vision, thinking, tool calling, KV offload to host RAM and disk):
+DeepSeek-V4.1-Flash, 4× RTX PRO 6000 at 400 W, image `vllm-moet-sm120:dsv41-nightly-df3bd094-r33`
+(TP4, 512K context, DSpark k = 7, vision, thinking, tool calling, KV offload to host RAM and disk; the Fraser
+series is of `-r32`):
 
 | | vLLM-Moet | official vLLM image on the same cards |
 |---|---|---|
 | decode, 1 stream | prose ~293 tok/s, code ~802 tok/s (129 steps/s); Fraser bench 671.5 tok/s median, 724.5 best at 128.4 steps/s over 40 reps | 60 steps/s with only the fixes it needs to start |
 | decode, 8 streams | prose ~721, code ~2,258 tok/s aggregate | — |
-| fresh prefill | 163K tokens in 5.44 s (30K tok/s), 19K in 0.66 s (medians of runs with no other request in flight; the pipelined sequence-parallel prefill with its replay layers as CUDA graphs and the prefill MoE on the producer-warp and warpgroup kernels, bit-identical to `-r26b`'s 5.6–5.8 s, `-r25`'s 6.6 s, `-r24`'s 6.8 s and `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
+| fresh prefill | 163K tokens in 5.29 s (30.8K tok/s), 19K in 0.65 s with the attention cubin `v43c` selected by its key, as the reference host serves (medians of runs with no other request in flight; the pipelined sequence-parallel prefill, bit-identical to `-r26b`'s 5.6–5.8 s, `-r25`'s 6.6 s, `-r24`'s 6.8 s and `-r23`'s 7.1 s); BRRR aggregate +11…+28 % over the recipe's stock vLLM at 2K–65K | 163K in ~15.5 s |
+| fresh prefill as `SERVED=1` starts | 163K in 5.44 s, 19K in 0.66 s on the shipped attention cubin: `-r32`'s series, the same kernels bit for bit | — |
 | KV cache | 6.14M tokens on the GPUs (11.7× concurrency at 512K; 9.62M with the one-group prefill) + 64 GiB host RAM + a disk tier | 1.49M (official KV formats) |
-| quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; identical requests return identical logits at any batch size and prompt length | the same checkpoint's quality |
+| quality | GSM8K-200 194/200, needle PASS at 29K / 106K / 400K, tool calls / JSON / vision pass; a request repeated while no other request is in flight returns identical logits (checked at 12 and 128 rows and on prompts of 3K–13K tokens); a request that shares its steps with another request can return other logprobs ([record](docs/benchmarks/dsv41-sm120-r33-2026-11-12.md#bits)) | the same checkpoint's quality |
 
 ### 4× RTX PRO 6000: Ripple-65B Preview
 
@@ -86,7 +88,7 @@ served (less: `KV_OFFLOAD_GIB=0`).
 ```bash
 git clone https://github.com/kacper-daftcode/vLLM-Moet && cd vLLM-Moet
 hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 --local-dir /srv/models/DeepSeek-V4.1-Flash-1017
-export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r32 \
+export IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r33 \
   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 CACHE_DIR=/srv/cache/ds41
 DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t $IMAGE .     # ~11 min
 

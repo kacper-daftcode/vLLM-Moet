@@ -8,7 +8,7 @@
 # switch and its served state: docs/dsv41-sm120.md; the measurements behind it:
 # docs/dsv41-sm120-internals.md; the patchers, kernels and tests by step: tools/dsv41_sm120/README.md.
 #
-#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r32 .
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-dsv41-nightly -t vllm-moet-sm120:dsv41-nightly-df3bd094-r33 .
 #   MODEL_DIR=/srv/models/DeepSeek-V4.1-Flash-1017 SERVED=1 docker/sm120/run-dsv41.sh      # docker/sm120/run-dsv41.sh
 #
 # Steps 7 and 9 (the SWA bounded replay, the fused query-norm + quantization gate) and 24, 25, 29, 35 are vLLM's own

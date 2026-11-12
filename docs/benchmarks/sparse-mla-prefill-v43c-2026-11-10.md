@@ -120,4 +120,7 @@ Times, µs per launch, 4096 rows, the kernels in the same rounds (RTX PRO 6000 B
 | real prefill input, 126+448 | 895 | 763 | 621 | 621 |
 | real prefill input, 128+0 | 269 | 239 | 200 | 200 |
 
-Not measured in situ: the served forward's numbers of `v43` / `v43b` are of the same instruction stream.
+In situ, measured after this record: in the serving server of the reference host `v43c` is 2.569 % ± 0.323 %
+faster than the default cubin at 163K (8 pairs, read by order;
+[record](dsv41-sm120-r33-2026-11-12.md#the-runtime-keys-in-the-serving-server)); the served forward's numbers of `v43` / `v43b` are of the
+same instruction stream.
