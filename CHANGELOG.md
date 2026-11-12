@@ -6,20 +6,35 @@ the release tag that points at it.
 
 ## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
 
-### In the tree after `-r32` (in no released image)
-- The m-tile loops of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS` and its runtime key), off by default.
-- The first claim of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_FIRST_CLAIM` and its runtime key), off by default; the watchdog
-  record of the prefill MoE is reported as set whenever it is filled.
-- The grid caps of step 42 (`VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID1` / `_GRID2`) as runtime keys, and their tokens in the stats line.
-- The `FZ` form of step 42's served FC1 kernels (`VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ` and its runtime key), off by default:
-  the FC1 epilogue's values defined on every path — the same bits with fewer registers per thread.
-- The phase-wait instrument of step 47 (`VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=1|2|3`, off by default): log lines that say where a
-  pipelined prefill step waits — per comm phase, per element of a phase, per layer.
-- The instrument's level as a runtime key (`PREFILL_PIPE_PHASE_WAIT` in step 42b's control file): a running server takes the
-  instrument on for a few requests and off again; `sp_pipeline/phase_balance.py` reads its lines as one line per rank.
-- `sparse_mla_prefill_v43c.cubin` — `v43b` with every dequant store waited on every path — in `kernels/cubins-sm120/`
-  and, from image step 46e on, in the image (loaded only when named as the second cubin of step 46b), and the store path
-  check `tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py`.
+### In the tree after `-r33` (in no released image)
+- A test that makes a wait of the persistent prefill MoE launch last, and expire (`test_persistent_watchdog_sm120.py`);
+  no kernel, module or default changes.
+
+### `dsv41-nightly-df3bd094-r33` — 2026-11-12 (commit `7cadfa3`)
+`-r32` bit for bit in its environment state, plus the following — every switch and key of it off by default in the
+image and off as served. `SERVED=1` changes in one entry: the second attention cubin it names is `v43c`.
+- Step 42, switches and runtime keys of the prefill MoE: the m-tile loops (`VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS`);
+  the first claim of a work item (`…_FIRST_CLAIM`), with the watchdog record of the prefill MoE reported as set whenever
+  it is filled; the grid caps of FC1 / FC2 as runtime keys (`…_GRID1` / `…_GRID2`), their tokens in the stats line; the
+  `FZ` form of the served FC1 kernels (`…_FC1_FZ`): the FC1 epilogue's values defined on every path — the same bits
+  with fewer registers per thread.
+- Step 47: the phase-wait instrument (`VLLM_MOET_PREFILL_PIPE_PHASE_WAIT=1|2|3`: log lines that say where a pipelined
+  prefill step waits — per comm phase, per element of a phase, per layer) and its level as a runtime key
+  (`PREFILL_PIPE_PHASE_WAIT` in step 42b's control file: a running server takes the instrument on for a few requests
+  and off again), with `sp_pipeline/phase_balance.py`, which reads its lines as one line per rank. A comm stream
+  priority other than the compute stream's is refused while FC2's sum items can be on, and the pipeline logs the
+  prefill MoE's watchdog record when a group fails.
+- Step 46e: `sparse_mla_prefill_v43c.cubin` — `v43b` with every dequant store waited on every path — in the image (the
+  build asserts its sha256), with the store path check `tools/dsv41_sm120/sparse_mla_sass/store_war_paths.py`.
+  *Served* as the second cubin of step 46b and selected through its runtime key; `v43b` stays in the image and must
+  not be selected.
+- The persistent prefill MoE launch (`VLLM_MOET_B12X_MOE_PREFILL_FAST_WS` ≥ 20, not served): a process in that mode
+  runs the sum items in none of its calls; the kernel's statistics are a template form the served form does not
+  carry; its FC1 epilogue defines its values on every path.
+- Measured at the change of the served image: fresh prefill 163K 5.29 s and 19K 0.65 s on runs with no other
+  request in flight — at 163K 2.25 % less than `-r32` at the same server age; in the serving server `v43c` takes
+  2.57 % ± 0.32 % less time than the shipped cubin at 163K and 2.31 % ± 1.13 % at 19K (8 pairs each, read by order);
+  bits identical to `-r32` — [record](docs/benchmarks/dsv41-sm120-r33-2026-11-12.md).
 
 ### `dsv41-nightly-df3bd094-r32` — 2026-11-11 (commit `3e3d519`)
 `-r28`'s kernels and switches bit for bit, plus the following — every switch off by default in the image; `SERVED=1`

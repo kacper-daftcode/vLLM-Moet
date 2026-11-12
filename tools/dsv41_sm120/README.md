@@ -83,7 +83,7 @@ of the superseded recipe image (`vllm/vllm-openai:deepseekv41-flash-0909`):
 ## Running the tests
 
 ```bash
-IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r32
+IMAGE=vllm-moet-sm120:dsv41-nightly-df3bd094-r33
 docker run --rm --gpus '"device=0"' --ipc host --entrypoint bash $IMAGE -c \
   'cd /opt/vllm-moet/dsv41_sm120 && python3 sm120_gemv/test_mxfp8_gemv_sm120.py --ms 1,6,16 --shapes decode \
    && python3 dsv4_topk/test_dsv4_topk_sm120.py && python3 det_topk/test_det_topk_sm120.py \
