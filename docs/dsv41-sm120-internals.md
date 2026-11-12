@@ -279,8 +279,9 @@ times.
 
 ### Step 46b — two cubins of the attention kernel
 
-The runtime A/B of step 46 between two cubins of the attention kernel — two schedules of the same
-instruction words, e.g. `sparse_mla_prefill_v41.cubin` and `sparse_mla_prefill_v41s1.cubin`. With
+The runtime A/B of step 46 between two cubins of the attention kernel with bit-identical outputs: beside
+the shipped cubin, another schedule of its instruction words (`sparse_mla_prefill_v41s1.cubin`) or another
+instruction stream (`sparse_mla_prefill_v43c.cubin`). With
 `VLLM_MOET_RUNTIME_AB=1` and `VLLM_MOET_SPARSE_MLA_PREFILL_SASS_CUBIN_B` naming the second cubin, it is
 loaded next to the first when a device's launcher is created, and the key
 `SPARSE_MLA_PREFILL_SASS_CUBIN_SEL` of the control file (0 = the cubin of `…_SASS_CUBIN`, the start-up

@@ -118,13 +118,19 @@ dependency-aware schedule (`v41s1` and every cubin after it) runs on cards with 
 | bits | bit-identical with the reference kernel: the 8 synthetic cases and the 8 dumps, 30 repeated launches in one process and 30 fresh processes each, `v43` as the control — 0 differences |
 | in situ: the runtime key flipped inside one server lifetime, image `-r32` as built, the second host | 1.83 % ± 0.12 % faster than the default cubin at 163K (8 pairs), 1.66 % ± 0.61 % at 19K |
 | the four cards of the reference host, with the server stopped | bits and timing floors PASS on 4 of 4 ([record](dsv41-sm120-r32-2026-11-11.md#the-attention-kernel-on-the-four-cards)) |
-| image | copied from image `-r32` on (Dockerfile step 46d); `SERVED=1` names it as the second cubin of step 46b: loaded, compared with the default once, never selected |
+| image | copied from image `-r32` on (Dockerfile step 46d); loads only when named. While `-r32` was the served image, `SERVED=1` named it as the second cubin of step 46b: loaded, compared with the default once, never selected |
 
-## `sparse_mla_prefill_v43c.cubin` — the candidate
+## `sparse_mla_prefill_v43c.cubin` — `v43b` with every store of the dequant waited
 
 sha256 `7e812fa2d9c47770…`, 30 344 B: `v43b` with one control word changed, so that every store of the dequant is
 waited before a register it reads is rewritten, on every path — the branch behind the loop-top `BAR.SYNC` waits on
 scoreboards 3, 4 and 5. Build: `KERNEL=v43c tools/dsv41_sm120/sparse_mla_sass/build_sparse_mla_sass.sh`. The
-instruction words, stalls and time of `v43b`; bit-identical with the reference kernel; not in the served image (image
-step 46e copies it from the next build on). Its gate, the
+instruction words, stalls and time of `v43b`; bit-identical with the reference kernel. Its gate, the
 probe and its times: [record](sparse-mla-prefill-v43c-2026-11-10.md).
+
+| what | value |
+|---|---|
+| in situ: the runtime key flipped inside one server lifetime, image `-r33` as built, the second host | 1.81 % ± 0.05 % faster than the default cubin at 163K (8 pairs) |
+| in situ: the same key in the serving server of the reference host, image `-r33` | 2.569 % ± 0.323 % faster than the default cubin at 163K, 2.306 % ± 1.130 % at 19K (8 pairs each, read by order; [record](dsv41-sm120-r33-2026-11-12.md#the-runtime-keys-in-the-serving-server)) |
+| the four cards of the reference host, with the server stopped | bits and timing floors PASS on 4 of 4; the runtime key's helper with the two cubins in both roles 17 of 17 on each ([record](dsv41-sm120-r33-2026-11-12.md#the-attention-kernel-on-the-four-cards)) |
+| image | copied from image `-r33` on (Dockerfile step 46e) |
