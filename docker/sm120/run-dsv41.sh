@@ -12,6 +12,9 @@
 #                        it names is in the image from -r33 on; the runtime keys, a second attention cubin and the idle
 #                        freeze (steps 42b, 46b, 49) came with -r32; step 42's _WS1=9 (FC1 on the warpgroup kernel) and
 #                        its five _SUM_* (the top-k sum as FC2 work items) with -r28.
+#                        The profile loads the second attention cubin and does not select it: a start serves on the
+#                        shipped cubin. The reference host serves with v43c selected through its runtime key;
+#                        docs/dsv41-sm120.md ("Switches") has the three commands that select it on a running server.
 #            RUNTIME_AB_KEEP_FILE (0)  with the reader of the runtime keys on (VLLM_MOET_RUNTIME_AB=1; SERVED=1 sets it) the
 #                        launcher refuses to start while the reader's control file exists: /dev/shm/vllm_moet_ab.json, or
 #                        the /dev/shm path VLLM_MOET_RUNTIME_AB_FILE names. The container shares the host's /dev/shm, so a
