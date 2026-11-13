@@ -14,7 +14,7 @@ behind a runtime switch.
 | **Kimi-K3 + DSpark on 8× B300 (HGX, sm_103)** | the official v0.32.0 image with what DSpark needs on a hybrid KDA / MLA model: RecoverSSM admitted next to KV offload (the pool back from 19.3M to 21.6M tokens), the RedHat sliding-window draft under DCP8 with prefix caching | superseded by K3.1 on the same host (2026-11-04); rollback kept | [docs/k3-b300-dspark-kv.md](docs/k3-b300-dspark-kv.md) |
 | **Kimi-K3.1-Pro + DSpark on 8× B300 (HGX, sm_103)** | the day-0 `kimi-k31` image with its specialized decode path unlocked on a 148-SM B300 (the persistent experts grid was sized for GB300's 152 SMs): single-stream 252 vs 143 tok/s, 8K C=32 61.5 vs 48.4 tok/s per session at the same acceptance and GSM8K | **active, served** | [docs/benchmarks/k31-b300-2026-11-04.md](docs/benchmarks/k31-b300-2026-11-04.md) |
 | **Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000** | Ricursive's 65B dense model with its DFlash2 drafter on vLLM main: the TP all-reduces on the PCIe P2P push, the draft length by batch size, the drafter at the schedule's k, two microbatches at 16+ requests; code ~630 tok/s single stream, ~3050 aggregate at 8 requests, ~5100 at 32 on the NVFP4 checkpoint, ~740 / ~3350 / ~5800 with an optional derived checkpoint (attention projections in MXFP8) | serving | [docs/ripple-sm120.md](docs/ripple-sm120.md) |
-| **Inkling-2-Small on 4× RTX PRO 6000** | Thinking Machines' 594B MoE with the experts of layers 40–47 repacked from MXFP8 to six bits (e2m3: 62–65 % of the weights exact; a six-layer cut matches the released weights' greedy tokens, GSM8K-200 193/200) so that four 96 GB cards hold it; the day-0 image is sm_100 only: the expert GEMM and the relative attention on `mma.sync`; code ~500 tok/s at 1 request, ~4200 at 32 with the DSpark draft | as built and measured | [docs/inkling2-sm120.md](docs/inkling2-sm120.md) |
+| **Inkling-2-Small on 4× RTX PRO 6000** | Thinking Machines' 594B MoE, experts of layers 40–47 repacked from MXFP8 to six bits (e2m3, lossy: 76–79 % of those weights exact; GSM8K-200 194/200 against 195/200 as released in an 8K-context setup both fit: 6.4 against 0.7 GiB of KV cache a card); the day-0 image is sm_100 only: expert GEMM and relative attention on `mma.sync`; code ~490 tok/s at 1 request, ~4200 at 32 with the DSpark draft | as built and measured | [docs/inkling2-sm120.md](docs/inkling2-sm120.md) |
 
 ## Results, as served
 
@@ -50,20 +50,25 @@ derived checkpoint with the attention projections in MXFP8, the second the NVFP4
 
 ### 4× RTX PRO 6000: Inkling-2-Small
 
-Inkling-2-Small with the experts of layers 40–47 held in six bits (e2m3) instead of the checkpoint's MXFP8 — 5.7 GiB
-less per card, 62–65 % of those weights exact and the rest within −38 dB; against the released weights a six-layer
-cut on one card returns the same greedy tokens and the full model answers 193 of 200 GSM8K questions — on 4× RTX PRO
-6000 at 400 W, image `vllm-moet-sm120:inkling2-b974b306-r13` (TP4 with the experts expert-parallel, 65K context, the
-DSpark draft of 7 tokens, thinking, tool calling, vision; [the doc](docs/inkling2-sm120.md)):
+Inkling-2-Small with the experts of layers 40–47 held in six bits (e2m3) instead of the checkpoint's MXFP8 — a lossy
+repacking, made for room: 5.7 GiB less per card, 76–79 % of those weights keep their value, the largest error is
+1 / 64 of a block's largest weight. Against the released weights, both served in one configuration (an 8K context,
+64-token prefill chunks, no draft - what the released precision's 0.7 GiB of KV cache a card allow; the packed form
+has 6.4 GiB there): 194 of 200 GSM8K questions packed and 195 as released, the same answer to 197 of the 200; 19 of
+24 greedy answers the same text to the end (a server repeats its own: 24 of 24); decode 1–3 % faster packed. With
+the 65K context and the draft below, the packed model answers 193 of 200 in each of three runs. The released
+precision was not measured beyond 8K tokens or with the draft. On 4× RTX PRO 6000 at 400 W, image
+`vllm-moet-sm120:inkling2-b974b306-r13` (TP4 with the experts expert-parallel, 65K context, the DSpark draft of 7
+tokens, thinking, tool calling, vision; [the doc](docs/inkling2-sm120.md)):
 
 | | vLLM-Moet | the official image on the same cards |
 |---|---|---|
-| decode, 1 stream | code ~500 tok/s at 75 steps/s (6.7 tokens per step), prose ~175; 149 without the draft at 148 steps/s | does not load: its expert GEMM, attention and small-batch linear kernels are sm_100's |
-| decode, 8 streams | code ~1,850 tok/s aggregate, prose ~620 (768 / 677 without the draft) | — |
-| decode, 32 streams | code ~4,200, prose ~1,390 (1,693 / 1,480 without the draft) | — |
+| decode, 1 stream | code ~490 tok/s at 75 steps/s (6.4–6.7 tokens per step), prose ~180; 149 without the draft at 148 steps/s | not started: by its code its expert GEMM, attention and small-batch linear kernels are sm_100's, with none for capability 12 |
+| decode, 8 streams | code ~1,840 tok/s aggregate, prose ~620 (768 / 677 without the draft) | — |
+| decode, 32 streams | code ~4,200, prose ~1,390 in the one wave with a common window (1,693 / 1,480 without the draft) | — |
 | fresh prefill | 20.9K tokens in 2.4 s (8.7K tok/s), 60.3K in 7.5 s; a 17K-token prefix again in 0.07 s | — |
-| KV cache | 3.3 GiB per card beside 86.9 GiB of weights and draft (4.6 GiB without the draft); a request holds 57 MiB and 8 MiB per 1,000 tokens of context | — |
-| quality | GSM8K-200 193/200 without the draft, with it at 8 requests and with it at 32; needle 4/4 at 29K / 58K, arithmetic 5/5, tool calls / JSON / vision pass | — |
+| KV cache | 3.3 GiB per card beside 86.9 GiB of weights and draft (4.5–4.6 GiB without the draft; with an 8K context and no draft 6.4 GiB, and 0.7 GiB at the released precision) | — |
+| quality | GSM8K-200 193/200 without the draft, with it at 8 requests and with it at 32; in the 8K pair 194/200 packed and 195/200 as released; needle 4/4 at 29K / 58K, arithmetic 5/5, tool calls / JSON / vision pass (in a server with a draft schedule) | — |
 
 ### 1–4× RTX 5090, 1–2× RTX PRO 6000: DeepSeek-V4.1-Flash as the MoET hybrid
 

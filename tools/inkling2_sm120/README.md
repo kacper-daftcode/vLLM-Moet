@@ -17,8 +17,8 @@ kernel must not read poisoned with NaN.
 | `bmm/inkling2_bmm_sm120.cu`, `.py` | 1 | the MoE's batched expert GEMM: block-scaled activations × block-scaled expert weights → bf16 on `mma.sync` QMMAs (`kind::mxf4nvf4` `scale_vec::4X` m16n8k64 for NVFP4, `kind::mxf8f6f4` `scale_vec::1X` m16n8k32 for MXFP8 and for MXFP8 activations × e2m3 weights). A persistent kernel per format and tile (CTAs take work items from a counter; replays from a CUDA graph), K in cp.async stages of 64 elements, weights in a step-major layout prepared at load, L2 prefetch ahead of the ring. `pack_e2m3`: MXFP8 expert weights → e2m3, six bits per value |
 | `bmm/test_qmma_layout_sm120.py` | 1 | the operand layouts of the three QMMAs established on the card: one instruction with every lane's registers given by the host, against exact arithmetic |
 | `bmm/test_bmm_sm120.py` | 1 | the GEMM against exact arithmetic on synthetic operands and on the checkpoint's own expert weights (`--model-dir`), every tile, grid and run independence, untouched padding; `--bench`: decode and prefill shapes with the bytes read per second |
-| `bmm/test_drop_file_pages.py` | 1 | `drop_file_pages` on CPU: a slice of a memory-mapped checkpoint tensor is in the page cache after it is read and gone after it is dropped, its neighbour keeps its pages (the expert loader releases every chunk's file pages once it is on the card, so a load leaves no page cache behind) |
-| `bmm/test_pack_e2m3.py` | 1 | the 6-bit packing on CPU: round trip, which weights are exact, the error bound, the checkpoint's weights |
+| `bmm/test_drop_file_pages.py` | 1 | `drop_file_pages` on CPU: a slice of a memory-mapped checkpoint tensor is in the page cache after it is read and gone after it is dropped, its neighbour keeps its pages (the expert loader releases every chunk's file pages once it is on the card: a load leaves 13 GiB of the checkpoint in the page cache instead of 82) |
+| `bmm/test_pack_e2m3.py` | 1 | the 6-bit packing on CPU: round trip, which weights are exact, the error bound, the checkpoint's weights; `--census N`: the share of exact weights and the error energy over N experts of each of the layers 40–47, both projections |
 | `patch_vllm_inkling2_bmm_sm120.py` | 1 | anchored patcher on `ops/trtllm_bmm.py` (`expert_plan`, `load_kernels`, `bmm`), `ops/block_scales.py` (row-major activation scales) and `moe.py` (expert weights into the prepared layout at load; `VLLM_MOET_INKLING2_MXFP6=1` packs the MXFP8 experts) |
 | `attn/inkling2_attn_sm120.cu`, `.py` | 2 | the relative attention: decode, verify, the DSpark draft's block attention and prefill in one `mma.sync` m16n8k16 kernel (64 query rows = tokens × GQA group per CTA, steps of 64 keys from the paged cache through a two-stage cp.async ring, Q in registers, `ldmatrix` on XOR-swizzled K / V, the sheared relative logits of the attention prologue, online softmax in the log2 domain, split-KV partials and a combine kernel, the gate and the sink). `reference`: the operation in torch |
 | `attn/test_attn_sm120.py` | 2 | the kernel through both entries against the float64 definition: full and window layers, 1 … 94 splits, padding requests, the draft mode, multi-request prefill with and without context, page sizes 16 / 32 / 128, GQA groups 6 and 4; `--bench` |
@@ -37,3 +37,18 @@ kernel must not read poisoned with NaN.
 
 Run a test inside the image on a capability-12 card, e.g.
 `python3 /opt/vllm-moet/inkling2_sm120/attn/test_attn_sm120.py --bench`.
+
+What the tests do not cover: steps 5 and 6 (the embedding path, the argmax all-gather) and the expert loader as a
+whole (the order of weight and scale tensors, the scales that wait for their weights) are held by the served runs
+only; the attention kernel is tested against this directory's own float64 reading of the operation, since none of
+vLLM's kernels of it runs on these cards; the linear test covers the `mma.sync` kernel, which is off by default.
+`VLLM_MOET_INKLING2_BMM=0`, `VLLM_MOET_INKLING2_ATTN=0` and `VLLM_MOET_INKLING2_LINEAR=0` hand the operation back
+to vLLM's own kernels: they are for other architectures, on capability 12 those kernels do not run.
+
+Checks the code does not make yet (none is reached by the model's shapes): the layout of the activations' block
+scales is decided when `ops/block_scales.py` is imported, by its own capability query that reads any exception as
+"not sm_120", apart from the kernel choice made at the first call; the loader clamps a repacked block's scale byte to
+0–254 without counting the clamps; the prefill entry of the attention does not assert that the relative table's
+width is a multiple of 128 keys as the decode entry does; the native entries of the three extensions rely on the
+Python wrappers' assertions for dtypes and sizes, and `bmm_run` takes K values whose scale rows are not a multiple
+of eight bytes.

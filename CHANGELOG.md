@@ -158,17 +158,31 @@ sets the three marked *served*:
 
 ## Inkling-2-Small on 4× RTX PRO 6000
 
-### `inkling2-b974b306-r13` — 2026-11-13
-- Steps 1–9 on the official day-0 image `vllm/vllm-openai:inkling-2-small` (vLLM `0.1.dev25249+gb974b306f`), which does
-  not load the model on sm_120: the MoE's expert GEMM on block-scaled `mma.sync` (NVFP4, MXFP8, MXFP8 × e2m3), the
+### In the tree after `-r13` (in no released image)
+- The launcher takes its cards by name: `GPUS` is required, and a card that holds a compute process or more than
+  1 GiB is refused; the container's memory is capped (`MEMORY`, 96 GiB) and `CPUSET_MEMS` goes with `CPUS`.
+- `bmm/test_pack_e2m3.py --census N`: the packing's figures over N experts of each MXFP8 layer, on the CPU; the card
+  test's packing figures build their powers of two from bits. Comments and docstrings; `quality_cmp.Client` carries
+  its default thinking kwargs. No kernel, no patched text and no default of the image changes.
+
+### `inkling2-b974b306-r13` — 2026-11-13 (commit `1740c25`)
+- **The experts of layers 40–47 are repacked from MXFP8 to six bits (e2m3) as they load** (`MXFP6=1`, the launcher's
+  default; the image's own default is the released precision) - a lossy change of those weights, made for room:
+  76–79 % of them keep their value, the largest error is 1 / 64 of a block's largest magnitude, 5.7 GiB less per
+  card. Against the released weights, both served in one configuration (an 8K context, 64-token chunks, no draft:
+  6.38 GiB of paged cache packed, 0.69 GiB as released): GSM8K-200 194/200 packed and 195/200 as released, the same
+  answer to 197 of the 200; 19 of 24 greedy answers the same text; decode 1–3 % faster packed. A six-layer cut on
+  one card returns the same greedy tokens. The released precision was not measured beyond 8K tokens or with the
+  draft.
+- Steps 1–9 on the official day-0 image `vllm/vllm-openai:inkling-2-small` (vLLM `0.1.dev25249+gb974b306f`), whose
+  kernels are sm_100's: the MoE's expert GEMM on block-scaled `mma.sync` (NVFP4, MXFP8, MXFP8 × e2m3), the
   relative attention of decode / verify / draft / prefill in one `mma.sync` kernel, the small-batch linears and the
   router's partials within 99 KB of shared memory, the vision tower's forward, a TP group's embedding, the draft's
   argmax and K / V write without the compiled library's kernels (no sm_120 images), the all-reduce push (built in,
   off: 4 % slower than PyNCCL at one request on this model), the draft's CUDA graphs by the draft schedule.
-- The experts of layers 40–47 packed from MXFP8 to six bits as they load (`MXFP6=1`, the launcher's default: 5.7 GiB
-  less per card - what four 96 GB cards need beside a KV cache; a numerics change of those layers); an expert loader
-  that holds no second copy of a tensor on the card and releases the checkpoint's file pages as it goes.
-- With the DSpark draft at every batch size (the launcher's default): code 481–512 tok/s at one request, 1777–1893
+- An expert loader that holds no second copy of a tensor on the card and releases the checkpoint's file pages as it
+  goes (a load leaves 13 GiB of the checkpoint in the page cache instead of 82).
+- With the DSpark draft at every batch size (the launcher's default): code 481–498 tok/s at one request, 1777–1893
   at 8, 3050 at 16, 4190–4237 at 32 (149 / 768 / 1077–1114 / 1692–1694 without it); prose 167–193 / 599–643 /
   982–1021 / 1386 (149 / 677 / 987–1118 / 1478–1481); a fresh prefill of 20.9K tokens at 8.7K tok/s, of 60.3K at
   8.0K; GSM8K-200 193/200 without the draft, with it at 8 requests and with it at 32.
