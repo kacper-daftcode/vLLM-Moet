@@ -81,6 +81,8 @@ FILLER = ("The quick brown fox jumps over the lazy dog. A journey of a thousand 
 class Client:
     def __init__(self, base, model, api_key, timeout=3600):
         self.base, self.model, self.api_key, self.timeout = base.rstrip("/"), model, api_key, timeout
+        # chat_template_kwargs for thinking off / on; main() replaces them with --think-off / --think-on
+        self.think_kwargs = {False: {"thinking": False}, True: {"thinking": True}}
 
     def post(self, path, payload, timeout=None):
         headers = {"Content-Type": "application/json"}
