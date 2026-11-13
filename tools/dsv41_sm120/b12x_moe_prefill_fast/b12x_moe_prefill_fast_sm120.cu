@@ -2681,10 +2681,31 @@ struct PersistArgs {
   int route_cs;               // 1: the route rows are written with st.global.cs (evict-first; VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_ROUTE_CS, default 1)
   float limit;
 };
+// SM = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_WS = 40, moe_persistent_sum_kernel): the top-k sum as work items of the persistent kernel - the
+// sum items of fc2_kernel_ws (fc2_sum_item) in the n256 kernel; no topk_sum_kernel follows. The work list is not a table of its own: items
+// 0 .. n1 - 1 are the scan CTA's FC1 list (`items`, counts[1] of them: every FC1 item precedes every FC2 item); behind them, for each pair
+// p = 0 .. P - 1 of 128-column tiles, the C FC2 items of the pair (C = the call's 64-row chunks, in expert order: entry r of `items2`, the
+// first block of the scan CTA's column-tile-major FC2 list, is chunk r's (expert, row0, m_tiles)), and behind the FC2 items of pair
+// p + sum_lag the sum items of pair p (per tile ceil(T / sum_tokens) of them, tile 2p before tile 2p + 1); the sum items of the last
+// sum_lag pairs end the list. A sum item waits for tile_done[2p] == *sum_need = 8 x C (every consumer warp adds 1 behind its route stores
+// of an FC2 item of pair p), with fc2_sum_item's bounded poll (what = 100 + tile). An item still waits only for items in front of it
+// in the list, which is what keeps the list free of deadlock. In this form `route_cs` is 2 (the route rows are stored with an L2
+// evict_last hint: they are read back by the pair's sum items) or 0 (plain stores); `fc1_need` is not used (an FC2 item's wait target is
+// computed from exp_cnt).
+struct PersistSumArgs : PersistArgs {
+  const int4* items2;         // the scan CTA's FC2 list built with FrontArgs::sum_items (its first C entries are read)
+  const int32_t* exp_cnt;     // [kMaxE] the experts' pair counts (the scan CTA)
+  uint32_t* out;              // [T][K] bf16: the top-k sum
+  const int32_t* ids;         // [T * topk]
+  int32_t* tile_done;         // [kMaxTiles] (the counts buffer, zeroed by the host's memset)
+  const int32_t* sum_need;    // the scan CTA's word: 8 x C
+  int T, sum_tokens, sum_lag, sum_discard;
+};
 
 // an expired wait: the record (first writer wins the device lock) goes to the pinned host buffer, then the CTA traps - the launch fails
 // loudly and the GPU is left clean (never a spinning kernel). what: 1 / 2 = the FC2 wait on fc1_done (A producer role 0 / 1), 10 + site = an
-// mbarrier wait (site: 0 consumer full at the item start, 1 consumer full in the K-loop, 2 producer empty, 3 producer bar_meta, 4 terminator)
+// mbarrier wait (site: 0 consumer full at the item start, 1 consumer full in the K-loop, 2 producer empty, 3 producer bar_meta, 4 terminator,
+// 5 consumer full of a sum item's data-less stage); 100 + tile = a sum item's wait for the FC2 items of its pair of tiles (fc2_sum_item)
 // (the primitives - red_release_gpu_add, ld_acquire_gpu_s32, globaltimer_ns, smid, fail_record - are in the helpers section: K-12 shares them)
 __device__ __noinline__ void ps_fail(const PersistArgs& a, int what, int x, int need, int seen) {
   fail_record(a.err, a.err_lock, a.watchdog_ns, what, x, need, seen);
@@ -2710,12 +2731,66 @@ __device__ __forceinline__ void ps_mbar_wait(uint32_t bar, uint32_t parity, bool
   }
 }
 
+// SM = 1: item i of the work list described at PersistSumArgs, one int per lane 0-3 - (expert, row0, m_tiles, tile | kPsFc2) of an FC1 /
+// FC2 item, (token0, ntok, 1, tile | kSumItem) of a sum item, 0 past the end of the list (m_tiles == 0: no item). The list's sizes are
+// read where they are needed (two words of the counts buffer): nothing of it lives in a register across the items.
+__device__ __forceinline__ int ps_sum_item_word(const PersistSumArgs& a, int i, int lane) {
+  const int n1 = __ldg(a.counts + 1);
+  if (i < n1) return __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)i * 4 + lane);
+  const int C = __ldg(a.sum_need) / kSumConsumerWarps;                      // the FC2 items per pair of tiles
+  const int S = (a.T + a.sum_tokens - 1) / a.sum_tokens, S2 = 2 * S;        // the sum items per tile / per pair
+  const int P = a.out_tiles / 2, lag = min(a.sum_lag, P), per = C + S2;
+  int j = i - n1, pair, r;  // r < C: FC2 item r of `pair`; r >= C: sum item r - C of `pair`
+  if (j < lag * C) {  // the first `lag` pairs: FC2 items only
+    pair = j / C;
+    r = j - pair * C;
+  } else {
+    j -= lag * C;
+    if (j < (P - lag) * per) {  // the FC2 items of pair lag + b, then the sum items of pair b
+      const int b = j / per;
+      r = j - b * per;
+      pair = r < C ? lag + b : b;
+    } else {  // the sum items of the last `lag` pairs
+      j -= (P - lag) * per;
+      if (j >= lag * S2) return 0;
+      const int b = j / S2;
+      pair = P - lag + b;
+      r = C + (j - b * S2);
+    }
+  }
+  if (r < C) return lane == 3 ? ((2 * pair) | kPsFc2) : __ldg(reinterpret_cast<const int32_t*>(a.items2) + (size_t)r * 4 + lane);
+  const int g = (r - C) / S, token0 = (r - C - g * S) * a.sum_tokens;
+  return lane == 0 ? token0 : lane == 1 ? min(a.sum_tokens, a.T - token0) : lane == 2 ? 1 : ((2 * pair + g) | kSumItem);
+}
+// SM = 1: a sum item of the persistent kernel = fc2_sum_item on this kernel's arguments. Tile n's route rows are complete when the FC2
+// items of its pair are: the counter is the one of the pair's first tile (an n256 item publishes both tiles with one add per warp).
+__device__ __noinline__ void ps_sum_item(const PersistSumArgs& a, int token0, int ntok, int n, int lane, int tid, int item) {
+  Fc2Args s;  // the fields fc2_sum_item reads
+  s.route = a.route; s.out = a.out; s.ids = a.ids; s.K = a.K; s.topk = a.topk;
+  s.tile_done = a.tile_done - (n & 1); s.sum_need = a.sum_need;
+  s.err = a.err; s.err_lock = a.err_lock; s.watchdog_ns = a.watchdog_ns;
+  s.sum_discard = a.sum_discard;
+  fc2_sum_item(s, token0, ntok, n, lane, tid, item);
+}
+// the FC2 item's wait target: the FC1 arrivals of its expert (8 per FC1 item) - the scan CTA's fc1_need[e]; SM = 1: from the expert's
+// pair count (its 64-row chunks x the five FC1 column tiles x the eight consumer warps: the scan CTA's own arithmetic)
+template <int SM, typename Args>
+__device__ __forceinline__ int ps_fc1_need(const Args& a, int e) {
+  if constexpr (SM != 0) {
+    const int cnt = __ldg(a.exp_cnt + e);
+    return ((((cnt + 15) >> 4) + 3) >> 2) * (kN1Tiles * kWgConsumers);
+  } else {
+    return __ldg(a.fc1_need + e);
+  }
+}
+
 // the FC2 item's wait for its expert's FC1 items (lane 0 polls with acquire semantics, the warp follows): bounded by the watchdog;
 // returns the ns waited (lane 0; 0 when the counter was already complete)
-__device__ __forceinline__ unsigned long long ps_wait_fc1_done(const PersistArgs& a, int e, int item, int lane, int what) {
+template <int SM, typename Args>
+__device__ __forceinline__ unsigned long long ps_wait_fc1_done(const Args& a, int e, int item, int lane, int what) {
   unsigned long long waited = 0;
   if (lane == 0) {
-    const int need = __ldg(a.fc1_need + e);
+    const int need = ps_fc1_need<SM, Args>(a, e);
     int seen = ld_acquire_gpu_s32(a.fc1_done + e);
     if (seen < need) {
       const unsigned long long t0 = globaltimer_ns();
@@ -2732,19 +2807,28 @@ __device__ __forceinline__ unsigned long long ps_wait_fc1_done(const PersistArgs
 
 // the hand-off warp's staging of the next item (= producer_stage_next + the token weights at d == 5 / 7 and the kind-aware A offsets): the
 // next item's kind is known from d == 4 on (its meta); the ring slot nb is written at d == 6 (meta, pairs, A offsets; bar_meta released
-// for the other producers) and d == 7 (token weights: read by the consumers' FC2 epilogue only)
+// for the other producers) and d == 7 (token weights: read by the consumers' FC2 epilogue only). SM = 1: the next item's four ints come
+// from ps_sum_item_word (n_items is not used), and a sum item has no rows (its metadata is (token0, ntok, 1, tile | kSumItem)).
+template <int SM, typename Args>
 __device__ __forceinline__ void ps_stage_next(ItemRing& ring, ProducerNext& nx, float& tw0, float& tw1, int d, int nb, int lane, int cur_item,
-                                              int n_items, const PersistArgs& a, uint64_t* bar_meta_nb) {
+                                              int n_items, const Args& a, uint64_t* bar_meta_nb) {
   if (d == 0) {
     int c = 0;
     if (lane == 0) c = claim_next_item(a.counts + 3, cur_item, a.dynamic_schedule);
     nx.item = __shfl_sync(0xffffffffu, c, 0);
   }
-  if (d == 2) nx.w = (lane < 4 && nx.item < n_items) ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)nx.item * 4 + lane) : 0;
+  if constexpr (SM != 0) {
+    if (d == 2) nx.w = lane < 4 ? ps_sum_item_word(a, nx.item, lane) : 0;
+  } else {
+    if (d == 2) nx.w = (lane < 4 && nx.item < n_items) ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)nx.item * 4 + lane) : 0;
+  }
   if (d == 4) {
     nx.meta = make_int4(__shfl_sync(0xffffffffu, nx.w, 0), __shfl_sync(0xffffffffu, nx.w, 1), __shfl_sync(0xffffffffu, nx.w, 2),
                         __shfl_sync(0xffffffffu, nx.w, 3));
-    const int rows = nx.meta.z * 16;
+    int rows = nx.meta.z * 16;
+    if constexpr (SM != 0) {
+      if (nx.meta.w & kSumItem) rows = 0;
+    }
     nx.pr0 = lane < rows ? __ldg(a.row_pair + nx.meta.y + lane) : -1;
     nx.pr1 = lane + 32 < rows ? __ldg(a.row_pair + nx.meta.y + lane + 32) : -1;
   }
@@ -2778,12 +2862,18 @@ __device__ __forceinline__ void ps_stage_next(ItemRing& ring, ProducerNext& nx, 
 // whole item loop, K-loops included, also when a.stats is null: with them ptxas schedules the consumer K-loops worse (<4, 2>: QMMA words
 // at stall 15 31 instead of 21 per FC1 pass and 27 instead of 14 per FC2 pass, read from the two builds' listings) - so the launch takes
 // ST = 1 only when the statistics are asked for, and the form without them (ST = 0) is the one every timing and every served call runs.
-template <int STAGES, int N2, int ST = 0>
-__global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistArgs a) {
+// SM = 1 (Args = PersistSumArgs; N2 = 2, ST = 0): the top-k sum as work items, see PersistSumArgs. What it adds to the kernel: a sum item
+// passes the ring as nine data-less stages (the hand-off of the next item runs through them, as in fc2_kernel_ws: the producers copy
+// nothing, the consumers release the stages and then sum - bounded waits, site 5); an FC2 item publishes its route stores with one
+// add per consumer warp; the route rows take the evict_last hint. The body is one function template for both kernels below: with
+// SM = 0 it is the kernel as it was, statement for statement.
+template <int STAGES, int N2, int ST, int SM, typename Args>
+__device__ __forceinline__ void moe_persistent_body(const Args& a) {
   // an FC2 item has 9 stages and its hand-off writes the ring slot at stages 7 / 8: the consumers must have left the slot's previous
   // reader (the epilogue of the item before the current one), which the `empty` wait of stage 7 guarantees only for STAGES <= 7
   static_assert(STAGES >= 2 && STAGES <= 7, "the FC2 hand-off needs STAGES <= 7");
   static_assert(N2 == 1 || N2 == 2, "FC2 items of one or two 128-column tiles");
+  static_assert(SM == 0 || (N2 == 2 && ST == 0), "the sum items exist in the n256 kernel without the statistics");
   constexpr int NCW = kWgConsumers;
   constexpr uint32_t kF2TileBytes = 128 * (kSlices * 4 - 2) * 16;  // 36 KB of W2 per 128-column tile (18 k32)
   constexpr uint32_t kF2TileSfBytes = 128 * (kSlices * 4 - 2);     // 2304 B of scales per tile
@@ -2808,12 +2898,21 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
   if (warp == NCW) {  // the first item straight from global memory
     int4 m = make_int4(0, 0, 0, 0);
     const int item = blockIdx.x;
+    if constexpr (SM != 0) {
+      const int w = lane < 4 ? ps_sum_item_word(a, item, lane) : 0;
+      m = make_int4(__shfl_sync(0xffffffffu, w, 0), __shfl_sync(0xffffffffu, w, 1), __shfl_sync(0xffffffffu, w, 2),
+                    __shfl_sync(0xffffffffu, w, 3));
+    } else {
     if (item < n_items) {
       const int w = lane < 4 ? __ldg(reinterpret_cast<const int32_t*>(a.items) + (size_t)item * 4 + lane) : 0;
       m = make_int4(__shfl_sync(0xffffffffu, w, 0), __shfl_sync(0xffffffffu, w, 1), __shfl_sync(0xffffffffu, w, 2),
                     __shfl_sync(0xffffffffu, w, 3));
     }
-    const int rows = m.z * 16;
+    }
+    int rows = m.z * 16;
+    if constexpr (SM != 0) {
+      if (m.w & kSumItem) rows = 0;  // a sum item has no rows
+    }
     const bool fc2 = (m.w & kPsFc2) != 0;
     const uint32_t row_b = fc2 ? (uint32_t)kInterBytes : (uint32_t)K;
     const int p0 = lane < rows ? __ldg(a.row_pair + m.y + lane) : -1;
@@ -2854,6 +2953,24 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
         }
         const bool fc2 = (it.w & kPsFc2) != 0;
         const int e = it.x, slot = k & 1, nb = slot ^ 1;
+        if constexpr (SM != 0) {
+          if (it.w & kSumItem) {  // a sum item: the hand-off of the next item through nine data-less stages (claimed at stage 1), no copies
+#pragma unroll 1
+            for (int t = 0; t < kF2Stages; ++t) {
+              if (round0 > 0) --round0;
+              else ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
+              const uint32_t full = smem_addr(&bar_full[pos.buf]);
+              ps_stage_next<SM, Args>(ring, nx, tw0, tw1, t - 1, nb, lane, item, n_items, a, &bar_meta[nb]);
+              __syncwarp();
+              if (lane == 0) mbar_arrive(full);
+              cp_async_mbar_arrive_noinc(full);
+              pos.advance<STAGES>();
+            }
+            item = nx.item;
+            ++k;
+            continue;
+          }
+        }
         const int n_stages = fc2 ? kF2Stages : n1_stages;
         // the next item is claimed 10 stages before the current one ends (FC1: K >= 640 -> >= 10 stages) / at stage 1 of an FC2 item (9 stages:
         // d = 0..7 at stages 1..8 - v9's fc2 hand-off)
@@ -2868,9 +2985,9 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
         for (int t = 0; t < n_stages; ++t) {
           if (round0 > 0) --round0;
           else ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
-          if (fc2 && t == 0) wait_ns += ps_wait_fc1_done(a, e, item, lane, 1);  // the expert's FC1 items are complete: the A rows exist
+          if (fc2 && t == 0) wait_ns += ps_wait_fc1_done<SM, Args>(a, e, item, lane, 1);  // the expert's FC1 items are complete: the A rows exist
           const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
-          ps_stage_next(ring, nx, tw0, tw1, t - claim_at, nb, lane, item, n_items, a, &bar_meta[nb]);
+          ps_stage_next<SM, Args>(ring, nx, tw0, tw1, t - claim_at, nb, lane, item, n_items, a, &bar_meta[nb]);
           __syncwarp();  // the ring writes of this stage (if any) precede lane 0's release arrive
           if (lane == 0) mbar_arrive(full);
           wg_copy_a(sb + a_region, a_base, rows, 0, t, lane);
@@ -2895,6 +3012,19 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
           if (round0 == 0) ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
           cp_async_mbar_arrive_noinc(smem_addr(&bar_full[pos.buf]));
           break;
+        }
+        if constexpr (SM != 0) {
+          if (it.w & kSumItem) {  // a sum item: nine data-less stages
+#pragma unroll 1
+            for (int t = 0; t < kF2Stages; ++t) {
+              if (round0 > 0) --round0;
+              else ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
+              cp_async_mbar_arrive_noinc(smem_addr(&bar_full[pos.buf]));
+              pos.advance<STAGES>();
+            }
+            ++k;
+            continue;
+          }
         }
         const bool fc2 = (it.w & kPsFc2) != 0;
         const int e = it.x, tile = it.w & 0xFF;
@@ -2922,7 +3052,7 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
           else ps_mbar_wait(smem_addr(&bar_empty[pos.buf]), pos.par ^ 1u, true, a, 2, k);
           const uint32_t sb = sbase0 + pos.buf * kF1Stage, full = smem_addr(&bar_full[pos.buf]);
           if (role == 1) {
-            if (fc2 && t == 0) ps_wait_fc1_done(a, e, k, lane, 2);
+            if (fc2 && t == 0) ps_wait_fc1_done<SM, Args>(a, e, k, lane, 2);
             wg_copy_a(sb + a_region, a_base, rows, 1, t, lane);
             const uint32_t off = rows.sf;
             const bool on = off != 0xFFFFFFFFu;
@@ -2990,7 +3120,9 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
     const bool fc2 = (it.w & kPsFc2) != 0;
     const int tile = it.w & 0xFF;
     const int pslot = k & 1;
-    if (!fc2) {
+    bool sum_item = false;  // SM = 1: the item is a sum item (its branch stands behind the FC1 / FC2 items)
+    if constexpr (SM != 0) sum_item = (it.w & kSumItem) != 0;
+    if (!fc2 && !sum_item) {
       // ---------------------------------------------------------------- FC1 item = v10's consumer (fc1_kernel_wg) verbatim
       const bool wide = tile != kN1Tiles - 1;
       const int ns16 = wide ? warp : (warp & 3);
@@ -3127,7 +3259,7 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
       // this warp's rows of the expert's intermediate are written: one arrival of the 8 per FC1 item (the FC2 producers wait for them)
       __syncwarp();
       if (lane == 0) red_release_gpu_add(a.fc1_done + e, 1);
-    } else {
+    } else if (fc2) {
       // ---------------------------------------------------------------- FC2 item
       const int ns16 = warp;  // n16 slice of a 128-column tile; every warp takes all m-tiles
       const float down_scale = fmul(__ldg(a.down_alpha + e), __ldg(a.global_scale + (a.gs_per_expert ? e : 0)));
@@ -3198,6 +3330,14 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
         step(I0{}, std::true_type{});  // stage 8: k32 16, 17 (the tail slice's u16 scale words); the zero tail is not run
 
         // ---- epilogue = v9's per tile: scale, bf16, token-major route rows (512 contiguous bytes per row over the two tiles)
+        // SM = 1: the L2 policy of the route stores (evict_last), built once per item, behind the stage loop: nothing of it is held
+        // across the K-loops
+        bool route_hint = false;
+        uint64_t route_pol = 0ull;
+        if constexpr (SM != 0) {
+          route_hint = a.route_cs == 2;
+          route_pol = route_hint ? l2_policy_evict_last() : 0ull;
+        }
 #pragma unroll
         for (int mt = 0; mt < 4; ++mt) {
           if (mt >= m_tiles) continue;
@@ -3215,11 +3355,20 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
               quad_transpose32(w, c, o);
               if (pair >= 0 && c < 2) {  // streaming store (MK-2 round 5): the route rows are read back by topk_sum only
                 uint4* dst = reinterpret_cast<uint4*>(a.route + (size_t)pair * (a.K / 2) + ((tile + pp) * 128 + ns16 * 16 + c * 8) / 2);
+                if constexpr (SM != 0) {  // read back by the pair's sum items: kept in L2 (evict_last) until they discard it
+                  if (route_hint) st_global_hint_v4(dst, make_uint4(o[0], o[1], o[2], o[3]), route_pol);
+                  else *dst = make_uint4(o[0], o[1], o[2], o[3]);
+                } else {
                 if (a.route_cs) st_global_cs_v4(dst, make_uint4(o[0], o[1], o[2], o[3]));
                 else *dst = make_uint4(o[0], o[1], o[2], o[3]);
+                }
               }
             }
           }
+        }
+        if constexpr (SM != 0) {  // publish this warp's route stores of the pair to its sum items (one add per warp per item)
+          __syncwarp();
+          if (lane == 0) red_release_gpu_add(a.tile_done + tile, 1);
         }
       } else {
       // ---- v9's item (one tile) as a register pipeline over the stages (K-4's v9f idea; it did not fit fc1's 64 accumulators at 168 registers,
@@ -3314,6 +3463,19 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
         }
       }
       }
+    } else {
+      if constexpr (SM != 0) {
+        // ---------------------------------------------------------------- sum item: release its nine data-less stages (the producers
+        // then fill the ring for the next item), then the top-k sum of its tokens' route rows of one 128-column tile
+#pragma unroll 1
+        for (int t = 0; t < kF2Stages; ++t) {
+          ps_mbar_wait(smem_addr(&bar_full[pos.buf]), pos.par, false, a, 5, k);
+          __syncwarp();
+          if (lane == 0) mbar_arrive(smem_addr(&bar_empty[pos.buf]));
+          pos.advance<STAGES>();
+        }
+        ps_sum_item(a, it.x, it.y, tile, lane, tid, k);
+      }
     }
     if (keep_stats) {
       const unsigned long long t1 = globaltimer_ns();
@@ -3326,6 +3488,15 @@ __global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistAr
     atomicAdd(a.stats + 0, st_fc1); atomicAdd(a.stats + 1, st_n1); atomicAdd(a.stats + 2, st_fc2); atomicAdd(a.stats + 3, st_n2);
     atomicAdd(a.stats + 4, st_idle); atomicAdd(a.stats + 6, globaltimer_ns() - st_t0); atomicAdd(a.stats + 7, 1ull);
   }
+}
+template <int STAGES, int N2, int ST = 0>
+__global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_kernel(PersistArgs a) {
+  moe_persistent_body<STAGES, N2, ST, 0, PersistArgs>(a);
+}
+// the n256 kernel with the top-k sum as its work items (WS = 40; PersistSumArgs)
+template <int STAGES>
+__global__ void __launch_bounds__(kWgThreads, 1) moe_persistent_sum_kernel(PersistSumArgs a) {
+  moe_persistent_body<STAGES, 2, 0, 1, PersistSumArgs>(a);
 }
 
 }  // namespace b12x_moe_prefill_fast
@@ -3418,7 +3589,13 @@ static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // _WS_LEAD = the lead in experts of the work list (default 32), _WS_MIN_ROWS = below this many rows the separate kernels run (default 0),
 // _WS_WATCHDOG_MS = the bound of every FC2 wait on its expert's FC1 items (default 2000; expiry = an error record + a trapped launch).
 // Contiguous rows only (lda == K). Every configuration computes the same bits.
+// 40 = the n256 kernel of mode 30 (four ring stages) with the top-k sum as its work items (moe_persistent_sum_kernel; no topk_sum_kernel
+// follows): the sum items of fc2_kernel_ws inside the persistent launch, with _SUM_TOKENS / _SUM_DISCARD / _SUM_ROUTE_HINT as in the
+// separate kernels and _WS_SUM_LAG = the pairs of 128-column tiles between a pair's FC2 items and its sum items (default 1). A call of
+// such a process that asks for no top-k sum, has fewer than _SUM_MIN_ROWS rows, K % 256 != 0 or more than kSumMaxTopk slots runs
+// mode 30 (20) and the separate topk_sum_kernel; a call that cannot be persistent runs the separate kernels as a process without _WS.
 static int ws_mode() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS"); return m; }
+static int ws_sum_lag() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_SUM_LAG"); static const int m = v ? std::max(0, std::atoi(v)) : 1; return m; }
 static int ws_lead() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_LEAD"); static const int m = v ? std::atoi(v) : 64; return m; }
 static int ws_min_rows() { static const int m = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_MIN_ROWS"); return m; }
 static int ws_watchdog_ms() { const char* v = std::getenv("VLLM_MOET_B12X_MOE_PREFILL_FAST_WS_WATCHDOG_MS"); static const int m = v ? std::atoi(v) : 2000; return m; }
@@ -3469,6 +3646,22 @@ struct PsLaunch {  // MK-2: moe_persistent_kernel<S, N2, ST> (12 warps, 1 CTA/SM
   static void run(const b12x_moe_prefill_fast::PersistArgs& p, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
     moe_persistent_kernel<S, N2, ST><<<grid, kT, S * kF1Stage, stream>>>(p);
+  }
+};
+template <int S>
+struct PsSumLaunch {  // moe_persistent_sum_kernel<S>: the n256 persistent kernel with the top-k sum as its work items (WS = 40)
+  static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
+  static int grid(int sms) {
+    using namespace b12x_moe_prefill_fast;
+    int occ = 0;
+    static bool done = false;
+    if (!done) { cudaFuncSetAttribute(moe_persistent_sum_kernel<S>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, moe_persistent_sum_kernel<S>, kT, S * kF1Stage);
+    return sms * (occ > 0 ? occ : 1);  // every CTA resident (the deadlock-freedom argument of the work list)
+  }
+  static void run(const b12x_moe_prefill_fast::PersistSumArgs& p, int grid, cudaStream_t stream) {
+    using namespace b12x_moe_prefill_fast;
+    moe_persistent_sum_kernel<S><<<grid, kT, S * kF1Stage, stream>>>(p);
   }
 };
 // 20-25: one 128-column tile per FC2 item (4 / 6 / 7 / 3 / 5 / 2 stages); 30-35: n256 FC2 items (round 3), the same stage counts
@@ -3836,14 +4029,21 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
               "removed: unset it and use VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1 (with _WS2 >= 1) - the top-k sum as FC2 work items");
   // MK-2: the fused persistent launch (WS >= 20): contiguous rows, at or above _WS_MIN_ROWS rows
   const int lda_b = prequant ? (int)a_values.stride(0) : K, lds_b = prequant ? (int)a_scales.stride(0) : K / 32;
+  TORCH_CHECK(ws_mode() <= 40, "VLLM_MOET_B12X_MOE_PREFILL_FAST_WS=", ws_mode(), ": the modes are 20-25, 30-35 and 40 (the n256 persistent "
+              "kernel with four ring stages and the top-k sum as its work items)");
   const bool persistent = ws_mode() >= 20 && lda_b == K && lds_b == K / 32 && T >= ws_min_rows();
+  // WS = 40: this call's persistent launch runs the top-k sum as its work items (moe_persistent_sum_kernel) - when a top-k sum is asked
+  // for, at or above _SUM_MIN_ROWS rows, with n256 items (K % 256 == 0) and at most kSumMaxTopk slots; else it is mode 30's launch
+  const bool ps_sum = persistent && ws_mode() >= 40 && topk_sum && T >= sum_min_rows_env() && K % 256 == 0 && K / 128 <= kMaxTiles &&
+                      topk <= kSumMaxTopk;
   // K-12: the sum items of fc2_kernel_ws (the column-tile-major list): with the v9 fc2 kernel, and in no call of a process that runs the
-  // persistent mode (WS >= 20) - not in the persistent launch, and not in its calls that fall back to the separate kernels either
+  // persistent modes 20-35 - not in the persistent launch, and not in its calls that fall back to the separate kernels either
   // (row-strided rows, fewer than _WS_MIN_ROWS rows). sum_items_mode() / route_rows_consumed() answer once for the process, so every
   // call of it has to leave the route rows written: with the sum items and _SUM_DISCARD=1 such a fallback call returned scratch route
-  // rows in a process that had reported them as valid.
-  const bool sum_items = topk_sum && ws_mode() < 20 && sum_items_env() >= 1 && ws2_mode() >= 1 && T >= sum_min_rows_env() &&
-                         K / 128 <= kMaxTiles && topk <= kSumMaxTopk;
+  // rows in a process that had reported them as valid. A process with WS = 40 reports the sum items (its persistent launches run
+  // them), so its calls that fall back to the separate kernels run them as a process without _WS does.
+  const bool sum_items = topk_sum && (ws_mode() < 20 || (ws_mode() >= 40 && !persistent)) && sum_items_env() >= 1 && ws2_mode() >= 1 &&
+                         T >= sum_min_rows_env() && K / 128 <= kMaxTiles && topk <= kSumMaxTopk;
   {  // K-13 task B: the activation counters (one add per call per counter pair)
     const bool fc1_v10 = !persistent && ws1_mode() >= 8 && T >= ws1_min_rows() && lda_b == K && lds_b == K / 32;
     g_cnt[fc1_v10 ? 0 : 2] += 1; g_cnt[fc1_v10 ? 1 : 3] += (unsigned long long)T;
@@ -3860,14 +4060,18 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
     // the FC1 epilogue's values defined on every path: the calls whose FC1 launch is the FZ form of the served mode's kernel
     if (fc1_fz_mode() >= 1 && fc1_v10 && ws1_mode() == 9) { g_cnt_fz[0] += 1; g_cnt_fz[1] += (unsigned long long)T; }
   }
-  // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs
-  const int ps_mode = (ws_mode() >= 30 && K % 256 != 0) ? ws_mode() - 10 : ws_mode();
+  // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs; a persistent
+  // launch of WS = 40 without the sum inside is mode 30's
+  const int ws_ps = ws_mode() >= 40 ? 30 : ws_mode();
+  const int ps_mode = (ws_ps >= 30 && K % 256 != 0) ? ws_ps - 10 : ws_ps;
   const int f2_group = ws_f2_group(ps_mode);
   FrontArgs fa;
   fa.hidden = prequant ? nullptr : reinterpret_cast<const uint32_t*>(hidden.data_ptr());
   fa.a_values = reinterpret_cast<uint32_t*>(a_values.data_ptr());
   fa.a_scales = a_scales.data_ptr<uint8_t>();
-  Routing rt = launch_frontend(fa, !prequant, T, K, topk, E, dev, persistent, f2_group, sum_items);
+  // ps_sum: the two lists as for the separate kernels with the sum items (the kernel reads the FC1 list and the first block of the
+  // column-tile-major FC2 list, see PersistSumArgs) - no unified list
+  Routing rt = launch_frontend(fa, !prequant, T, K, topk, E, dev, persistent && !ps_sum, f2_group, sum_items || ps_sum);
   fa.ids = ids.data_ptr<int32_t>();
   run_frontend(fa, stream);
 
@@ -3921,7 +4125,30 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   f2.w2_evict_first = w2_evict_first_env() >= 1 ? 1 : 0;
   f2.sum_route_hint = (sum_items && sum_route_hint_env() >= 1) ? 1 : 0;
 
-  if (persistent) {  // MK-2: one launch for fc1 + SwiGLU/quant + fc2 (section 6), then the separate top-k sum below
+  if (ps_sum) {  // WS = 40: one launch for fc1 + SwiGLU/quant + fc2 + the top-k sum (the sum items of the persistent kernel)
+    PersistSumArgs pa;
+    pa.a_values = f1.a_values; pa.a_scales = f1.a_scales; pa.w13 = f1.w13; pa.w13_sf = f1.w13_sf;
+    pa.alpha = f1.alpha; pa.input_global_scale = f1.input_global_scale; pa.inter = f1.inter; pa.inter_sf = f1.inter_sf;
+    pa.w2 = f2.w2; pa.w2_sf = f2.w2_sf; pa.token_weights = f2.token_weights; pa.down_alpha = f2.down_alpha; pa.global_scale = f2.global_scale;
+    pa.route = f2.route;
+    pa.row_pair = fa.row_pair; pa.items = fa.f1_items; pa.counts = fa.counts;
+    pa.fc1_done = fa.counts + 8; pa.fc1_need = nullptr; pa.err_lock = fa.counts + 7; pa.err = ps_err_dev();
+    pa.stats = nullptr;
+    pa.watchdog_ns = (unsigned long long)std::max(1, ws_watchdog_ms()) * 1000000ull;
+    pa.K = K; pa.topk = topk; pa.igs_per_expert = f1.igs_per_expert; pa.gs_per_expert = f2.gs_per_expert; pa.out_tiles = fa.n2_tiles;
+    pa.dynamic_schedule = (int)dynamic_schedule; pa.limit = (float)limit;
+    pa.route_cs = sum_route_hint_env() >= 1 ? 2 : 0;  // read back by the sum items: evict_last or plain, never streaming
+    pa.items2 = fa.f2_items; pa.exp_cnt = fa.exp_cnt;
+    pa.out = reinterpret_cast<uint32_t*>(out.data_ptr()); pa.ids = f2.ids;
+    pa.tile_done = fa.counts + kCntTileDone; pa.sum_need = fa.counts + kCntSumNeed;
+    pa.T = T; pa.sum_tokens = fa.sum_tokens; pa.sum_lag = ws_sum_lag();
+    pa.sum_discard = (sum_discard_env() >= 1 && (reinterpret_cast<uintptr_t>(route.data_ptr()) & 127) == 0) ? 1 : 0;
+    int g = PsSumLaunch<4>::grid(sms);
+    if (grid1_cap > 0) g = std::min<int>(g, (int)grid1_cap);
+    g = std::min(g, fa.f1_cap + fa.f2_cap);
+    PsSumLaunch<4>::run(pa, g, stream);
+    TORCH_CHECK(cudaGetLastError() == cudaSuccess);
+  } else if (persistent) {  // MK-2: one launch for fc1 + SwiGLU/quant + fc2 (section 6), then the separate top-k sum below
     PersistArgs pa;
     pa.a_values = f1.a_values; pa.a_scales = f1.a_scales; pa.w13 = f1.w13; pa.w13_sf = f1.w13_sf;
     pa.alpha = f1.alpha; pa.input_global_scale = f1.input_global_scale; pa.inter = f1.inter; pa.inter_sf = f1.inter_sf;
@@ -3964,7 +4191,7 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
   }
   }
 
-  if (topk_sum && !sum_items) {
+  if (topk_sum && !sum_items && !ps_sum) {
     const long long total = (long long)T * (K / 8);
     topk_sum_kernel<<<(unsigned)((total + 255) / 256), 256, 0, stream>>>(
         reinterpret_cast<const uint4*>(route.data_ptr()), ids.data_ptr<int32_t>(),
@@ -4048,10 +4275,15 @@ std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
   return r;
 }
 // K-12: the sum-items mode of this process (VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS; active only with WS2 >= 1 and without the persistent
-// mode: with WS >= 20 no call of the process runs the sum items, whichever kernels it launches), and
+// modes 20-35: with them no call of the process runs the sum items, whichever kernels it launches), and
 // whether the route rows are consumed in-kernel (summed and discarded from L2: their content after the call is unspecified - the harness
-// then compares the output only)
-int64_t sum_items_mode() { return (sum_items_env() >= 1 && ws2_mode() >= 1 && ws_mode() < 20) ? sum_items_env() : 0; }
+// then compares the output only).
+// A process with WS = 40 runs the sum items too - inside its persistent launches (whatever _SUM_ITEMS says), and in its calls that fall
+// back to the separate kernels as a process without _WS would: it answers 1, and its route rows are scratch under _SUM_DISCARD=1.
+int64_t sum_items_mode() {
+  if (ws_mode() >= 40) return 1;
+  return (sum_items_env() >= 1 && ws2_mode() >= 1 && ws_mode() < 20) ? sum_items_env() : 0;
+}
 bool route_rows_consumed() { return sum_items_mode() >= 1 && sum_discard_env() >= 1; }
 // the watchdog record of the bounded waits (pinned host memory, readable after a trapped launch): [set, what, item, need, seen, smid, block,
 // watchdog_ms]; set == 0: no expired wait since the process started (or since `clear`). The kernel stores `set` last, right before it

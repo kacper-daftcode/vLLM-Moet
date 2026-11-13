@@ -41,8 +41,18 @@ _WS_WATCHDOG_MS (2000), _WS_STATS=1 (per-item %globaltimer statistics, moe_prefi
 consumer K-loops ptxas schedules worse - a bench switch, never beside a timing), _WS_ROUTE_CS (streaming route-row stores, 1).
 Bit-identical to v8/v9/v10 on W's harness (6/6 at 4096 and 128 rows, 3 runs); measured +2.6 % vs WS1=9 + WS2=3 at call1 4096 rows
 (MK/REPORT.md 2) - off by default. The persistent launch needs contiguous rows and at least _WS_MIN_ROWS of them; a call without them runs
-the separate kernels. In a process with _WS >= 20 no call runs the sum items below (`sum_items_mode()` is 0, the route rows are written
-by every call and the separate topk_sum_kernel follows), whatever _SUM_ITEMS says.
+the separate kernels. In a process with _WS = 20 ... 35 no call runs the sum items below (`sum_items_mode()` is 0, the route rows are
+written by every call and the separate topk_sum_kernel follows), whatever _SUM_ITEMS says.
+
+`VLLM_MOET_B12X_MOE_PREFILL_FAST_WS=40` is the launch of mode 30 with the top-k sum as its work items (`moe_persistent_sum_kernel`, four
+ring stages; no separate topk_sum_kernel): every FC1 item first, then per pair of 128-column tiles the FC2 items of every expert and,
+_WS_SUM_LAG pairs later (default 1), the pair's sum items - the sum items of the FC2 kernel below, unchanged, which wait for the pair's
+FC2 items with their watchdog-bounded poll and sum the pair's route rows while these are in L2 (_SUM_TOKENS, _SUM_DISCARD,
+_SUM_ROUTE_HINT as below). A process in this mode answers `sum_items_mode()` 1; a call of it below _SUM_MIN_ROWS rows or without a
+top-k sum runs mode 30's launch and the separate topk_sum_kernel, a call that cannot be persistent runs the separate kernels as a
+process without _WS does. Because a pair's sum items wait for ALL its FC2 items, this launch - like the separate FC2 kernel with its
+sum items, and unlike modes 20 ... 35 - stands for as long as a kernel of another stream holds one of the grid's SMs
+(`test_persistent_watchdog_sm120.py --ws 40`). Off by default, not served.
 
 K-12 (the route rows' DRAM round trip): `VLLM_MOET_B12X_MOE_PREFILL_FAST_SUM_ITEMS=1` (with WS2 >= 1) puts the FC2 work list in column-tile-major
 order and runs the top-k sum as work items of `fc2_kernel_ws` (the sum items of a tile follow the FC2 items of tile + _SUM_LAG (2) and wait for
@@ -244,7 +254,8 @@ def fc1_fz_supported() -> bool:
 def watchdog_record(clear: bool = False) -> list[int]:
     """The record of an expired bounded wait of this process: [set, what, item, need, seen, smid, block, watchdog_ms] (pinned host
     memory: readable after the trapped launch, without a CUDA call). what 100 + n = a sum item of FC2 waited for the FC2 items of
-    column tile n (`need - seen` arrivals missing, 8 per FC2 item); 1 / 2 and 10 + site = the waits of the persistent launch. The
+    column tile n (`need - seen` arrivals missing, 8 per FC2 item; in the persistent launch with the sum inside: the FC2 items of
+    the tile's pair); 1 / 2 and 10 + site = the waits of the persistent launch. The
     kernel stores `set` last, right before it traps, and that store does not always reach the host: a filled record counts as set
     here whatever the build of the extension says. All zero = no expired wait (since the last `clear`)."""
     e = _ext()
