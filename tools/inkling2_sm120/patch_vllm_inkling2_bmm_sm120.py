@@ -15,8 +15,8 @@ Where (vllm/models/inkling2/):
                       is no room for a second copy of a layer); with VLLM_MOET_INKLING2_MXFP6=1 the MXFP8 experts
                       (layers 40-47 of the released checkpoint) are packed to e2m3, six bits per value, as they load,
                       and `_register` allocates them in that form from the start. Every chunk's file pages are
-                      released as soon as it is on the card (`drop_file_pages`), so the load leaves no page cache
-                      behind it (VLLM_MOET_INKLING2_DROP_PAGES=0 keeps the pages).
+                      released as soon as it is on the card (`drop_file_pages`), so a load leaves 13 GiB of the
+                      checkpoint in the page cache instead of 82 (VLLM_MOET_INKLING2_DROP_PAGES=0 keeps the pages).
   model.py            `load_weights` - its dtype check accepts a parameter that names the checkpoint's dtype (the
                       packed experts are bytes, the checkpoint's are e4m3).
 

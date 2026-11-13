@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """CPU test of the MXFP8 -> e2m3 packing (inkling2_bmm_sm120.pack_e2m3) and of the prepared weight layout.
 
-    python3 test_pack_e2m3.py [--model-dir DIR]        # no GPU needed
+    python3 test_pack_e2m3.py [--model-dir DIR [--census N]] [--threads T]        # no GPU needed
 
   1. every e4m3 code as a block maximum, with every e4m3 code beside it: the packed value times the moved block scale
      equals the original exactly when the value lies in the block's top three binades, and is within half a step of
@@ -9,7 +9,12 @@
      decoder (a table of the 64 e2m3 codes);
   2. random blocks: the same bound, the block scale moves by one power of two per block, an all-zero block stays zero;
   3. prepare / unprepare are inverse byte permutations for every format's step size;
-  4. with --model-dir: the same on real MXFP8 expert weights (the share kept exactly, error / weight energy).
+  4. with --model-dir: the same on real MXFP8 expert weights (the share kept exactly, error / weight energy);
+  5. with --census N: the packing's figures over N experts of each MXFP8 layer (indices spread over the layer), both
+     projections, one line per expert and the range found - the share of the weights that keep their value, the share
+     that lies in the block's top three binades (exact by construction), the error energy over the weight energy in
+     the weights' own units (every block times its scale) and the largest error over the block's largest magnitude.
+     One expert is read at a time and its file pages are released (N = 12: 192 experts, a few minutes on four threads).
 """
 from __future__ import annotations
 
@@ -68,15 +73,72 @@ def check_blocks(w: torch.Tensor, label: str) -> bool:
     return ok
 
 
+def read_expert(model_dir: str, index: dict, name: str, expert: int) -> torch.Tensor:
+    """one expert's slice of a per-expert tensor of the checkpoint, uint8 [rows, columns]; its file pages are released"""
+    path = os.path.join(model_dir, index[name])
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        hl = struct.unpack("<Q", os.pread(fd, 8, 0))[0]
+        t = json.loads(os.pread(fd, hl, 8))[name]
+        per = t["shape"][1] * t["shape"][2]
+        off = 8 + hl + t["data_offsets"][0] + expert * per
+        buf = os.pread(fd, per, off)
+        assert len(buf) == per, f"{name}: short read of expert {expert}"
+        os.posix_fadvise(fd, off, per, os.POSIX_FADV_DONTNEED)
+    finally:
+        os.close(fd)
+    return torch.frombuffer(bytearray(buf), dtype=torch.uint8).reshape(t["shape"][1], t["shape"][2])
+
+
+def census(model_dir: str, per_layer: int) -> bool:
+    index = json.load(open(os.path.join(model_dir, "model.safetensors.index.json")))["weight_map"]
+    num_experts = json.load(open(os.path.join(model_dir, "config.json")))["text_config"]["n_routed_experts"]
+    experts = sorted({round(i * (num_experts - 1) / max(per_layer - 1, 1)) for i in range(per_layer)})
+    rows, ok = [], True
+    for layer in range(40, 48):
+        for proj in ("w13", "w2"):
+            name = f"model.llm.layers.{layer}.mlp.experts.{proj}_weight"
+            for e in experts:
+                w = read_expert(model_dir, index, name, e).reshape(-1, 32)
+                scale = 2.0 ** (read_expert(model_dir, index, name + "_scale", e).reshape(-1).to(torch.float64) - 127)
+                packed, delta = m.pack_e2m3(w)
+                orig = m.e4m3_values(w)
+                unit = 2.0 ** delta.reshape(-1).to(torch.float64)       # the packed block's unit in the original's
+                err = m.e2m3_values(packed) * unit[:, None] - orig
+                exact = float((err == 0).double().mean())
+                top3 = orig.abs() >= unit[:, None]                      # e2m3's binades [1, 2), [2, 4), [4, 8)
+                ok &= bool((err[top3] == 0).all())
+                db = float(10 * torch.log10(((err**2).sum(1) * scale**2).sum().clamp(min=1e-300)
+                                            / ((orig**2).sum(1) * scale**2).sum()))
+                worst = float((err.abs().amax(1) / orig.abs().amax(1).clamp(min=1e-30)).max())
+                ok &= worst <= 1 / 64
+                rows.append((proj, exact, float(top3.double().mean()), db, worst))
+                print(f"  layer {layer} {proj:3s} expert {e:3d}: exact {100 * exact:.2f} %, in the top three binades "
+                      f"{100 * rows[-1][2]:.2f} %, error / weight energy {db:.1f} dB, largest error / block maximum {worst:.4f}",
+                      flush=True)
+    for proj in ("w13", "w2"):
+        r = [x for x in rows if x[0] == proj]
+        span = lambda i, k, f: f"{f.format(k * min(x[i] for x in r))} .. {f.format(k * max(x[i] for x in r))}"  # noqa: E731
+        print(f"  census {proj}: {len(r)} experts ({len(experts)} of each layer 40-47): exact "
+              f"{span(1, 100, '{:.2f}')} %, in the top three binades {span(2, 100, '{:.2f}')} %, error / weight energy "
+              f"{span(3, 1, '{:.1f}')} dB, largest error / block maximum {max(x[4] for x in r):.4f}")
+    return ok
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-dir")
+    ap.add_argument("--census", type=int, default=0, metavar="N",
+                    help="with --model-dir: the packing's figures over N experts of each MXFP8 layer, both projections")
+    ap.add_argument("--threads", type=int, default=4, help="torch threads (4)")
     a = ap.parse_args()
+    torch.set_num_threads(a.threads)
     ok = True
+    g = torch.Generator().manual_seed(1)
     # 1. every code as the block's maximum-magnitude member next to every other code
     blocks = []
     for top in CODES.tolist():
-        row = CODES[torch.randperm(len(CODES))[:31]].clone()
+        row = CODES[torch.randperm(len(CODES), generator=g)[:31]].clone()
         blocks.append(torch.cat((torch.tensor([top], dtype=torch.uint8), row)))
     grid = torch.stack(blocks)
     pair = torch.stack(torch.meshgrid(CODES, CODES, indexing="ij"), dim=-1).reshape(-1, 2)
@@ -113,6 +175,8 @@ def main() -> int:
             w = torch.frombuffer(bytearray(buf), dtype=torch.uint8).reshape(-1, 32)
             ok &= check_blocks(w, f"real weights, layer {layer} w13, experts 5-6")
             break
+        if a.census:
+            ok &= census(a.model_dir, a.census)
     print("PACK E2M3 " + ("OK" if ok else "FAILED"))
     return 0 if ok else 1
 

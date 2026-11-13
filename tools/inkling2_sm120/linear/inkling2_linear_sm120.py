@@ -9,7 +9,7 @@ which FlashInfer provides for capabilities 100, 103 and 107 only. `linear` here 
 By default it is cuBLAS (`torch.nn.functional.linear`), which reads these weights at the memory's rate on sm_120.
 VLLM_MOET_INKLING2_LINEAR_KERNEL=1 takes the mma.sync kernel of inkling2_linear_sm120.cu instead (one CTA per 32
 output columns, K in cp.async stages of 64 elements, the weight rows prefetched into L2): on one RTX PRO 6000 it ties
-with cuBLAS at one row and on the 10 MB `wo`, and is 5 - 12 us behind at 8 - 32 rows of the 27 MB `qkvr`, where every
+with cuBLAS at one row and on a 10 MB weight, and is 5 - 13 us behind at 8 - 32 rows of the 27 MB `qkvr`, where every
 CTA stages the batch's rows beside its weight rows (test_linear_sm120.py --bench) - so it is off. Shapes the kernel
 does not take (K not a multiple of 64, an odd N, non-contiguous or unaligned operands) go to cuBLAS either way.
 Tuning: VLLM_MOET_INKLING2_LINEAR_PF (K steps of the weight rows prefetched ahead of the ring, default 4).

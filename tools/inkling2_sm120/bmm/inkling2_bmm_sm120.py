@@ -90,8 +90,8 @@ def _file_mapping(addr: int):
 def drop_file_pages(t: torch.Tensor) -> int:
     """For a slice of a memory-mapped checkpoint tensor that has been copied to the card: unmap its pages and tell
     the kernel that the file range will not be read again (madvise + posix_fadvise DONTNEED), so that the load of a
-    394 GB checkpoint leaves no page cache behind it - a model start beside another server otherwise pushes the host
-    into reclaim. Returns the bytes released; 0 for a tensor that is not file-backed, with
+    394 GB checkpoint leaves 13 GiB of it in the page cache instead of 82 - a model start beside another server
+    otherwise pushes the host into reclaim. Returns the bytes released; 0 for a tensor that is not file-backed, with
     VLLM_MOET_INKLING2_DROP_PAGES=0, or on any error (the load does not depend on it)."""
     if os.environ.get("VLLM_MOET_INKLING2_DROP_PAGES", "1") == "0" or t.device.type != "cpu" or t.numel() == 0:
         return 0

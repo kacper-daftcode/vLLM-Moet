@@ -4,8 +4,8 @@
     python3 test_linear_sm120.py [--bench]
 
 Cases: every row count class (1 .. 32 rows), the model's shapes on one rank of TP4 (qkvr 2896 x 4608, the full
-layers' query side 2512 x 4608 and K / V 256 x 4608, wo 4608 x 1152, the draft's MLP 4608 x 4608) and odd ones (a
-partial last column block, K of one and five steps). x and the weight are row slices of larger tensors whose other
+layers' query side 2512 x 4608 and K / V 256 x 4608, the draft's MLP 4608 x 4608), a short-K output projection
+4608 x 1152 (a rank's `wo` is 4608 x 1536) and odd ones (a partial last column block, K of one and five steps). x and the weight are row slices of larger tensors whose other
 rows are NaN: what the kernel must not read is poison.
 
 Criterion. The kernel accumulates K / 16 products in fp32 and rounds once to bf16. With `exact` the float64 product

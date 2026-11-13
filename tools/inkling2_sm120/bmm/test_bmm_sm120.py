@@ -52,6 +52,12 @@ def make_weights(fmt, experts, n, k, g):
     return w, s
 
 
+def pow2(exponent):
+    """2^exponent as float64, built from its bits: a float pow is not exact on every device, and the packing's
+    figures compare values for equality"""
+    return ((exponent.to(torch.int64) + 1023) << 52).view(torch.float64)
+
+
 def to_kernel(fmt, w, s):
     """row-major checkpoint bytes -> (kernel operands in the prepared layout, row-major operands for the reference)"""
     w, s = w.to(dev), s.to(dev)
@@ -169,8 +175,8 @@ def real_weights(model_dir):
             ok &= check(m.MXFP8, tile, 4608, k, 4, 4 if tile < 128 else 2, 99 + tile, weights=w8, label=f" [layer {layer} {proj}]")
             ok &= check(m.MXFP6, tile, 4608, k, 4, 4 if tile < 128 else 2, 99 + tile, weights=w6, label=f" [layer {layer} {proj}, packed]")
         # the packing itself: e4m3 -> e2m3 on the real weights
-        v8 = m.e4m3_values(w.to(dev)) * (2.0 ** (s.to(dev).to(torch.float64) - 127)).repeat_interleave(32, dim=-1)
-        v6 = m.e2m3_values(w6[1][0]) * (2.0 ** (w6[1][1].to(torch.float64) - 127)).repeat_interleave(32, dim=-1)
+        v8 = m.e4m3_values(w.to(dev)) * pow2(s.to(dev).to(torch.int64) - 127).repeat_interleave(32, dim=-1)
+        v6 = (m.e2m3_values(w6[1][0]) * 8).round() / 8 * pow2(w6[1][1].to(torch.int64) - 127).repeat_interleave(32, dim=-1)
         exact = float((v8 == v6).double().mean())
         err = v6 - v8
         snr = 10 * torch.log10((v8**2).sum() / (err**2).sum())

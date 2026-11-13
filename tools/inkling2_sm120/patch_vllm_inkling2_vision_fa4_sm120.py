@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inkling2 step 6: the vision tower's attention on sm_120.
+"""Inkling2 step 4: the vision tower's attention on sm_120.
 
 Where: vllm/third_party/tml_fa4/flash_fwd_sm120.py - `FlashAttentionForwardSm120`, the mma.sync forward tml_fa4
 selects on capability 12 (the vision tower calls tml_fa4's plain `flash_attn_varlen_func`). The class means to run

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Inkling2 step 5: the small-batch bf16 linear on sm_120 (tools/inkling2_sm120/linear).
+"""Inkling2 step 3: the small-batch bf16 linear on sm_120 (tools/inkling2_sm120/linear).
 
 Where: `linear` in vllm/models/inkling2/ops/linear.py - every projection of the decoder and of the DSpark draft
 (qkvr, wo, the router, the draft's MLPs). Batches of up to 32 rows go to FlashInfer's CuTe DSL low-M kernels, which

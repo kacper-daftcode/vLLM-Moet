@@ -77,6 +77,7 @@ def write_draft(src: str, dst: str, cols: list[int]) -> None:
                 if cut is not None:
                     rows, width, elem = cut
                     raw = os.pread(fd, nbytes, pos)
+                    assert len(raw) == nbytes, "short read in mtp.safetensors"
                     w.write(b"".join(raw[(r * width + c) * elem:(r * width + c + 1) * elem] for r in range(rows) for c in cols))
                     continue
                 done = 0
