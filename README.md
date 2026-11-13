@@ -63,7 +63,7 @@ tokens, thinking, tool calling, vision; [the doc](docs/inkling2-sm120.md)):
 
 | | vLLM-Moet | the official image on the same cards |
 |---|---|---|
-| decode, 1 stream | code ~490 tok/s at 75 steps/s (6.4–6.7 tokens per step), prose ~180; 149 without the draft at 148 steps/s | not started: by its code its expert GEMM, attention and small-batch linear kernels are sm_100's, with none for capability 12 |
+| decode, 1 stream | code ~490 tok/s at 75 steps/s (6.4–6.7 tokens per step), prose ~180; 149 without the draft at 148 steps/s | does not load: with this image's steps switched off the first expert layer ends in FlashInfer's `No supported CUDA architectures found for major versions [10]` (the official image itself was not started); its attention and small-batch linear kernels are sm_100's as well |
 | decode, 8 streams | code ~1,840 tok/s aggregate, prose ~620 (768 / 677 without the draft) | — |
 | decode, 32 streams | code ~4,200, prose ~1,390 in the one wave with a common window (1,693 / 1,480 without the draft) | — |
 | fresh prefill | 20.9K tokens in 2.4 s (8.7K tok/s), 60.3K in 7.5 s; a 17K-token prefix again in 0.07 s | — |

@@ -87,7 +87,7 @@ of them stream / per request @ engine steps per second; a range is two waves. Ev
 
 | configuration | code 1 | code 8 | code 16 | code 32 | prose 1 | prose 8 | prose 16 | prose 32 |
 |---|---|---|---|---|---|---|---|---|
-| the official image | no kernel for capability 12 (by its code; not started) | | | | | | | |
+| vLLM's own kernels (this image, every step switched off) | does not load: `No supported CUDA architectures found for major versions [10]` | | | | | | | |
 | no draft | 149 @ 148 | 768 / 96 @ 95 | 1077–1114 / 67–70 @ 68 | 1692–1694 / 53 @ 53 | 149 @ 148 | 677 / 85 @ 84 | 987–1118 / 60–62 @ 60 | 1478–1481 / 46 @ 45 |
 | DSpark, 7 tokens at every batch size (the default) | **481–498 @ 75** | **1777–1893 / 223–237 @ 35** | **3050 / 191 @ 28.5** | **4190–4237 / 131 @ 19.7** | 167–193 @ 76 | 599–643 / 74–75 @ 34 | 982–1021 / 59–61 @ 26.5 | 1386 (one wave) / 42 @ 19 |
 | no draft, 8K context, 64-token chunks: packed | 147 @ 146 | 647–652 / 81–82 @ 81 | | | 147 @ 144 | 634 / 79 @ 78 | | |
@@ -176,10 +176,13 @@ that capability 12 does not have, and each fails at a different moment of a star
 | the residual stream's fused all-reduce | multicast Lamport buffers (NVLink), capability 10 | vLLM itself falls back to PyNCCL | 7 |
 | the draft's K / V write into the paged cache | `reshape_and_cache_flash` of the same library | no image for capability 12: "no kernel image is available" in the draft's first forward (the target writes its cache in its own prologue and never calls it) | 8 |
 
-How each row is known. The expert GEMM, both attention kernels, the small-batch linear, the argmax and the
-all-reduce (steps 1, 2, 6, 7 and the first row of step 3) are read from vLLM's code: the unpatched image was not
-started on a capability-12 card. The others are failures seen on a card with the steps before them in place: the
-router's shared memory and the vision forward on one card with a checkpoint cut to six layers
+How each row is known. The first row was seen: served with every runtime switch on vLLM's own path, a six-layer
+cut of the checkpoint ends its start while the first layer's experts are built - FlashInfer compiles its
+`fused_moe_trtllm_sm100` module for some minutes and raises `No supported CUDA architectures found for major
+versions [10]`; no weight is loaded. That start does not reach the attention kernels, the small-batch linear, the
+argmax and the all-reduce (steps 2, 6, 7 and the first row of step 3): those rows are read from vLLM's code, and
+the official image itself was not started on these cards. The others are failures seen on a card with the steps
+before them in place: the router's shared memory and the vision forward on one card with the six-layer cut
 (`make_mini_checkpoint.py`), the embedding with the same cut on four cards, the draft's K / V write by calling the
 operation alone in a process (a launch without a kernel image leaves a sticky CUDA error). The record has each.
 
