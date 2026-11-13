@@ -14,6 +14,20 @@ the release tag that points at it.
   compute stream for a comm-bound slot (`sp_pipeline/test_phase_balance.py`, three recorded states); the two plan
   dictionaries of the b12x MoE path are held to one rule by a comment and a test (`test_b12x_plan_dicts.py`). A tool,
   a comment and tests: no kernel, module or default changes.
+- The persistent prefill MoE launch with the top-k sum as its work items (`VLLM_MOET_B12X_MOE_PREFILL_FAST_WS=40`, off by
+  default, not served): `moe_persistent_sum_kernel` — the n256 persistent kernel with the FC2 kernel's sum items inside
+  it, every wait bounded, no separate `topk_sum_kernel`. The 34 kernels that are not persistent and the twelve n256
+  persistent kernels are byte for byte what they were; the twelve one-tile persistent kernels (modes 20–25) differ in 31
+  words each, the zero moves of their accumulators standing in another order. Bit-identical on the harness from 4 096 to
+  128 rows. On one RTX PRO 6000 Server Edition card, the device time of every kernel of a 4 096-row call summed, four
+  alternating rounds: 1 574.3 µs against 1 732.0 for the persistent launch with the separate sum (−9.1 %) and against
+  1 571.2 for the served set without the m-tile loops (1 478.1 with them) — the bar set for the mode, a call not slower
+  than that set, is missed by 3.1 µs (+0.20 % ± 0.07): the mode stays off, and the m-tile loops are not brought into
+  its kernel. Below `_SUM_MIN_ROWS` rows (512 as served) a call of the mode runs the launch with the separate sum; with
+  the sum inside there as well it reads 820.0 / 714.5 µs at 256 / 128 rows, 9.1 / 4.6 µs under the served set — the
+  threshold is the separate kernels' rule and is not changed. Like the separate FC2 kernel with its sum items, this
+  launch waits for as long as a kernel of another stream holds one of its SMs
+  (`test_persistent_watchdog_sm120.py --ws 40`): mode 30 does not.
 
 ### `dsv41-nightly-df3bd094-r33` — 2026-11-12 (commit `7cadfa3`)
 `-r32` bit for bit in its environment state, plus the following — every switch and key of it off by default in the

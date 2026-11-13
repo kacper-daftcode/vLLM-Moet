@@ -36,10 +36,19 @@ watchdog. The cases, on the dumps of a real prefill, in the served switch set wi
                   them - passes with the warning and is refused under --strict-record; and the count of SMs to hold on a list
                   written by hand.
 
-  python3 test_persistent_watchdog_sm120.py --dumps DIR [--case beside|hold|trap] [--watchdog-ms N] [--strict-record]
+  python3 test_persistent_watchdog_sm120.py --dumps DIR [--case beside|hold|trap] [--ws 30|40] [--watchdog-ms N] [--strict-record]
   python3 test_persistent_watchdog_sm120.py --case criteria
 (DIR: weights_layer2.pt, call1_layer2.pt.) Exit 0 only if the case behaves as described. The persistent launch has no activation
 counter of its own: its calls are told by the counters of the kernels it replaces standing still.
+
+--ws 40 runs the cases on the launch with the top-k sum as its work items (moe_persistent_sum_kernel). Its work list starts with
+the same FC1 items in the same order, so the same hold keeps the same FC1 items out; behind them stand, per pair of column tiles,
+the FC2 items of every expert and then the pair's sum items, which wait for ALL the pair's FC2 items - a held expert's FC2 items
+wait in every pair, and the sum items of every pair wait behind them. So in this mode no CTA leaves while one FC1 item is kept
+out, however few SMs are held: the case `beside` (four SMs) is there a wait that lasts as long as the hold and ends - the launch
+ends no sooner than the hold, without an error, its output is b12x's, the record stays empty - as the case `hold` is in both
+modes (the separate FC2 kernel with its sum items waits for a held SM in the same way). The first wait to expire in the case
+`trap` is again one of an FC2 item for its expert's FC1 items.
 """
 from __future__ import annotations
 
@@ -57,6 +66,7 @@ P = "VLLM_MOET_B12X_MOE_PREFILL_FAST"
 SERVED = {f"{P}_WS1": "9", f"{P}_WS2": "3", f"{P}_SUM_ITEMS": "1", f"{P}_SUM_ROUTE_HINT": "1", f"{P}_SUM_DISCARD": "1",
           f"{P}_SUM_TOKENS": "128", f"{P}_SUM_MIN_ROWS": "512"}
 WS_MODE = 30  # the persistent launch with FC2 items of two column tiles and four ring stages
+WS_SUM_MODE = 40  # the same launch with the top-k sum as its work items (--ws 40)
 ROWS = 4096
 WHOLE_SM = 98560  # bytes of shared memory: a CTA that needs an empty SM
 HOLD_THREADS = 544
@@ -202,6 +212,8 @@ def main() -> int:
     ap.add_argument("--dumps", default=os.environ.get("VLLM_MOET_DUMPS", "dumps"),
                     help="directory with the served model's MoE dumps (weights_layer2.pt, call1_layer2.pt); env VLLM_MOET_DUMPS")
     ap.add_argument("--case", choices=["beside", "hold", "trap", "criteria"], default="beside")
+    ap.add_argument("--ws", type=int, choices=[WS_MODE, WS_SUM_MODE], default=WS_MODE,
+                    help="the persistent mode of this process: 30 (the separate top-k sum follows the launch) or 40 (the top-k sum as the launch's work items)")
     ap.add_argument("--watchdog-ms", type=int, default=0, help="_WS_WATCHDOG_MS of this process (0: what the environment says, else as built)")
     ap.add_argument("--strict-record", action="store_true",
                     help="the case trap: a record whose last three words (SM, block, watchdog ms) did not reach the host is a failure, not a warning")
@@ -209,9 +221,9 @@ def main() -> int:
     if a.case == "criteria":
         return criteria_case()
     os.environ.update(SERVED)
-    os.environ[f"{P}_WS"] = str(WS_MODE)
+    os.environ[f"{P}_WS"] = str(a.ws)
     os.environ.setdefault("B12X_DYNAMIC_DETERMINISTIC_OUTPUT", "1")
-    for k in ("MT_LOOPS", "FIRST_CLAIM", "FC1_FZ", "WS_STATS", "WS_MIN_ROWS", "WS_LEAD"):  # the launch as it is by default
+    for k in ("MT_LOOPS", "FIRST_CLAIM", "FC1_FZ", "WS_STATS", "WS_MIN_ROWS", "WS_LEAD", "WS_SUM_LAG"):  # the launch as it is by default
         os.environ.pop(f"{P}_{k}", None)
     if a.watchdog_ms > 0:
         os.environ[f"{P}_WS_WATCHDOG_MS"] = str(a.watchdog_ms)
@@ -235,7 +247,7 @@ def main() -> int:
 
     ext = m._ext()
     mode = int(ext.persistent_mode()) if hasattr(ext, "persistent_mode") else 0
-    if mode != WS_MODE or not hasattr(ext, "moe_prefill_ws_error"):
+    if mode != a.ws or not hasattr(ext, "moe_prefill_ws_error"):
         print(f"FAIL: this build of the extension does not run the persistent launch with a watchdog record (persistent_mode {mode})")
         return 1
     dev = torch.device("cuda")
@@ -283,6 +295,8 @@ def main() -> int:
     chunks = ((per_expert + 15) // 16 + 3) // 4
     n_chunks = max(1, int(chunks.sum().item()))
     n_f1, n_items = int(res[7][1].item()), int(res[7][6].item())
+    if a.ws == WS_SUM_MODE:  # no list of its own: one FC2 item per chunk and pair of 128-column tiles (the sum items are not counted)
+        n_items = n_f1 + n_chunks * (int(x.shape[1]) // 256)
     tiles1, tiles2 = n_f1 // n_chunks, (n_items - n_f1) // n_chunks
     f1_items = [int(v) for v in (tiles1 * chunks).tolist()]
     f2_items = [int(v) for v in (tiles2 * chunks).tolist()]
@@ -385,15 +399,17 @@ def main() -> int:
         bad.append("the output is not b12x's")
     if any(record) or any(raw):
         bad.append(f"the record is not empty: {record}")
-    if error is None and a.case == "hold" and ms < 0.8 * hold_ms:
+    # with the sum items inside (--ws 40) the launch waits for a hold of any size: its sum items wait for every FC2 item of their pair
+    waits = a.case == "hold" or a.ws == WS_SUM_MODE
+    if error is None and waits and ms < 0.8 * hold_ms:
         bad.append(f"the call's launches ended after {ms:.1f} ms: the launch did not wait for the hold")
-    if error is None and a.case == "beside" and ms > 0.5 * hold_ms:
+    if error is None and not waits and ms > 0.5 * hold_ms:
         bad.append(f"the call's launches ended after {ms:.1f} ms: the launch waited for the hold")
     print(f"{a.case}: error {error!r}; the call's launches ended after {ms:.1f} ms (the hold: {hold_ms} ms on {sms_text}{held}); output "
           f"identical to b12x: {same}; watchdog record {record}")
     for b in bad:
         print(f"  not as described: {b}")
-    what = ("the launch beside four held SMs does not wait for them: no trap, the output is b12x's, the record stays empty" if a.case == "beside"
+    what = ("the launch beside four held SMs does not wait for them: no trap, the output is b12x's, the record stays empty" if not waits
             else f"a wait that lasts {hold_ms} ms under a watchdog of {watchdog_ms} ms: no trap, the output is b12x's, the record stays empty")
     print(f"{'PASS' if not bad else 'FAIL'}: persistent watchdog, case {a.case} ({what})", flush=True)
     if error is not None:
