@@ -26,6 +26,12 @@ DEFAULT_PATH = Path(
 MARKER = "[vllm-moet] b12x compact bind"
 
 CLASS_ANCHOR = "@dataclass(frozen=True)\nclass TPMoEScratchPlan:\n"
+# The rule of the cache the helper below keeps (held by test_b12x_plan_dicts.py; the helper's text is unchanged):
+# _MOET_COMPACT_LAUNCHES gets one entry per plan that was ever bound, the entry HOLDS the plan, and nothing evicts it.
+# vLLM's B12xExperts._plans, which hands the plans out (one per layer and distinct row count), is never evicted either,
+# so the two grow together and stop together. WHOEVER BOUNDS ONE OF THE TWO BOUNDS THE OTHER IN THE SAME CHANGE: an
+# eviction from _plans alone frees nothing, because every plan stays alive here; and the helper's `hit[0] is not plan`
+# test must stay, because the id of an evicted plan can be handed to a new one.
 HELPER = f'''# {MARKER}: compact W4A8 launchers for plans bound through the tensor-based API.
 _MOET_COMPACT_LAUNCHES: dict[int, tuple[object, object]] = {{}}
 
