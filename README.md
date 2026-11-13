@@ -14,6 +14,7 @@ behind a runtime switch.
 | **Kimi-K3 + DSpark on 8× B300 (HGX, sm_103)** | the official v0.32.0 image with what DSpark needs on a hybrid KDA / MLA model: RecoverSSM admitted next to KV offload (the pool back from 19.3M to 21.6M tokens), the RedHat sliding-window draft under DCP8 with prefix caching | superseded by K3.1 on the same host (2026-11-04); rollback kept | [docs/k3-b300-dspark-kv.md](docs/k3-b300-dspark-kv.md) |
 | **Kimi-K3.1-Pro + DSpark on 8× B300 (HGX, sm_103)** | the day-0 `kimi-k31` image with its specialized decode path unlocked on a 148-SM B300 (the persistent experts grid was sized for GB300's 152 SMs): single-stream 252 vs 143 tok/s, 8K C=32 61.5 vs 48.4 tok/s per session at the same acceptance and GSM8K | **active, served** | [docs/benchmarks/k31-b300-2026-11-04.md](docs/benchmarks/k31-b300-2026-11-04.md) |
 | **Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000** | Ricursive's 65B dense model with its DFlash2 drafter on vLLM main: the TP all-reduces on the PCIe P2P push, the draft length by batch size, the drafter at the schedule's k, two microbatches at 16+ requests; code ~630 tok/s single stream, ~3050 aggregate at 8 requests, ~5100 at 32 on the NVFP4 checkpoint, ~740 / ~3350 / ~5800 with an optional derived checkpoint (attention projections in MXFP8) | serving | [docs/ripple-sm120.md](docs/ripple-sm120.md) |
+| **Inkling-2-Small on 4× RTX PRO 6000** | Thinking Machines' 594B MoE with the experts of layers 40–47 repacked from MXFP8 to six bits (e2m3: 62–65 % of the weights exact; a six-layer cut matches the released weights' greedy tokens, GSM8K-200 193/200) so that four 96 GB cards hold it; the day-0 image is sm_100 only: the expert GEMM and the relative attention on `mma.sync`; code ~500 tok/s at 1 request, ~4200 at 32 with the DSpark draft | as built and measured | [docs/inkling2-sm120.md](docs/inkling2-sm120.md) |
 
 ## Results, as served
 
@@ -46,6 +47,23 @@ derived checkpoint with the attention projections in MXFP8, the second the NVFP4
 | fresh prefill | 19K tokens in 2.2 s, 163K in 28.5 s, 391K in 106 s | 2.4 s, 31 s, 112 s |
 | KV cache | 3.27M / 3.14M tokens on the GPUs (bf16) | 3.17M |
 | quality | GSM8K-200 194/200, needle 6/6 at 28K / 105K / 399K, tool calls / JSON pass; on the NVFP4 checkpoint the steps keep stock vLLM's numerics (step 1 reproduces NCCL's bits, greedy parity identical) | GSM8K-200 193/200 |
+
+### 4× RTX PRO 6000: Inkling-2-Small
+
+Inkling-2-Small with the experts of layers 40–47 held in six bits (e2m3) instead of the checkpoint's MXFP8 — 5.7 GiB
+less per card, 62–65 % of those weights exact and the rest within −38 dB; against the released weights a six-layer
+cut on one card returns the same greedy tokens and the full model answers 193 of 200 GSM8K questions — on 4× RTX PRO
+6000 at 400 W, image `vllm-moet-sm120:inkling2-b974b306-r13` (TP4 with the experts expert-parallel, 65K context, the
+DSpark draft of 7 tokens, thinking, tool calling, vision; [the doc](docs/inkling2-sm120.md)):
+
+| | vLLM-Moet | the official image on the same cards |
+|---|---|---|
+| decode, 1 stream | code ~500 tok/s at 75 steps/s (6.7 tokens per step), prose ~175; 149 without the draft at 148 steps/s | does not load: its expert GEMM, attention and small-batch linear kernels are sm_100's |
+| decode, 8 streams | code ~1,850 tok/s aggregate, prose ~620 (768 / 677 without the draft) | — |
+| decode, 32 streams | code ~4,200, prose ~1,390 (1,693 / 1,480 without the draft) | — |
+| fresh prefill | 20.9K tokens in 2.4 s (8.7K tok/s), 60.3K in 7.5 s; a 17K-token prefix again in 0.07 s | — |
+| KV cache | 3.3 GiB per card beside 86.9 GiB of weights and draft (4.6 GiB without the draft); a request holds 57 MiB and 8 MiB per 1,000 tokens of context | — |
+| quality | GSM8K-200 193/200 without the draft, with it at 8 requests and with it at 32; needle 4/4 at 29K / 58K, arithmetic 5/5, tool calls / JSON / vision pass | — |
 
 ### 1–4× RTX 5090, 1–2× RTX PRO 6000: DeepSeek-V4.1-Flash as the MoET hybrid
 
@@ -135,6 +153,8 @@ NVMe for the store and, in the NVMe modes, the Engram shards. Knobs, the per-hos
 - The DeepSeek-V4.1 kernels are CUDA C++ compiled into the image, each with an op-level test:
   [`tools/dsv41_sm120/`](tools/dsv41_sm120/README.md). The hybrid's CPU tier, its kernel and tools:
   [`tools/dsv41_5090/`](tools/dsv41_5090/README.md). Qwen3.8's MoE GEMV: `tools/qwen38_sm120/moe_gemv/`.
+  Inkling-2's block-scaled expert GEMM and relative attention on `mma.sync`:
+  [`tools/inkling2_sm120/`](tools/inkling2_sm120/README.md).
 - Host-side benchmark and profiling scripts: [`tools/sm120_perf/`](tools/sm120_perf/README.md).
 - SM120 kernel-design notes from the hardware counters: [docs/sm120-alu-subunits.md](docs/sm120-alu-subunits.md).
 
@@ -148,6 +168,7 @@ NVMe for the store and, in the NVMe modes, the Engram shards. Knobs, the per-hos
 | `Dockerfile.b300-k3`, `tools/k3_b300/`, `docker/b300/run-k3.sh` | Kimi-K3 + DSpark on 8× B300: the image (official v0.32.0 + anchored patchers), the probes and the KV budget model, the launcher |
 | `Dockerfile.b300-k31`, `tools/k3_b300/patch_vllm_k31_experts_grid.py`, `tools/k3_b300/k31/`, `tools/k3_b300/apply_file_patches.py` | Kimi-K3.1-Pro on 8× B300: the day-0 image + the specialized decode's experts grid capped at the device's SM count + three sha256-anchored file patch sets: two for the decode step (the DSpark drafter and the MoE tail; the Markov head across the TP ranks and the sampler chain) and one for what API clients such as Codex send (the `developer` role, tool results the model's encoding cannot name); switches in [tools/k3_b300/README.md](tools/k3_b300/README.md); the same launcher serves both families |
 | `Dockerfile.sm120-ripple`, `tools/ripple_sm120/`, `docker/sm120/run-ripple.sh` | Ripple-65B Preview (the all-reduce module is `tools/dsv41_sm120/p2p_ar/`, shared with DeepSeek) |
+| `Dockerfile.sm120-inkling2`, `tools/inkling2_sm120/`, `docker/sm120/run-inkling2.sh` | Inkling-2-Small: the official day-0 image + the sm_120 steps (kernels, anchored patchers, tests), the launcher |
 | `patch/`, `Dockerfile.sm120-v024`, `Dockerfile.recipes`, `docker/serve_recipe.py`, `bench/`, `kernels/`, `tools/*.py` | the 2-bit line: the generated v0.24.0 patch (never edited by hand), its images, the recipes and the benchmark runner, SASS sources and cubins, its tests |
 | `tools/sm120_perf/` | benchmark and profiling scripts |
 | `docs/` | one doc per line, the benchmark records, the kernel-design notes |

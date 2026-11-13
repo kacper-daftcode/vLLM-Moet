@@ -156,6 +156,23 @@ sets the three marked *served*:
   PCIe P2P push (+14 % at 8 requests); the dynamic draft length 15 / 11 / 7 by batch size. Code 600 / 3050 / 4740 tok/s at
   1 / 8 / 32 requests against stock vLLM's 416 / 2270 at static k 7.
 
+## Inkling-2-Small on 4× RTX PRO 6000
+
+### `inkling2-b974b306-r13` — 2026-11-13
+- Steps 1–9 on the official day-0 image `vllm/vllm-openai:inkling-2-small` (vLLM `0.1.dev25249+gb974b306f`), which does
+  not load the model on sm_120: the MoE's expert GEMM on block-scaled `mma.sync` (NVFP4, MXFP8, MXFP8 × e2m3), the
+  relative attention of decode / verify / draft / prefill in one `mma.sync` kernel, the small-batch linears and the
+  router's partials within 99 KB of shared memory, the vision tower's forward, a TP group's embedding, the draft's
+  argmax and K / V write without the compiled library's kernels (no sm_120 images), the all-reduce push (built in,
+  off: 4 % slower than PyNCCL at one request on this model), the draft's CUDA graphs by the draft schedule.
+- The experts of layers 40–47 packed from MXFP8 to six bits as they load (`MXFP6=1`, the launcher's default: 5.7 GiB
+  less per card - what four 96 GB cards need beside a KV cache; a numerics change of those layers); an expert loader
+  that holds no second copy of a tensor on the card and releases the checkpoint's file pages as it goes.
+- With the DSpark draft at every batch size (the launcher's default): code 481–512 tok/s at one request, 1777–1893
+  at 8, 3050 at 16, 4190–4237 at 32 (149 / 768 / 1077–1114 / 1692–1694 without it); prose 167–193 / 599–643 /
+  982–1021 / 1386 (149 / 677 / 987–1118 / 1478–1481); a fresh prefill of 20.9K tokens at 8.7K tok/s, of 60.3K at
+  8.0K; GSM8K-200 193/200 without the draft, with it at 8 requests and with it at 32.
+
 ## Qwen3.8-Flash-Next-FP8 on 4× RTX PRO 6000
 
 ### `qwen38-20073` — 2026-09-19
