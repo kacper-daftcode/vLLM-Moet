@@ -53,9 +53,9 @@ bases). The changes behind it:
 input's all-gather alone 15 %), the MoE **19 %** (0.94 ms per layer-chunk against a 0.83 ms DRAM floor), the
 sparse-MLA prefill kernel **13 %** (BF16, one CTA per SM, latency-bound), CUTLASS MXFP8 **9 %**, cuBLAS bf16 4 %,
 GPU idle 2 %. The steps that took it from ~15.5 s (the official image) through ~8.5–9 s (newer vLLM bases: the SWA
-bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.29 s with
-step 42's later kernels (−2 %), the host's CPU governor `performance` (−5.49 %) and the attention chunks on the
-`v43c` cubin (−2.6 %):
+bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.08 s with
+step 42's later kernels (−2 %), the host's CPU governor `performance` (−5.49 %), the attention chunks on the
+`v43c` cubin (−2.6 %) and step 42's m-tile loops with FC2 on 256 CTAs (−2.7 %):
 
 - **Step 40** — the V4.1-record prefill rows on sm_120 went through FlashInfer's single-group FP8 kernel (Q, QK, P and
   PV in FP8; H100 / B200 compute the same attention in BF16). The full-BF16 SM120 kernel FlashInfer also ships is 24×
@@ -139,8 +139,9 @@ was measured with 2 (grid 376): … registers per thread …` when a kernel of t
 fewer CTAs per SM than its mode was measured with. `VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_STRICT=1`
 refuses such a launch instead (a debug switch); the check changes no launch.
 
-**The m-tile loops.** `_MT_LOOPS=1` (off by default) launches the served FC1 / FC2 kernels with the
-consumers' stage loop specialised on the item's m-tiles. The served loops run the QMMAs of an m-tile
+**The m-tile loops.** `_MT_LOOPS=1` (off by default in the image; on as served, through its runtime key)
+launches the FC1 / FC2 kernels of `_WS1=9` / `_WS2=3` with the consumers' stage loop specialised on the item's
+m-tiles. Without the switch the loops run the QMMAs of an m-tile
 under a warp-uniform predicate, and a QMMA under a false predicate keeps its stall and its place in the
 tensor pipe's issue throttle (eight warps per SM issue 614 M QMMA slots per second when every slot
 executes and 658 M when none does), so an item pays for four m-tiles whatever it has: at 4 096 rows of a
@@ -149,12 +150,16 @@ the four. With the switch an item branches once to a loop that holds only its ow
 QMMAs: the same QMMAs on the same operands in the same order per accumulator, identical on the harness
 in every mode. FC2's specialised kernel is built for two CTAs per SM (92 registers per thread; the
 warning above covers it as `fc2_kernel_ws_mt<4, 2>`). On one card the loops make the MoE call's kernels
-6.9 % shorter. In the served forward they are bit-identical and worth 0.19–0.32 % of a 163K prefill at a
-400 W limit, 1.1–1.3 % at 300 W, and 0.84 % at 400 W when the two row groups run one after the other:
-the pipelined step is paced by the communication phase that runs beside the MoE, not by the MoE — the
-compute stream waits about 0.6 ms after every MoE call for that phase to end, 24 ms of a 239-ms step,
-and a shorter MoE lengthens the wait. The arms:
-[record](benchmarks/dsv41-sm120-steps-2026-11-10.md#step-42--the-prefill-moe-kernels).
+6.9 % shorter. In the forward of a serving server they are bit-identical, and what they are worth of a
+163K prefill depends on the host and its power limit: 1.33 % ± 0.13 % and 1.49 % ± 0.19 % on the reference
+host, in its power cap at 400 W; on the second host 0.19–0.32 % at a 400 W limit, 1.1–1.3 % at 300 W, and
+0.84 % at 400 W when the two row groups run one after the other. On the second host at 400 W the pipelined
+step is paced by the communication phase that runs beside the MoE, not by the MoE — the compute stream
+waits about 0.6 ms after every MoE call for that phase to end, 24 ms of a 239-ms step, and a shorter MoE
+lengthens the wait. On the reference host the rank with the longest MoE segment ends its glue with that
+segment, and a shorter MoE shortens the slot. The series:
+[the second host](benchmarks/dsv41-sm120-steps-2026-11-10.md#step-42--the-prefill-moe-kernels),
+[the reference host](benchmarks/dsv41-sm120-stage-2026-11-13.md#where-the-pipelined-step-waits-with-the-m-tile-loops-on).
 
 **The first claim.** `_FIRST_CLAIM=1` (off by default) launches the served FC1 / FC2 kernels with every
 CTA claiming its first work item from the work counter, as it claims every later one. In the served
@@ -191,10 +196,17 @@ a CTA of the kernel. What a cap buys is room for what runs beside the MoE in a p
 for them to exit, and a collective, which needs empty SMs, waits for FC2 to end. What it costs is FC2's
 own time, which grows as the grid shrinks — little while every SM keeps a CTA, in proportion below that.
 
+As served FC2 runs under a cap of 256, set through its runtime key: of the 188 SMs, 68 keep two FC2 CTAs and
+120 one. On one card that cap is a cost — a 4 096-row call with the m-tile loops takes 1 535.8 instead of
+1 478.1 µs. In the pipelined step on the reference host, four cards in their power cap, it is the larger of
+the two gains, 1.943 % ± 0.375 % of a 163K prefill; the second host reads 1.46–1.62 % at a 400 W limit and
+1.91–1.97 % at 300 W
+([record](benchmarks/dsv41-sm120-stage-2026-11-13.md#the-same-levers-on-the-second-host-and-on-one-card)).
+
 ### Step 42b — the runtime keys
 
-The runtime switch between the bit-identical kernel alternatives of step 42, for paired A/B
-measurements in one server lifetime.
+The runtime switch between the bit-identical kernel alternatives of step 42: for paired A/B
+measurements in one server lifetime, and for a state that a server keeps when the file is removed.
 With `VLLM_MOET_RUNTIME_AB=1` every rank reads the control file — one flat JSON object switch → value,
 written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/vllm_moet_ab.json'` — at
 most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the
@@ -212,12 +224,28 @@ The two states of every key are bit-identical alternatives.
 The launcher runs the container with the host's IPC namespace, so the control file is a file of the
 host's `/dev/shm` and outlives the server: a file left behind is applied by the next server at its
 first prefill, and removing a file keeps the state it last set until a restart. Write `{}` before
-removing it, unless the state is meant to stay (as served: the attention cubin's key, step 46b). With
+removing it, unless the state is meant to stay (as served: the attention cubin's key of step 46b, the m-tile
+loops and FC2's grid cap of step 42). With
 the switch on the launcher refuses to start while a control file exists in the host's
 `/dev/shm` (`RUNTIME_AB_KEEP_FILE=1` starts anyway). The watchdog, before it restarts a server that died
 with its file in place, moves the file aside (`<file>.stale-<UTC>`, one line in its log): the restart
 comes up in the environment's state. `SERVED=1` turns the switch on with no control file: every key is
 in its environment's state (one warning per rank and module that the file is missing).
+
+**A key and its environment switch.** For a call that the host issues, a key and the environment switch of
+the same name set the same variable before the same launch. The m-tile loops' kernels are chosen at every
+launch from the key's value when the file carries one and from the environment's otherwise
+(`test_mt_loops_sm120.py --case runtime|env`: the same two kernels either way, identical to b12x from 4 096
+to 256 rows); a grid cap is taken per call, behind the poll of the same call — the file's value when it
+carries one, the environment's otherwise (`test_grid_keys_sm120.py`). A launch recorded into a CUDA graph is
+another matter: it keeps the kernel and the grid of its capture. The 128-row replay layers of step 47, and
+any other MoE call of more than 8 rows that a graph holds, are captured when the server starts, with what
+the environment says then, whatever a key says later. A state written through keys into a running server
+therefore has the two levers on its eager calls and not in its graphs; a server started with
+`VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS=1` and `VLLM_MOET_B12X_MOE_PREFILL_FAST_GRID2=256` has them in
+both. Both run kernels that their tests hold identical to b12x. The first state is the one that is served
+and that was measured in a server; the second has no series and no bit check in a server
+([record](benchmarks/dsv41-sm120-stage-2026-11-13.md#what-is-not-known-and-what-is-not-claimed)).
 
 The activation counters (calls / rows through FC1 v10 vs v8/v9, FC2 with the sum items vs with the
 separate sum kernel, and FC1 / FC2 with the m-tile loops) are printed per rank every

@@ -29,9 +29,28 @@ the release tag that points at it.
   launch waits for as long as a kernel of another stream holds one of its SMs
   (`test_persistent_watchdog_sm120.py --ws 40`): mode 30 does not.
 
+### `dsv41-nightly-df3bd094-r33`, two runtime keys of step 42 set as served — 2026-11-13 (no new image)
+The image, its environment and `SERVED=1` are unchanged. Beside the attention cubin's key, two keys of step 42b's
+control file are set in the serving server: the m-tile loops (`B12X_MOE_PREFILL_FAST_MT_LOOPS` = 1) and a cap of
+256 CTAs on FC2 (`B12X_MOE_PREFILL_FAST_GRID2` = 256). They are a state of the running server: a start comes up
+without them, and `docs/dsv41-sm120.md` ("Switches") has the commands that set the three keys.
+- Measured in the serving server on top of `v43c`, paired series read by order, 163K | 19K: the m-tile loops
+  −1.329 % ± 0.127 | −1.243 % ± 1.052 (8 pairs), FC2 on 256 CTAs −1.943 % ± 0.375 | −1.256 % ± 0.625 (6 pairs), the
+  loops under that cap against the cap alone −1.131 % ± 0.361 | −1.302 % ± 1.086 (8 pairs). long_agree and agree in
+  the state that stayed: identical.
+- That state against the one before it, runs with no other request in flight in one server life: fresh prefill
+  163K 5.08 s against 5.21 s — 2.67 % less at the same card temperature (95 %: 2.32 … 3.03; 17 runs against 30) —,
+  19K 0.63 s, with no number claimed against the state before.
+- Not known: why the first step of a 163K prefill was 17 – 28 ms longer in the 40 minutes after the keys were set
+  (86 minutes after, it was not). Not measured: a server started with the two levers in its environment — a key
+  does not reach the launches captured into CUDA graphs at start, an environment switch does —, another card model,
+  another power limit. On one card the cap is a cost, and the second host at a 400 W limit reads 0.14 – 0.25 % for
+  the loops and a loss for the loops under the cap — [record](docs/benchmarks/dsv41-sm120-stage-2026-11-13.md).
+
 ### `dsv41-nightly-df3bd094-r33` — 2026-11-12 (commit `7cadfa3`)
 `-r32` bit for bit in its environment state, plus the following — every switch and key of it off by default in the
-image and off as served. `SERVED=1` changes in one entry: the second attention cubin it names is `v43c`.
+image and, when the image was released, off as served but for the cubin's key (what is served now: the entry above).
+`SERVED=1` changes in one entry: the second attention cubin it names is `v43c`.
 - Step 42, switches and runtime keys of the prefill MoE: the m-tile loops (`VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS`);
   the first claim of a work item (`…_FIRST_CLAIM`), with the watchdog record of the prefill MoE reported as set whenever
   it is filled; the grid caps of FC1 / FC2 as runtime keys (`…_GRID1` / `…_GRID2`), their tokens in the stats line; the
