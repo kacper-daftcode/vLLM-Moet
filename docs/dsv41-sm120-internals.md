@@ -53,9 +53,9 @@ bases). The changes behind it:
 input's all-gather alone 15 %), the MoE **19 %** (0.94 ms per layer-chunk against a 0.83 ms DRAM floor), the
 sparse-MLA prefill kernel **13 %** (BF16, one CTA per SM, latency-bound), CUTLASS MXFP8 **9 %**, cuBLAS bf16 4 %,
 GPU idle 2 %. The steps that took it from ~15.5 s (the official image) through ~8.5–9 s (newer vLLM bases: the SWA
-bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.08 s with
+bounded replay, the indexer's row sharding) to 7.2 s and on to 5.6–5.8 s; the served configuration is at 5.12 s with
 step 42's later kernels (−2 %), the host's CPU governor `performance` (−5.49 %), the attention chunks on the
-`v43c` cubin (−2.6 %) and step 42's m-tile loops with FC2 on 256 CTAs (−2.7 %):
+`v43c` cubin (−2.6 %) and step 42's m-tile loops with FC2 on 256 CTAs (−2.6 %):
 
 - **Step 40** — the V4.1-record prefill rows on sm_120 went through FlashInfer's single-group FP8 kernel (Q, QK, P and
   PV in FP8; H100 / B200 compute the same attention in BF16). The full-BF16 SM120 kernel FlashInfer also ships is 24×

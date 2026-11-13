@@ -39,13 +39,14 @@ without them, and `docs/dsv41-sm120.md` ("Switches") has the commands that set t
   loops under that cap against the cap alone −1.131 % ± 0.361 | −1.302 % ± 1.086 (8 pairs). long_agree and agree in
   the state that stayed: identical.
 - That state against the one before it, runs with no other request in flight in one server life: fresh prefill
-  163K 5.08 s against 5.21 s — 2.67 % less at the same card temperature (95 %: 2.32 … 3.03; 17 runs against 30) —,
-  19K 0.63 s, with no number claimed against the state before.
-- Not known: why the first step of a 163K prefill was 17 – 28 ms longer in the 40 minutes after the keys were set
-  (86 minutes after, it was not). Not measured: a server started with the two levers in its environment — a key
-  does not reach the launches captured into CUDA graphs at start, an environment switch does —, another card model,
-  another power limit. On one card the cap is a cost, and the second host at a 400 W limit reads 0.14 – 0.25 % for
-  the loops and a loss for the loops under the cap — [record](docs/benchmarks/dsv41-sm120-stage-2026-11-13.md).
+  163K 5.12 s against 5.21 s — 2.56 % less at the same card temperature (95 %: 2.25 … 2.86; 29 runs against 30) —,
+  19K 0.64 s, with no number claimed against the state before.
+- Not known: whether the first step of a 163K prefill is longer in that state — +3 ms by the medians of all clean
+  runs (95 %: +0 … +13), +5 ms by the means, and the series of one state differ by more. Not measured: a server
+  started with the two levers in its environment — a key does not reach the launches captured into CUDA graphs at
+  start, an environment switch does —, another card model, another power limit. On one card the cap is a cost, and
+  the second host at a 400 W limit reads 0.14 – 0.25 % for the loops and a loss for the loops under the cap —
+  [record](docs/benchmarks/dsv41-sm120-stage-2026-11-13.md).
 
 ### `dsv41-nightly-df3bd094-r33` — 2026-11-12 (commit `7cadfa3`)
 `-r32` bit for bit in its environment state, plus the following — every switch and key of it off by default in the
