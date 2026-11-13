@@ -16,7 +16,8 @@ One wave per (mode, concurrency): C concurrent streaming chat requests (thinking
 usage:
   spec_matrix.py --base http://127.0.0.1:8001 --model deepseek-ai/DeepSeek-V4.1-Flash \
       [--concurrencies 1,4,8] [--modes prose,code] [--output-tokens 512] [--repeats 2] \
-      [--metrics-url http://127.0.0.1:8001/metrics] [--label k5] --out results.json
+      [--metrics-url http://127.0.0.1:8001/metrics] [--label k5] \
+      [--chat-template-kwargs '{"reasoning_effort": "none"}'] --out results.json
 """
 from __future__ import annotations
 
@@ -51,6 +52,12 @@ def parse_args():
     ap.add_argument("--metrics-url", default="")
     ap.add_argument("--label", default="")
     ap.add_argument("--timeout", type=int, default=600)
+    ap.add_argument(
+        "--chat-template-kwargs",
+        default='{"thinking": false}',
+        help='JSON of the request\'s chat_template_kwargs: how the model\'s template turns thinking off '
+        '(default {"thinking": false}; Inkling: {"reasoning_effort": "none"})',
+    )
     ap.add_argument("--out", required=True)
     return ap.parse_args()
 
@@ -90,7 +97,7 @@ def one_request(args, prompt: str, wave_start: float) -> dict:
         "ignore_eos": True,
         "stream": True,
         "stream_options": {"include_usage": True},
-        "chat_template_kwargs": {"thinking": False},
+        "chat_template_kwargs": json.loads(args.chat_template_kwargs),
     }
     headers = {"Content-Type": "application/json"}
     if args.api_key:

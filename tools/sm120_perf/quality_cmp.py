@@ -10,6 +10,7 @@ Greedy everywhere. Run once per serving stack, then compare_outputs.py on the tw
   vision       red circle + blue square 3024x588 PNG (0xSero boot.py smoke)
   needle       6-digit code at depth 0.2/0.7 in ~29K / ~106K / ~400K token prompts (vLLM-Moet needle_any)
 usage: quality_cmp.py --base URL --model NAME --out FILE [--api-key KEY] [--skip needle,vision] [--needle-sizes 29000,106000,400000]
+                      [--think-off JSON] [--think-on JSON]   (the model's chat_template_kwargs for thinking off / on)
 """
 import argparse
 import base64
@@ -94,7 +95,7 @@ class Client:
 
     def chat(self, messages, max_tokens, thinking=False, **extra):
         body = dict(model=self.model, messages=messages, max_tokens=max_tokens, temperature=0,
-                    chat_template_kwargs={"thinking": thinking})
+                    chat_template_kwargs=self.think_kwargs[bool(thinking)])
         body.update(extra)
         return self.post("/v1/chat/completions", body)
 
@@ -233,9 +234,14 @@ def main():
     ap.add_argument("--skip", default="")
     ap.add_argument("--needle-sizes", default="29000,106000,400000")
     ap.add_argument("--label", default="")
+    ap.add_argument("--think-off", default='{"thinking": false}',
+                    help='chat_template_kwargs that turn thinking off (Inkling: {"reasoning_effort": "none"})')
+    ap.add_argument("--think-on", default='{"thinking": true}',
+                    help='chat_template_kwargs that turn thinking on (Inkling: {"reasoning_effort": "high"})')
     a = ap.parse_args()
     skip = set(filter(None, a.skip.split(",")))
     c = Client(a.base, a.model, a.api_key)
+    c.think_kwargs = {False: json.loads(a.think_off), True: json.loads(a.think_on)}
     res = dict(label=a.label, base=a.base, model=a.model, started=time.strftime("%Y-%m-%dT%H:%M:%S"))
     tests = [("arith_nothink", lambda: t_arith(c, False)), ("arith_think", lambda: t_arith(c, True)),
              ("coherence", lambda: t_coherence(c)), ("agreement", lambda: t_agreement(c)),
