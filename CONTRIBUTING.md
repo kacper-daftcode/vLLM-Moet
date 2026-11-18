@@ -9,6 +9,7 @@
 | 2-bit experts on vLLM v0.24.0 | frozen | the fork branch `moet-v0.24.0` of [`kacper-daftcode/vllm-tmp`](https://github.com/kacper-daftcode/vllm-tmp) — **not** `patch/` |
 | Qwen3.8-Flash-Next-FP8 | as built | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` |
 | Ripple-65B Preview on 4× RTX PRO 6000 | serving | `tools/ripple_sm120/` + a step in `Dockerfile.sm120-ripple` |
+| Inkling-2-Small on 4× RTX PRO 6000 | as built and measured | `tools/inkling2_sm120/` + a step in `Dockerfile.sm120-inkling2` |
 
 The frozen line takes fixes, not features: open the pull request against the fork branch; the patch
 file in `patch/` is generated from it (`tools/check_patch_files.py --update`) and a PR that edits

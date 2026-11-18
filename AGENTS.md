@@ -13,6 +13,7 @@ tree correct and readable; the maintainers' operational notes live outside the r
 | 2-bit experts on vLLM v0.24.0 (frozen) | the fork branch `moet-v0.24.0` of [`kacper-daftcode/vllm-tmp`](https://github.com/kacper-daftcode/vllm-tmp); `patch/` is **generated** from it | the procedure below — never the patch file |
 | Qwen3.8-Flash-Next-FP8 | `tools/qwen38_sm120/` + `Dockerfile.sm120-qwen38` | as the first line |
 | Ripple-65B Preview (NVFP4) on 4× RTX PRO 6000 | `tools/ripple_sm120/` + `Dockerfile.sm120-ripple` (+ `tools/dsv41_sm120/p2p_ar/`, shared) | as the first line; steps numbered from 0 (the vLLM wheel) |
+| Inkling-2-Small on 4× RTX PRO 6000 | `tools/inkling2_sm120/` + `Dockerfile.sm120-inkling2` (+ `tools/dsv41_sm120/p2p_ar/` and the Ripple line's all-reduce hook, shared) | as the first line; the base is the official day-0 image, steps numbered from 0 (the base check) |
 
 ## The iron rule
 

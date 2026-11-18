@@ -1,0 +1,159 @@
+# vLLM-Moet: Inkling-2-Small (thinkingmachines; 594B total / 17B active, 48 layers, 384 experts top-8: NVFP4 experts in
+# layers 0-39, MXFP8 in 40-47, everything else BF16; a DSpark draft in the same checkpoint) on sm_120
+# (4x RTX PRO 6000 Blackwell), TP4 with the experts expert-parallel over the TP group.
+# Launcher: docker/sm120/run-inkling2.sh; docs: docs/inkling2-sm120.md.
+#
+# The base is the official day-0 image vllm/vllm-openai:inkling-2-small (vLLM 0.1.dev25249+gb974b306f, torch 2.14.0,
+# FlashInfer 0.7.3, CUDA 13.0). Its Inkling2 runs on kernels written for sm_100 - FlashInfer's TRT-LLM-gen cubins for
+# the expert GEMMs, a Triton Gluon tcgen05 kernel and tml_fa4's sheared-bias forward for the attention, FlashInfer's
+# CuTe DSL kernels for the small-batch linears, Triton tiles sized for 227 KB of shared memory, a compiled library
+# (vllm/_C) whose 86 cubins are sm_80 / sm_89 / sm_90 / sm_100 - so on capability 12 the model does not load, and
+# past the load no forward runs. Steps 1-4 are what sm_120 needs to serve the model at
+# all, steps 5-7 what a TP group of sm_120 cards without NVLink needs, steps 8-9 what the DSpark draft needs. Steps are numbered like the other lines' (a build arg each,
+# a com.vllm-moet.inkling2.* label the launcher and the tests read); patchers are anchored on the installed files'
+# text and refuse any other version; the kernels are compiled here so that no serving process builds them.
+#
+#   DOCKER_BUILDKIT=1 docker build -f Dockerfile.sm120-inkling2 -t vllm-moet-sm120:inkling2-b974b306-r13 .
+#   MODEL_DIR=/srv/models/Inkling-2-Small docker/sm120/run-inkling2.sh
+
+ARG BASE_IMAGE=vllm/vllm-openai:inkling-2-small@sha256:a710ed3b5eba4e205fa1904cae57444446ead088bac575423f9b4a392a9a80a5
+FROM ${BASE_IMAGE}
+
+# 0. The base as it is: the registry check fails the build if the architecture, its parsers or the draft class are
+#    missing (another base).
+RUN python3 -c "import vllm; assert vllm.__version__.startswith('0.1.dev25249+gb974b306f'), vllm.__version__; print('vllm', vllm.__version__)" \
+    && python3 -c "import importlib.util as u, os, vllm; d = os.path.dirname(vllm.__file__); need = ['models/inkling2/moe.py', 'models/inkling2/ops/trtllm_bmm.py', 'models/inkling2/ops/block_scales.py', 'models/inkling2/ops/attention.py', 'models/inkling2/ops/linear.py', 'models/inkling2/dspark.py', 'third_party/tml_fa4/flash_fwd_sm120.py', 'model_executor/layers/vocab_parallel_embedding.py']; missing = [n for n in need if not os.path.exists(os.path.join(d, n))]; assert not missing, missing; print('inkling2 model files present')"
+
+ENV TORCH_EXTENSIONS_DIR=/opt/vllm-moet/torch_extensions
+
+# The kernels of steps 1, 2, 3 and 7 are compiled first and their patchers applied after, so that a change of a
+# patcher does not compile a kernel again; each pair stands under its step's build arg.
+ARG VLLM_MOET_INKLING2_BMM_PATCH=1
+ARG VLLM_MOET_INKLING2_ATTN_PATCH=1
+ARG VLLM_MOET_INKLING2_LINEAR_PATCH=1
+ARG VLLM_MOET_INKLING2_VISION_FA4_PATCH=1
+ARG VLLM_MOET_INKLING2_TP_EMBEDDING_PATCH=1
+ARG VLLM_MOET_INKLING2_DSPARK_ARGMAX_PATCH=1
+ARG VLLM_MOET_INKLING2_P2P_AR_PATCH=1
+ARG VLLM_MOET_INKLING2_CACHE_FLASH_PATCH=1
+ENV VLLM_MOET_P2P_AR_H=4608
+COPY tools/inkling2_sm120/bmm/ /opt/vllm-moet/inkling2_sm120/bmm/
+RUN if [ "$VLLM_MOET_INKLING2_BMM_PATCH" = "1" ]; then python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/inkling2_sm120/bmm'); import inkling2_bmm_sm120 as m; e = m._ext(); assert hasattr(e, 'bmm_run') and hasattr(e, 'qmma_probe'); print('sm120 expert GEMM extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_inkling2_bmm_sm120/*.so; fi
+COPY tools/inkling2_sm120/attn/ /opt/vllm-moet/inkling2_sm120/attn/
+RUN if [ "$VLLM_MOET_INKLING2_ATTN_PATCH" = "1" ]; then python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/inkling2_sm120/attn'); import inkling2_attn_sm120 as m; e = m._ext(); assert hasattr(e, 'attn_run') and hasattr(e, 'combine_run'); print('sm120 relative attention extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_inkling2_attn_sm120/*.so; fi
+COPY tools/inkling2_sm120/linear/ /opt/vllm-moet/inkling2_sm120/linear/
+RUN if [ "$VLLM_MOET_INKLING2_LINEAR_PATCH" = "1" ]; then python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/inkling2_sm120/linear'); import inkling2_linear_sm120 as m; e = m._ext(); assert hasattr(e, 'linear_run'); print('sm120 small-batch linear extension built')" \
+    && ls /opt/vllm-moet/torch_extensions/vllm_moet_inkling2_linear_sm120/*.so; fi
+COPY tools/dsv41_sm120/p2p_ar/ /opt/vllm-moet/dsv41_sm120/p2p_ar/
+RUN if [ "$VLLM_MOET_INKLING2_P2P_AR_PATCH" = "1" ]; then python3 -c "import sys; sys.path.insert(0, '/opt/vllm-moet/dsv41_sm120/p2p_ar'); import p2p_allreduce_sm120 as m; assert m.H == 4608, m.H; e = m._build(); assert hasattr(e, 'all_reduce_twoshot') and hasattr(e, 'push'); print('sm120 P2P all-reduce extension built for H = 4608')"; fi
+
+# 1. The MoE's batched expert GEMMs on sm_120: a persistent QMMA kernel per format (nvfp4: mma.sync kind::mxf4nvf4
+#    scale_vec::4X m16n8k64; mxfp8: kind::mxf8f6f4 scale_vec::1X m16n8k32) behind vLLM's own `trtllm_bmm.bmm` entry,
+#    the activations' block scales row-major, the expert weights in the kernel's step-major layout (a byte
+#    permutation at load, a few experts at a time: a rank's experts fill the card). Without it the model does not
+#    load on sm_120. Runtime: VLLM_MOET_INKLING2_BMM=0 leaves vLLM's path (other architectures need nothing from
+#    this step); VLLM_MOET_INKLING2_MXFP6=1 (default 0, a documented change of the MXFP8 layers' arithmetic) holds
+#    the MXFP8 experts as e2m3, six bits per value, packed as they load - what four 96 GB cards need to hold the
+#    checkpoint with room for a KV cache.
+COPY tools/inkling2_sm120/patch_vllm_inkling2_bmm_sm120.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_BMM_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_bmm_sm120.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_bmm_sm120.py --check; fi
+
+# 2. The relative attention on sm_120: vLLM's decode / verify / draft kernel is Triton Gluon on tcgen05 and tensor
+#    memory, its prefill kernel tml_fa4's sheared-bias forward - sm_100 instructions both - and the fallback it has
+#    for sm_103 (upstream cute FA4 with a score_mod bias) runs on capability 12 through a forward that takes the page
+#    table and does not read it. One mma.sync kernel (m16n8k16, ldmatrix, cp.async; 64 query rows x steps of 64
+#    keys of the paged cache; the sheared relative logits the prologue writes; split-KV partials and their merge; the
+#    gate and the sink) stands behind vLLM's two entries, `_decode_attention` and
+#    `Inkling2FA4RelAttentionKernel.kernel`. Runtime: VLLM_MOET_INKLING2_ATTN=kernel (default) | ref (the torch
+#    definition of the operation, the tests' oracle; needs --enforce-eager) | 0 (vLLM's path).
+COPY tools/inkling2_sm120/patch_vllm_inkling2_attn_sm120.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_ATTN_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_attn_sm120.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_attn_sm120.py --check; fi
+
+# 3. The linears on sm_120. Batches of up to 32 rows (every projection of a decode step) go to FlashInfer's CuTe DSL
+#    low-M kernels in vLLM, which exist for capabilities 100 / 103 / 107: on capability 12 they take cuBLAS, which
+#    reads these weights at the memory's rate there (an mma.sync kernel of the same operation is built beside it -
+#    one CTA per 32 output columns, K in cp.async stages; it measures no faster, so it is off:
+#    VLLM_MOET_INKLING2_LINEAR_KERNEL=1). The router's K-group partials stay on vLLM's mma.sync Triton kernel for
+#    every batch size, with the stage count that fits 99 KB of shared memory (its TMA kernel for 2048 rows and more
+#    needs 197 KB). Runtime: VLLM_MOET_INKLING2_LINEAR=0 leaves vLLM's path.
+COPY tools/inkling2_sm120/patch_vllm_inkling2_linear_sm120.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_LINEAR_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_linear_sm120.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_linear_sm120.py --check; fi
+
+# 4. The vision tower's attention on sm_120: tml_fa4's mma.sync forward class means to run the Ampere code paths, but
+#    its base constructor overwrites `arch` with the device's, which turns on a TMA output path the kernel has no
+#    atom for, and the compile fails at start-up. The fix vLLM's other copy of that kernel carries (arch = sm_80 after
+#    the base constructor), applied to tml_fa4's copy.
+COPY tools/inkling2_sm120/patch_vllm_inkling2_vision_fa4_sm120.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_VISION_FA4_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_vision_fa4_sm120.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_vision_fa4_sm120.py --check; fi
+
+# 5. The vocabulary-parallel embedding of a TP group on sm_120: with more than one rank vLLM gathers a rank's
+#    embedding rows with one kernel of its compiled library, and the base image's library has no image of that kernel
+#    for capability 12 - its unchecked launch surfaces as "no kernel image is available" at the next torch operation
+#    and the server ends in its first warm-up step. On capability 12 the layer takes the unfused path vLLM has for
+#    quantized embeddings (mask, shift, embedding, all-reduce). Runtime: VLLM_MOET_FUSED_EMBEDDING=1 keeps vLLM's rule.
+COPY tools/inkling2_sm120/patch_vllm_tp_embedding_sm120.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_TP_EMBEDDING_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_tp_embedding_sm120.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_tp_embedding_sm120.py --check; fi
+
+# 6. The DSpark draft's argmax without vLLM's multicast kernel: vLLM gathers the ranks' (max, index) pairs through
+#    multicast Lamport buffers with a kernel of its compiled library and asserts multicast when the group has more
+#    than one rank - four PCIe cards have no multicast, and the library has no image of the kernel for capability 12
+#    at any rank count. There each rank takes the first argmax of its vocabulary shard and the ranks all-gather
+#    (maximum, global index) - the same value as the full row's first argmax. Runtime:
+#    VLLM_MOET_INKLING2_DSPARK_ARGMAX_TP=0 turns it off.
+COPY tools/inkling2_sm120/patch_vllm_inkling2_dspark_argmax_tp.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_DSPARK_ARGMAX_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_dspark_argmax_tp.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_dspark_argmax_tp.py --check; fi
+
+# 7. The TP group's all-reduces on the sm_120 P2P push with NCCL's summation order (runtime switch VLLM_MOET_P2P_AR=1,
+#    default off): the DeepSeek line's p2p_ar module behind the generic hook in GroupCoordinator._all_reduce_out_place
+#    (the Ripple line's step 1), compiled for Inkling2's row width (VLLM_MOET_P2P_AR_H=4608). Without vLLM's fused
+#    multicast all-reduce (NVLink only) every sublayer's partial is all-reduced by PyNCCL: 96 per decode step on the
+#    48 layers plus the draft's.
+COPY tools/ripple_sm120/patch_vllm_p2p_allreduce_tp_sm120.py /opt/vllm-moet/ripple_sm120/patch_vllm_p2p_allreduce_tp_sm120.py
+RUN if [ "$VLLM_MOET_INKLING2_P2P_AR_PATCH" = "1" ]; then python3 /opt/vllm-moet/ripple_sm120/patch_vllm_p2p_allreduce_tp_sm120.py \
+    && python3 -c "import vllm.distributed.parallel_state as p; assert hasattr(p, '_moet_p2p_try_all_reduce'); print('TP all-reduce hook patched')"; fi
+
+# 8. `reshape_and_cache_flash` on sm_120 - the DSpark draft's K / V write: the scatter of a step's keys and values
+#    into the paged cache is one kernel of vLLM's compiled library, and the library has no image of it for capability
+#    12. The target model writes its cache in its own prologue; the draft's layers call the kernel, so a server with
+#    the draft ends in the draft's first forward ("no kernel image is available"). On capability 12 the call goes to
+#    vLLM's Triton kernel of the same operation. Runtime: VLLM_MOET_CACHE_FLASH_C=1 keeps the compiled kernel.
+COPY tools/inkling2_sm120/patch_vllm_cache_flash_sm120.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_CACHE_FLASH_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_cache_flash_sm120.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_cache_flash_sm120.py --check; fi
+
+# 9. The draft's CUDA graphs follow the draft schedule: the draft's query pass is captured as a FULL graph for every
+#    batch size up to max_num_seqs, also with a draft length by batch size (num_speculative_tokens_per_batch_size),
+#    under which the pass never runs at the batch sizes whose length is 0 (the target's graphs already follow the
+#    schedule). A DSpark draft graph holds logits over the vocabulary per request and Markov step: on a card with
+#    86 GiB of weights that memory is the paged cache's. The draft's graphs are captured up to the largest batch size
+#    that drafts. Runtime: VLLM_MOET_DRAFT_GRAPHS_ALL=1 keeps vLLM's rule.
+#    (Its build arg stands here, not with the others above the kernels: a build arg above them compiles them again.)
+ARG VLLM_MOET_INKLING2_DRAFT_GRAPHS_PATCH=1
+COPY tools/inkling2_sm120/patch_vllm_draft_graphs_by_schedule.py /opt/vllm-moet/inkling2_sm120/
+RUN if [ "$VLLM_MOET_INKLING2_DRAFT_GRAPHS_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_draft_graphs_by_schedule.py \
+    && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_draft_graphs_by_schedule.py --check; fi
+
+# The tools and the remaining tests of the line (make_mini_checkpoint.py, the README).
+COPY tools/inkling2_sm120/ /opt/vllm-moet/inkling2_sm120/
+
+ARG BASE_IMAGE
+LABEL org.opencontainers.image.title="vLLM-Moet Inkling-2-Small SM120" \
+      org.opencontainers.image.description="Inkling-2-Small on sm_120: the official vllm/vllm-openai:inkling-2-small image with the sm_120 steps of vLLM-Moet (docs/inkling2-sm120.md)" \
+      com.vllm-moet.inkling2.base="${BASE_IMAGE}" \
+      com.vllm-moet.inkling2.bmm="${VLLM_MOET_INKLING2_BMM_PATCH}" \
+      com.vllm-moet.inkling2.attn="${VLLM_MOET_INKLING2_ATTN_PATCH}" \
+      com.vllm-moet.inkling2.linear="${VLLM_MOET_INKLING2_LINEAR_PATCH}" \
+      com.vllm-moet.inkling2.vision-fa4="${VLLM_MOET_INKLING2_VISION_FA4_PATCH}" \
+      com.vllm-moet.inkling2.tp-embedding="${VLLM_MOET_INKLING2_TP_EMBEDDING_PATCH}" \
+      com.vllm-moet.inkling2.dspark-argmax-tp="${VLLM_MOET_INKLING2_DSPARK_ARGMAX_PATCH}" \
+      com.vllm-moet.inkling2.p2p-ar="${VLLM_MOET_INKLING2_P2P_AR_PATCH}" \
+      com.vllm-moet.inkling2.cache-flash="${VLLM_MOET_INKLING2_CACHE_FLASH_PATCH}" \
+      com.vllm-moet.inkling2.draft-graphs="${VLLM_MOET_INKLING2_DRAFT_GRAPHS_PATCH}"
