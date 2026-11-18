@@ -79,11 +79,11 @@ listens on `127.0.0.1:8002` (`BIND=` for all interfaces). Thinking is set per re
 
 ## Measurements
 
-4× RTX PRO 6000 Blackwell at their 400 W cap, TP4 with the experts expert-parallel, PyNCCL all-reduces, thinking
-off; the experts of layers 40–47 as e2m3 except in the last row. `tools/sm120_perf/spec_matrix.py`: N concurrent
-requests of 512 tokens (256 at 1 and 8 requests in the "no draft" row), aggregate tok/s in the window in which all
-of them stream / per request @ engine steps per second; a range is two waves. Every row with its files:
-[the record](benchmarks/inkling2-sm120-2026-11-13.md).
+4× RTX PRO 6000 Blackwell at their 400 W cap (GDDR7 +5000 MHz), TP4 with the experts expert-parallel, PyNCCL
+all-reduces, thinking off; the experts of layers 40–47 as e2m3 except in the last row.
+`tools/sm120_perf/spec_matrix.py`: N concurrent requests of 512 tokens (256 at 1 and 8 requests in the "no draft"
+row), aggregate tok/s in the window in which all of them stream / per request @ engine steps per second; a range is
+two waves. Every row with its files: [the record](benchmarks/inkling2-sm120-2026-11-13.md).
 
 | configuration | code 1 | code 8 | code 16 | code 32 | prose 1 | prose 8 | prose 16 | prose 32 |
 |---|---|---|---|---|---|---|---|---|
