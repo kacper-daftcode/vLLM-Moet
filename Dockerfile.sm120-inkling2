@@ -68,7 +68,8 @@ RUN if [ "$VLLM_MOET_INKLING2_BMM_PATCH" = "1" ]; then python3 /opt/vllm-moet/in
 #    keys of the paged cache; the sheared relative logits the prologue writes; split-KV partials and their merge; the
 #    gate and the sink) stands behind vLLM's two entries, `_decode_attention` and
 #    `Inkling2FA4RelAttentionKernel.kernel`. Runtime: VLLM_MOET_INKLING2_ATTN=kernel (default) | ref (the torch
-#    definition of the operation, the tests' oracle; needs --enforce-eager) | 0 (vLLM's path).
+#    definition of the operation, the tests' oracle; needs --enforce-eager) | 0 (vLLM's path: for other
+#    architectures only - on capability 12 that path does not run).
 COPY tools/inkling2_sm120/patch_vllm_inkling2_attn_sm120.py /opt/vllm-moet/inkling2_sm120/
 RUN if [ "$VLLM_MOET_INKLING2_ATTN_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_attn_sm120.py \
     && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_attn_sm120.py --check; fi
@@ -79,7 +80,7 @@ RUN if [ "$VLLM_MOET_INKLING2_ATTN_PATCH" = "1" ]; then python3 /opt/vllm-moet/i
 #    one CTA per 32 output columns, K in cp.async stages; it measures no faster, so it is off:
 #    VLLM_MOET_INKLING2_LINEAR_KERNEL=1). The router's K-group partials stay on vLLM's mma.sync Triton kernel for
 #    every batch size, with the stage count that fits 99 KB of shared memory (its TMA kernel for 2048 rows and more
-#    needs 197 KB). Runtime: VLLM_MOET_INKLING2_LINEAR=0 leaves vLLM's path.
+#    needs 197 KB). Runtime: VLLM_MOET_INKLING2_LINEAR=0 leaves vLLM's path (for other architectures only).
 COPY tools/inkling2_sm120/patch_vllm_inkling2_linear_sm120.py /opt/vllm-moet/inkling2_sm120/
 RUN if [ "$VLLM_MOET_INKLING2_LINEAR_PATCH" = "1" ]; then python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_linear_sm120.py \
     && python3 /opt/vllm-moet/inkling2_sm120/patch_vllm_inkling2_linear_sm120.py --check; fi

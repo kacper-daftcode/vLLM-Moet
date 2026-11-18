@@ -7,8 +7,10 @@
 #                        MXFP8 experts in layers 40-47, everything else BF16, mtp.safetensors = the DSpark draft; 394 GB)
 #            GPUS        the four cards of this server, indices or UUIDs (e.g. 4,5,6,7). There is no default: a load
 #                        puts 87 GiB on each card, so the cards are named by whoever knows that they are free. The
-#                        launcher refuses a card that holds a compute process or more than GPU_BUSY_MIB (1024) MiB
-#                        (an `nvidia-smi` query; GPU_CHECK=0 skips it)
+#                        launcher refuses a card that holds a compute process or more than GPU_BUSY_MIB (1024) MiB,
+#                        and a card whose memory reading is not a number (an `nvidia-smi` query). Three settings
+#                        start on a card without that check, each only when given: GPU_CHECK=0, a raised
+#                        GPU_BUSY_MIB, a second --gpus in EXTRA_DOCKER_ARGS. The word `all` is not accepted
 #
 # Fit:       MXFP6 (1)   1 = the MXFP8 experts (layers 40-47) are packed to e2m3, six bits per value, as they load
 #                        (step 1's VLLM_MOET_INKLING2_MXFP6): 5.7 GiB less per card at TP4 - a lossy change of those
@@ -93,6 +95,7 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"
 EXTRA_DOCKER_ARGS="${EXTRA_DOCKER_ARGS:-}"
 
 [[ "$GPUS" =~ ^[A-Za-z0-9-]+(,[A-Za-z0-9-]+)*$ ]] || { echo "GPUS must be a comma-separated list of card indices or UUIDs, got $GPUS" >&2; exit 1; }
+[[ ! ",${GPUS,,}," == *,all,* ]] || { echo "GPUS must name the cards of this server: 'all' is not accepted" >&2; exit 1; }
 [[ -f "$MODEL_DIR/config.json" ]] || { echo "no config.json in MODEL_DIR=$MODEL_DIR" >&2; exit 1; }
 for v in SPEC_TOKENS MAX_NUM_SEQS MAX_NUM_BATCHED_TOKENS MAX_MODEL_LEN TP P2P_AR_ROWS GPU_BUSY_MIB; do
   [[ "${!v}" =~ ^[0-9]+$ ]] || { echo "$v must be a non-negative integer, got ${!v}" >&2; exit 1; }
@@ -118,6 +121,8 @@ if [[ "$GPU_CHECK" == "1" ]]; then
   while IFS=', ' read -r index uuid used; do
     [[ -n "$index" ]] || continue
     pids=$(grep -F "$uuid" <<< "$apps" | cut -d, -f2 | tr -d ' ' | paste -sd' ' -) || true
+    # a reading that is not a number ([N/A], an error word) is not a free card
+    [[ "$used" =~ ^[0-9]+$ ]] || { echo "card $index ($uuid): memory.used reads '$used', not a number" >&2; busy=1; continue; }
     if [[ -n "$pids" || "$used" -gt "$GPU_BUSY_MIB" ]]; then
       echo "card $index ($uuid) is in use: $used MiB${pids:+, compute process(es) $pids}" >&2; busy=1
     fi
