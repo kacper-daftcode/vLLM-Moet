@@ -88,6 +88,16 @@ same condition - which the compiler cannot join, so on the other path the values
 and hold 32 registers of every consumer thread through the stage loops. The `FZ` form zero-fills them at the head of the epilogue; the
 zeros are never read: the same bits, fewer registers per thread. FC2, the other FC1 modes and the calls below `_WS1_MIN_ROWS` rows
 (FC1 v8) are not affected. `fc1_fz_supported()` tells whether the built extension has the kernels.
+
+The twins of the served FC1 / FC2 kernels: `VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT=1|2` (default 0). Four kernels - the served modes'
+(WS1 = 9, WS2 = 3) without and with the m-tile loops - are instantiated twice more in the extension (template parameter `TX`), which
+the compiler turns into the same text as the kernel itself. A build step (`splice_fc_texts.py`) may write a pinned text of a kernel
+- another assembler's schedule of the same instructions, `fc_texts/` with its manifest - over that kernel's `TX = 1` twin. `1`
+launches the twins that carry a pinned text, `2` the twins with the compiler's own text (the same text at a twin's place: what a
+pair needs as its other state), `0` the kernels as before. The key acts only on the kernels whose pinned text this process found in
+its loaded extension (checked once, digest and bytes; `fc_text_mask()`), and only on a call that launches exactly such a kernel -
+not with the first claim, not with `FZ`; every other call launches what it launches without the key. The same instructions on the
+same data: bit-identical alternatives. `fc_text_supported()` tells whether the built extension has the twins.
 """
 from __future__ import annotations
 
@@ -156,9 +166,10 @@ def route_rows_consumed() -> bool:
 #                                   reaches every rank). Keys of this module: B12X_MOE_PREFILL_FAST_SUM_ITEMS (0 / 1 - the sum items with
 #                                   their _DISCARD / _ROUTE_HINT companions as one unit), B12X_MOE_PREFILL_FAST_WS1 (0..11; 0 = v8,
 #                                   9 = v10), B12X_MOE_PREFILL_FAST_MT_LOOPS (0 / 1 - the m-tile loops of the served FC1 / FC2
-#                                   modes), B12X_MOE_PREFILL_FAST_FIRST_CLAIM (0 / 1 - the first-claim kernels of the same modes) and
+#                                   modes), B12X_MOE_PREFILL_FAST_FIRST_CLAIM (0 / 1 - the first-claim kernels of the same modes),
 #                                   B12X_MOE_PREFILL_FAST_FC1_FZ (0 / 1 - the served FC1 mode's kernel with its epilogue values defined
-#                                   on every path); in
+#                                   on every path) and B12X_MOE_PREFILL_FAST_FC_TEXT (0 / 1 / 2 - the twins of the served FC1 / FC2
+#                                   kernels: 1 = the twins with a pinned text, 2 = the twins with the compiler's text); in
 #                                   the log lines the newer keys carry their full names, the two older keys their short tokens
 #                                   SUM_ITEMS / WS1. Every rank stats the file at most once per 100 ms (at the entry of moe_prefill_fast, i.e.
 #                                   at a MoE-call boundary - this module has no view of the prefill forward; the states are bit-identical
@@ -251,6 +262,54 @@ def fc1_fz_supported() -> bool:
     return hasattr(_ext(), "set_fc1_fz")
 
 
+def fc_text_supported() -> bool:
+    """Whether the built extension has the twins of the served FC1 / FC2 kernels (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT and its
+    runtime key)."""
+    return hasattr(_ext(), "set_fc_text")
+
+
+_FC_TEXT = {"mask": None}
+
+
+def fc_text_mask() -> int:
+    """The kernels whose pinned text stands in this process's loaded extension (bit 0 fc1, bit 1 fc2, bit 2 fc1 with the m-tile
+    loops, bit 3 fc2 with them), found once per process and handed to the extension: for every text of fc_texts/fc_texts.json the
+    file's digest must be the manifest's and its bytes must lie in the extension's file exactly once. Anything else - no manifest,
+    another digest, a build without the splice - leaves the kernel's bit clear with one WARNING, and the key then launches nothing
+    new for that kernel. 0 with a build that has no twins."""
+    if _FC_TEXT["mask"] is not None:
+        return _FC_TEXT["mask"]
+    _FC_TEXT["mask"] = mask = 0
+    if not fc_text_supported():
+        return 0
+    import hashlib
+    import json
+
+    e = _ext()
+    found = []
+    try:
+        man = json.loads((_HERE / "fc_texts" / "fc_texts.json").read_text(encoding="utf-8"))
+        blob = Path(e.__file__).read_bytes()
+        for t in man["texts"]:
+            k = man["kernels"][t["kernel"]]
+            body = (_HERE / "fc_texts" / t["file"]).read_bytes()
+            if hashlib.sha256(body).hexdigest() != t["sha256"] or len(body) != int(k["text_bytes"]):
+                _rt_warn_once("fctext:" + t["name"], f"fc texts: {t['file']} is not the manifest's text of {t['kernel']} - its twin is not used")
+            elif blob.count(body) != 1:
+                _rt_warn_once("fctext:" + t["name"], f"fc texts: {t['name']} does not stand in the loaded extension {e.__file__} "
+                              f"(found {blob.count(body)} times; a build without the splice step?) - its twin is not used")
+            else:
+                mask |= 1 << int(k["bit"])
+                found.append(f"{t['name']} for {t['kernel']} (sha256 {t['sha256'][:16]})")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        mask = 0
+        _rt_warn_once("fctext", f"fc texts: no usable manifest beside the module ({exc!r}) - no twin is used")
+    e.set_fc_text_mask(int(mask))
+    _FC_TEXT["mask"] = mask
+    _rt_log(f"fc texts: mask {mask} - " + ("; ".join(found) if found else "no pinned text in the loaded extension"))
+    return mask
+
+
 def watchdog_record(clear: bool = False) -> list[int]:
     """The record of an expired bounded wait of this process: [set, what, item, need, seen, smid, block, watchdog_ms] (pinned host
     memory: readable after the trapped launch, without a CUDA call). what 100 + n = a sum item of FC2 waited for the FC2 items of
@@ -269,7 +328,7 @@ def watchdog_record(clear: bool = False) -> list[int]:
 
 def runtime_switches() -> dict:
     """The effective switch values of this process (env or runtime override): ws1, sum_items, sum_discard, sum_route_hint and, with a
-    build that has them, mt_loops, first_claim and fc1_fz."""
+    build that has them, mt_loops, first_claim, fc1_fz and fc_text."""
     e = _ext()
     if not hasattr(e, "get_runtime_switches"):
         return {}
@@ -281,13 +340,15 @@ def runtime_switches() -> dict:
         sw["FIRST_CLAIM"] = int(e.get_first_claim())
     if hasattr(e, "get_fc1_fz"):
         sw["FC1_FZ"] = int(e.get_fc1_fz())
+    if hasattr(e, "get_fc_text"):
+        sw["FC_TEXT"] = int(e.get_fc_text())
     return sw
 
 
 def apply_runtime_switches(values: dict) -> list[str]:
     """Apply {"B12X_MOE_PREFILL_FAST_SUM_ITEMS": 0|1, "B12X_MOE_PREFILL_FAST_WS1": 0..11, "B12X_MOE_PREFILL_FAST_MT_LOOPS": 0|1,
-    "B12X_MOE_PREFILL_FAST_FIRST_CLAIM": 0|1, "B12X_MOE_PREFILL_FAST_FC1_FZ": 0|1, "B12X_MOE_PREFILL_FAST_GRID1": 0..4096,
-    "B12X_MOE_PREFILL_FAST_GRID2": 0..4096}
+    "B12X_MOE_PREFILL_FAST_FIRST_CLAIM": 0|1, "B12X_MOE_PREFILL_FAST_FC1_FZ": 0|1, "B12X_MOE_PREFILL_FAST_FC_TEXT": 0|1|2,
+    "B12X_MOE_PREFILL_FAST_GRID1": 0..4096, "B12X_MOE_PREFILL_FAST_GRID2": 0..4096}
     (keys of other modules ignored); returns the change descriptions. A key the file does not carry goes back to its env value (-1); an
     out-of-range value keeps the current effective value (one WARNING). The sum-items unit sets SUM_ITEMS, SUM_DISCARD and
     SUM_ROUTE_HINT together."""
@@ -296,12 +357,13 @@ def apply_runtime_switches(values: dict) -> list[str]:
         _rt_warn_once("ext", "this build of the extension has no set_runtime_switches entry: runtime A/B inactive")
         return []
     cur = runtime_switches()
-    ws1_arg, si_arg, mt_arg, fc_arg, fz_arg = -1, -1, -1, -1, -1
+    ws1_arg, si_arg, mt_arg, fc_arg, fz_arg, tx_arg = -1, -1, -1, -1, -1, -1
     grid_arg = {"GRID1": -1, "GRID2": -1}
     grid_was = {k: _grid_eff(k) for k in grid_arg}
     has_mt = hasattr(e, "set_mt_loops")
     has_fc = hasattr(e, "set_first_claim")
     has_fz = hasattr(e, "set_fc1_fz")
+    has_tx = hasattr(e, "set_fc_text")
     for key, val in values.items():
         if not isinstance(key, str) or not key.startswith("B12X_MOE_PREFILL_FAST_"):
             continue
@@ -339,6 +401,12 @@ def apply_runtime_switches(values: dict) -> list[str]:
             else:
                 fz_arg = cur["FC1_FZ"]
                 _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1) - kept {cur['FC1_FZ']}")
+        elif key == "B12X_MOE_PREFILL_FAST_FC_TEXT" and has_tx:
+            if v in (0, 1, 2):
+                tx_arg = v
+            else:
+                tx_arg = cur["FC_TEXT"]
+                _rt_warn_once("val:" + key, f"runtime A/B: {key}={val!r} out of range (0 / 1 / 2) - kept {cur['FC_TEXT']}")
         elif key in ("B12X_MOE_PREFILL_FAST_GRID1", "B12X_MOE_PREFILL_FAST_GRID2"):
             name = key[-5:]
             if 0 <= v <= 4096:
@@ -356,6 +424,8 @@ def apply_runtime_switches(values: dict) -> list[str]:
         e.set_first_claim(int(fc_arg))
     if has_fz:
         e.set_fc1_fz(int(fz_arg))
+    if has_tx:
+        e.set_fc_text(int(tx_arg))
     now = runtime_switches()
     changes = []
     _RT_GRID.update(grid_arg)  # a key the file does not carry goes back to its environment value
@@ -370,6 +440,8 @@ def apply_runtime_switches(values: dict) -> list[str]:
         changes.append(f"B12X_MOE_PREFILL_FAST_FIRST_CLAIM {cur['FIRST_CLAIM']} -> {now['FIRST_CLAIM']}")
     if has_fz and now["FC1_FZ"] != cur["FC1_FZ"]:
         changes.append(f"B12X_MOE_PREFILL_FAST_FC1_FZ {cur['FC1_FZ']} -> {now['FC1_FZ']}")
+    if has_tx and now["FC_TEXT"] != cur["FC_TEXT"]:
+        changes.append(f"B12X_MOE_PREFILL_FAST_FC_TEXT {cur['FC_TEXT']} -> {now['FC_TEXT']}")
     if (now["SUM_ITEMS"], now["SUM_DISCARD"], now["SUM_ROUTE_HINT"]) != (cur["SUM_ITEMS"], cur["SUM_DISCARD"], cur["SUM_ROUTE_HINT"]):
         changes.append(f"SUM_ITEMS {cur['SUM_ITEMS']} -> {now['SUM_ITEMS']} (DISCARD {cur['SUM_DISCARD']} -> {now['SUM_DISCARD']}, "
                        f"ROUTE_HINT {cur['SUM_ROUTE_HINT']} -> {now['SUM_ROUTE_HINT']})")
@@ -428,6 +500,9 @@ def activation_counters(clear: bool = False) -> dict:
     if hasattr(e, "moe_prefill_fast_fz_counters"):
         t = [int(v) for v in e.moe_prefill_fast_fz_counters(bool(clear))]
         out["fc1_fz"] = (t[0], t[1])
+    if hasattr(e, "moe_prefill_fast_tx_counters"):  # the twins: launches of the pinned texts, then of the twins with the compiler's text
+        t = [int(v) for v in e.moe_prefill_fast_tx_counters(bool(clear))]
+        out["fc1_text"], out["fc2_text"], out["fc1_twin"], out["fc2_twin"] = (t[0], t[1]), (t[2], t[3]), (t[4], t[5]), (t[6], t[7])
     return out
 
 
@@ -444,6 +519,10 @@ def _stats_line(reason: str) -> None:
     if "FC1_FZ" in sw and "fc1_fz" in c:  # a build with the FZ form of the served FC1 kernels: the same
         mt_cnt += f", fc1 fz {c['fc1_fz'][0]} / {c['fc1_fz'][1]}"
         mt_tok += f" B12X_MOE_PREFILL_FAST_FC1_FZ={sw['FC1_FZ']}"
+    if "FC_TEXT" in sw and "fc1_text" in c:  # a build with the twins of the served FC1 / FC2 kernels: the same, and the loader's mask
+        mt_cnt += (f", fc1 text {c['fc1_text'][0]} / {c['fc1_text'][1]}, fc2 text {c['fc2_text'][0]} / {c['fc2_text'][1]}"
+                   f", fc1 twin {c['fc1_twin'][0]} / {c['fc1_twin'][1]}, fc2 twin {c['fc2_twin'][0]} / {c['fc2_twin'][1]}")
+        mt_tok += f" B12X_MOE_PREFILL_FAST_FC_TEXT={sw['FC_TEXT']} FC_TEXT_MASK={_FC_TEXT['mask'] or 0}"  # the mask as found (0: not looked for)
     _rt_log(f"activation counters ({reason}; calls / rows): fc1 v10 {c['fc1_v10'][0]} / {c['fc1_v10'][1]}, fc1 v8-v9 {c['fc1_v8_v9'][0]} / {c['fc1_v8_v9'][1]}, "
             f"fc2 sum-items {c['fc2_sum_items'][0]} / {c['fc2_sum_items'][1]}, fc2 + topk_sum_kernel {c['fc2_topk_sum_kernel'][0]} / {c['fc2_topk_sum_kernel'][1]}{mt_cnt}; "
             f"switches now WS1={sw.get('WS1')} SUM_ITEMS={sw.get('SUM_ITEMS')} DISCARD={sw.get('SUM_DISCARD')} ROUTE_HINT={sw.get('SUM_ROUTE_HINT')}{mt_tok}"
@@ -455,6 +534,8 @@ def _runtime_hooks() -> None:
     if st["on"] is None:
         st["on"] = os.environ.get("VLLM_MOET_RUNTIME_AB", "0") == "1"
         st["stats_every"] = _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_STATS_EVERY", 0)
+        if st["on"] or _env_int("VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT", 0) >= 1:
+            fc_text_mask()  # the twins: which pinned texts stand in the loaded extension - once, before the first launch can use one
     if st["on"]:
         _runtime_ab_poll()
     st["calls"] += 1

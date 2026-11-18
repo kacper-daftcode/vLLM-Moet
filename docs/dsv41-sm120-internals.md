@@ -186,6 +186,24 @@ registers per thread, still one CTA per SM. FC2, the other FC1 modes and the cal
 `_WS1_MIN_ROWS` rows, which launch FC1 v8, are not affected. `test_fc1_fz_sm120.py` holds the key's
 states against b12x and the launch counters.
 
+**Twins of the served kernels, and pinned texts.** `_FC_TEXT` (0 by default) selects among three texts of
+the same kernel. Four kernels — FC1 and FC2 of the served modes, without and with the m-tile loops — are
+instantiated twice more in the extension by a template parameter (`TX`) that stands in no line of the
+kernel, so the compiler gives each twin the text of its kernel, byte for byte. A build step,
+`splice_fc_texts.py`, may then write a pinned text over the `TX = 1` twin: the bytes of that kernel's
+`.text` section as another assembler scheduled the same instructions (`fc_texts/`, with a manifest that
+names for every kernel the digest of the compiler's text a pinned one was made from). The step refuses
+unless the kernel and both twins hold exactly that compiler's text, and after it every byte outside the
+written sections is unchanged. `_FC_TEXT=1` launches the twins with a pinned text, `2` the twins with
+the compiler's text — the same text at a twin's place, the other state of a pair that is to measure a
+text and nothing else — and `0` the kernels as before. At its first call a process looks once for each
+pinned text in its loaded extension (digest and bytes); the key acts only on the kernels it found, and
+only where a call launches exactly such a kernel: not with the first claim, not with `FZ`. The three
+states compute the same bits. The two texts in the tree are measured on one card model (RTX PRO 6000
+Blackwell Server Edition) and belong in a test image only; no released image carries the step.
+`test_fc_text_sm120.py` holds the key's states against b12x and the launch counters,
+`test_splice_fc_texts.py` the step.
+
 **The grid caps.** `_GRID1` and `_GRID2` cap the number of CTAs FC1 and FC2 launch (0, the default, is
 the occupancy grid: one FC1 CTA and two FC2 CTAs on every SM). The work list does not change, the CTAs
 that run take every item, and every grid computes the same bits. A cap of the SM count or more is spread
@@ -212,7 +230,8 @@ written from outside with `docker exec <container> sh -c 'printf … > /dev/shm/
 most once per 100 ms at a MoE-call boundary and applies `B12X_MOE_PREFILL_FAST_SUM_ITEMS` (0/1, the
 sum-items unit), `B12X_MOE_PREFILL_FAST_WS1` (0..11), `B12X_MOE_PREFILL_FAST_MT_LOOPS` (0/1, the
 m-tile loops of step 42), `B12X_MOE_PREFILL_FAST_FIRST_CLAIM` (0/1, its first claim),
-`B12X_MOE_PREFILL_FAST_FC1_FZ` (0/1, the `FZ` form of its served FC1 kernel) and
+`B12X_MOE_PREFILL_FAST_FC1_FZ` (0/1, the `FZ` form of its served FC1 kernel),
+`B12X_MOE_PREFILL_FAST_FC_TEXT` (0/1/2, the twins of its served FC1 / FC2 kernels) and
 `B12X_MOE_PREFILL_FAST_GRID1` / `_GRID2` (0 … 4096, its grid caps) without a restart. A missing / malformed file or an unknown value keeps the state (one warning), a key the file
 drops goes back to the environment's value, each change is logged once per rank.
 

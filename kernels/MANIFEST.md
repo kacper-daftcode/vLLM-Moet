@@ -540,3 +540,23 @@ one MMA per 32-wide scale block, fp32 accumulation.
 |---|---|---|---|
 | `tools/dsv41_sm120/sm120_gemv/mxfp8_gemv_sm120.cu` | `mxfp8_gemv` (dense M ≤ 16, F8_128x4 scales; v3 transport for M ≤ 8 since 2026-09-20, `VLLM_MOET_GEMV_IMPL=v1` for the previous kernel), `mxfp8_gemv_grouped` (DeepSeek-V4 `wo_a`, T ≤ 64, row-major + DeepGEMM MN-packed scales); scalar fallback `VLLM_MOET_GEMV_IMPL=scalar`, experiment `=v2` | FlashInfer CUTLASS `mm_mxfp8` for decode shapes; BF16-weight cuBLAS bmm for `wo_a` | `sm120_gemv/test_mxfp8_gemv_sm120.py` (vs CUTLASS + fp32 ref, maxrel 3.8e-3 = CUTLASS), `test_wo_a_gemv_sm120.py`, integration tests |
 | `tools/qwen38_sm120/moe_gemv/fused_moe_gemv_sm120.cu` | `fused_moe_gemv` (vLLM `fused_moe_kernel` contract, naive + `moe_align_block_size` paths, routed weights), `fused_moe_gemv_act` (silu·up + UE8M0 per-32 quant fused, naive path) | Triton `fused_moe_kernel` at ≤ 320 (token, expert) pairs; `act_and_mul` + `per_token_group_quant_fp8` | `moe_gemv/test_fused_moe_gemv_sm120.py` (vs Triton: 0 differing elements, and fp32 ref), `test_fused_moe_integration.py` (dispatch + `TritonExperts.apply` with vLLM's workspace layout) |
+
+## Pinned texts for the twins of the fast prefill MoE's FC1 / FC2 kernels (sm_120, in no released image)
+
+Not cubins: the bytes of ONE kernel's `.text` section each, in another assembler's schedule of the same instructions —
+`tools/dsv41_sm120/b12x_moe_prefill_fast/fc_texts/`, with the manifest `fc_texts.json` that names, for every kernel that
+has twins, the digest of the compiler's text a pinned one is made from. `splice_fc_texts.py` (same directory) writes a
+text over the `TX = 1` twin of its kernel inside the built extension and refuses where the compiler's text is another;
+`VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT=1` (default 0) launches the twins that carry one. No Dockerfile runs the step.
+**Both texts are measured on one card model (RTX PRO 6000 Blackwell Server Edition): for a test image only.**
+
+| file | kernel (twin `TX = 1`) | bytes | sha256 of the file | made from the compiler's text (sha256) | the whole cubin it was cut from (sha256) |
+|---|---|---|---|---|---|
+| `fc1.fp1_PH.text` | `fc1_kernel_wg<4, 1, 0, 0, 0>` — FC1 of the served mode without the m-tile loops | 48 768 | `57915be62f47230cd95142a8232155e2a19893e496194e132feb3e3a0efcdbec` | `1d9b0d7f23c31efb51dbfb5830fdce5b5a0e0cc9d89273d9dec30bc8c5923948` | `19402d4ef993af14d5864166571330dfd630c37e3cb8c434ff7ad868f6eaa664` |
+| `fc2.fp1_PH.text` | `fc2_kernel_ws<4, 1, 0, 0>` — FC2 of the served mode without the m-tile loops | 41 216 | `4a3e0a09ecc159de6ba97250152a7577a31c1fcd6bea67c049880feb85204339` | `99d0b5cfcc72d8887eb1ce204bc5664d545f61f088c748a202cabdeb9185d4dc` | `cf6ae451dace6701b675f57871a4b0af49bd39d320a54f625b38a2db01bf0d23` |
+
+Both are builds of `cubit` (the record text's recipe of each kernel with `CUBIT_SCHED2_PACE=tensor` and
+`CUBIT_TENSOR_YIELD=holds`): 1 915 and 319 bytes differ from the compiler's text, every instruction is the compiler's.
+The kernels with the m-tile loops (`fc1_kernel_wg<4, 1, 1, 0, 0>`, `fc2_kernel_ws<4, 2, 1, 0>`: compiler's texts
+`432ddacb10c4db6a9e26488c196c36ebf2a84bd77e8db75c9eaa3ed22f7d94a5`, `0a374d51554520b217e8b380dc12ece007e621b8bee1857cc9303793c920506c`)
+have twins and no text yet.
