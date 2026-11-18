@@ -7,6 +7,17 @@ the release tag that points at it.
 ## DeepSeek-V4.1-Flash on 4× RTX PRO 6000
 
 ### In the tree after `-r33` (in no released image)
+- Twins of the served FC1 / FC2 kernels of the prefill MoE, and a build step for pinned texts
+  (`VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT`, runtime key `B12X_MOE_PREFILL_FAST_FC_TEXT`; both 0 by default, in no
+  released image): four kernels — FC1 and FC2 of the served modes, without and with the m-tile loops — are instantiated
+  twice more by a template parameter that stands in no line of them; `splice_fc_texts.py` writes a pinned text of a
+  kernel, another assembler's schedule of the same instructions (`fc_texts/` with its manifest), over that kernel's
+  first twin in the built extension. `1` launches the twins that carry a pinned text, `2` the twins with the compiler's
+  text, `0` the kernels as before; the key acts only on the kernels whose text the process finds in its loaded
+  extension. With the twins in the source the compiler gives every kernel the module had the text it had, byte for
+  byte, and each of the eight twins the text of its kernel; the step changes the bytes of the written sections and no
+  other. The three states compute the same bits. Two texts are in the tree (FC1 and FC2 without the m-tile loops),
+  measured on one card model: for a test image only.
 - A test that makes a wait of the persistent prefill MoE launch last, and expire (`test_persistent_watchdog_sm120.py`);
   no kernel, module or default changes.
 - The reader of the phase-wait instrument (`sp_pipeline/phase_balance.py`) prints where a phase's glue ends against

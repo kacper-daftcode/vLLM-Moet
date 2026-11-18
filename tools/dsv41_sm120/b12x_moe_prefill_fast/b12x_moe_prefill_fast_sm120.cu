@@ -1910,7 +1910,10 @@ __device__ __forceinline__ void wg_copy_a(uint32_t sb_a, const uint8_t* a_base, 
 
 // MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
 // FZ = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC1_FZ): the epilogue's packed values `v` are zero-filled on every path, see the epilogue
-template <int STAGES, int MINB, int MT = 0, int FC = 0, int FZ = 0>
+// TX (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT): a twin - the parameter stands in no line of the kernel, so every TX instance is compiled
+// to the text of its TX = 0 instance; TX = 1 is the twin whose text section a build step may replace by a pinned text of the same
+// kernel (splice_fc_texts.py), TX = 2 the twin that keeps the compiler's text
+template <int STAGES, int MINB, int MT = 0, int FC = 0, int FZ = 0, int TX = 0>
 __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
   constexpr int NCW = kWgConsumers;
   extern __shared__ __align__(128) uint8_t smem[];
@@ -2290,7 +2293,8 @@ __global__ void __launch_bounds__(kWgThreads, MINB) fc1_kernel_wg(Fc1Args a) {
 
 // FC2 with the producer-warp skeleton
 // MT = 1 (VLLM_MOET_B12X_MOE_PREFILL_FAST_MT_LOOPS): the consumers' stage loop specialised on the item's m-tiles, see below
-template <int STAGES, int MINB, int MT = 0, int FC = 0>
+// TX (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT): a twin, as in fc1_kernel_wg - the parameter stands in no line of the kernel
+template <int STAGES, int MINB, int MT = 0, int FC = 0, int TX = 0>
 __global__ void __launch_bounds__(kWsThreads, MINB) fc2_kernel_ws(Fc2Args a) {
   extern __shared__ __align__(128) uint8_t smem[];
   __shared__ ItemRing ring;
@@ -3581,6 +3585,25 @@ static int fc1_fz_mode() {
 }
 // its activation counters: [FC1 calls, rows] launched with those kernels
 static unsigned long long g_cnt_fz[2] = {0, 0};
+// The twins of the served FC1 / FC2 kernels (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT=0|1|2; run-time override set_fc_text, -1 = the env
+// value). Four kernels have twins: fc1_kernel_wg<4, 1> and fc2_kernel_ws<4, 1> (the served modes WS1 = 9 / WS2 = 3 without the m-tile
+// loops) and fc1_kernel_wg<4, 1, 1> / fc2_kernel_ws<4, 2, 1> (with them). A twin is the same source instantiated once more (TX), so
+// the compiler gives it the text of its kernel; a build step (splice_fc_texts.py) may write a pinned text of that kernel - another
+// assembler's schedule of the same instructions - over the TX = 1 twin's text section. 1 launches the TX = 1 twins (the pinned text),
+// 2 the TX = 2 twins (the compiler's own text at a twin's place: the null of the path), 0 the kernels as before. Bit-identical
+// alternatives: the same instructions on the same data. The key acts only on the kernels named in the mask (set_fc_text_mask, set by
+// the loader for the kernels whose pinned text it found in the loaded extension: bit 0 fc1, bit 1 fc2, bit 2 fc1 with the m-tile loops,
+// bit 3 fc2 with them; 0 = none, the key then launches nothing new) and only where the call launches exactly such a kernel - not
+// with the first claim, not with FZ. g_tx_fc1 / g_tx_fc2: this call's twin (0 = none), set at its entry.
+static int g_rt_fc_text = -1;
+static int g_fc_text_mask = 0;
+static int fc_text_mode() {
+  static const int m = [] { const int v = ws_env("VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT"); return (v == 1 || v == 2) ? v : 0; }();
+  return g_rt_fc_text >= 0 ? g_rt_fc_text : m;
+}
+static int g_tx_fc1 = 0, g_tx_fc2 = 0;
+// their activation counters: [FC1 calls, rows, FC2 calls, rows] launched with the TX = 1 twins, then the same four for the TX = 2 twins
+static unsigned long long g_cnt_tx[8] = {0, 0, 0, 0, 0, 0, 0, 0};
 // K-13 (task B): activation counters of the switched paths, one add per call (moe_prefill_fast_counters() reads them: calls / rows through
 // fc1 v10 (WS1 >= 8) vs fc1 v8/v9 (WS1 < 8), fc2 with the sum items vs fc2 + the separate topk_sum_kernel, the persistent launch)
 static unsigned long long g_cnt[8] = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -3710,49 +3733,51 @@ struct WsLaunch1 {
     fc1_kernel_ws<S, MB, MH><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB, int MT = 0, int FC = 0, int FZ = 0>
+template <int S, int MB, int MT = 0, int FC = 0, int FZ = 0, int TX = 0>
 struct WgLaunch1 {  // v10: fc1_kernel_wg (12 warps, setmaxnreg at MB = 2; MT = 1: the m-tile loops; FC = 1: the first claim;
-                    // FZ = 1: the epilogue's values defined on every path)
+                    // FZ = 1: the epilogue's values defined on every path; TX = 1 / 2: a twin of the same kernel, see FC_TEXT)
   static constexpr int kT = b12x_moe_prefill_fast::kWgThreads;
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT, FC, FZ>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT, FC, FZ>, kT, S * kF1Stage);
+    if (!done) { cudaFuncSetAttribute(fc1_kernel_wg<S, MB, MT, FC, FZ, TX>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF1Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc1_kernel_wg<S, MB, MT, FC, FZ, TX>, kT, S * kF1Stage);
     // on record: <4, 1> one CTA per SM (167 registers, the served mode; its FZ form 141), <3, 2> two (setmaxnreg)
     static bool noted = false;
-    occ_check(FZ == 1 ? (FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc_fz" : "fc1_kernel_wg_fc_fz") : (MT == 1 ? "fc1_kernel_wg_mt_fz" : "fc1_kernel_wg_fz"))
+    occ_check(TX == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_text" : "fc1_kernel_wg_text") : TX == 2 ? (MT == 1 ? "fc1_kernel_wg_mt_twin" : "fc1_kernel_wg_twin")
+              : FZ == 1 ? (FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc_fz" : "fc1_kernel_wg_fc_fz") : (MT == 1 ? "fc1_kernel_wg_mt_fz" : "fc1_kernel_wg_fz"))
                       : (FC == 1 ? (MT == 1 ? "fc1_kernel_wg_mt_fc" : "fc1_kernel_wg_fc") : (MT == 1 ? "fc1_kernel_wg_mt" : "fc1_kernel_wg")),
-              fc1_kernel_wg<S, MB, MT, FC, FZ>, noted, S, MB, occ,
+              fc1_kernel_wg<S, MB, MT, FC, FZ, TX>, noted, S, MB, occ,
               occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC1", (S == 4 && MB == 1) ? 1 : (S == 3 && MB == 2) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc1Args& f1, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc1_kernel_wg<S, MB, MT, FC, FZ><<<grid, kT, S * kF1Stage, stream>>>(f1);
+    fc1_kernel_wg<S, MB, MT, FC, FZ, TX><<<grid, kT, S * kF1Stage, stream>>>(f1);
   }
 };
-template <int S, int MB, int MT = 0, int FC = 0>
-struct WsLaunch2 {
+template <int S, int MB, int MT = 0, int FC = 0, int TX = 0>
+struct WsLaunch2 {  // TX = 1 / 2: a twin of the same kernel, see FC_TEXT
   static int grid(int sms) {
     using namespace b12x_moe_prefill_fast;
     int occ = 0;
     static bool done = false;
-    if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB, MT, FC>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
-    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB, MT, FC>, kWsThreads, S * kF2Stage);
+    if (!done) { cudaFuncSetAttribute(fc2_kernel_ws<S, MB, MT, FC, TX>, cudaFuncAttributeMaxDynamicSharedMemorySize, S * kF2Stage); done = true; }
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, fc2_kernel_ws<S, MB, MT, FC, TX>, kWsThreads, S * kF2Stage);
     // on record: <4, 1> (the served mode) and <3, 2> two CTAs per SM - at 96 registers per thread, the most two CTAs of 9 warps get;
     // the m-tile loops' <4, 2, 1> two as well (92 registers); the first-claim kernels <4, 2, MT, 1> are built for two
     static bool noted = false;
-    occ_check(FC == 1 ? (MT == 1 ? "fc2_kernel_ws_mt_fc" : "fc2_kernel_ws_fc") : (MT == 1 ? "fc2_kernel_ws_mt" : "fc2_kernel_ws"),
-              fc2_kernel_ws<S, MB, MT, FC>, noted, S, MB, occ,
+    occ_check(TX == 1 ? (MT == 1 ? "fc2_kernel_ws_mt_text" : "fc2_kernel_ws_text") : TX == 2 ? (MT == 1 ? "fc2_kernel_ws_mt_twin" : "fc2_kernel_ws_twin")
+              : FC == 1 ? (MT == 1 ? "fc2_kernel_ws_mt_fc" : "fc2_kernel_ws_fc") : (MT == 1 ? "fc2_kernel_ws_mt" : "fc2_kernel_ws"),
+              fc2_kernel_ws<S, MB, MT, FC, TX>, noted, S, MB, occ,
               occ_expect("VLLM_MOET_B12X_MOE_PREFILL_FAST_OCC_EXPECT_FC2",
                          ((S == 4 && MB == 1) || (S == 3 && MB == 2) || (S == 4 && MB == 2 && (MT == 1 || FC == 1))) ? 2 : 0), sms);
     return sms * (occ > 0 ? occ : 1);
   }
   static void run(const b12x_moe_prefill_fast::Fc2Args& f2, int grid, cudaStream_t stream) {
     using namespace b12x_moe_prefill_fast;
-    fc2_kernel_ws<S, MB, MT, FC><<<grid, kWsThreads, S * kF2Stage, stream>>>(f2);
+    fc2_kernel_ws<S, MB, MT, FC, TX><<<grid, kWsThreads, S * kF2Stage, stream>>>(f2);
   }
 };
 template <typename Fn>
@@ -3776,7 +3801,12 @@ static void with_ws1(int mode, Fn fn) {
       } else if (g_fc_call) {
         if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1, 1>{});
         else fn(WgLaunch1<4, 1, 0, 1>{});
-      } else if (mt_loops_mode() >= 1) fn(WgLaunch1<4, 1, 1>{});
+      } else if (mt_loops_mode() >= 1) {
+        if (g_tx_fc1 == 1) fn(WgLaunch1<4, 1, 1, 0, 0, 1>{});  // FC_TEXT = 1: the twin that carries the pinned text
+        else if (g_tx_fc1 == 2) fn(WgLaunch1<4, 1, 1, 0, 0, 2>{});  // FC_TEXT = 2: the twin with the compiler's text
+        else fn(WgLaunch1<4, 1, 1>{});
+      } else if (g_tx_fc1 == 1) fn(WgLaunch1<4, 1, 0, 0, 0, 1>{});
+      else if (g_tx_fc1 == 2) fn(WgLaunch1<4, 1, 0, 0, 0, 2>{});
       else fn(WgLaunch1<4, 1>{});
       break;
     case 10: fn(WgLaunch1<6, 1>{}); break;
@@ -3792,7 +3822,12 @@ static void with_ws2(int mode, Fn fn) {
       if (g_fc_call) {
         if (mt_loops_mode() >= 1) fn(WsLaunch2<4, 2, 1, 1>{});
         else fn(WsLaunch2<4, 2, 0, 1>{});
-      } else if (mt_loops_mode() >= 1) fn(WsLaunch2<4, 2, 1>{});
+      } else if (mt_loops_mode() >= 1) {
+        if (g_tx_fc2 == 1) fn(WsLaunch2<4, 2, 1, 0, 1>{});  // FC_TEXT = 1: the twin that carries the pinned text
+        else if (g_tx_fc2 == 2) fn(WsLaunch2<4, 2, 1, 0, 2>{});  // FC_TEXT = 2: the twin with the compiler's text
+        else fn(WsLaunch2<4, 2, 1>{});
+      } else if (g_tx_fc2 == 1) fn(WsLaunch2<4, 1, 0, 0, 1>{});
+      else if (g_tx_fc2 == 2) fn(WsLaunch2<4, 1, 0, 0, 2>{});
       else fn(WsLaunch2<4, 1>{});
       break;
     default: fn(WsLaunch2<7, 1>{}); break;
@@ -4059,6 +4094,13 @@ std::vector<torch::Tensor> moe_prefill_fast(c10::optional<torch::Tensor> hidden_
     }
     // the FC1 epilogue's values defined on every path: the calls whose FC1 launch is the FZ form of the served mode's kernel
     if (fc1_fz_mode() >= 1 && fc1_v10 && ws1_mode() == 9) { g_cnt_fz[0] += 1; g_cnt_fz[1] += (unsigned long long)T; }
+    {  // FC_TEXT: this call's twins - only of a kernel named in the mask, and only where the call launches exactly that kernel
+      const int tx = fc_text_mode(), mt = mt_loops_mode() >= 1 ? 1 : 0;
+      g_tx_fc1 = (tx >= 1 && !g_fc_call && fc1_fz_mode() < 1 && fc1_v10 && ws1_mode() == 9 && ((g_fc_text_mask >> (mt ? 2 : 0)) & 1)) ? tx : 0;
+      g_tx_fc2 = (tx >= 1 && !g_fc_call && !persistent && ws2_mode() == 3 && ((g_fc_text_mask >> (mt ? 3 : 1)) & 1)) ? tx : 0;
+      if (g_tx_fc1 >= 1) { g_cnt_tx[4 * (g_tx_fc1 - 1)] += 1; g_cnt_tx[4 * (g_tx_fc1 - 1) + 1] += (unsigned long long)T; }
+      if (g_tx_fc2 >= 1) { g_cnt_tx[4 * (g_tx_fc2 - 1) + 2] += 1; g_cnt_tx[4 * (g_tx_fc2 - 1) + 3] += (unsigned long long)T; }
+    }
   }
   // n256 FC2 items (modes 30-35) need K % 256 == 0; otherwise the one-tile item kernel of the same ring depth runs; a persistent
   // launch of WS = 40 without the sum inside is mode 30's
@@ -4269,6 +4311,24 @@ std::vector<int64_t> moe_prefill_fast_fz_counters(bool clear) {
   if (clear) for (auto& c : g_cnt_fz) c = 0;
   return r;
 }
+// The run-time override of the twins (-1 = the env value, 0 / 1 / 2), the effective value, the mask of the kernels whose pinned text
+// the loader found (bit 0 fc1, bit 1 fc2, bit 2 fc1 with the m-tile loops, bit 3 fc2 with them) and the counters
+// [FC1 calls, rows, FC2 calls, rows] of the TX = 1 twins followed by the same four of the TX = 2 twins.
+void set_fc_text(int64_t v) {
+  TORCH_CHECK(v >= -1 && v <= 2, "set_fc_text: -1 (the env value), 0, 1 or 2");
+  g_rt_fc_text = (int)v;
+}
+int64_t get_fc_text() { return fc_text_mode(); }
+void set_fc_text_mask(int64_t m) {
+  TORCH_CHECK(m >= 0 && m <= 15, "set_fc_text_mask: 0 .. 15");
+  g_fc_text_mask = (int)m;
+}
+int64_t get_fc_text_mask() { return g_fc_text_mask; }
+std::vector<int64_t> moe_prefill_fast_tx_counters(bool clear) {
+  std::vector<int64_t> r(g_cnt_tx, g_cnt_tx + 8);
+  if (clear) for (auto& c : g_cnt_tx) c = 0;
+  return r;
+}
 std::vector<int64_t> moe_prefill_fast_counters(bool clear) {
   std::vector<int64_t> r(g_cnt, g_cnt + 8);
   if (clear) for (auto& c : g_cnt) c = 0;
@@ -4340,6 +4400,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("set_fc1_fz", &set_fc1_fz);
   m.def("get_fc1_fz", &get_fc1_fz);
   m.def("moe_prefill_fast_fz_counters", &moe_prefill_fast_fz_counters);
+  m.def("set_fc_text", &set_fc_text);
+  m.def("get_fc_text", &get_fc_text);
+  m.def("set_fc_text_mask", &set_fc_text_mask);
+  m.def("get_fc_text_mask", &get_fc_text_mask);
+  m.def("moe_prefill_fast_tx_counters", &moe_prefill_fast_tx_counters);
   m.def("moe_prefill_fast_counters", &moe_prefill_fast_counters);
   m.def("moe_prefill_ws_error", &moe_prefill_ws_error);
   m.def("moe_prefill_ws_stats", &moe_prefill_ws_stats);

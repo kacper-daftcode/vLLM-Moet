@@ -1,0 +1,53 @@
+{
+  "_about": "Pinned texts of the fast prefill MoE's FC1 / FC2 kernels (VLLM_MOET_B12X_MOE_PREFILL_FAST_FC_TEXT). A text is the bytes of one kernel's .text section: another assembler's schedule of the same instructions, made from the compiler's text of that kernel. splice_fc_texts.py writes it over the TX = 1 twin of the kernel in the built extension - only where the compiler's own text of the kernel has the digest compiler_sha256, the text the pinned one was made from. `bit` is the kernel's bit in the loader's mask (set_fc_text_mask). A kernel without an entry in `texts` keeps the compiler's text in both twins and the key does not act on it.",
+  "kernels": {
+    "fc1": {
+      "bit": 0,
+      "kernel": "fc1_kernel_wg<4, 1, 0, 0, 0, TX>",
+      "symbol": "_ZN21b12x_moe_prefill_fast13fc1_kernel_wgILi4ELi1ELi0ELi0ELi0ELi{TX}EEEvNS_7Fc1ArgsE",
+      "text_bytes": 48768,
+      "compiler_sha256": "1d9b0d7f23c31efb51dbfb5830fdce5b5a0e0cc9d89273d9dec30bc8c5923948"
+    },
+    "fc2": {
+      "bit": 1,
+      "kernel": "fc2_kernel_ws<4, 1, 0, 0, TX>",
+      "symbol": "_ZN21b12x_moe_prefill_fast13fc2_kernel_wsILi4ELi1ELi0ELi0ELi{TX}EEEvNS_7Fc2ArgsE",
+      "text_bytes": 41216,
+      "compiler_sha256": "99d0b5cfcc72d8887eb1ce204bc5664d545f61f088c748a202cabdeb9185d4dc"
+    },
+    "fc1_mt": {
+      "bit": 2,
+      "kernel": "fc1_kernel_wg<4, 1, 1, 0, 0, TX>",
+      "symbol": "_ZN21b12x_moe_prefill_fast13fc1_kernel_wgILi4ELi1ELi1ELi0ELi0ELi{TX}EEEvNS_7Fc1ArgsE",
+      "text_bytes": 87680,
+      "compiler_sha256": "432ddacb10c4db6a9e26488c196c36ebf2a84bd77e8db75c9eaa3ed22f7d94a5"
+    },
+    "fc2_mt": {
+      "bit": 3,
+      "kernel": "fc2_kernel_ws<4, 2, 1, 0, TX>",
+      "symbol": "_ZN21b12x_moe_prefill_fast13fc2_kernel_wsILi4ELi2ELi1ELi0ELi{TX}EEEvNS_7Fc2ArgsE",
+      "text_bytes": 56960,
+      "compiler_sha256": "0a374d51554520b217e8b380dc12ece007e621b8bee1857cc9303793c920506c"
+    }
+  },
+  "texts": [
+    {
+      "kernel": "fc1",
+      "name": "fc1.fp1_PH",
+      "file": "fc1.fp1_PH.text",
+      "sha256": "57915be62f47230cd95142a8232155e2a19893e496194e132feb3e3a0efcdbec",
+      "from_cubin_sha256": "19402d4ef993af14d5864166571330dfd630c37e3cb8c434ff7ad868f6eaa664",
+      "built": "cubit, the record text's recipe with CUBIT_SCHED2_PACE=tensor and CUBIT_TENSOR_YIELD=holds",
+      "status": "measured on one card model (RTX PRO 6000 Blackwell Server Edition): for a test image only"
+    },
+    {
+      "kernel": "fc2",
+      "name": "fc2.fp1_PH",
+      "file": "fc2.fp1_PH.text",
+      "sha256": "4a3e0a09ecc159de6ba97250152a7577a31c1fcd6bea67c049880feb85204339",
+      "from_cubin_sha256": "cf6ae451dace6701b675f57871a4b0af49bd39d320a54f625b38a2db01bf0d23",
+      "built": "cubit, the record text's recipe with CUBIT_SCHED2_PACE=tensor and CUBIT_TENSOR_YIELD=holds",
+      "status": "measured on one card model (RTX PRO 6000 Blackwell Server Edition): for a test image only"
+    }
+  ]
+}
