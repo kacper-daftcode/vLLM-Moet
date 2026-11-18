@@ -50,5 +50,7 @@ scales is decided when `ops/block_scales.py` is imported, by its own capability 
 "not sm_120", apart from the kernel choice made at the first call; the loader clamps a repacked block's scale byte to
 0–254 without counting the clamps; the prefill entry of the attention does not assert that the relative table's
 width is a multiple of 128 keys as the decode entry does; the native entries of the three extensions rely on the
-Python wrappers' assertions for dtypes and sizes, and `bmm_run` takes K values whose scale rows are not a multiple
-of eight bytes.
+Python wrappers' assertions for dtypes and sizes, and `bmm_run` does not check that its tensors are on a CUDA
+device and takes K values whose scale rows are not a multiple of eight bytes. The tests' oracle (`reference`,
+`e2m3_values`) still takes a float power of two on the device - the operation that made a card test print a wrong
+share of exact weights; the 53 GEMM cases pass with it, and the packing's printed figures no longer go through it.

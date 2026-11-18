@@ -24,7 +24,7 @@ packed model has 3.3 GiB of paged cache beside the draft's 1.0 GiB of weights an
 request of the full context reserves 2.4 GiB of it.
 
 Within each block of 32 weights the three largest binades keep their values exactly and smaller weights are
-rounded to an eighth of the third binade's lower end. Over 192 experts of the eight layers, 76–79 % of the weights
+rounded to an eighth of the third binade's lower end. Over 96 experts of the eight layers, 76–79 % of the weights
 keep their value (the 66–69 % that lie in those binades and the smaller ones that fall on the grid), the largest
 error is 1 / 64 of a block's largest magnitude, the error energy −38 to −39 dB of the weight energy.
 
@@ -114,8 +114,9 @@ Prefill: a fresh prompt of 20.9K tokens reaches its first token after 2.4 s (8.7
 of the same size in the same server: 10.4K tok/s). The same 17.4K-token prefix with another question: 0.07 s (the
 prefix cache keeps the conv state with the K / V).
 
-Memory per card: weights 85.9 GiB (86.9 GiB with the draft; 91.6 GiB at the released precision), a load of 116–149 s
-per rank (107 s without the packing) and 177–233 s to `/health` with warm kernel caches; the paged cache 4.5–4.6 GiB
+Memory per card: weights 85.9 GiB (86.9 GiB with the draft; 91.6 GiB at the released precision); the weights load
+in 113–115 s per rank (107 s without the packing), the model with its initialisation in 116–149 s, and a start
+reaches `/health` after 177–233 s with warm kernel caches; the paged cache 4.5–4.6 GiB
 without the draft (32 and 8 sequences) and 3.3 GiB with it (1.40 requests of 65 536 tokens by vLLM's count); with
 an 8K context and no draft 6.38 GiB packed and 0.69 GiB at the released precision
 ([below](#what-is-left-of-a-card-the-paged-cache)).
@@ -256,7 +257,7 @@ On a card: 85.86 GiB after the load with the experts packed (the table's 85.2 Gi
 `pack_e2m3`: per block of 32 weights the ue8m0 scale moves by a power of two so that the block's largest magnitude
 lies in e2m3's top binade [4, 8). A weight in the block's top three binades keeps all three mantissa bits - it is
 the same number; a smaller one is rounded to nearest even on e2m3's subnormal grid, and may become zero. Measured
-on 192 experts (12 of each of the layers 40–47, both projections; `bmm/test_pack_e2m3.py --census 12`, on the CPU):
+on 96 experts (12 of each of the layers 40–47, both projections of each; `bmm/test_pack_e2m3.py --census 12`, CPU):
 76.2–76.4 % of the gate / up weights and 77.5–78.6 % of the down weights keep their value (65.7–66.0 % and
 67.5–69.1 % lie in the three binades), the error energy is −38.4 to −38.3 dB and −39.4 to −38.7 dB of the weight
 energy, the largest error 1 / 64 of the block's largest magnitude. The kernel reads the 6-bit
@@ -309,16 +310,16 @@ the default drafts at every batch size, where the step changes nothing.
 
 ## Loading
 
-The target model is 363.3 GiB of the checkpoint's 366.5 (the draft is the other 3.2 GiB), and its experts are
-350 GiB of that. A rank registers its experts in the kernel's layout (and the
-MXFP8 layers in six bits) from the start and loads them a few at a time - a byte permutation on the card, the 6-bit
-packing two experts at a time with the allocator's cache emptied after each chunk - so a card never holds a second
-copy of a tensor. Each chunk's file pages are released once the chunk is on the card (`madvise` and
-`posix_fadvise(DONTNEED)` on the range just read; `VLLM_MOET_INKLING2_DROP_PAGES=0` turns it off): the server's host
-memory stays at 23 GiB through a load instead of filling its limit with page cache within a minute, and a load leaves
-13 GiB of the checkpoint cached instead of 82. A load takes 116 s per rank; a start, 177 s to `/health` with warm
-kernel caches (the model's Triton kernels compile per batch shape at first use - the launcher keeps Triton's cache
-in `CACHE_DIR`; the first start takes about a minute longer).
+The target model is 363.3 GiB of the checkpoint's 366.5 (the draft is the other 3.2 GiB), and its experts are 350 GiB
+of that. A rank registers its experts in the kernel's layout (and the MXFP8 layers in six bits) from the start and
+loads them a few at a time - a byte permutation on the card, the 6-bit packing two experts at a time with the
+allocator's cache emptied after each chunk - so a card never holds a second copy of a tensor. Each chunk's file pages
+are released once the chunk is on the card (`madvise` and `posix_fadvise(DONTNEED)` on the range just read;
+`VLLM_MOET_INKLING2_DROP_PAGES=0` turns it off): the server's host memory stays at 23 GiB through a load instead of
+filling its limit with page cache within a minute, and a load leaves 13 GiB of the checkpoint cached instead of 82.
+The weights load in 113 s per rank; a start, 177 s to `/health` with warm kernel caches (the model's Triton kernels
+compile per batch shape at first use - the launcher keeps Triton's cache in `CACHE_DIR`; the first start takes about a
+minute longer).
 
 ## Open items
 
