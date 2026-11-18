@@ -193,11 +193,13 @@ sets the three marked *served*:
 ## Inkling-2-Small on 4× RTX PRO 6000
 
 ### In the tree after `-r13` (in no released image)
-- The launcher takes its cards by name: `GPUS` is required, and a card that holds a compute process or more than
-  1 GiB is refused; the container's memory is capped (`MEMORY`, 96 GiB) and `CPUSET_MEMS` goes with `CPUS`.
+- The launcher takes its cards by name: `GPUS` is required (the word `all` is not accepted), and a card that holds
+  a compute process or more than 1 GiB, or whose memory reading is not a number, is refused; the container's memory
+  is capped (`MEMORY`, 96 GiB) and `CPUSET_MEMS` goes with `CPUS`.
 - `bmm/test_pack_e2m3.py --census N`: the packing's figures over N experts of each MXFP8 layer, on the CPU; the card
   test's packing figures build their powers of two from bits. Comments and docstrings; `quality_cmp.Client` carries
-  its default thinking kwargs. No kernel, no patched text and no default of the image changes.
+  its default thinking kwargs; two comments of the Dockerfile. No kernel, no patched text and no default of the
+  image changes.
 
 ### `inkling2-b974b306-r13` — 2026-11-13 (commit `1740c25`)
 - **The experts of layers 40–47 are repacked from MXFP8 to six bits (e2m3) as they load** (`MXFP6=1`, the launcher's

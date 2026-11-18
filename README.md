@@ -56,8 +56,8 @@ repacking, made for room: 5.7 GiB less per card, 76–79 % of those weights keep
 64-token prefill chunks, no draft - what the released precision's 0.7 GiB of KV cache a card allow; the packed form
 has 6.4 GiB there): 194 of 200 GSM8K questions packed and 195 as released, the same answer to 197 of the 200; 19 of
 24 greedy answers the same text to the end (a server repeats its own: 24 of 24); decode 1–3 % faster packed. With
-the 65K context and the draft below, the packed model answers 193 of 200 in each of three runs. The released
-precision was not measured beyond 8K tokens or with the draft. On 4× RTX PRO 6000 at 400 W, image
+the 65K context below the packed model answers 193 of 200 in each of three runs - without the draft and with it at
+8 and at 32 requests. The released precision was not measured beyond 8K tokens or with the draft. On 4× RTX PRO 6000 at 400 W, image
 `vllm-moet-sm120:inkling2-b974b306-r13` (TP4 with the experts expert-parallel, 65K context, the DSpark draft of 7
 tokens, thinking, tool calling, vision; [the doc](docs/inkling2-sm120.md)):
 

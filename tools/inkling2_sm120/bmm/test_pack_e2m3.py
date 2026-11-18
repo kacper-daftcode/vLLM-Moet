@@ -14,7 +14,8 @@
      projections, one line per expert and the range found - the share of the weights that keep their value, the share
      that lies in the block's top three binades (exact by construction), the error energy over the weight energy in
      the weights' own units (every block times its scale) and the largest error over the block's largest magnitude.
-     One expert is read at a time and its file pages are released (N = 12: 192 experts, a few minutes on four threads).
+     One expert is read at a time and its file pages are released (N = 12: 96 experts, 192 tensors, a few minutes on
+     four threads).
 """
 from __future__ import annotations
 
